@@ -1,0 +1,19 @@
+{
+  "updated": "2026-09-15T22:45:00.000Z",
+  "iteration": 0,
+  "passThreshold": 8.5,
+  "wave": "0-scaffold",
+  "waves": {
+    "0-scaffold": { "status": "done", "notes": "ARCHITECTURE.md contract, tools/serve.mjs, tools/test.mjs, package.json, CI workflow, index.html, styles.css" },
+    "1-foundations": { "status": "pending", "modules": ["core", "state", "input", "renderer"] },
+    "2-generation": { "status": "pending", "modules": ["maze"] },
+    "3-hud-polish": { "status": "pending", "modules": ["ui", "renderer-polish"] },
+    "integration": { "status": "pending" },
+    "gauntlet": { "status": "pending" },
+    "stress": { "status": "pending" }
+  },
+  "modules": {},
+  "metrics": {},
+  "blocking": [],
+  "history": []
+}

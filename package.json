@@ -1,0 +1,17 @@
+{
+  "name": "a-maze",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Retro torch-lit raycaster maze crawler. Plain ES modules, zero runtime deps.",
+  "scripts": {
+    "serve": "node tools/serve.mjs",
+    "test": "node tools/test.mjs",
+    "validate": "node tools/validate-mazes.mjs",
+    "stress": "node tools/stress.mjs",
+    "verify": "node tools/verify.mjs"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^23.11.1"
+  }
+}

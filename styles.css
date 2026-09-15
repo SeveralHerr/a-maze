@@ -1,0 +1,10 @@
+/* A-MAZE page shell. Integrator-owned. The game draws into two stacked canvases that are
+   rendered at a low internal resolution and scaled up with nearest-neighbour filtering. */
+:root { color-scheme: dark; --bg: #07090f; }
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; touch-action: none; }
+#app { position: fixed; inset: 0; display: grid; place-items: center; user-select: none; -webkit-user-select: none; }
+#app > canvas, #post, #touch { position: absolute; inset: 0; width: 100%; height: 100%; }
+#app > canvas { image-rendering: pixelated; image-rendering: crisp-edges; }
+#overlay { cursor: default; }
+#post, #touch { pointer-events: none; }

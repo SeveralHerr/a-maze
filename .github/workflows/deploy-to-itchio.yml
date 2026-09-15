@@ -1,0 +1,85 @@
+name: Deploy to itch.io
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Only the newest push to main can reach itch.io, so letting an older run finish
+# means paying for a build-and-deploy whose upload is immediately replaced.
+concurrency:
+  group: deploy-itchio
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      # butler pushes a directory; this one is assembled in the "Assemble build" step.
+      BUILD_DIR: dist
+      ITCH_TARGET: severalherr/a-maze:html5
+
+    steps:
+    # First step on purpose. butler is the last thing this workflow runs, so a bad key
+    # is otherwise only reported at the end of the run. The empty case is checked
+    # separately from the missing one because they are NOT the same mistake:
+    # `gh secret set NAME --repo owner/repo` in a shell with no terminal reads stdin,
+    # gets EOF, and stores an empty secret at exit 0. `gh secret list` then shows it
+    # present, and butler reports it exactly as if it had never been set.
+    - name: Check the itch.io credentials exist
+      env:
+        BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
+      run: |
+        if [ -z "${BUTLER_API_KEY}" ]; then
+          echo "::error::BUTLER_API_KEY is unset or empty - butler cannot push, so this run would fail at the last step."
+          echo "Set it with a value on the command line; a bare 'gh secret set' with no terminal stores an EMPTY secret:"
+          echo "  gh secret set BUTLER_API_KEY --repo <owner/repo> --body \"\$KEY\""
+          echo "Generate the key at https://itch.io/user/settings/api-keys"
+          exit 1
+        fi
+        echo "BUTLER_API_KEY is present and non-empty (${#BUTLER_API_KEY} characters)."
+
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # No build step: the game is plain ES modules loaded straight from index.html.
+    # The upload is index.html at the root plus src/ beside it, which is exactly the
+    # layout `node tools/serve.mjs` serves locally. Tests, tooling and node_modules
+    # are left out - they are never fetched by the page and only inflate the upload.
+    - name: Assemble build
+      run: |
+        rm -rf "${BUILD_DIR}"
+        mkdir -p "${BUILD_DIR}"
+        cp index.html styles.css "${BUILD_DIR}/"
+        rsync -a --exclude='*.test.mjs' --exclude='README.md' src "${BUILD_DIR}/"
+
+    # A missing or empty index.html is the one failure that would still upload
+    # successfully and leave a blank page on itch.io.
+    - name: Verify build output
+      run: |
+        if [ ! -s "${BUILD_DIR}/index.html" ] || [ ! -s "${BUILD_DIR}/src/main.js" ]; then
+          echo "::error::Build produced no ${BUILD_DIR}/index.html or no ${BUILD_DIR}/src/main.js - aborting deploy."
+          ls -laR "${BUILD_DIR}" || true
+          exit 1
+        fi
+        du -sh "${BUILD_DIR}"
+        find "${BUILD_DIR}" -type f | wc -l
+
+    - name: Install Butler
+      run: |
+        curl -L -o butler.zip https://broth.itch.zone/butler/linux-amd64/LATEST/archive/default
+        unzip butler.zip
+        sudo mv butler /usr/local/bin/butler
+        sudo chmod +x /usr/local/bin/butler
+        butler -V  # Verify installation
+
+    # butler reads BUTLER_API_KEY from the environment; the repository secret of the
+    # same name is the one-time setup step. --userversion stamps the build with the
+    # commit, so `butler status` answers "is the live build the commit I think it is".
+    - name: Deploy to itch.io
+      env:
+        BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
+      run: |
+        butler push "${BUILD_DIR}" "${ITCH_TARGET}" --userversion "${GITHUB_SHA::7}"
