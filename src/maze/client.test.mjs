@@ -8,7 +8,7 @@
  * `new URL('./worker.js', import.meta.url)`) is covered by `logs/maze-worker-check.mjs` and by
  * `tools/verify.mjs`.
  */
-import test from 'node:test';
+import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createMazeClient } from './client.js';
 import { buildLevel } from './level.js';
@@ -16,6 +16,22 @@ import { handleMazeRequest } from './worker.js';
 
 const BIG = { cols: 30, rows: 30, braid: 0.2, gems: 6, oil: 2 };
 const SMALL = { cols: 6, rows: 6, braid: 0, gems: 3, oil: 1 };
+
+// client.js deliberately unrefs its worker-deadline timer, and the fakes below mirror that, so
+// nothing in this file keeps the process alive on its own. That is fine in a browser and fine when
+// node:test happens to keep the loop spinning between tests, but it is not guaranteed: on a slower
+// or differently-scheduled runtime the event loop can decide it is done before an unref'd timer
+// gets its turn, and every in-flight test is cancelled with "Promise resolution is still pending
+// but the event loop has already resolved" (observed in CI on Node 22/Linux; not reproducible
+// locally on Node 24/Windows). A single ref'd interval for the duration of this file removes the
+// race without touching the production unref behaviour it is testing.
+let keepalive;
+before(() => {
+  keepalive = setInterval(() => {}, 1 << 30);
+});
+after(() => {
+  clearInterval(keepalive);
+});
 
 /**
  * A fake `Worker` that answers on a timer using the real worker-side handler.
