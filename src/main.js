@@ -38,6 +38,7 @@ import { loadPersist, savePersist } from './state/save.js';
 
 import { createInput } from './input/input.js';
 import { CONTROL_HINTS } from './input/bindings.js';
+import { createFullscreen, shouldAutoFullscreen } from './input/fullscreen.js';
 import { createMazeClient } from './maze/client.js';
 
 import { createRaycaster } from './renderer/raycaster.js';
@@ -88,6 +89,13 @@ const LOAD_TIMEOUT_S = 12;
  */
 const MIN_LOAD_S = 0.8;
 
+/**
+ * Milliseconds after a fullscreen request during which losing pointer lock does not pause. Chrome
+ * drops the lock 8–25 ms into the transition; a second covers a slow frame without masking a real
+ * Esc, which leaves fullscreen and pauses through that change instead.
+ */
+const FULLSCREEN_LOCK_GRACE_MS = 1000;
+
 /** Iris open/close rates, 1/s (the level-transition wipe of §1). */
 const IRIS_OPEN_RATE = 2.4;
 const IRIS_CLOSE_RATE = 2.8;
@@ -134,6 +142,19 @@ const HEADLESS = params.get('headless') !== null && params.get('headless') !== '
  * another is how `inject()` becomes a function that exists, returns no error and does nothing.
  */
 const EXPOSE = HEADLESS || isDebug();
+/**
+ * Running inside an iframe (the itch.io embed). Reading `top` across origins can throw in older
+ * engines; a page that cannot even look at its parent is certainly framed.
+ */
+const EMBEDDED = (() => {
+  try {
+    return globalThis.self !== globalThis.top;
+  } catch {
+    return true;
+  }
+})();
+/** `?fullscreen=1` / `?fullscreen=0` force auto-fullscreen on or off (§4.7 Fullscreen). */
+const FULLSCREEN_PARAM = params.get('fullscreen');
 /** `?seed=N` pins the run seed so a headless run replays exactly. */
 const SEED_PARAM = Number(params.get('seed'));
 const FORCED_SEED = Number.isFinite(SEED_PARAM) && params.get('seed') !== null ? SEED_PARAM >>> 0 : null;
@@ -262,14 +283,24 @@ function boot() {
 
   const menus = createMenus(overlay, {
     // Menus never invent a seed and never touch state: every row becomes one dispatch.
+    // Fullscreen is asked for FIRST in the three rows that put the player back in the maze: the
+    // request must land while the gesture's transient activation is still fresh, before a dispatch
+    // whose subscribers (level build, pointer-lock release) could take long enough to matter.
     onNewGame: () => {
+      autoFullscreen();
       audio.unlock(); // we are inside a real user gesture here, which is the only place this works
       hud.reset();
       store.dispatch({ type: 'newGame', seed: FORCED_SEED === null ? randomSeed() : FORCED_SEED });
     },
-    onResume: () => store.dispatch({ type: 'resume' }),
+    onResume: () => {
+      autoFullscreen();
+      store.dispatch({ type: 'resume' });
+    },
     onQuit: () => store.dispatch({ type: 'toTitle' }),
-    onNextLevel: () => store.dispatch({ type: 'nextLevel' }),
+    onNextLevel: () => {
+      autoFullscreen();
+      store.dispatch({ type: 'nextLevel' });
+    },
     onSetting: (key, value) => store.dispatch({ type: 'setSetting', key, value }),
     onUiSound: (type) => {
       if (type === 'uiMove') audio.playUi('move');
@@ -290,6 +321,35 @@ function boot() {
     shouldLockPointer: () => store.getState().phase === 'playing',
     touchRoot: /** @type {HTMLElement|null} */ (touchRoot),
   });
+
+  // ── Fullscreen (itch.io embed, §4.7) ────────────────────────────────────────────────────────
+  // The whole document goes fullscreen, not `#view`: every layer (HUD, menus, touch stick) has to
+  // come with it, and `layout()` already fits the world band to whatever the window becomes.
+  const fullscreen = createFullscreen();
+
+  /**
+   * Ask for fullscreen if this page should have it. Only ever called from inside a user gesture —
+   * browsers refuse the request anywhere else, and `request()` swallows that refusal.
+   * @returns {void}
+   */
+  function autoFullscreen() {
+    if (fullscreen.active) return;
+    const wanted = shouldAutoFullscreen({
+      param: FULLSCREEN_PARAM,
+      headless: HEADLESS,
+      embedded: EMBEDDED,
+      setting: store.getState().settings.fullscreen,
+    });
+    if (wanted && fullscreen.request()) fullscreenRequestMs = performance.now();
+  }
+
+  /**
+   * When the last fullscreen request went out. Entering fullscreen drops a pointer lock taken by the
+   * same gesture (measured in Chrome inside an iframe: the lock lands, then is lost 8–25 ms later as
+   * the transition completes), and treating that loss as "the player pressed Esc" bounced every
+   * resume straight back into the pause menu. See {@link FULLSCREEN_LOCK_GRACE_MS}.
+   */
+  let fullscreenRequestMs = -1e9;
 
   // ── Maze generation ─────────────────────────────────────────────────────────────────────────
   const mazeClient = createMazeClient();
@@ -550,6 +610,11 @@ function boot() {
    * @returns {void}
    */
   function applySettings(settings) {
+    // Switching the option off is also the player asking to leave fullscreen now, not next run.
+    if (settings.fullscreen !== appliedSettings.fullscreen && !settings.fullscreen && fullscreen.active) {
+      fullscreen.exit();
+    }
+    appliedSettings.fullscreen = settings.fullscreen;
     if (
       settings.sensitivity !== appliedSettings.sensitivity ||
       settings.invertLook !== appliedSettings.invertLook
@@ -651,6 +716,14 @@ function boot() {
 
   // Pointer events reach the menus directly: they hit-test the layout recorded by the last render.
   const onPointer = (/** @type {PointerEvent} */ ev) => {
+    // A press on the world while playing is the gesture that re-enters fullscreen after the player
+    // left it (Esc). It runs on the pointer event, which precedes the `click` input.js turns into
+    // pointer lock. Browsers grant activation on `pointerdown` for a mouse but only on `pointerup`
+    // for touch and pen, so each kind asks on the event that actually carries the gesture.
+    if (store.getState().phase === 'playing') {
+      const mouse = ev.pointerType === 'mouse' || !ev.pointerType;
+      if (ev.type === (mouse ? 'pointerdown' : 'pointerup')) autoFullscreen();
+    }
     const handled = menus.handlePointer(ev);
     if (handled && ev.cancelable) ev.preventDefault();
   };
@@ -695,7 +768,7 @@ function boot() {
     // The framebuffer can never be taller than 4:3 (§4.5 pins 240 rows and clamps the width to
     // 320…560), so a phone in portrait always letterboxes. Rather than centring the band and
     // leaving two dead bars, it is pushed up to 42 % of the height: the strip above it takes the
-    // HUD's top row, and the deeper deck below takes the compass, the minimap and the thumb that
+    // HUD's top row, and the deeper deck below takes the minimap and the thumb that
     // drives the virtual stick. The result reads as a handheld cabinet instead of a broken video.
     const portrait = cssH > cssW * 1.15;
     for (const el of /** @type {HTMLElement[]} */ ([view, postRoot])) {
@@ -754,8 +827,16 @@ function boot() {
     doc.body.classList.toggle('locked', locked);
     // Escape is how a browser gives the pointer back, and it does NOT deliver that keypress to the
     // page — so without this, the first Esc frees the cursor and the game keeps running behind it.
-    // Losing the pointer while playing means the player stopped driving: pause.
-    if (!locked) autoPause();
+    // Losing the pointer while playing means the player stopped driving: pause — unless our own
+    // fullscreen transition took it. A real Esc during that window also leaves fullscreen, and that
+    // change pauses on its own below; input.js re-acquires the lock, and free mouse look covers the gap.
+    if (!locked && performance.now() - fullscreenRequestMs > FULLSCREEN_LOCK_GRACE_MS) autoPause();
+  });
+  // Fullscreen changes the window size (relayout), and Esc leaves it without delivering the key to
+  // the page — the same trap as pointer lock above, so leaving it while playing pauses too.
+  fullscreen.onChange((active) => {
+    scheduleLayout();
+    if (!active) autoPause();
   });
 
   // ─── Frame ────────────────────────────────────────────────────────────────────────────────
@@ -1003,6 +1084,7 @@ function boot() {
     for (const close of [
       () => mazeClient.dispose(),
       () => input.destroy(),
+      () => fullscreen.destroy(),
       () => audio.dispose(),
       () => raycaster.dispose(),
       () => post.destroy(),

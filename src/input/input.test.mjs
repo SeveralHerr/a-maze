@@ -283,10 +283,11 @@ function mouseMove(t, dx) {
   t.env.document.dispatchEvent({ type: 'mousemove', movementX: dx, movementY: 0 });
 }
 
-test('lookDX accumulates only while locked, and resets every poll', () => {
+test('lookDX accumulates while locked, and resets every poll', () => {
   const t = setup({ sensitivity: 1 });
   mouseMove(t, 100);
-  assert.equal(t.input.poll().lookDX, 0, 'no lock, no drag → no look');
+  mouseMove(t, 100);
+  assert.equal(t.input.poll().lookDX, 0, 'not playing, not locked → no look');
 
   t.env.document.pointerLockElement = t.env.canvas;
   assert.equal(t.input.pointerLocked, true);
@@ -434,22 +435,98 @@ test('requestPointerLock is safe when unsupported or rejected', () => {
   });
 });
 
-test('drag-look works as a pointer-lock fallback, but only while playing', () => {
+test('mouse look works without pointer lock while playing, never in menus', () => {
   const t = setup({ playing: false });
-  // The fallback is for engines that cannot lock the pointer at all; take the API away so the
-  // automatic re-lock below cannot grab it out from under the drag.
+  // Take the lock API away so nothing can capture the pointer out from under the test.
   delete t.env.canvas.requestPointerLock;
-  t.env.canvas.dispatchEvent({ type: 'mousedown', button: 0 });
   mouseMove(t, 100);
-  assert.equal(t.input.poll().lookDX, 0, 'dragging in a menu must not turn the camera');
+  mouseMove(t, 100);
+  assert.equal(t.input.poll().lookDX, 0, 'moving the cursor over a menu must not turn the camera');
 
   t.setPlaying(true);
+  mouseMove(t, 1400); // the first free move is the cursor's jump since the menu: dropped
+  assert.equal(t.input.poll().lookDX, 0);
   mouseMove(t, 100);
-  assert.ok(t.input.poll().lookDX > 0);
+  mouseMove(t, 50);
+  let dx = t.input.poll().lookDX;
+  assert.ok(Math.abs(dx - 150 * 0.0024) < 1e-12, `expected 0.36 rad, got ${dx}`);
 
-  t.env.document.dispatchEvent({ type: 'mouseup' });
+  // Sensitivity and invert apply to free look exactly as to locked look.
+  t.input.setOptions({ sensitivity: 2, invertLook: true });
   mouseMove(t, 100);
-  assert.equal(t.input.poll().lookDX, 0, 'drag ended');
+  dx = t.input.poll().lookDX;
+  assert.ok(Math.abs(dx + 100 * 0.0024 * 2) < 1e-12, `got ${dx}`);
+
+  // A glitch is still dropped unlocked.
+  mouseMove(t, 100000);
+  assert.equal(t.input.poll().lookDX, 0);
+
+  t.setPlaying(false);
+  mouseMove(t, 100);
+  assert.equal(t.input.poll().lookDX, 0, 'back in a menu');
+  t.input.destroy();
+});
+
+test('free mouse look: the first move after a pause in motion is dropped (cursor re-entry)', () => {
+  const t = setup({ playing: true });
+  delete t.env.canvas.requestPointerLock;
+  mouseMove(t, 10);
+  mouseMove(t, 10);
+  assert.ok(Math.abs(t.input.poll().lookDX - 10 * 0.0024) < 1e-12);
+
+  // The cursor leaves the iframe and comes back in on the other side.
+  t.env.advance(150);
+  mouseMove(t, 1400);
+  assert.equal(t.input.poll().lookDX, 0, 'the re-entry jump is not a turn');
+  t.env.advance(16);
+  mouseMove(t, 20);
+  assert.ok(Math.abs(t.input.poll().lookDX - 20 * 0.0024) < 1e-12, 'continuous motion resumes');
+
+  // Blur re-arms the guard too.
+  t.env.window.dispatchEvent({ type: 'blur' });
+  mouseMove(t, 500);
+  assert.equal(t.input.poll().lookDX, 0);
+  t.input.destroy();
+});
+
+test('arrow-key turning and free mouse look apply in the same frame', () => {
+  const t = setup({ playing: true });
+  delete t.env.canvas.requestPointerLock;
+  t.keyDown('ArrowRight');
+  mouseMove(t, 30);
+  mouseMove(t, 30);
+  const f = t.input.poll();
+  assert.equal(f.turn, 1, 'the key still turns');
+  assert.ok(f.lookDX > 0, 'and the mouse adds to it');
+  t.input.destroy();
+});
+
+test('touch devices never take look from synthesised mouse moves', () => {
+  const t = setup({ coarsePointer: true, playing: true });
+  mouseMove(t, 100);
+  mouseMove(t, 100);
+  assert.equal(t.input.poll().lookDX, 0);
+  t.input.destroy();
+});
+
+test('a mouse click that starts a level authorises the pointer lock once play begins', () => {
+  // Clicking "New Game" lands during `loading`: onClick cannot lock then.
+  const t = setup({ playing: false });
+  t.env.canvas.dispatchEvent({ type: 'mousedown', button: 0 });
+  t.env.canvas.dispatchEvent({ type: 'click' });
+  assert.equal(t.env.document.pointerLockElement, null, 'menus keep the cursor');
+  t.env.advance(900); // the loading screen
+  t.setPlaying(true);
+  t.input.poll();
+  assert.equal(t.env.document.pointerLockElement, t.env.canvas, 'captured without a second click');
+
+  // A right-click is not treated as that authorisation.
+  const u = setup({ playing: false });
+  u.env.canvas.dispatchEvent({ type: 'mousedown', button: 2 });
+  u.setPlaying(true);
+  u.input.poll();
+  assert.equal(u.env.document.pointerLockElement, null);
+  u.input.destroy();
   t.input.destroy();
 });
 

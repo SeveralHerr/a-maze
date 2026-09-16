@@ -70,7 +70,7 @@ tree is served locally (`npm run serve`) and uploaded to itch.io by CI.
   _Consequence of the tank (deliberate, see `SCORE`):_ the clear bonus is roughly constant per level
   because the tank no longer grows, while gems scale with area (6 at level 1 → 273 at the cap), so
   the incentive tips from "get out fast" to "explore" as the labyrinth grows.
-- **Controls:** WASD/arrows move + turn, mouse look with pointer lock, Shift sprint (fast but
+- **Controls:** WASD/arrows move + turn, mouse look (always live while playing; pointer lock when captured, plain mouse movement otherwise — it sums with arrow-key turning), Shift sprint (fast but
   wasteful: drains fuel 2× at 1.6× speed, so a sprinted tile costs 1.25× a walked one), M cycles the map **off → corner → full** (once this level's map scroll is found), Esc/P pause, Enter/Space confirm. Touch: left
   virtual stick move, right half drag to turn, tap buttons for pause/map. Gamepad: standard mapping.
 - **Feedback cues:** head bob, footstep sounds synced to bob, wall-bump thud + tiny camera
@@ -214,6 +214,8 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
  * @property {MapMode} mapMode    what the map restores to (default 'corner')
  * @property {boolean} minimap    LEGACY mirror of `mapMode !== 'off'`, kept because audio, touch and
  *   older call sites still read it. main.js and the options row write BOTH on every change.
+ * @property {boolean} fullscreen go fullscreen on the gesture that starts/resumes a run when embedded
+ *   (default true; §4.3 `fullscreen.js`, §4.7). Turning it off also leaves fullscreen.
  * @typedef {Object} GameState
  * @property {Phase} phase
  * @property {number} time            total sim seconds since boot (monotonic)
@@ -392,7 +394,13 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   would decrement a different slot on keyup; `wantsPointer` is true while the game wants mouse look
   but does not own the pointer (playing, not touch, lock supported, not locked) — the hook for a
   "click to look" prompt.
-  Keyboard (`code`-based, layout independent), mouse w/ pointer lock, gamepad (deadzone 0.18),
+  _Mouse look without a click:_ while `shouldLockPointer()` is true and the device has not proven
+  touch, `mousemove.movementX` turns the camera whether or not the pointer is locked. Pointer lock is
+  still requested (canvas click, or automatically after a recent keyboard **or mouse** gesture —
+  starting a level from a menu row counts) because it removes the screen edge and hides the cursor.
+  Unlocked, the first move after a gap of `FREE_MOVE_REARM_MS` is dropped (the cursor re-entering
+  the frame reports its jump as one delta). `lookDX` sums with keyboard/pad `turn` in the sim.
+  Keyboard (`code`-based, layout independent), mouse (locked or free), gamepad (deadzone 0.18),
   touch (virtual stick left 40% of screen, drag-look on right, rendered by `touch-overlay.js`).
   `poll()` reuses one frame object **and one `pressed` Set** (no alloc) — never retain either.
   Clears stuck keys on `blur`, `visibilitychange`, pointer-lock loss and `touchcancel`. Never calls
@@ -422,6 +430,20 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   draws the stick and pause/map buttons as DOM/CSS elements. `input.js` owns it and creates it
   lazily on the first real touch; `{touchOverlay:false}` opts out. The button bar carries the class
   `amaze-touch-bar` so `styles.css` (integrator) can keep it clear of the HUD's top-right panel.
+- `fullscreen.js` — `createFullscreen({root?, env?}) → { request():boolean, exit(), readonly active:boolean, readonly supported:boolean, onChange(fn) → unsubscribe, destroy() }`
+  plus the pure `shouldAutoFullscreen({param, headless, embedded, setting}) → boolean`.
+  `root` defaults to `document.documentElement`. `request()` **never throws** and swallows the
+  promise rejection a browser returns outside a user gesture (or inside a sandboxed iframe without
+  `allowfullscreen`); it is a no-op (returns false) when unsupported, `fullscreenEnabled === false`,
+  already active or destroyed. It falls back to `webkitRequestFullscreen` / `webkitExitFullscreen` /
+  `webkitFullscreenElement` / `webkitfullscreenchange` (Safari). `onChange(fn)` subscribes `fn(active)`
+  to transitions, de-duplicated on `active` because Chrome fires both the prefixed and unprefixed
+  event; `destroy()` removes the document listeners and subscribers. `env` injects `{document}` for
+  Node tests.
+  `shouldAutoFullscreen`: `param === '1'` → true, `param === '0'` → false, otherwise
+  `!headless && embedded && setting` — fullscreen is only automatic inside an embed (itch.io), where
+  the iframe is small; a top-level tab already owns the window, and `?headless=1` tools never get it
+  unless they ask with `?fullscreen=1`.
 
 ### 4.4 `src/maze` (Wave 2)
 - `constants.js` — `TILE = { FLOOR:0, WALL:1 }`, `DIRS`.
@@ -668,11 +690,10 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
     hole, but the constant must be raised to match.
 - `hud.js` — `createHud(overlayCanvas, {map?:'off'|'corner'|'full', minimap?:boolean|MapMode}) → { render(state, frameStats?, alpha?), resize(cssW, cssH, dpr?), surface, pop(value, kind?), cycleMap(settings?), mapMode(settings?), mapStats(), mapLocked(state), notice(text), reset(), dispose() }`
   (`minimap: true` still means `'corner'`, so an older call site keeps working):
-  fuel gauge, score with rolling counter + pop-up deltas, gem count, depth, level timer, compass
-  needle toward the exit **plus a distance-to-exit readout in tiles** — both free on depths 1–2 and
-  from depth 3 earned at `compassGems(gemsTotal)` = `min(8, ceil(15 % of gemsTotal))` gems, an
-  absolute count so the instrument stays reachable at the cap (exported and pinned by a test), the map (via `map.js`), FPS in
-  `?debug=1`. `cycleMap` advances OFF → CORNER → FULL and returns the new mode; `mapMode` reports the
+  fuel gauge, score with rolling counter + pop-up deltas, gem count, depth, level timer, the map
+  (via `map.js`), FPS in
+  `?debug=1`. There is **no compass** and no distance-to-exit readout (removed: finding the way is
+  the map scroll's job, and a needle toward the exit made the maze moot). `cycleMap` advances OFF → CORNER → FULL and returns the new mode; `mapMode` reports the
   one in force; `mapStats()` returns a reused
   `{updateMs, drawMs, painted, scanned, flushes, explored, tiles, rebuilds}` (**stale while the mode
   is `'off'`** — no update runs, so it keeps its last numbers rather than zeroing).
@@ -828,13 +849,24 @@ the post effects frame the **world** and never darken the HUD or the menus. `#vi
 sized in JS to the largest box that preserves the framebuffer's aspect, snapped to a whole pixel
 multiple when that costs < 3 % (exact 3× at 720p), and centred — at 42 % of the height on a
 portrait phone, where the 4:3 framebuffer must letterbox and the deeper deck below the world holds
-the compass, the minimap and the thumb on the virtual stick. `#overlay` and `#touch` are inset by
+the minimap and the thumb on the virtual stick. `#overlay` and `#touch` are inset by
 the safe-area insets instead, so a notch never sits on the fuel gauge. After sizing, `layout()` hands the band to the shared overlay surface with
 `hud.surface.setViewRect(...)` (overlay-relative CSS px) before `hud.resize`/`menus.resize`, so the UI
 lays out around the world band without measuring the DOM itself.
 
 **Focus:** losing window focus or the tab being hidden while `playing` dispatches `pause`; the
 cursor is hidden only while the pointer is locked (`body.locked`).
+
+**Fullscreen** _(itch.io embed)_: browsers only honour `requestFullscreen` inside a user gesture, so
+main.js asks on the gestures that start or resume play: first thing in the menus' `onNewGame`,
+`onResume` and `onNextLevel` callbacks (a pointer confirm is inside the event; a keyboard confirm is
+polled on the next step, which is still inside the browser's transient-activation window), and on
+`pointerdown` over `#overlay` while `playing` — registered before the click that takes pointer
+lock. Each ask is gated by `shouldAutoFullscreen({param: ?fullscreen=, headless: ?headless=1,
+embedded: window.self !== window.top, setting: settings.fullscreen})` and skipped when already
+active. A `fullscreenchange` relayouts, and **leaving fullscreen while `playing` pauses** (Escape
+leaves fullscreen without delivering the key, exactly like pointer lock). Turning the `fullscreen`
+setting off exits fullscreen. `shutdown()` destroys the controller.
 
 `?headless=1` (or `?debug=1`) exposes
 `window.__game = { ready, state(), dispatch(action), subscribe(fn), stepOnce(n), stats(), renderStats(), audioStats(), screen(), mapMode(), errors, input:{inject(partialFrame), clear()} }`
@@ -879,7 +911,7 @@ The "oil only when ≥ 55 % would land" rule is unchanged.
   `{type:'pickup', kind:'map', x, y, value:0}`. It does not score and does not count toward
   `gemsTotal`. `isLevelData` accepts `'map'`.
 - `src/ui/hud.js` + `map.js`: while `state.run.mapFound` is false the map draws **nothing** in any
-  mode (corner and full), and the compass / layout behave as if the mode were `'off'`. The HUD
+  mode (corner and full), and the layout behaves as if the mode were `'off'`. The HUD
   derives a **"Map Found"** banner (`MAP_FOUND_TEXT`, title case like every gothic label; `MapView.invalidate()` does the one catch-up rescan on unlock) from the `mapFound` false→true delta (same rule as the score
   pops — not from the event). `hud.mapLocked(state) → boolean` is exported for main.js.
   `hud.notice(text)` shows a short centred one-line notice (~1.6 s, reduced-motion aware).

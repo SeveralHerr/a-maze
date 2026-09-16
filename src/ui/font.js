@@ -97,7 +97,7 @@ export const COLOR = Object.freeze({
   woodBright: '#7a5230',
   woodHilite: '#96683c',
 
-  // Iron — sconce, compass ring (palette).
+  // Iron — sconce (palette).
   ironShadow: '#0f1116',
   ironDark: '#1c1f26',
   ironBase: '#2f343d',

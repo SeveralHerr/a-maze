@@ -1365,8 +1365,8 @@ export function createMapView(options) {
   }
 
   /**
-   * Has the exit been seen? The map must not leak where it is before then — the compass is earned,
-   * not given (ARCHITECTURE.md §4.6).
+   * Has the exit been seen? The map must not leak where it is before then — the exit is
+   * found, not given (ARCHITECTURE.md §4.6).
    * @param {GameState} state
    * @returns {boolean}
    */

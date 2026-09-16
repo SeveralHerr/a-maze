@@ -914,7 +914,23 @@ test('setSetting: validates, clamps and ignores nonsense in every phase', () => 
   assert.equal(/** @type {any} */ (s.settings).hack, undefined);
   reducer(s, /** @type {any} */ ({ type: 'setSetting', key: 42, value: 1 }));
   reducer(s, /** @type {any} */ ({ type: 'setSetting' }));
-  assert.equal(Object.keys(s.settings).length, 8);
+  assert.equal(Object.keys(s.settings).length, 9);
+});
+
+test('setSetting: fullscreen defaults on and takes only boolean-shaped values', () => {
+  const s = createInitialState();
+  assert.equal(s.settings.fullscreen, true, 'factory default: an embed goes fullscreen');
+  reducer(s, { type: 'setSetting', key: 'fullscreen', value: false });
+  assert.equal(s.settings.fullscreen, false);
+  for (const junk of ['on', 'true', null, undefined, 2, {}]) {
+    reducer(s, /** @type {any} */ ({ type: 'setSetting', key: 'fullscreen', value: junk }));
+    assert.equal(s.settings.fullscreen, false, `${String(junk)} is ignored, not coerced`);
+  }
+  reducer(s, { type: 'setSetting', key: 'fullscreen', value: true });
+  assert.equal(s.settings.fullscreen, true);
+  // A persisted blob from before the setting existed restores the default rather than `undefined`.
+  const old = createInitialState(/** @type {any} */ ({ volume: 0.5 }));
+  assert.equal(old.settings.fullscreen, true);
 });
 
 // ─── Events ──────────────────────────────────────────────────────────────────────────────────

@@ -780,6 +780,9 @@ export const SETTING_SPEC = Object.freeze({
   mapMode: Object.freeze({ kind: 'enum', def: 'corner', values: MAP_MODES }),
   reducedMotion: Object.freeze({ kind: 'boolean', def: false }),
   invertLook: Object.freeze({ kind: 'boolean', def: false }),
+  // On by default: the itch.io embed is a small iframe, and a first-person maze played through a
+  // letterbox is a worse game. Only acted on when embedded (see `src/input/fullscreen.js`).
+  fullscreen: Object.freeze({ kind: 'boolean', def: true }),
 });
 
 /**
@@ -839,6 +842,7 @@ export function defaultSettings() {
     ),
     reducedMotion: /** @type {boolean} */ (SETTING_SPEC.reducedMotion.def),
     invertLook: /** @type {boolean} */ (SETTING_SPEC.invertLook.def),
+    fullscreen: /** @type {boolean} */ (SETTING_SPEC.fullscreen.def),
   };
 }
 

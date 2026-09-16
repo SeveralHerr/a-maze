@@ -116,6 +116,7 @@ function makeState(phase) {
       minimap: true,
       reducedMotion: false,
       invertLook: false,
+      fullscreen: true,
     },
     derived: { exitDist: 8, nearExit: 0, lowFuel: false },
     events: [],
@@ -276,6 +277,21 @@ test('options: arrows adjust settings without mutating state', () => {
   state.settings.scanlines = true;
   menus.handleInput(press('left'), state);
   assert.deepEqual(settings.at(-1), ['scanlines', false]);
+});
+
+test('options: the Fullscreen row sits above Back and toggles the fullscreen setting', () => {
+  const { menus, settings } = harness();
+  const state = makeState('title');
+  menus.handleInput(press('down'), state); // Options
+  menus.handleInput(press('confirm'), state);
+  // Up from the first row wraps to Back; one more up is the last setting row.
+  menus.handleInput(press('up'), state);
+  menus.handleInput(press('up'), state);
+  menus.handleInput(press('confirm'), state);
+  assert.deepEqual(settings.at(-1), ['fullscreen', false]);
+  state.settings.fullscreen = false;
+  menus.handleInput(press('right'), state);
+  assert.deepEqual(settings.at(-1), ['fullscreen', true]);
 });
 
 test('options: the sensitivity slider stays inside its own range', () => {

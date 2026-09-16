@@ -11,7 +11,6 @@ import assert from 'node:assert/strict';
 import {
   ICON_SIZE,
   MAP_FOUND_TEXT,
-  compassGems,
   compileArt,
   createHud,
   createSurface,
@@ -340,7 +339,7 @@ function playingState(over) {
   };
 }
 
-test('the HUD draws the tank, the depth panel and the compass without a map', () => {
+test('the HUD draws the tank, and the depth panel without a map', () => {
   const canvas = drawableCanvas(1280, 720);
   const hud = createHud(canvas, { map: 'off' });
   hud.resize(1280, 720, 1);
@@ -410,25 +409,9 @@ test('every map mode renders without throwing at both layouts', () => {
   }
 });
 
-test('the compass gate is an absolute gem count, not a fraction of a 273-gem level', () => {
-  // 15 % capped at 8: reachable in a couple of minutes at every size on the shipped curve
-  // (6 gems on depth 1 → 273 at the 128×128 cap).
-  assert.equal(compassGems(6), 1);
-  assert.equal(compassGems(12), 2);
-  assert.equal(compassGems(29), 5, 'depth 3');
-  assert.equal(compassGems(120), 8, 'the cap bites well before the biggest levels');
-  assert.equal(compassGems(273), 8, 'depth 15');
-  assert.equal(compassGems(0), 0);
-  assert.equal(compassGems(NaN), 0);
-  for (const total of [6, 12, 29, 57, 120, 273]) {
-    assert.ok(compassGems(total) <= total, `${total} gems: the gate is reachable`);
-    assert.ok(compassGems(total) >= 1, `${total} gems: the gate is not free`);
-  }
-});
-
-test('the compass appears once those gems are collected, at any maze size', () => {
+test('there is no compass: nothing is drawn at the bottom centre, however many gems', () => {
   /**
-   * Fills in the bottom-centre dial area — where `drawCompass` puts its ring, ticks and needle.
+   * Fills in the bottom-centre area where the (removed) exit compass used to sit.
    * @param {any} run
    * @returns {number}
    */
@@ -448,14 +431,9 @@ test('the compass appears once those gems are collected, at any maze size', () =
     }
     return n;
   };
-
-  // Depth 9 carries 120-odd gems. Under the old "half the gems" rule this instrument — and the
-  // distance readout under it — could never appear at all.
-  const none = dialFills({ gems: 0, gemsTotal: 120 });
-  const earned = dialFills({ gems: 8, gemsTotal: 120 });
-  assert.ok(earned > none + 10, `the dial is drawn once earned (${none} → ${earned} fills)`);
-  const almost = dialFills({ gems: 7, gemsTotal: 120 });
-  assert.equal(almost, none, 'and not before');
+  assert.equal(dialFills({ gems: 0, gemsTotal: 120 }), dialFills({ gems: 120, gemsTotal: 120 }));
+  const early = dialFills({ gems: 0, gemsTotal: 6 });
+  assert.equal(early, 0, 'no dial and no exit-distance readout');
 });
 
 test('the HUD survives a level with no data and a low tank', () => {

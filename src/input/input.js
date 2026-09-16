@@ -97,6 +97,15 @@ const LOCK_SETTLE_MS = 50;
 const MAX_MOUSE_EVENT_PX = 2000;
 
 /**
+ * Without pointer lock, the first `mousemove` after a gap this long (ms) is dropped. An unlocked
+ * cursor that leaves the window or itch.io iframe and comes back in elsewhere reports the whole jump
+ * as one `movementX`, and the first move after play starts carries whatever the cursor did over the
+ * menu. A continuously moving mouse reports every frame (~16 ms), so real motion is never lost
+ * beyond one imperceptible event.
+ */
+const FREE_MOVE_REARM_MS = 100;
+
+/**
  * Hard ceiling on the yaw accumulated between two polls, in radians. Half a turn per sim step is
  * already beyond any deliberate flick; anything larger is a bug or a hostile input source.
  */
@@ -219,8 +228,9 @@ const AUTO_LOCK_MAX_FAILS = 8;
  * @property {number} [sensitivity]   look multiplier, clamped to 0.2…3 (default 1)
  * @property {boolean} [invertLook]   flip the yaw direction of mouse/touch look (default false)
  * @property {() => boolean} [shouldLockPointer]
- *   Predicate asked on every canvas click: return true only while the player is actually playing,
- *   so clicking a menu never swallows the cursor. Default: always false (main.js opts in).
+ *   Predicate asked on every canvas click and every unlocked mouse move: return true only while the
+ *   player is actually playing, so clicking a menu never swallows the cursor and moving over one
+ *   never turns the camera. Default: always false (main.js opts in).
  * @property {HTMLElement|null} [touchRoot]
  *   Container for the on-screen controls. Defaults to `#touch`, else the canvas's parent.
  * @property {boolean} [touchOverlay]  set false to suppress the on-screen controls entirely
@@ -312,8 +322,8 @@ export function createInput(canvasEl, opts) {
   let pendingMask = 0;
   /** Yaw radians accumulated from mouse/touch since the last poll (sensitivity already applied). */
   let lookAccum = 0;
-  /** True while a non-locked left-button drag is steering (pointer-lock fallback). */
-  let dragging = false;
+  /** Timestamp of the last unlocked mouse move; see {@link FREE_MOVE_REARM_MS}. */
+  let lastFreeMoveMs = -1e9;
 
   // Touch gesture state. `-1` identifiers mean "no touch claimed".
   let stickId = -1;
@@ -466,10 +476,9 @@ export function createInput(canvasEl, opts) {
     }
     // An unmodified keypress is a user gesture, and a gesture is what a pointer-lock request
     // needs. Recorded for every key (bound or not) so resuming a paused game from the keyboard can
-    // take the pointer back on the next step — see maybeAutoLock. Deliberately *only* the
-    // keyboard: a mouse player's click already locks directly in `onClick`, and treating clicks as
-    // standing authorisation would have the module asking for the pointer behind gestures the
-    // player aimed at something else.
+    // take the pointer back on the next step — see maybeAutoLock. A mouse press on the canvas is
+    // recorded too (onMouseDown): clicking "New Game" lands while the phase is still `loading`, so
+    // `onClick` cannot lock, and the auto-lock is what captures the mouse once play begins.
     lastGestureMs = now();
 
     const code = e.code || codeFromKey(e.key);
@@ -518,7 +527,7 @@ export function createInput(canvasEl, opts) {
     heldCodes.clear();
     hold.fill(0);
     lookAccum = 0;
-    dragging = false;
+    lastFreeMoveMs = -1e9;
     releaseStick();
     lookId = -1;
     navHoldMask = 0;
@@ -551,7 +560,12 @@ export function createInput(canvasEl, opts) {
   /** @param {any} e */
   function onMouseMove(e) {
     if (!e) return;
-    if (!isLocked() && !(dragging && shouldLockPointer())) return;
+    const locked = isLocked();
+    // Mouse look is live whenever the player is playing — captured or not. Pointer lock is the
+    // better mode (no screen edge, hidden cursor) and is still requested, but a player who never
+    // clicks must not find the mouse dead. Touch devices synthesise mouse events after a tap, which
+    // would double-apply on top of the drag-look.
+    if (!locked && (touchDetected || !shouldLockPointer())) return;
     const dx = e.movementX;
     if (typeof dx !== 'number' || !Number.isFinite(dx)) return;
     // Engagement spike guard (see LOCK_SETTLE_MS): only right after the lock lands.
@@ -559,20 +573,27 @@ export function createInput(canvasEl, opts) {
       lockFirstMove = false;
       return;
     }
-    if (now() - lockEngagedMs < LOCK_SETTLE_MS) return;
+    const t = now();
+    if (t - lockEngagedMs < LOCK_SETTLE_MS) return;
     // Glitch guard (see MAX_MOUSE_EVENT_PX): discarded, never clamped into a maximum-size turn.
     if (dx > MAX_MOUSE_EVENT_PX || dx < -MAX_MOUSE_EVENT_PX) return;
+    if (!locked) {
+      // Re-entry guard (see FREE_MOVE_REARM_MS).
+      const stale = t - lastFreeMoveMs > FREE_MOVE_REARM_MS;
+      lastFreeMoveMs = t;
+      if (stale) return;
+    }
     addLook(dx * MOUSE_RAD_PER_PX);
   }
 
-  /** @param {any} e */
+  /**
+   * A mouse press on the play surface is a user gesture that can authorise the automatic lock (see
+   * onKeyDown), which is what captures the mouse after a menu click starts a level.
+   * @param {any} e
+   */
   function onMouseDown(e) {
-    if (e && e.button === 0) dragging = true;
+    if (e && e.button === 0) lastGestureMs = now();
   }
-
-  const onMouseUp = () => {
-    dragging = false;
-  };
 
   /**
    * Pointer lock may only be requested from a user gesture. A click is the most direct one, and it
@@ -596,8 +617,8 @@ export function createInput(canvasEl, opts) {
     // Either direction is a discontinuity: releasing the pointer (Esc) abandons a half-gesture the
     // player has stopped watching, and *acquiring* it is where browsers are known to deliver one
     // bogus jumbo delta. Drop whatever has accumulated and start the next poll clean.
-    dragging = false;
     lookAccum = 0;
+    lastFreeMoveMs = -1e9;
     if (isLocked()) {
       autoLockPending = false;
       autoLockFails = 0;
@@ -1260,7 +1281,6 @@ export function createInput(canvasEl, opts) {
   listen(win, 'gamepaddisconnected', onGamepadDisconnected);
 
   listen(doc, 'mousemove', onMouseMove);
-  listen(doc, 'mouseup', onMouseUp);
   listen(doc, 'pointerlockchange', onPointerLockChange);
   listen(doc, 'pointerlockerror', onPointerLockError);
   listen(target, 'mousedown', onMouseDown);

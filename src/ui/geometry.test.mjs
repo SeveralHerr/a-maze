@@ -379,24 +379,6 @@ test('end screens: each stat value sits closer to its own label than to the next
   }
 });
 
-test('HUD on a phone: the exit distance is not louder than the score', () => {
-  for (const vp of VIEWPORTS.filter(isPortrait)) {
-    const hud = hudAt(vp, 'corner');
-    const state = playingState();
-    state.level = 2; // the compass is free on the first two depths
-    state.run.score = 4820;
-    for (let i = 0; i < 90; i++) {
-      state.time += 1 / 60;
-      hud.render(state, null, 0);
-    }
-    const boxes = collectLayout(() => hud.render(state, null, 0));
-    const dist = boxes.find((b) => b.kind === 'text' && /m$/.test(b.label));
-    const score = boxes.find((b) => b.kind === 'text' && b.label === '4,820');
-    assert.ok(dist !== undefined && score !== undefined, `${vp.name}: distance and score drawn`);
-    assert.ok(dist.unit <= score.unit, `${vp.name}: distance ×${dist.unit} vs score ×${score.unit}`);
-  }
-});
-
 test('title and panel headings stay within 2× of a world texel on desktop (no mixels)', () => {
   for (const vp of VIEWPORTS.filter((v) => !isPortrait(v))) {
     for (const screen of ['title', 'pause', 'options', 'complete', 'gameover']) {

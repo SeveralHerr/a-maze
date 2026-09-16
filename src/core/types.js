@@ -137,6 +137,8 @@
  * @property {MapMode} mapMode       three-state map: off → corner → full (§4.6)
  * @property {boolean} reducedMotion
  * @property {boolean} invertLook
+ * @property {boolean} fullscreen     go fullscreen on the gesture that starts/resumes a run when the
+ *   game is embedded (itch.io iframe); default true (ARCHITECTURE.md §4.3 `fullscreen.js`)
  */
 
 /**

@@ -211,6 +211,8 @@ const OPTION_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
   },
   { id: 'reducedMotion', label: 'Reduced Motion', kind: 'toggle', key: 'reducedMotion' },
   { id: 'invertLook', label: 'Invert Look', kind: 'toggle', key: 'invertLook' },
+  // Only acted on inside an embed (main.js, ARCHITECTURE.md §4.7); off also leaves fullscreen.
+  { id: 'fullscreen', label: 'Fullscreen', kind: 'toggle', key: 'fullscreen' },
   { id: 'back', label: 'Back', kind: 'back' },
 ]);
 

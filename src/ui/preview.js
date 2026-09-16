@@ -258,6 +258,7 @@ const state = {
     mapMode: mapParam === 'off' || mapParam === 'full' ? mapParam : 'corner',
     reducedMotion,
     invertLook: false,
+    fullscreen: true,
   },
   derived: { exitDist: 14, nearExit: 0.2, lowFuel: lowFuel },
   events: [],
@@ -607,7 +608,7 @@ let targetY = 1.5;
 let scoreTimer = 0;
 
 /**
- * Walk the demo player along open corridors so the minimap arrow and the compass move.
+ * Walk the demo player along open corridors so the minimap arrow moves.
  * @param {number} dt seconds
  * @returns {void}
  */

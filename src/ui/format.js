@@ -195,7 +195,7 @@ export function formatPercent(f) {
 }
 
 /**
- * A distance in tiles for the compass readout: `"12m"`. Tiles are read as metres because a
+ * A distance in tiles for the map and results readouts: `"12m"`. Tiles are read as metres because a
  * corridor is roughly a metre wide — a unit the player already understands.
  *
  * Distances are grouped past a thousand (`"1,240m"`), because a walk across a 128-cell labyrinth

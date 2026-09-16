@@ -51,7 +51,6 @@ import {
   createTextMemo,
   formatCount,
   formatDepth,
-  formatDistance,
   formatInt,
   formatLabyrinth,
   formatSigned,
@@ -64,8 +63,6 @@ import {
   drawPanel,
   drawTorchIcon,
   drawWell,
-  fillDisc,
-  fillRing,
   ICON_SIZE,
   strokeRect,
   withAlpha,
@@ -486,26 +483,6 @@ const FUEL_TICK_EVERY = 4;
 /** Fraction of `fuelMax` at or below which the gauge goes red (mirrors `FUEL.LOW_FRACTION`). */
 const LOW_FUEL_FRACTION = 0.25;
 
-/** Most gems the compass ever asks for, whatever the level holds. */
-const COMPASS_GEM_CAP = 8;
-
-/** Fraction of a level's gems the compass asks for, under the cap. */
-const COMPASS_GEM_FRACTION = 0.15;
-
-/**
- * Gems needed before the compass and the exit-distance readout are earned, from depth 3 on.
- *
- * An **absolute** count that does not scale with the maze's area: see `drawCompass`. Exported for
- * the unit test, which pins it against the real gem curve (6 gems on depth 1 → 273 at the cap) so
- * a future balance change cannot quietly make the instrument unreachable again.
- * @param {number} gemsTotal gems on this level
- * @returns {number} gems required
- */
-export function compassGems(gemsTotal) {
-  if (!Number.isFinite(gemsTotal) || gemsTotal <= 0) return 0;
-  return Math.min(COMPASS_GEM_CAP, Math.ceil(gemsTotal * COMPASS_GEM_FRACTION));
-}
-
 /**
  * Seconds the refill flare lasts. Long enough to be felt as an event, short enough that chaining
  * two flasks does not leave the gauge permanently white.
@@ -729,7 +706,6 @@ export function createHud(overlayCanvas, options) {
   const gemsText = createTextMemo((g, t) => formatCount(g, t));
   const depthText = createTextMemo((lv) => formatDepth(lv));
   const sizeText = createTextMemo((c, r) => formatLabyrinth(c, r));
-  const distText = createTextMemo((d) => formatDistance(d));
 
   /** @type {Pop[]} */
   const pops = new Array(MAX_POPS);
@@ -1006,8 +982,7 @@ export function createHud(overlayCanvas, options) {
     drawFuelGauge(ctx, state, m, reduced);
     drawScorePanel(ctx, state, m);
     drawDepthPanel(ctx, state, m);
-    const mapH = mode === 'corner' ? mapView.drawCorner(ctx, m, state, anim.clock, reduced) : 0;
-    drawCompass(ctx, state, m, reduced, mapH);
+    if (mode === 'corner') mapView.drawCorner(ctx, m, state, anim.clock, reduced);
     drawPops(ctx, m, reduced);
     drawBanner(ctx, m, reduced);
     if (isDebug()) drawDebug(ctx, state, m, frameStats === undefined ? null : frameStats);
@@ -1217,8 +1192,8 @@ export function createHud(overlayCanvas, options) {
     const flare = reduced ? 0 : anim.refillFlare;
     // The flame flickers on its own cycle; when the tank is low it stutters, which is the first
     // cue the player gets that the next flask has become urgent.
-    // The flicker noise (see `noise`) is written out here: a fractional argument per frame to a call
-    // that is not inlined is a boxed number per frame.
+    // The flicker noise (two incommensurable sines) is written out here: a fractional argument per
+    // frame to a call that is not inlined is a boxed number per frame.
     const nt = anim.clock * (low ? 17 : 9);
     const flicker = reduced ? 0.5 : 0.5 + 0.25 * Math.sin(nt) + 0.25 * Math.sin(nt * 1.7 + 1.3);
     const frame = reduced ? 0 : ((anim.clock * (low ? 14 : 8)) | 0) % 3;
@@ -1465,115 +1440,6 @@ export function createHud(overlayCanvas, options) {
   }
 
   /**
-   * Bottom-centre: a dial whose needle points at the exit, in *view-relative* terms (up = straight
-   * ahead), because a north-up compass in a first-person maze is a puzzle rather than a help.
-   *
-   * It only appears once the player has earned it: always on the first two depths while the rules
-   * are still being learned, and from depth 3 after a **fixed** handful of gems (ARCHITECTURE.md
-   * §4.6).
-   *
-   * WHY a fixed count and not a fraction: the gate used to be "half the gems", which was written
-   * for a 6-gem level. Gems scale with area now — 29 at depth 3, 273 at the cap — so a fraction
-   * meant the compass *and* the distance readout were unreachable from depth 3 onward, i.e. an
-   * entire instrument was dead content for 13 of the 15 depths. `min(8, 15 % of the level)` keeps
-   * the early-game lesson ("collect things and the dungeon tells you more") and reaches it in a
-   * few minutes at any size.
-   *
-   * Under the dial sits the **distance to the exit in tiles**. In a 6×6 maze the needle alone was
-   * enough; across a 128×128 labyrinth "which way" without "how far" is nearly useless — 40 m and
-   * 900 m are the difference between pushing on and turning back to hunt for a flask. It is shown
-   * whenever the compass is (the compass is the earned instrument), and marked as a straight-line
-   * distance by being an `m` reading rather than a route.
-   * @param {CanvasRenderingContext2D} ctx
-   * @param {GameState} state
-   * @param {SurfaceMetrics} m
-   * @param {boolean} reduced
-   * @param {number} mapH height of the corner map, so the dial can step aside on a narrow screen
-   * @returns {void}
-   */
-  function drawCompass(ctx, state, m, reduced, mapH) {
-    const level = state.levelData;
-    if (level === null) return;
-    const run = state.run;
-    const earned = state.level <= 2 || run.gems >= compassGems(run.gemsTotal);
-    if (!earned) return;
-
-    const u = m.u;
-    const r = 9 * u;
-    // The readout is sized like every other phone readout (a step under the unit): at a full unit
-    // `63m` was the tallest text on a phone's HUD, louder than the score and the tank.
-    const textSize = m.narrow ? Math.max(1, u - 1) : u;
-    const lineH = heightAt('hud', textSize);
-    const cx = Math.round(m.w / 2);
-    // The readout hangs below the dial, so the dial itself lifts by a line. On a narrow surface the
-    // corner map is directly to the right; lift again so the two never touch.
-    const bottom = m.narrow && mapH > 0 ? m.h - mapH - 5 * u : m.h - 4 * u;
-    const cy = Math.round(bottom - lineH - 2 * u - r);
-
-    // Dial: a ring of iron with a dark face.
-    ctx.fillStyle = withAlpha(COLOR.void, 0.8);
-    fillDisc(ctx, cx, cy, r + u, u);
-    ctx.fillStyle = COLOR.ironBase;
-    fillRing(ctx, cx, cy, r, u);
-    ctx.fillStyle = withAlpha(COLOR.stoneShadow, 0.85);
-    fillDisc(ctx, cx, cy, r - u, u);
-
-    // Cardinal ticks, so the dial reads as an instrument even when the needle is still.
-    ctx.fillStyle = COLOR.ironHilite;
-    ctx.fillRect(cx - Math.round(u / 2), cy - r, Math.max(1, u), u);
-    ctx.fillRect(cx - Math.round(u / 2), cy + r - u, Math.max(1, u), u);
-    ctx.fillRect(cx - r, cy - Math.round(u / 2), u, Math.max(1, u));
-    ctx.fillRect(cx + r - u, cy - Math.round(u / 2), u, Math.max(1, u));
-
-    const ex = level.maze.exit.x + 0.5;
-    const ey = level.maze.exit.y + 0.5;
-    const p = state.player;
-    // Screen-relative bearing: subtract the player's yaw, then rotate so that "ahead" is up.
-    const bearing = Math.atan2(ey - p.y, ex - p.x) - p.angle - Math.PI / 2;
-    const dirX = Math.cos(bearing);
-    const dirY = Math.sin(bearing);
-
-    // The needle is plotted as a run of square pixels along the bearing — a rotated pixel line,
-    // which stays crisp where a stroked path would blur.
-    const len = r - 2 * u;
-    const step = Math.max(1, Math.round(u / 2));
-    const near = clamp01(state.derived !== undefined ? state.derived.nearExit : 0);
-    for (let d = -Math.round(len * 0.45); d <= len; d += step) {
-      const t = d / len;
-      const size = t < 0 ? u : Math.max(1, Math.round(u * (t > 0.8 ? 1.6 : 1.2)));
-      ctx.fillStyle =
-        t < 0
-          ? COLOR.stoneMid
-          : t > 0.72
-            ? near > 0.5 && !reduced && noise(anim.clock * 6) > 0.5
-              ? COLOR.arcPale
-              : COLOR.arcCyan
-            : COLOR.arcMid;
-      ctx.fillRect(
-        Math.round(cx + dirX * d - size / 2),
-        Math.round(cy + dirY * d - size / 2),
-        size,
-        size,
-      );
-    }
-    // Hub.
-    ctx.fillStyle = COLOR.goldLight;
-    ctx.fillRect(cx - u, cy - u, 2 * u, 2 * u);
-
-    // Distance to the exit. `derived.exitDist` is Infinity while no level is loaded, which
-    // `formatDistance` prints as "--" rather than as a lie.
-    const dist = state.derived !== undefined ? state.derived.exitDist : Infinity;
-    // Keyed on the whole tile count `formatDistance` prints; Infinity is a stable key.
-    const distLine = distText(Math.round(dist));
-    const distY = cy + r + 2 * u;
-    const distW = measureAt(distLine, 'hud', textSize);
-    ctx.fillStyle = withAlpha(COLOR.void, 0.72);
-    ctx.fillRect(Math.round(cx - distW / 2) - 2 * u, distY - u, distW + 4 * u, lineH + 2 * u);
-    // Close to the exit the readout turns arcane, matching the needle tip and the portal hum.
-    drawAt(ctx, distLine, cx, distY, 'hud', textSize, near > 0.5 ? 'hudBright' : 'hudDim', 'center');
-  }
-
-  /**
    * Floating score pops.
    * @param {CanvasRenderingContext2D} ctx
    * @param {SurfaceMetrics} m
@@ -1682,14 +1548,3 @@ export function createHud(overlayCanvas, options) {
   };
 }
 
-// ─── Small helpers ───────────────────────────────────────────────────────────────────────────
-
-/**
- * Deterministic 0..1 flicker noise. Two incommensurable sines: cheap, allocation free, and it
- * never repeats on a visible period — which is exactly what a flame needs.
- * @param {number} t seconds
- * @returns {number} 0..1
- */
-function noise(t) {
-  return 0.5 + 0.25 * Math.sin(t) + 0.25 * Math.sin(t * 1.7 + 1.3);
-}

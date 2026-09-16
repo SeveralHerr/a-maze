@@ -1,6 +1,6 @@
 {
- "updated": "2026-09-16T19:00:00.000Z",
- "iteration": 8,
+ "updated": "2026-09-16T20:03:56.096Z",
+ "iteration": 9,
  "passThreshold": 8.5,
  "wave": "gauntlet-stopped-r2",
  "waves": {
@@ -800,6 +800,17 @@
     "browserSmoke": "headless Chrome seed 1337: locked on arrival, M shows notice without changing mapMode, walking into scroll unlocks, M cycles to full, 0 page errors"
    },
    "verifyPass": null
+  },
+  {
+   "iteration": 9,
+   "updated": "2026-09-16T20:03:56.096Z",
+   "wave": "mouse-look-fullscreen-no-compass",
+   "summary": "(1) Mouse look without a click: input.js applies unlocked movementX while playing (first move after a 100 ms gap dropped as a cursor re-entry jump; touch excluded); a left mousedown now authorises the auto pointer lock, fixing the mouse-start path where the Descend click landed before `playing` and the lock was never requested (reproduced in headful Chrome). Arrow-key turn and mouse look sum in the sim. (2) Compass and distance-to-exit readout removed from the HUD (drawCompass, compassGems and their tests; ARCHITECTURE §4.6/§4.8/layout text). (3) Auto-fullscreen for the itch.io embed: src/input/fullscreen.js (createFullscreen: request never throws, swallows rejections, webkit fallback, onChange de-duplicated; pure shouldAutoFullscreen). Settings.fullscreen (default true) + Options toggle. main.js asks inside the gesture in onNewGame/onResume/onNextLevel and on pointerdown (mouse) / pointerup (touch) while playing; only when embedded, never under ?headless=1 unless ?fullscreen=1; leaving fullscreen while playing pauses; a pointer-lock loss within FULLSCREEN_LOCK_GRACE_MS (1 s) of our own fullscreen request does not pause (headful Chrome in a cross-origin iframe: entering fullscreen dropped the lock 8–25 ms after resume and bounced back to the pause menu; fixed and re-probed — resume stays playing, lock re-acquired); turning the option off exits. ARCHITECTURE §3, §4.3, §4.7.",
+   "gates": {
+    "npmTest": "38/38 files, 691 tests",
+    "browserSmoke": "headless Chrome: ?headless=1 never fullscreens, 0 errors; iframe allowfullscreen at 640x400 enters fullscreen (1280x720) on Descend, 0 errors"
+   },
+   "verifyPass": null
   }
  ],
  "openIssues": [
@@ -809,6 +820,7 @@
   "No typecheck runs anywhere in the repo (no tsconfig, no tsc dependency), so // @ts-check is enforced only by an editor.",
   "The phone depth panel is four rows tall and its lower edge sits close to the top of the 3-D band in portrait. Cosmetic, within tolerance, but it is the tightest spot in the mobile layout.",
   "verify.mjs (full ~8 min autopilot run) was not re-run after the map-scroll wave; only a targeted headless smoke check was. Its autopilot ignores the scroll, so the map stays locked in its screenshots.",
-  "Oil flasks are still left on the floor when <55% would land; with the larger pickup radius this is now the most likely remaining 'walked past an item' report. Consider a HUD cue ('tank full') when standing on a skipped flask."
+  "Oil flasks are still left on the floor when <55% would land; with the larger pickup radius this is now the most likely remaining 'walked past an item' report. Consider a HUD cue ('tank full') when standing on a skipped flask.",
+  "Auto-fullscreen not yet checked on the real itch.io page, in Safari/iOS (iPhone has no element fullscreen) or Firefox; keyboard-started runs rely on transient activation surviving to the next sim step, and fullscreen + pointer lock from one gesture is only smoke-tested in headless Chrome."
  ]
 }

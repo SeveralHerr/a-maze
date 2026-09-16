@@ -164,6 +164,31 @@ export class FakeDocument extends FakeNode {
     /** @type {any} */
     this.defaultView = null;
     this.exitPointerLockCalls = 0;
+    // Fullscreen API (for `fullscreen.test.mjs`). `documentElement.requestFullscreen` behaves like a
+    // browser that grants the request; a test deletes or replaces it to model refusal, the webkit
+    // prefix, or no support at all. `fullscreenchange` is dispatched synchronously (a real browser
+    // does it a task later), which is all the module's bookkeeping needs.
+    this.documentElement = new FakeNode(this, 'html');
+    this.documentElement.parentNode = this;
+    /** @type {FakeNode|null} */
+    this.fullscreenElement = null;
+    this.exitFullscreenCalls = 0;
+    const doc = this;
+    const html = /** @type {any} */ (this.documentElement);
+    html.requestFullscreenCalls = 0;
+    html.requestFullscreen = function () {
+      html.requestFullscreenCalls++;
+      doc.fullscreenElement = html;
+      doc.dispatchEvent({ type: 'fullscreenchange' });
+      return Promise.resolve();
+    };
+  }
+
+  exitFullscreen() {
+    this.exitFullscreenCalls++;
+    this.fullscreenElement = null;
+    this.dispatchEvent({ type: 'fullscreenchange' });
+    return Promise.resolve();
   }
 
   /** @param {string} tag */
