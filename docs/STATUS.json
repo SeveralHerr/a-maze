@@ -1,8 +1,8 @@
 {
-  "updated": "2026-09-16T04:46:41.394Z",
-  "iteration": 5,
+  "updated": "2026-09-16T04:50:11.598Z",
+  "iteration": 6,
   "passThreshold": 8.5,
-  "wave": "massive-mazes",
+  "wave": "4-massive-mazes",
   "waves": {
     "0-scaffold": {
       "status": "done",
@@ -584,14 +584,40 @@
         "integration: 'Difficulty plateaus after level ~18: the maze is capped at 40x40 cells and the fuel-per-cell rate has finished decaying' — the cap is now 128x128 at level 15 and past it braid, drain and oil density keep moving, which is exactly the late-game pressure that issue asked for.",
         "integration/maze: the fuel seam ('balance.js supplies a size-based floor that always wins over populate's path-derived budget') — there is one owner of the tank now and no floor to win."
       ]
+    },
+    "4-massive-mazes": {
+      "status": "done",
+      "notes": "MASSIVE MAZES + refillable torch economy. Fuel is a TANK (110 s at L1 -> 150 s at the cap) independent of maze area; oil flasks are the economy (35% of tank each, clamped 25-60 s, 7-22 refuels per level). Measured finding that reshaped the design: the ~13-tiles-per-cell-side path law only holds for BRAIDED mazes (a perfect maze's farthest route is ~side^1.6: 72x72 at braid 0 = 3,903 path tiles vs 907 at braid 0.25), so the braid ramp was front-loaded to keep the curve monotone at 3.6 -> 13.5 minutes. Per-step cost made size-independent: a CSR 4-tile bucket grid for pickups (0.675 us/step on a 128x128/819-item level vs 0.635 us on the old 6x6, ratio 1.06x), pooled explored buffer, fixed 7x7 LOS window. Feasibility proven on 250 real levels (levels 1-25 x 10 seeds) with a 2.0x-wander autopilot: 250/250 reached the exit, lowest fuel 62-70% of tank, with a flask-stripped negative control that correctly dies.",
+      "sizeCurve": "L1 16x16 cells / 33x33 tiles; +8 cells/side/level; cap 128x128 cells / 257x257 tiles / 16,384 cells at L15 (CAP_LEVEL derived from BASE_CELLS 16, GROWTH 8, MAX_CELLS 128). Braid 0 -> 0.6 over 17 levels, square-root shaped (0.54 at L15, 0.6 from L18); past the cap drain +2%/level to 1.35x and oil density thins 1/20 -> 1/30 cells.",
+      "perModule": {
+        "state": {
+          "selfScore": 9,
+          "tests": {
+            "passed": 110,
+            "failed": 0
+          },
+          "openIssues": [
+            "FUEL.LOW_FRACTION left at 0.2 so the src/ui/hud.js mirror does not drift; on the new tank that is a 22-30 s warning and must be changed in both files together if the ui owner wants longer.",
+            "The pinned score formulas were not touched, so the clear bonus is now roughly constant per level (~1500 x level) while gems scale with area (6 at L1 -> 273 at the cap): the incentive tips from 'get out fast' to 'explore'. A pacing change the lead should sign off.",
+            "ARCHITECTURE.md contract text still needs rewriting in three places: the section 6 fuel assumption ('~4x the optimal route') is obsolete, the section 4.4 fuel seam text ('balance.js supplies a size-based floor') is dead, and the section 1/6 size numbers are new.",
+            "src/state/perf.test.mjs and feasibility.test.mjs import src/maze as a TEST-ONLY dependency; the section 2 runtime rule is unchanged but the gate list in section 5 must say so.",
+            "src/main.js DEMO_LEVEL = 3 makes the title maze 32x32 cells (~68 items), crossing the maze client's 400-cell worker threshold; works, but DEMO_LEVEL = 1 would be a calmer title screen.",
+            "resolveTank's downward clamp is belt-and-braces: with the current populate it is a no-op, but it stops a stale worker build or a future path-derived budget (~650 s on a 128x128) from inflating the economy."
+          ]
+        }
+      }
     }
   },
   "modules": {},
   "metrics": {
-    "source": "tools/verify.mjs --tag massive (1280x720 headless Chrome) + npm test + validate-mazes + stress",
-    "sizeCurve": "L1 16x16 cells / 33x33 tiles; +8 cells/side/level; cap 128x128 cells / 257x257 tiles at L15",
+    "source": "logs/massive.json (tools/verify.mjs --tag massive, 1280x720 headless Chrome) + npm test + validate-mazes + stress",
+    "sizeCurve": "L1 16x16 cells / 33x33 tiles; +8 cells/side/level; cap 128x128 cells / 257x257 tiles / 16,384 cells at L15 (CAP_LEVEL derived from BASE_CELLS 16, GROWTH 8, MAX_CELLS 128). Braid 0 -> 0.6 over 17 levels, square-root shaped (0.54 at L15, 0.6 from L18); past the cap drain +2%/level to 1.35x and oil density thins 1/20 -> 1/30 cells.",
     "tankSeconds": "L1 110 s -> cap 150 s, independent of maze area",
-    "fpsVsyncLimited": 120,
+    "fpsVsyncLimited": {
+      "fps": 120,
+      "frameMsP99": 8.7,
+      "note": "compositor frame limiter enabled (realistic display cap)"
+    },
     "fpsUnlimited": 611.1,
     "renderMsAvgFull": 1.239,
     "renderMsAvgWorld": 0.986,
@@ -611,17 +637,45 @@
       "soakStepMsAvg": 0.1091,
       "soakRenderMsAvg": 1.2,
       "soakWorldMsP99": 1.9,
-      "soakHeapGrowthMB": 0.21
+      "soakHeapGrowthMB": 0.21,
+      "soakRefuels": 7,
+      "distance": 929
     },
     "refuelsObserved": 36,
-    "fuelSecondsRecovered": 348,
+    "fuelSecondsRecovered": 348.19,
     "consoleErrors": 0,
     "consoleWarnings": 0,
-    "tests": 523,
+    "tests": 503,
     "mazesValidated": 117306,
     "campaignLevelsValidated": 750,
     "mazeFailures": 0,
-    "fps": 120
+    "fps": 596,
+    "loadMs": 562,
+    "renderMsMaxWorld": 4.3,
+    "droppedFrames": 0,
+    "level1": {
+      "seconds": 132.588,
+      "fuelLeft": 103.77,
+      "fuelMax": 110,
+      "score": 1630
+    },
+    "level2": {
+      "seconds": 119.089,
+      "fuelLeft": 101.31,
+      "fuelMax": 113,
+      "score": 4850
+    },
+    "lowFuelEvents": 0,
+    "mobile": {
+      "fps": 638,
+      "renderMsAvg": 1.02,
+      "horizontalOverflow": false,
+      "errors": 0
+    },
+    "pageErrors": 0,
+    "gameErrors": 0,
+    "verifyPass": true,
+    "stateTests": 110
   },
   "blocking": [],
   "history": [
@@ -654,6 +708,12 @@
       "wave": "massive-mazes",
       "updated": "2026-09-16T04:46:41.394Z",
       "summary": "Massive mazes shipped: level 1 is 16x16 cells and the curve caps at 128x128 cells (257x257 tiles, ~820 items, ~1300 torches) at level 15, with the torch converted from a whole-level budget into a 110-150 s tank refilled from oil flasks whose placement along the solution path is a proven guarantee rather than a balance note. Every per-frame and per-step cost is now independent of maze size. Gates: 523 tests, 117306 mazes + 750 campaign levels, stress clean, and a browser run that descends to the cap and drives it for 60.01 s at 623.4 fps with a 19.3 ms worst build frame gap and zero console output."
+    },
+    {
+      "iteration": 6,
+      "wave": "4-massive-mazes",
+      "updated": "2026-09-16T04:50:11.598Z",
+      "summary": "Wave 4 (massive mazes) recorded with the src/state builder's delivery. Level 1 is 16x16 cells growing +8 cells/side to a 128x128-cell cap (257x257 tiles, 819 items) at level 15; the torch became a 110-150 s tank refilled from oil flasks instead of a whole-level budget, with the braid ramp front-loaded after measuring that a perfect maze's farthest route is superlinear (~side^1.6) and would have made levels 3-8 longer than level 15. Step cost is now size-independent (1.06x from the smallest level to the largest, via a CSR bucket grid for pickups) and 108,000 ticks on a cap-size level grow the heap by 5.4 KiB. src/state: 110 tests passing, 0 failing, self-score 9; repo 503 tests, validate-mazes and stress clean; the browser run descends to the cap and soaks it for 60.01 s at 623.4 fps with a 19.3 ms worst build frame gap and zero console output. No blockers; the remaining work is ARCHITECTURE.md contract text and the pacing sign-off on score scaling."
     }
   ],
   "openIssues": [
