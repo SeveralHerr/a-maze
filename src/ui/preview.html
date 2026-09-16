@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <title>A-MAZE — UI preview</title>
+    <!-- Inline favicon: keeps the console free of a 404 so console-error checks stay meaningful. -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230a0e18'/%3E%3Cpath d='M3 12h10M4 9h8M5 6h6' stroke='%23d9a441' fill='none'/%3E%3C/svg%3E"
+    />
+    <!--
+      Standalone harness for src/ui. NOT shipped: index.html loads src/main.js, which owns the real
+      overlay. This page builds a hand-made GameState (no src/state import — §2 forbids it) and
+      drives the HUD and the menus over a cheap painted backdrop that stands in for the raycaster.
+
+      Query parameters (all optional):
+        ?screen=hud|title|options|credits|pause|loading|complete|gameover|font
+        ?t=3.5      freeze the clock at this many seconds (one deterministic frame)
+        ?low=1      start with the torch nearly out (red gauge, flicker)
+        ?level=7    pretend to be this deep
+        ?minimap=0  hide the minimap
+        ?reduced=1  reduced motion
+        ?debug=1    FPS line in the HUD (also enables core logging)
+
+      window.__ui = { state, hud, menus, setScreen, step }
+    -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #07090f;
+        overflow: hidden;
+        color-scheme: dark;
+      }
+      #app {
+        position: fixed;
+        inset: 0;
+      }
+      #app > canvas {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        image-rendering: pixelated;
+        image-rendering: crisp-edges;
+      }
+      #overlay {
+        touch-action: none;
+      }
+      #hint {
+        position: absolute;
+        left: 8px;
+        top: 8px;
+        margin: 0;
+        padding: 4px 7px;
+        font: 11px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        color: #8a9bb0;
+        background: rgba(5, 7, 12, 0.6);
+        border: 1px solid rgba(138, 155, 176, 0.25);
+        white-space: pre;
+        pointer-events: none;
+      }
+      [hidden] {
+        display: none !important;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="back" aria-hidden="true"></canvas>
+      <canvas id="overlay" aria-label="A-MAZE interface preview"></canvas>
+      <pre id="hint" hidden></pre>
+    </div>
+    <script type="module" src="./preview.js"></script>
+  </body>
+</html>

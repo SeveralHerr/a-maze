@@ -1,17 +1,28 @@
 {
-  "updated": "2026-09-16T00:20:09.289Z",
-  "iteration": 1,
+  "updated": "2026-09-16T01:37:48.564Z",
+  "iteration": 2,
   "passThreshold": 8.5,
-  "wave": "1-foundations",
+  "wave": "3-hud-polish",
   "waves": {
-    "0-scaffold": { "status": "done", "notes": "ARCHITECTURE.md contract, tools/serve.mjs, tools/test.mjs, package.json, CI workflow, index.html, styles.css" },
+    "0-scaffold": {
+      "status": "done",
+      "notes": "ARCHITECTURE.md contract, tools/serve.mjs, tools/test.mjs, package.json, CI workflow, index.html, styles.css"
+    },
     "1-foundations": {
       "status": "done",
-      "modules": ["core", "state", "input", "renderer"],
+      "modules": [
+        "core",
+        "state",
+        "input",
+        "renderer"
+      ],
       "notes": "All four foundation modules delivered, 287 tests passing, zero failures, every self-score above the 8.5 threshold. Verified in Node and in real headless Chrome.",
       "core": {
         "selfScore": 9,
-        "tests": { "passed": 82, "failed": 0 },
+        "tests": {
+          "passed": 82,
+          "failed": 0
+        },
         "openIssues": [
           "FrameStats.droppedFrames is an estimate from frame intervals relative to the sim rate; on a 30 Hz display it reports one dropped frame per frame by design.",
           "stepOnce() does not feed the statistics window, so stats() stays empty in a purely headless stepOnce-driven run.",
@@ -46,7 +57,10 @@
       },
       "state": {
         "selfScore": 8.9,
-        "tests": { "passed": 93, "failed": 0 },
+        "tests": {
+          "passed": 93,
+          "failed": 0
+        },
         "openIssues": [
           "No escape hatch from the 'loading' phase: pause and toTitle are ignored there. Needs ARCHITECTURE.md to add loading --toTitle--> title if Esc should work during a long build.",
           "No TypeScript dependency, so JSDoc types are hand-verified; a tsc --checkJs gate would need GameState to gain an @property {Object} sim line.",
@@ -82,7 +96,10 @@
       },
       "input": {
         "selfScore": 8.8,
-        "tests": { "passed": 64, "failed": 0 },
+        "tests": {
+          "passed": 64,
+          "failed": 0
+        },
         "openIssues": [
           "Mouse look requires pointer lock or a held left-drag; if a browser refuses pointer lock there is no on-screen prompt (belongs to src/ui).",
           "navigator.getGamepads() allocates a fresh array per poll while a pad is connected; unavoidable through the standard API.",
@@ -112,7 +129,10 @@
       },
       "renderer": {
         "selfScore": 8.8,
-        "tests": { "passed": 48, "failed": 0 },
+        "tests": {
+          "passed": 48,
+          "failed": 0
+        },
         "openIssues": [
           "Wall-torch light has no line-of-sight test around outside corners; a torch just around a convex corner spills slightly onto the adjacent corridor.",
           "The first rendered frame costs ~40 ms in a cold browser (JIT warm-up) against ~1.2 ms steady state.",
@@ -193,11 +213,16 @@
     },
     "2-generation": {
       "status": "done",
-      "modules": ["maze"],
+      "modules": [
+        "maze"
+      ],
       "notes": "Generator, validator, populate, level, worker and client delivered. 67 unit tests, 117,306 mazes validated with zero failures, stress clean.",
       "maze": {
         "selfScore": 8.8,
-        "tests": { "passed": 67, "failed": 0 },
+        "tests": {
+          "passed": 67,
+          "failed": 0
+        },
         "openIssues": [
           "Oil flasks fall back onto the solution path for ~6% of placements when a stretch has no side passage within 3 tiles; asserted to stay >=85% off-path.",
           "WALK_SPEED (3.2) and CORNER_FACTOR (1.18) are duplicated knowledge between src/state/balance.js and src/maze/populate.js, since §2 forbids the import.",
@@ -247,10 +272,116 @@
         "Scratch browser check: logs/maze-worker-check.html + logs/maze-worker-check.mjs (gitignored); worth folding into tools/verify.mjs."
       ]
     },
-    "3-hud-polish": { "status": "pending", "modules": ["ui", "renderer-polish"] },
-    "integration": { "status": "pending" },
-    "gauntlet": { "status": "pending" },
-    "stress": { "status": "pending" }
+    "3-hud-polish": {
+      "status": "done",
+      "modules": [
+        "ui",
+        "audio"
+      ],
+      "notes": "Wave 3 delivered: src/ui font/format/hud/menus plus the WebAudio synth in audio.js. 87 tests passing, zero failures; both modules self-scored 8.8, above the 8.5 threshold. Verified in real headless Chrome (screenshots, pointer/keyboard interaction, offline audio renders).",
+      "ui": {
+        "selfScore": 8.8,
+        "tests": {
+          "passed": 50,
+          "failed": 0
+        },
+        "openIssues": [
+          "Touch exercised only through synthetic pointer events in headless Chrome; no real-device test. Menu rows are >=50% of screen width and slider tracks padded by 2 units, so targets should be thumb-sized; the HUD itself has no tap targets.",
+          "The gothic display face is a heavy serif with blackletter cues rather than true blackletter, which is illegible at a 10-pixel cap height.",
+          "Screen transitions are a 0.26 s fade plus panel rise; the iris wipe named in S1 belongs to renderer/post.js and no menu hook exists in the contract.",
+          "Credits copy and the v0.1 footer are hard-coded in menus.js (CREDITS_LINES); both need editing at release.",
+          "The level-complete tally shows a gem row even at zero gems; unreachable in practice since populate.js always places GEM_MIN=4.",
+          "Roughly a dozen short-lived strings allocated per frame by the format.* calls in hud.js drawFuelGauge/drawScorePanel/drawDepthPanel; glyph, panel and minimap paths are allocation-free."
+        ],
+        "contractDeviations": [
+          "src/ui may not import src/state (S2), so three sets of numbers are mirrored locally and must be kept in step with balance.js: menus.js SCORE_RULES (GEM_BASE 100, CLEAR_BASE 500, FUEL_UNIT 10, cross-checked against run.levelScore), menus.js OPTION_ITEMS slider ranges/steps mirroring SETTING_SPEC, and hud.js LOW_FUEL_FRACTION 0.2 mirroring FUEL.LOW_FRACTION.",
+          "S4.6 signatures are supersets, not changes: createHud(overlayCanvas, options?) also returns {surface, pop, reset, dispose}; createMenus(...) also returns {resize, surface, screen, dispose}; resize takes an optional third dpr argument (defaults to 1).",
+          "size in drawText/measureText options is an INTEGER PIXEL SCALE (1 = one font pixel per surface pixel), not a point size; scale is accepted as an alias.",
+          "measureText returns {width, height, lines} rather than a bare number.",
+          "Frame protocol: hud.render() clears the whole overlay and menus.render() does not, so the S4.7 order hud then menus is required. Calling either alone is safe.",
+          "menus.js imports hud.js: the shared overlay Surface and pixel-art primitives live there because S4.6 allows only four files in this folder. Intra-module, so the S2 dependency graph is unaffected.",
+          "The HUD derives score/gem/fuel pops from GameState deltas rather than state.events, so nothing is missed on a double-step frame or replayed on a double-render one.",
+          "The HUD face is a 5x7 design in an 8-row cell (one descender row) rather than a literal 5x7 grid; visible cap height is unchanged."
+        ],
+        "files": [
+          "src/ui/font.js",
+          "src/ui/format.js",
+          "src/ui/hud.js",
+          "src/ui/menus.js",
+          "src/ui/font.test.mjs",
+          "src/ui/format.test.mjs",
+          "src/ui/hud.test.mjs",
+          "src/ui/menus.test.mjs",
+          "src/ui/preview.html",
+          "src/ui/preview.js",
+          "logs/ui-shot.mjs",
+          "logs/ui-interact.mjs",
+          "logs/ui-proof.mjs"
+        ]
+      },
+      "audio": {
+        "selfScore": 8.8,
+        "tests": {
+          "passed": 37,
+          "failed": 0
+        },
+        "openIssues": [
+          "Only the exit portal is spatialised (stereo pan by bearing); footsteps, pickups and bumps are deliberately non-positional, but wall torches have no audio counterpart yet.",
+          "The reverb is a damped feedback delay per bus, not a convolver, since an impulse response would mean a file and the zero-asset rule forbids it.",
+          "Voice stealing cuts a voice instantly rather than fading over ~5 ms; a click is theoretically possible under extreme overload, none measurable in the 60-event stress render.",
+          "The generative music RNG is seeded from options.seed (random by default), not the run seed, so a replayed seed does not reproduce the same ambience.",
+          "unlocked reports false against an OfflineAudioContext because its state stays suspended until startRendering(); harness-only.",
+          "Not verified with speakers: all mix judgements come from offline render measurements, so a human listening pass before release is still worth a minute."
+        ],
+        "contractDeviations": [
+          "S4.6 createAudio() -> {unlock(), handle(events, state), setVolume(v, music), update(state)} is implemented with exactly those names and argument orders. ADDITIVE ONLY: an optional options object (injectable AudioContext factory, doc, volume, music, maxVoices, seed, autoUnlock) plus playUi(kind), suspend(), resume(), dispose(), stats() and the unlocked/available getters.",
+          "A frozen AUDIO tuning table is exported from audio.js. CLAUDE.md puts tuning numbers in src/state/balance.js, but S2 forbids src/ui importing src/state, so the synthesis constants live in audio.js; they are audio-internal, not gameplay balance.",
+          "update(state) also reads state.levelData.maze.exit and state.player.{x,y,angle,vx,vy} beyond the derived block the contract names: the portal pan needs the exit bearing and footstep intensity needs ground speed. All reads are read-only GameState fields.",
+          "update(state) adopts state.settings.volume/.music automatically whenever they change, so main.js need not call setVolume() after an options edit; an explicit setVolume() still wins until the slider moves."
+        ],
+        "files": [
+          "src/ui/audio.js",
+          "src/ui/audio.test.mjs",
+          "logs/audio-check.html",
+          "logs/audio-check.mjs"
+        ]
+      },
+      "notesForIntegrator": {
+        "ui": [
+          "Wiring: const hud = createHud(overlayCanvas); const menus = createMenus(overlayCanvas, {onNewGame, onResume, onQuit, onNextLevel, onSetting, onUiSound}); on layout change call hud.resize(cssW, cssH, devicePixelRatio) AND menus.resize(...) (shared Surface, so the second is a cheap no-op); each frame hud.render(state, loop.stats(), alpha) then menus.render(state).",
+          "Do NOT set overlay.width/height yourself: the surface owns the backing store and sizes it to cssW x cssH x dpr (capped at ~4.2 MP). styles.css already stretches the canvas to 100%/100%, which the mapping assumes.",
+          "Input: if (!menus.handleInput(inputFrame, state)) { your pause/map/mute handling }. It returns false during playing and loading, true on every menu screen. Esc/back on pause calls onResume; on levelComplete/gameOver it calls onQuit.",
+          "Pointer: forward pointermove/pointerdown/pointerup/pointerleave to menus.handlePointer(ev) and preventDefault when it returns true; true also means do not request pointer lock for that click. Verified at devicePixelRatio 1 and 2 (logs/ui-interact.mjs).",
+          "Callbacks map straight to dispatches: onNewGame -> newGame with seed: randomSeed() (menus never invent a seed), onResume -> resume, onQuit -> toTitle, onNextLevel -> nextLevel, onSetting(key, value) -> setSetting. onUiSound carries uiMove|uiConfirm|uiBack|uiDeny; route the first two to the matching GameEvent for audio.js.",
+          "hud.reset() on newGame clears the score roll and minimap cache instantly; the HUD also self-resets whenever state.level changes.",
+          "HUD and menus take their clock from state.time (plus alpha/60 for the HUD), so animation stops cleanly with the sim and frozen-time screenshots are deterministic.",
+          "Debug: ?debug=1 (core/log.isDebug) adds the FPS line; pass loop.stats() as the second render argument or it prints NO FRAME STATS. The FrameStats object may be the loop reused instance; the HUD only reads it.",
+          "Everything degrades rather than throwing: a null canvas, a canvas with no 2-D context, a null or garbage state, a missing callback and a throwing callback are all covered by tests.",
+          "Verification artefacts: logs/release-{wide,phone}-*.png (all screens), logs/ship-{tablet,land,big,small}-*.png (extreme viewports), logs/ui-shot.mjs, logs/ui-interact.mjs (18 real-browser pointer/keyboard assertions at dpr 1 and 2), logs/ui-proof.mjs (ASCII glyph proof sheet). Whole overlay costs ~0.2 ms/frame at 1280x720 with zero console errors.",
+          "Preview harness: http://localhost:5173/src/ui/preview.html with ?screen=hud|title|options|credits|pause|loading|complete|gameover|font, ?t=SEC freeze, ?low=1, ?level=N, ?minimap=0, ?reduced=1, ?debug=1, ?hint=1; window.__ui exposes {state, hud, menus, setScreen, step, sfx, sfxCount}."
+        ],
+        "audio": [
+          "Wiring: const audio = createAudio() once at boot; in step() audio.handle(state.events, state) after the tick dispatch; once per frame audio.update(state). update() is cheap and allocation-free when nothing moves.",
+          "unlock(): the module attaches its own one-shot pointerdown/keydown/touchend listeners to document and unlocks on the first gesture (autoUnlock:false to opt out). Calling audio.unlock() from your own gesture handler is safe and idempotent; no AudioContext is constructed before a gesture, so Chrome never prints the autoplay warning.",
+          "Hidden tab: suspends on visibilitychange and resumes on return, rebasing its scheduler clocks so a long background pause does not dump a backlog of sounds. The loop own pause is independent.",
+          "Menus: audio.playUi(move|confirm|back), or emit uiMove/uiConfirm GameEvents; both paths produce the same blips. The engine plays a back blip on entering paused and a confirm blip on resuming.",
+          "Volume/mute: setVolume(volume, music) mirrors Settings; setVolume(0) is a hard mute that allocates NO WebAudio nodes at all, so a mute hotkey is also a CPU saving. Dispatching setSetting volume 0 is picked up by update() on its own.",
+          "Teardown: audio.dispose() stops and disconnects every node, removes its listeners and closes the context; idempotent, and the object stays safely callable.",
+          "Debug: audio.stats() returns a reused object {voices, maxVoices, stolen, dropped, time, failures, state}; steadily growing stolen/dropped would mean maxVoices is too low.",
+          "Measured cue peaks with music muted (logs/audio-check.mjs, real OfflineAudioContext in headless Chrome): footstep walk 0.067 / sprint 0.098, bump 0.158, gem 0.252 (combo x4 0.468), oil 0.168, lowFuel 0.122, levelStart 0.310, levelComplete 0.325, gameOver 0.265, UI 0.109, portal-near 0.179, heartbeat 0.353, torch bed 0.025, music 0.073, muted exactly 0.0. A 60-event burst peaks at 0.6998, the tanh limiter mathematical ceiling, so the output can never clip.",
+          "Re-run verification any time with node logs/audio-check.mjs (needs the dev server); it reports peak/RMS/NaN/voice stats per cue and fails loudly if a cue goes silent or a scheduling call throws."
+        ]
+      }
+    },
+    "integration": {
+      "status": "pending"
+    },
+    "gauntlet": {
+      "status": "pending"
+    },
+    "stress": {
+      "status": "pending"
+    }
   },
   "modules": {},
   "metrics": {},
@@ -261,6 +392,12 @@
       "wave": "1-foundations",
       "updated": "2026-09-16T00:20:09.289Z",
       "summary": "Waves 1 and 2 delivered: src/core, src/state, src/input, src/renderer and src/maze. 354 tests passing, zero failures; self-scores 8.8-9.0, all above the 8.5 threshold. No blockers. Open decision for the integrator: the fuel seam between state/balance.js levelParams() and maze/populate.js fuelBudget()."
+    },
+    {
+      "iteration": 2,
+      "wave": "3-hud-polish",
+      "updated": "2026-09-16T01:37:48.564Z",
+      "summary": "Wave 3 (HUD and polish) delivered: src/ui font.js, format.js, hud.js, menus.js and audio.js plus the preview and audio harnesses. 87 tests passing, zero failures; both modules self-scored 8.8, above the 8.5 threshold. No new blockers. Watch items for integration: the score/slider/low-fuel constants mirrored out of balance.js into src/ui, and the required hud.render() then menus.render() frame order."
     }
   ]
 }
