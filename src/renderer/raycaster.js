@@ -285,8 +285,11 @@ const WALL_LAMBERT = 0.3;
 /** North/south wall faces are drawn darker; the classic raycaster cue that reads as form. */
 const SIDE_SHADE = 0.76;
 
-/** Head-bob amplitude in pixels at the internal resolution, at `bobAmp` 1. */
-const BOB_PIXELS = 5;
+/**
+ * Head-bob amplitude in pixels at the internal resolution, at `bobAmp` 1. Was 5 (±2 % of the
+ * 240-row frame), which read as seasick at jog cadence; 2.5 keeps the footfall rhythm visible.
+ */
+const BOB_PIXELS = 2.5;
 
 /** Camera-shake amplitude in pixels at `shake` 1. */
 const SHAKE_PIXELS = 7;
