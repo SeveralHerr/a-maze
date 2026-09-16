@@ -15,10 +15,13 @@ import {
   formatDepth,
   formatDistance,
   formatInt,
+  formatLabyrinth,
+  formatLevelBanner,
   formatPercent,
   formatScore,
   formatSigned,
   formatTime,
+  formatUnits,
   padLeft,
   safeInt,
 } from './format.js';
@@ -170,4 +173,33 @@ test('ROLL constants are sane', () => {
   assert.ok(ROLL.DURATION > 0 && ROLL.DURATION < 2);
   assert.ok(ROLL.MIN_RATE > 0);
   assert.ok(ROLL.SNAP_EPSILON > 0 && ROLL.SNAP_EPSILON < 1);
+});
+
+// ─── Massive-maze labels ─────────────────────────────────────────────────────────────────────
+
+test('formatLabyrinth writes a cell size with a real multiplication sign', () => {
+  assert.equal(formatLabyrinth(16, 16), '16×16');
+  assert.equal(formatLabyrinth(128, 128), '128×128');
+  // Degenerate input still reads as a maze rather than as "0×0" or "NaN×NaN".
+  assert.equal(formatLabyrinth(0, -4), '1×1');
+  assert.equal(formatLabyrinth(NaN, Infinity), '1×1');
+});
+
+test('formatLevelBanner is the loading screen line', () => {
+  assert.equal(formatLevelBanner(7, 64, 64), 'DEPTH 7 · 64×64 LABYRINTH');
+  assert.equal(formatLevelBanner(0, 16, 16), 'DEPTH 1 · 16×16 LABYRINTH', 'depth is 1-based');
+});
+
+test('formatDistance groups four-figure walks', () => {
+  assert.equal(formatDistance(12), '12m');
+  assert.equal(formatDistance(1240.4), '1,240m');
+  assert.equal(formatDistance(-5), '0m');
+  assert.equal(formatDistance(Infinity), '--', 'an unknown distance is not a number');
+  assert.equal(formatDistance(NaN), '--');
+});
+
+test('formatUnits pluralises', () => {
+  assert.equal(formatUnits(1, 'REFUEL'), '1 REFUEL');
+  assert.equal(formatUnits(0, 'REFUEL'), '0 REFUELS');
+  assert.equal(formatUnits(12, 'REFUEL'), '12 REFUELS');
 });

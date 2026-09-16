@@ -22,6 +22,17 @@
  * full 1×1 block, a substep can neither cross a wall nor push the centre past a wall's mid-plane:
  * **tunnelling is impossible at any dt and any speed**, which `sim.test.mjs` asserts by brute force
  * over a matrix of angles, speeds and dt values.
+ *
+ * ## Cost per step is independent of the level's size (massive-maze invariant)
+ * A level now carries up to ~820 items and a 257×257 tile grid, so nothing here may be O(items) or
+ * O(tiles) per step:
+ * - **Pickups** query a uniform bucket grid (`buildItemGrid`, built once per level in the
+ *   `levelReady` reducer, flat `Int32Array`s reused across levels). The pickup disc is 0.9 tiles
+ *   across and a bucket is 4, so a step touches at most 2×2 buckets — a handful of items.
+ * - **Fog of war** probes at most `WORLD.REVEAL_BUDGET` tiles inside a fixed 7×7 window.
+ * - **`explored`** is allocated once per level (and reused from a pool across levels).
+ * Everything else is O(1). `perf.test.mjs` pins this on real generated levels: a step on a 128×128
+ * level with 819 items measured 0.68 µs against 0.64 µs for the old 6×6 level with six.
  */
 
 import { TILE } from '../maze/constants.js';
@@ -42,6 +53,8 @@ import { ATTRACT, BOB, BUMP, FUEL, PLAYER, SCORE, WORLD, gemScore, levelBonus, o
 
 /** @typedef {import('../core/types.js').GameState} GameState */
 /** @typedef {import('../core/types.js').Maze} Maze */
+/** @typedef {import('../core/types.js').LevelData} LevelData */
+/** @typedef {import('../core/types.js').Item} Item */
 /** @typedef {import('../core/types.js').Phase} Phase */
 /** @typedef {import('../core/types.js').Rng} Rng */
 
@@ -71,6 +84,14 @@ import { ATTRACT, BOB, BUMP, FUEL, PLAYER, SCORE, WORLD, gemScore, levelBonus, o
  * @property {number} comboTimer   seconds left on the combo window
  * @property {number} revealCursor resume index for the budgeted fog-of-war reveal
  * @property {number} runBestScore best score at the moment the run started (for `newBest`)
+ * @property {number} drain        the level's fuel drain multiplier (`balance.drainRate`)
+ * @property {LevelData|null} gridFor the level the item grid was built for (identity check)
+ * @property {number} gridW        item-grid buckets across
+ * @property {number} gridH        item-grid buckets down
+ * @property {Int32Array|null} gridStart  bucket → first slot in `gridItems`, length gridW*gridH+1
+ * @property {Int32Array|null} gridItems  item indices, grouped by bucket
+ * @property {Int32Array|null} gridCursor scratch used while filling `gridItems` (build only)
+ * @property {Uint8Array|null} exploredPool grow-only backing store for `state.explored`
  * @property {boolean} atValid     attract camera has a valid target tile
  * @property {number} atTx         attract target tile x
  * @property {number} atTy         attract target tile y
@@ -125,6 +146,14 @@ export function createSimScratch() {
     comboTimer: 0,
     revealCursor: 0,
     runBestScore: 0,
+    drain: 1,
+    gridFor: null,
+    gridW: 0,
+    gridH: 0,
+    gridStart: null,
+    gridItems: null,
+    gridCursor: null,
+    exploredPool: null,
     atValid: false,
     atTx: 0,
     atTy: 0,
@@ -137,7 +166,11 @@ export function createSimScratch() {
 
 /**
  * Reset the per-level parts of the scratch. Called whenever a level is installed so nothing leaks
- * across levels (a pending low-fuel cue, a half-finished reveal sweep, a bump cooldown).
+ * across levels (a pending low-fuel cue, a half-finished reveal sweep, a bump cooldown, an item
+ * grid describing the level that just ended).
+ *
+ * The pooled buffers (`gridStart`/`gridItems`/`gridCursor`/`exploredPool`) are deliberately kept:
+ * they are re-filled, not re-read, so a long run neither allocates nor grows.
  * @param {SimScratch} sim
  * @returns {void}
  */
@@ -149,8 +182,130 @@ export function resetSimScratch(sim) {
   sim.combo = 0;
   sim.comboTimer = 0;
   sim.revealCursor = 0;
+  sim.drain = 1;
+  // Drops the reference to the previous level's data — and forces a rebuild before the next query.
+  sim.gridFor = null;
+  sim.gridW = 0;
+  sim.gridH = 0;
   sim.atValid = false;
   sim.atSway = 0;
+}
+
+// ─── Item lookup grid ────────────────────────────────────────────────────────────────────────
+
+/**
+ * Return an `Int32Array` of at least `length` entries, reusing `existing` when it is big enough.
+ *
+ * Grow-only pooling: a run that descends 30 levels allocates these buffers once each, at the size
+ * of the largest level it reaches, instead of once per level.
+ * @param {Int32Array|null} existing
+ * @param {number} length
+ * @returns {Int32Array}
+ */
+function ensureInt32(existing, length) {
+  const n = Math.max(1, length | 0);
+  if (existing !== null && existing.length >= n) return existing;
+  return new Int32Array(n);
+}
+
+/**
+ * Bucket index of an item, clamped into the grid.
+ *
+ * Non-finite coordinates land in bucket 0 rather than poisoning the index — a malformed item must
+ * cost one wasted comparison per step, not corrupt the lookup for every other item.
+ * @param {number} x item x in tiles
+ * @param {number} y item y in tiles
+ * @param {number} gw buckets across
+ * @param {number} gh buckets down
+ * @returns {number} 0 … gw*gh-1
+ */
+function bucketOf(x, y, gw, gh) {
+  const cell = WORLD.ITEM_GRID_TILES;
+  let bx = Math.floor(x / cell);
+  let by = Math.floor(y / cell);
+  if (!(bx >= 0)) bx = 0;
+  else if (bx >= gw) bx = gw - 1;
+  if (!(by >= 0)) by = 0;
+  else if (by >= gh) by = gh - 1;
+  return by * gw + bx;
+}
+
+/**
+ * Build the uniform item lookup grid for the currently installed level.
+ *
+ * Called once per level from the `levelReady` reducer (and, defensively, the first time a step
+ * finds the grid describing a different level). A counting sort over the items produces a CSR
+ * layout — `gridStart[b] … gridStart[b+1]` are the slots of bucket `b` in `gridItems` — which is
+ * two flat typed arrays, no per-bucket objects, and no allocation at all once the pools are big
+ * enough. Taken items stay in the grid: the pickup pass skips them, and rebuilding on every pickup
+ * would be exactly the O(items) work this replaces.
+ *
+ * @param {SimState} state
+ * @returns {void}
+ */
+export function buildItemGrid(state) {
+  const sim = state.sim;
+  const level = state.levelData;
+  sim.gridFor = level;
+  if (level === null) {
+    sim.gridW = 0;
+    sim.gridH = 0;
+    return;
+  }
+  const items = level.items;
+  const n = Array.isArray(items) ? items.length : 0;
+  const maze = level.maze;
+  const cell = WORLD.ITEM_GRID_TILES;
+  const gw = Math.max(1, Math.ceil(maze.width / cell));
+  const gh = Math.max(1, Math.ceil(maze.height / cell));
+  const buckets = gw * gh;
+  sim.gridW = gw;
+  sim.gridH = gh;
+
+  const start = ensureInt32(sim.gridStart, buckets + 1);
+  const cursor = ensureInt32(sim.gridCursor, buckets + 1);
+  const order = ensureInt32(sim.gridItems, Math.max(1, n));
+  sim.gridStart = start;
+  sim.gridCursor = cursor;
+  sim.gridItems = order;
+  start.fill(0, 0, buckets + 1);
+  if (n === 0) return;
+
+  // Counts land at b+1 so the prefix sum turns them straight into start offsets.
+  for (let i = 0; i < n; i++) {
+    const it = items[i];
+    start[bucketOf(it.x, it.y, gw, gh) + 1]++;
+  }
+  for (let b = 0; b < buckets; b++) start[b + 1] += start[b];
+  cursor.set(start.subarray(0, buckets));
+  for (let i = 0; i < n; i++) {
+    const it = items[i];
+    order[cursor[bucketOf(it.x, it.y, gw, gh)]++] = i;
+  }
+}
+
+/**
+ * Give `state.explored` a zeroed `Uint8Array` of exactly `length` bytes.
+ *
+ * Backed by a grow-only pool in the sim scratch, because the array is 66 kB on a 257×257 level and
+ * a deep run installs one per level; the view handed out is always exactly `length` long, so every
+ * consumer indexes it exactly as before. The caller owns the returned view only until the next
+ * level is installed.
+ * @param {SimState} state
+ * @param {number} length tiles in the level (width × height)
+ * @returns {Uint8Array} zeroed, length `length`
+ */
+export function allocExplored(state, length) {
+  const n = Math.max(0, Math.floor(length));
+  const sim = state.sim;
+  let pool = sim.exploredPool;
+  if (pool === null || pool.length < n) {
+    pool = new Uint8Array(n);
+    sim.exploredPool = pool;
+    return pool;
+  }
+  pool.fill(0, 0, n);
+  return pool.length === n ? pool : pool.subarray(0, n);
 }
 
 // ─── Phase ───────────────────────────────────────────────────────────────────────────────────
@@ -433,6 +588,12 @@ export function hasLineOfSight(tiles, w, h, x0, y0, x1, y1) {
  * Only *unexplored* tiles are probed, so once an area is known the pass costs one array read per
  * tile in the window. The number of line-of-sight probes per step is capped by
  * `WORLD.REVEAL_BUDGET`; the cursor remembers where the sweep stopped so no tile is starved.
+ *
+ * **The cost is the same on a 257×257 maze as on a 13×13 one**: the window is
+ * `(2·REVEAL_RADIUS+1)² = 49` tiles wide whatever the map measures, so the loop below runs at most
+ * 49 times and performs at most `REVEAL_BUDGET` (24) DDA probes, each of them bounded by
+ * `WORLD.LOS_MAX_CELLS`. The only size-dependent quantity is the `explored` array itself, which is
+ * allocated once per level by `allocExplored` in the `levelReady` reducer — never here.
  * @param {SimState} state
  * @returns {void}
  */
@@ -482,6 +643,103 @@ export function revealAround(state) {
     if (hasLineOfSight(tiles, w, h, px, py, tx + 0.5, ty + 0.5)) explored[idx] = 1;
   }
   state.sim.revealCursor = 0;
+}
+
+// ─── Pickups ─────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Collect every item whose centre is within `WORLD.PICKUP_RADIUS` of the player.
+ *
+ * Only the buckets overlapping the pickup disc are visited (2×2 at most), so the cost does not
+ * depend on how many items the level holds — the difference between a 6×6 level with 4 items and a
+ * 128×128 level with 820. The grid is built by `buildItemGrid`; if it describes a different level
+ * (a consumer swapped `levelData` without going through the reducer) it is rebuilt once here rather
+ * than silently missing every pickup.
+ *
+ * Allocation free apart from the `pickup` events it emits, which only happen on the frames where
+ * something is actually collected.
+ * @param {SimState} state must be in `playing` with `levelData` installed
+ * @returns {void}
+ */
+function collectAround(state) {
+  const level = state.levelData;
+  if (level === null) return;
+  const sim = state.sim;
+  if (sim.gridFor !== level) buildItemGrid(state);
+  const start = sim.gridStart;
+  const order = sim.gridItems;
+  const gw = sim.gridW;
+  const gh = sim.gridH;
+  if (start === null || order === null || gw === 0 || gh === 0) return;
+
+  const items = level.items;
+  const p = state.player;
+  // A non-finite position would clamp to the whole grid below and turn this into the O(items) scan
+  // the grid exists to avoid. It cannot happen (the reducer sanitises input and `moveCircle` only
+  // returns finite values), which is exactly why the guard is one comparison rather than a fix-up.
+  if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) return;
+  const r = WORLD.PICKUP_RADIUS;
+  const pr2 = r * r;
+  const cell = WORLD.ITEM_GRID_TILES;
+
+  // The disc's bounding box in bucket coordinates. r ≪ cell, so this is at most 2×2 buckets.
+  let bx0 = Math.floor((p.x - r) / cell);
+  let bx1 = Math.floor((p.x + r) / cell);
+  let by0 = Math.floor((p.y - r) / cell);
+  let by1 = Math.floor((p.y + r) / cell);
+  if (!(bx0 >= 0)) bx0 = 0;
+  if (!(by0 >= 0)) by0 = 0;
+  if (!(bx1 < gw)) bx1 = gw - 1;
+  if (!(by1 < gh)) by1 = gh - 1;
+
+  for (let by = by0; by <= by1; by++) {
+    const row = by * gw;
+    for (let bx = bx0; bx <= bx1; bx++) {
+      const b = row + bx;
+      const to = start[b + 1];
+      for (let k = start[b]; k < to; k++) {
+        const it = items[order[k]];
+        if (it === undefined || it.taken) continue;
+        if (dist2(p.x, p.y, it.x, it.y) > pr2) continue;
+        takeItem(state, it);
+      }
+    }
+  }
+}
+
+/**
+ * Apply one item pickup: score a gem, or refill the torch from a flask.
+ * @param {SimState} state
+ * @param {Item} it the item under the player (not yet taken)
+ * @returns {void}
+ */
+function takeItem(state, it) {
+  const run = state.run;
+  const sim = state.sim;
+  if (it.kind === 'gem') {
+    it.taken = true;
+    run.gems++;
+    const value = gemScore(state.level);
+    run.score += value;
+    // Combo is a display statistic only — §1 pins the score formula, so it must not multiply.
+    sim.combo = sim.comboTimer > 0 ? sim.combo + 1 : 1;
+    sim.comboTimer = SCORE.COMBO_WINDOW;
+    if (sim.combo > run.bestCombo) run.bestCombo = sim.combo;
+    state.events.push({ type: 'pickup', kind: 'gem', x: it.x, y: it.y, value });
+    return;
+  }
+  // Walking over a flask with a full tank would burn it for nothing, which reads as a bug to the
+  // player. Leave it on the floor instead — it is still there on the way back. With the small
+  // tank of the new economy this happens often, and it is the difference between a generous
+  // world and a world that punishes you for topping up early.
+  if (run.fuelMax - run.fuel < OIL_MIN_GAIN) return;
+  it.taken = true;
+  const before = run.fuel;
+  run.fuel = Math.min(run.fuelMax, run.fuel + oilFuel(run.fuelMax));
+  // The refuel tally is a per-level statistic (§3 RunStats): on a labyrinth that takes 7–22 flasks
+  // to cross, "how many times did I refill" is the number that describes the level.
+  run.refuels++;
+  state.events.push({ type: 'pickup', kind: 'oil', x: it.x, y: it.y, value: run.fuel - before });
 }
 
 // ─── Derived values ──────────────────────────────────────────────────────────────────────────
@@ -614,6 +872,10 @@ export function endRun(state) {
  *   is already on the minimap for the summary screen.
  * - The exit is tested *before* the fuel-out test, so arriving on the very frame the torch dies is
  *   a win, not a loss.
+ * - Pickups run *before* the drain, so a flask collected on the frame the torch would die saves it.
+ *
+ * Fuel drains at `FUEL.DRAIN × sim.drain`, where `sim.drain` is the level's multiplier (1 up to the
+ * size cap, rising past it — `balance.drainRate`, installed by the `levelReady` reducer).
  *
  * @param {SimState} state must be in phase `playing` with `levelData` loaded
  * @param {number} dt seconds, finite and > 0 (clamped by the caller)
@@ -718,6 +980,9 @@ export function stepPlaying(state, dt, input) {
 
   // ── Head bob & footsteps ─────────────────────────────────────────────────────────────────
   const moved = Math.sqrt(movedX * movedX + movedY * movedY);
+  // Odometer for the run (§3 RunStats). This is the distance *actually covered* after collision,
+  // not the distance commanded, so scraping along a wall does not inflate it.
+  run.distance += moved;
   const speedNow = moved / dt;
   p.bobAmp = damp(p.bobAmp, clamp01(speedNow / PLAYER.WALK_SPEED), BOB.AMP_RATE, dt);
   if (moved > 0) {
@@ -733,38 +998,11 @@ export function stepPlaying(state, dt, input) {
   }
 
   // ── Pickups ──────────────────────────────────────────────────────────────────────────────
-  const items = level.items;
-  const pr2 = WORLD.PICKUP_RADIUS * WORLD.PICKUP_RADIUS;
-  for (let i = 0; i < items.length; i++) {
-    const it = items[i];
-    if (it.taken) continue;
-    if (dist2(p.x, p.y, it.x, it.y) > pr2) continue;
-    it.taken = true;
-    if (it.kind === 'gem') {
-      run.gems++;
-      const value = gemScore(state.level);
-      run.score += value;
-      // Combo is a display statistic only — §1 pins the score formula, so it must not multiply.
-      sim.combo = sim.comboTimer > 0 ? sim.combo + 1 : 1;
-      sim.comboTimer = SCORE.COMBO_WINDOW;
-      if (sim.combo > run.bestCombo) run.bestCombo = sim.combo;
-      state.events.push({ type: 'pickup', kind: 'gem', x: it.x, y: it.y, value });
-    } else {
-      // Walking over a flask with a full tank would burn it for nothing, which reads as a bug to
-      // the player. Leave it on the floor instead — it is still there on the way back.
-      if (run.fuelMax - run.fuel < OIL_MIN_GAIN) {
-        it.taken = false;
-        continue;
-      }
-      const before = run.fuel;
-      run.fuel = Math.min(run.fuelMax, run.fuel + oilFuel(run.fuelMax));
-      state.events.push({ type: 'pickup', kind: 'oil', x: it.x, y: it.y, value: run.fuel - before });
-    }
-  }
+  collectAround(state);
 
   // ── Fuel ─────────────────────────────────────────────────────────────────────────────────
   const sprinting = input.sprint && speedNow > PLAYER.SPRINT_MIN_SPEED;
-  run.fuel -= dt * FUEL.DRAIN * (sprinting ? FUEL.SPRINT_MULT : 1);
+  run.fuel -= dt * FUEL.DRAIN * sim.drain * (sprinting ? FUEL.SPRINT_MULT : 1);
   if (run.fuel < 0) run.fuel = 0;
   if (run.fuelMax > 0) {
     if (sim.lowFuelArmed) {

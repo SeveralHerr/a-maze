@@ -9,7 +9,18 @@ import assert from 'node:assert/strict';
 
 import { TILE } from '../maze/constants.js';
 import { createInitialState, reducer } from './game.js';
-import { FUEL, SCORE, SIM, gemScore, levelBonus, oilFuel } from './balance.js';
+import {
+  CAP_LEVEL,
+  FUEL,
+  PLAYER,
+  SCORE,
+  SIM,
+  drainRate,
+  gemScore,
+  levelBonus,
+  levelParams,
+  oilFuel,
+} from './balance.js';
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────────────────────
 
@@ -174,6 +185,8 @@ test('createInitialState: a clean, valid, contract-shaped state', () => {
     totalTime: 0,
     levelScore: 0,
     bestCombo: 0,
+    refuels: 0,
+    distance: 0,
   });
   assert.equal(s.derived.exitDist, Infinity);
   assert.equal(s.derived.lowFuel, false);
@@ -454,6 +467,33 @@ test('pickups: oil refills fuel, capped at the tank, and re-arms the low-fuel cu
   assert.ok(Math.abs(s.run.fuel - (expected - s.run.levelTime)) < 1.5, 'restored the documented amount');
 });
 
+test('run stats: refuels count flasks per level, distance is the run odometer', () => {
+  const s = started(level([item(1, 'oil', 2.5, 1.5)], 100));
+  assert.equal(s.run.refuels, 0);
+  assert.equal(s.run.distance, 0);
+  s.run.fuel = 10; // so the flask is actually worth taking
+  ticks(s, 40, { moveY: 1 });
+  assert.equal(s.run.refuels, 1, 'one flask burned');
+  assert.ok(s.run.distance > 0.5, `walked ${s.run.distance.toFixed(2)} tiles`);
+  // The odometer measures distance *covered*, so it can never outrun the top speed × time.
+  const ceiling = PLAYER.WALK_SPEED * PLAYER.SPRINT_MULT * s.run.levelTime;
+  assert.ok(s.run.distance <= ceiling, 'the odometer cannot exceed top speed × time');
+
+  // A new level resets the per-level tally but keeps the run odometer.
+  const walked = s.run.distance;
+  reducer(s, { type: 'debugWin' });
+  reducer(s, { type: 'nextLevel' });
+  reducer(s, { type: 'levelReady', data: level([item(1, 'oil', 2.5, 1.5)], 100) });
+  assert.equal(s.run.refuels, 0, 'refuels are per level');
+  assert.equal(s.run.distance, walked, 'distance is per run');
+
+  // A new run resets both.
+  reducer(s, { type: 'pause' });
+  reducer(s, { type: 'newGame', seed: 7 });
+  assert.equal(s.run.refuels, 0);
+  assert.equal(s.run.distance, 0);
+});
+
 test('pickups: a flask is left on the floor when the tank is already full', () => {
   const s = started(level([item(1, 'oil', 1.5, 1.5)], 100));
   assert.equal(s.run.fuel, 100);
@@ -465,6 +505,63 @@ test('pickups: a flask is left on the floor when the tank is already full', () =
   const events = collect(s, 2);
   assert.equal(count(events, 'pickup'), 1);
   assert.ok(s.run.fuel > 40);
+});
+
+test('levelReady: the tank is the state module’s number, never the maze’s', () => {
+  // `src/maze/populate.js` still derives a *path-sized* budget, which on a 128×128 maze is several
+  // times the tank. A tank that scaled with the maze would undo the whole torch economy, so
+  // `resolveTank` clamps it (ARCHITECTURE.md §4.4 fuel seam).
+  const big = started(level([], 9999));
+  assert.equal(big.run.fuelMax, levelParams(1).fuelSeconds, 'an oversized offer is clamped');
+  assert.equal(big.run.fuel, big.run.fuelMax, 'and the torch starts full');
+  const small = started(level([], 40));
+  assert.equal(small.run.fuelMax, 40, 'a smaller offer (demo, tutorial, fixture) is honoured');
+  const junk = started(level([], /** @type {any} */ ('lots')));
+  assert.equal(junk.run.fuelMax, levelParams(1).fuelSeconds, 'garbage falls back to the tank');
+});
+
+test('fuel: past the size cap the torch burns faster instead of the maze growing', () => {
+  const shallow = started(level([], 200));
+  const deep = createInitialState();
+  reducer(deep, { type: 'newGame', seed: 3 });
+  deep.level = CAP_LEVEL + 10;
+  reducer(deep, { type: 'levelReady', data: level([], 200) });
+  assert.equal(deep.run.fuelMax, FUEL.TANK_END, 'the tank stopped growing at the cap');
+
+  ticks(shallow, 60);
+  ticks(deep, 60);
+  const usedShallow = shallow.run.fuelMax - shallow.run.fuel;
+  const usedDeep = deep.run.fuelMax - deep.run.fuel;
+  const expected = drainRate(CAP_LEVEL + 10);
+  assert.ok(Math.abs(usedShallow - 1) < 0.02, `level 1 burns 1 s/s (${usedShallow})`);
+  assert.ok(
+    Math.abs(usedDeep - expected) < 0.02,
+    `level ${CAP_LEVEL + 10} burns ${expected} s/s (${usedDeep})`,
+  );
+});
+
+test('pickups: hundreds of items along one corridor are every one collected', () => {
+  // The pickup test is a bucket-grid query now (4-tile buckets), so the case that matters is an
+  // item sitting right on a bucket seam. A 57-tile corridor crosses fourteen of them.
+  const wide = 60;
+  const row = `#S${'.'.repeat(wide - 4)}E#`;
+  const items = [];
+  for (let x = 2; x < wide - 2; x++) items.push(item(x, x % 2 === 0 ? 'gem' : 'oil', x + 0.5, 1.5));
+  const s = started(level(items, 100, ['#'.repeat(wide), row, '#'.repeat(wide)]));
+  s.run.fuel = 1; // keep the tank empty so every flask is worth taking
+  assert.equal(s.run.gemsTotal, items.filter((i) => i.kind === 'gem').length);
+  for (let i = 0; i < 2000 && s.phase === 'playing'; i++) {
+    s.run.fuel = Math.min(s.run.fuelMax * 0.3, s.run.fuel);
+    ticks(s, 1, { moveY: 1 });
+  }
+  assert.equal(s.phase, 'levelComplete', 'the player walked the whole corridor');
+  const missed = /** @type {any} */ (s.levelData).items.filter((/** @type {any} */ it) => !it.taken);
+  assert.deepEqual(
+    missed.map((/** @type {any} */ it) => it.x),
+    [],
+    'every item on the route was picked up',
+  );
+  assert.equal(s.run.gems, s.run.gemsTotal);
 });
 
 test('lowFuel: fires exactly once per crossing, with hysteresis on the way back up', () => {
@@ -604,11 +701,22 @@ test('setSetting: validates, clamps and ignores nonsense in every phase', () => 
   assert.equal(s.settings.scanlines, false, 'numeric booleans are accepted');
   reducer(s, { type: 'setSetting', key: 'scanlines', value: 'off' });
   assert.equal(s.settings.scanlines, false, 'a string is ignored, not coerced');
+  // The three-state map is an enum: only a listed value is taken, and anything else leaves the
+  // setting exactly where it was rather than snapping it back to the default.
+  assert.equal(s.settings.mapMode, 'corner', 'factory default');
+  reducer(s, { type: 'setSetting', key: 'mapMode', value: 'full' });
+  assert.equal(s.settings.mapMode, 'full');
+  reducer(s, { type: 'setSetting', key: 'mapMode', value: 'sideways' });
+  assert.equal(s.settings.mapMode, 'full', 'an unlisted enum value is ignored');
+  reducer(s, /** @type {any} */ ({ type: 'setSetting', key: 'mapMode', value: 1 }));
+  assert.equal(s.settings.mapMode, 'full', 'a non-string enum value is ignored');
+  reducer(s, { type: 'setSetting', key: 'mapMode', value: 'off' });
+  assert.equal(s.settings.mapMode, 'off');
   reducer(s, /** @type {any} */ ({ type: 'setSetting', key: 'hack', value: 1 }));
   assert.equal(/** @type {any} */ (s.settings).hack, undefined);
   reducer(s, /** @type {any} */ ({ type: 'setSetting', key: 42, value: 1 }));
   reducer(s, /** @type {any} */ ({ type: 'setSetting' }));
-  assert.equal(Object.keys(s.settings).length, 7);
+  assert.equal(Object.keys(s.settings).length, 8);
 });
 
 // ─── Events ──────────────────────────────────────────────────────────────────────────────────

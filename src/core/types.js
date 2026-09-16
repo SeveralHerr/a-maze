@@ -132,14 +132,26 @@
  * @property {number} music          0..1
  * @property {number} sensitivity    0.2..3
  * @property {boolean} scanlines
- * @property {boolean} minimap
+ * @property {boolean} minimap       legacy two-state map switch; kept as a mirror of
+ *   `mapMode !== 'off'` so audio/touch and any older call site keep working
+ * @property {MapMode} mapMode       three-state map: off → corner → full (§4.6)
  * @property {boolean} reducedMotion
  * @property {boolean} invertLook
  */
 
 /**
+ * The map overlay's three states (`src/ui/map.js` owns the behaviour; this is the persisted value).
+ * @typedef {'off'|'corner'|'full'} MapMode
+ */
+
+/**
  * Per-run counters (the `GameState.run` shape, named so consumers can reference it).
- * @typedef {{score:number, gems:number, gemsTotal:number, fuel:number, fuelMax:number, levelTime:number, totalTime:number, levelScore:number, bestCombo:number}} RunStats
+ *
+ * `refuels` and `distance` exist for the massive-maze HUD and end screens: on a 14-minute labyrinth
+ * "how many times did I refill the torch" and "how far did I walk" are the statistics that describe
+ * the run, where a small maze was fully described by time and gems. `refuels` counts flasks burned
+ * **this level** (reset by `levelReady`); `distance` accumulates tiles walked over the whole **run**.
+ * @typedef {{score:number, gems:number, gemsTotal:number, fuel:number, fuelMax:number, levelTime:number, totalTime:number, levelScore:number, bestCombo:number, refuels:number, distance:number}} RunStats
  */
 
 /**
@@ -184,7 +196,7 @@
  * Store actions (ARCHITECTURE.md §4.2). `setSetting` is keyed by a `Settings` property name.
  * @typedef {{type:'tick', dt:number, input:InputFrame} | {type:'newGame', seed:number} | {type:'levelReady', data:LevelData}
  *   | {type:'pause'} | {type:'resume'} | {type:'nextLevel'} | {type:'toTitle'}
- *   | {type:'setSetting', key:keyof Settings, value:number|boolean} | {type:'debugWin'}} Action
+ *   | {type:'setSetting', key:keyof Settings, value:number|boolean|string} | {type:'debugWin'}} Action
  */
 
 /**

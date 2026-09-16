@@ -30,7 +30,10 @@
   <link rel="modulepreload" href="src/main.js" />
   <link rel="modulepreload" href="src/renderer/raycaster.js" />
   <link rel="modulepreload" href="src/renderer/textures.js" />
+  <link rel="modulepreload" href="src/renderer/sprite-index.js" />
   <link rel="modulepreload" href="src/ui/hud.js" />
+  <link rel="modulepreload" href="src/ui/map.js" />
+  <link rel="modulepreload" href="src/ui/pixels.js" />
   <link rel="modulepreload" href="src/ui/menus.js" />
   <link rel="modulepreload" href="src/ui/font.js" />
   <link rel="modulepreload" href="src/ui/audio.js" />
@@ -42,7 +45,7 @@
   <main id="app" aria-label="A-MAZE game">
     <canvas id="view" aria-hidden="true"></canvas>
     <div id="post" aria-hidden="true"></div>
-    <canvas id="overlay" aria-label="A-MAZE: torchlit dungeon maze. Keyboard: WASD or arrows to move, mouse to look, Shift to sprint, M for the map, Esc to pause."></canvas>
+    <canvas id="overlay" aria-label="A-MAZE: torchlit dungeon maze. Keyboard: WASD or arrows to move, mouse to look, Shift to sprint, M to cycle the map between off, corner and full screen, Esc to pause."></canvas>
     <div id="touch" aria-hidden="true"></div>
   </main>
   <noscript>

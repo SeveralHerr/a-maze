@@ -10,8 +10,9 @@
  *    axis-aligned block of device pixels. One surface is shared per canvas element (see
  *    `SURFACES`), so `hud.js` and `menus.js` draw into the same coordinate system without having
  *    to be told about each other.
- * 2. **Pixel primitives** — indexed-colour sprite art, stone/wood panels, icons. `menus.js`
- *    imports these; nothing else does.
+ * 2. **Pixel primitives** — re-exported from `./pixels.js`, which owns them now. `menus.js` and
+ *    the tests keep importing them from here, so §4.6's published surface is unchanged; the split
+ *    exists only so `map.js` can use them without an import cycle (see that file's header).
  * 3. **`createHud`** — the playing-phase readouts.
  *
  * ## Coordinate systems
@@ -29,12 +30,13 @@
  *
  * ## Hot path
  * A frame costs a few dozen canvas calls and about a dozen short-lived strings (the formatted
- * readouts and the option objects handed to `drawText`) — nothing that scales with the size of the
- * maze or with the number of glyphs drawn. Everything that *would* scale is precomputed: glyphs
- * come from a pre-coloured atlas, colour strings are memoised, the score pops live in a fixed-size
- * pool, panels and icons draw from run-length-merged rectangles, and the minimap is rasterised into
- * an offscreen canvas that is rebuilt only when the explored set actually grows. Measured at
- * 0.1–0.2 ms per frame for the whole overlay at 1280×720.
+ * readouts and the option objects handed to `drawText`) — **nothing that scales with the size of
+ * the maze or with the number of items in it**, which is the hard rule for the massive-maze wave:
+ * a level now holds up to ~900 items and a 257×257 explored grid. Everything that would scale is
+ * precomputed: glyphs come from a pre-coloured atlas, colour strings are memoised, the score pops
+ * live in a fixed-size pool, panels and icons draw from run-length-merged rectangles, and the map
+ * is an incrementally-maintained offscreen raster (see `map.js`) that costs one `drawImage`.
+ * Measured at 0.1–0.2 ms per frame for the whole overlay at 1280×720, map included.
  */
 
 import { clamp, clamp01 } from '../core/math.js';
@@ -45,16 +47,72 @@ import {
   formatClock,
   formatCount,
   formatDepth,
+  formatDistance,
   formatInt,
+  formatLabyrinth,
+  formatPercent,
   formatSigned,
   formatTime,
 } from './format.js';
+import { createMapView, cycleMapMode, readMapMode } from './map.js';
+import {
+  drawGemIcon,
+  drawOilIcon,
+  drawPanel,
+  drawTorchIcon,
+  drawWell,
+  fillDisc,
+  fillRing,
+  fitScale,
+  ICON_SIZE,
+  strokeRect,
+  withAlpha,
+} from './pixels.js';
 
 /** @typedef {import('../core/types.js').GameState} GameState */
 /** @typedef {import('../core/types.js').FrameStats} FrameStats */
 /** @typedef {import('./font.js').TextOptions} TextOptions */
+/** @typedef {import('./map.js').MapMode} MapMode */
 
 const log = createLogger('ui/hud');
+
+// The pixel-art primitives live in `./pixels.js` now (see the file header). Re-exported here
+// verbatim so `menus.js`, the preview harness and the tests keep the import path ARCHITECTURE.md
+// §4.6 documents.
+export {
+  ARROWS,
+  ARROW_PALETTE,
+  compileArt,
+  drawArt,
+  drawFlame,
+  drawGemIcon,
+  drawOilIcon,
+  drawPanel,
+  drawPortalIcon,
+  drawTorchIcon,
+  drawWell,
+  fillDisc,
+  fillRing,
+  fitScale,
+  hexToRgb,
+  ICON_SIZE,
+  strokeRect,
+  withAlpha,
+} from './pixels.js';
+
+// The map's mode helpers are re-exported for `menus.js` (the options row) and `src/main.js` (the
+// `map` hotkey), so neither has to know that the map moved into its own module.
+export {
+  MAP_MODES,
+  MAP_MODE_LABEL,
+  cycleMapMode,
+  mapModeFromSettings,
+  nextMapMode,
+  normalizeMapMode,
+  readMapMode,
+  resetMapMode,
+  setMapMode,
+} from './map.js';
 
 // ─── Surface ─────────────────────────────────────────────────────────────────────────────────
 
@@ -311,429 +369,29 @@ export function mapPointer(metrics, rectLeft, rectTop, rectW, rectH, clientX, cl
   return uiX >= 0 && uiY >= 0 && uiX < metrics.w && uiY < metrics.h;
 }
 
-// ─── Colour helpers ──────────────────────────────────────────────────────────────────────────
-
-/**
- * Memoised `rgba()` strings. Building one per fill per frame would allocate thousands of short
- * strings a second; the UI uses a few dozen distinct (colour, alpha) pairs in total.
- * @type {Map<string, string>}
- */
-const alphaColors = new Map();
-
-/**
- * `#rrggbb` + alpha → `rgba(r,g,b,a)`, memoised. Alpha is quantised to 1/64 so a fading element
- * cannot fill the cache with 60 new strings a second.
- * @param {string} hex `#rrggbb`
- * @param {number} alpha 0..1
- * @returns {string} a CSS colour
- */
-export function withAlpha(hex, alpha) {
-  const a = alpha <= 0 ? 0 : alpha >= 1 ? 1 : Math.round(alpha * 64) / 64;
-  if (a >= 1) return hex;
-  const key = hex + a;
-  const hit = alphaColors.get(key);
-  if (hit !== undefined) return hit;
-  const r = parseInt(hex.slice(1, 3), 16) || 0;
-  const g = parseInt(hex.slice(3, 5), 16) || 0;
-  const b = parseInt(hex.slice(5, 7), 16) || 0;
-  const css = `rgba(${r},${g},${b},${a})`;
-  if (alphaColors.size < 512) alphaColors.set(key, css);
-  return css;
-}
-
-// ─── Indexed pixel art ───────────────────────────────────────────────────────────────────────
-
-/**
- * A small indexed-colour sprite: one byte per pixel, index 0 transparent.
- * @typedef {{w:number, h:number, data:Uint8Array}} Art
- */
-
-/**
- * Compile rows of digits (`0`–`9`, where 0 = transparent) into an {@link Art}.
- *
- * Rows of unequal length are a data error in this file; the sprite is padded to the widest row and
- * the problem is recorded, because a half-drawn icon is better than a dead frame.
- * @param {ReadonlyArray<string>} rows
- * @param {string} [name] for diagnostics
- * @returns {Art}
- */
-export function compileArt(rows, name) {
-  let w = 0;
-  for (let i = 0; i < rows.length; i++) if (rows[i].length > w) w = rows[i].length;
-  const h = rows.length;
-  const data = new Uint8Array(w * h);
-  for (let y = 0; y < h; y++) {
-    const row = rows[y];
-    if (row.length !== w) log.error(`art ${name || '?'}: row ${y} is ${row.length}, expected ${w}`);
-    for (let x = 0; x < row.length; x++) {
-      const c = row.charCodeAt(x) - 48;
-      if (c > 0 && c < 10) data[y * w + x] = c;
-    }
-  }
-  return { w, h, data };
-}
-
-/**
- * Blit indexed art at an integer scale, merging horizontal runs of one colour into a single
- * `fillRect` (typically 3–5× fewer canvas calls than one rect per pixel).
- *
- * @param {CanvasRenderingContext2D} ctx
- * @param {Art} art
- * @param {number} x left edge in UI pixels (rounded)
- * @param {number} y top edge in UI pixels (rounded)
- * @param {number} scale integer UI pixels per art pixel (≥ 1)
- * @param {ReadonlyArray<string|null>} palette index → CSS colour; `null` or a missing entry skips
- * @returns {void}
- */
-export function drawArt(ctx, art, x, y, scale, palette) {
-  const s = scale < 1 ? 1 : Math.round(scale);
-  const ox = Math.round(x);
-  const oy = Math.round(y);
-  const { w, h, data } = art;
-  for (let py = 0; py < h; py++) {
-    let px = 0;
-    while (px < w) {
-      const idx = data[py * w + px];
-      if (idx === 0) {
-        px++;
-        continue;
-      }
-      let run = 1;
-      while (px + run < w && data[py * w + px + run] === idx) run++;
-      const color = palette[idx];
-      if (color !== undefined && color !== null) {
-        ctx.fillStyle = color;
-        ctx.fillRect(ox + px * s, oy + py * s, run * s, s);
-      }
-      px += run;
-    }
-  }
-}
-
-// ─── Panels ──────────────────────────────────────────────────────────────────────────────────
-
-/**
- * Panel options.
- * @typedef {Object} PanelOptions
- * @property {'stone'|'wood'|'iron'} [frame]  border material (default `'stone'`)
- * @property {number} [alpha]   background opacity 0..1 (default 0.72)
- * @property {boolean} [rivets] draw corner rivets (default true for stone)
- * @property {number} [border]  border thickness in UI pixels (default `u`)
- * @property {boolean} [texture] draw the masonry courses inside the panel (default true)
- */
-
-/** Border tone triples: [outer shadow, body, top-left highlight]. */
-const FRAME_TONES = Object.freeze({
-  stone: Object.freeze([COLOR.stoneShadow, COLOR.stoneDark, COLOR.stoneLight]),
-  wood: Object.freeze([COLOR.woodShadow, COLOR.woodMid, COLOR.woodBright]),
-  iron: Object.freeze([COLOR.ironShadow, COLOR.ironBase, COLOR.ironHilite]),
-});
-
-/**
- * Draw a framed panel: a dark translucent ground inside a two-tone bevelled border, with optional
- * corner rivets. This is the "stone/wood pixel panel" the HUD and every menu sit on.
- *
- * All edges are integer UI pixels, so the bevel stays a crisp single pixel at any scale.
- *
- * @param {CanvasRenderingContext2D} ctx
- * @param {number} x left edge (UI px)
- * @param {number} y top edge
- * @param {number} w width
- * @param {number} h height
- * @param {number} u layout unit (border thickness)
- * @param {PanelOptions} [opts]
- * @returns {void}
- */
-export function drawPanel(ctx, x, y, w, h, u, opts) {
-  const px = Math.round(x);
-  const py = Math.round(y);
-  const pw = Math.max(2, Math.round(w));
-  const ph = Math.max(2, Math.round(h));
-  const b = Math.max(1, Math.round(opts !== undefined && opts.border !== undefined ? opts.border : u));
-  const kind = opts !== undefined && opts.frame !== undefined ? opts.frame : 'stone';
-  const tones = FRAME_TONES[kind] !== undefined ? FRAME_TONES[kind] : FRAME_TONES.stone;
-  const alpha = opts !== undefined && opts.alpha !== undefined ? clamp01(opts.alpha) : 0.72;
-
-  // Outer edge, then the frame body, then the interior ground.
-  ctx.fillStyle = withAlpha(COLOR.void, Math.min(1, alpha + 0.2));
-  ctx.fillRect(px, py, pw, ph);
-  ctx.fillStyle = tones[1];
-  ctx.fillRect(px + b, py + b, pw - b * 2, ph - b * 2);
-  // Bevel: light along the top and left of the frame body, dark along the bottom and right.
-  ctx.fillStyle = tones[2];
-  ctx.fillRect(px + b, py + b, pw - b * 2, b);
-  ctx.fillRect(px + b, py + b, b, ph - b * 2);
-  ctx.fillStyle = tones[0];
-  ctx.fillRect(px + b, py + ph - b * 2, pw - b * 2, b);
-  ctx.fillRect(px + pw - b * 2, py + b, b, ph - b * 2);
-  // Interior, plus a hint of masonry: one course line every 7 units with staggered vertical
-  // joints. Kept at a low alpha — it has to read as depth behind the text, never as noise in it.
-  const inset = b * 2;
-  const iw = pw - inset * 2;
-  const ih = ph - inset * 2;
-  if (iw > 0 && ih > 0) {
-    ctx.fillStyle = withAlpha(COLOR.fog, alpha);
-    ctx.fillRect(px + inset, py + inset, iw, ih);
-    if (opts === undefined || opts.texture !== false) {
-      const course = 7 * b;
-      const joint = Math.max(1, b >> 1);
-      ctx.fillStyle = withAlpha(COLOR.stoneDeep, alpha * 0.5);
-      let row = 0;
-      for (let yy = py + inset + course; yy < py + inset + ih - 1; yy += course, row++) {
-        ctx.fillRect(px + inset, yy, iw, joint);
-        // Alternate courses offset by half a block, the way a wall is actually laid.
-        const step = course * 2;
-        for (let xx = px + inset + (row % 2 === 0 ? step : step / 2); xx < px + inset + iw - 1; xx += step) {
-          ctx.fillRect(xx, yy - course + joint, joint, course - joint);
-        }
-      }
-    }
-  }
-
-  const rivets = opts !== undefined && opts.rivets !== undefined ? opts.rivets : kind !== 'iron';
-  if (rivets && pw > b * 8 && ph > b * 8) {
-    ctx.fillStyle = COLOR.ironHilite;
-    const d = b;
-    ctx.fillRect(px + b * 2, py + b * 2, d, d);
-    ctx.fillRect(px + pw - b * 3, py + b * 2, d, d);
-    ctx.fillRect(px + b * 2, py + ph - b * 3, d, d);
-    ctx.fillRect(px + pw - b * 3, py + ph - b * 3, d, d);
-  }
-}
-
-/**
- * A plain filled rectangle with a 1-unit inner outline — the slider tracks and bar wells.
- * @param {CanvasRenderingContext2D} ctx
- * @param {number} x
- * @param {number} y
- * @param {number} w
- * @param {number} h
- * @param {number} u
- * @param {string} fill CSS colour
- * @param {string} edge CSS colour
- * @returns {void}
- */
-export function drawWell(ctx, x, y, w, h, u, fill, edge) {
-  const b = Math.max(1, Math.round(u));
-  ctx.fillStyle = edge;
-  ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h));
-  ctx.fillStyle = fill;
-  ctx.fillRect(
-    Math.round(x) + b,
-    Math.round(y) + b,
-    Math.max(0, Math.round(w) - b * 2),
-    Math.max(0, Math.round(h) - b * 2),
-  );
-}
-
-// ─── Icon art ────────────────────────────────────────────────────────────────────────────────
-
-/**
- * Torch: three flame frames over a shared handle. Palette indices:
- * 1 ember, 2 mid, 3 hot, 4 core, 5 wood dark, 6 wood light, 7 iron.
- * @type {ReadonlyArray<Art>}
- */
-const TORCH_FRAMES = Object.freeze([
-  compileArt(
-    ['....4....', '...343...', '..32323..', '..21312..', '..112211.', '...1221..', '....1....'],
-    'torch0',
-  ),
-  compileArt(
-    ['...4.....', '..343....', '.32333...', '.213112..', '..112211.', '...121...', '....1....'],
-    'torch1',
-  ),
-  compileArt(
-    ['.....4...', '....343..', '...33323.', '..213132.', '.1122121.', '...1221..', '....1....'],
-    'torch2',
-  ),
-]);
-
-/** The torch handle, drawn under every flame frame. */
-const TORCH_HANDLE = compileArt(
-  ['..77777..', '...656...', '...656...', '...656...', '...757...'],
-  'handle',
-);
-
-/** Fire + wood palette for the torch icon. */
-const TORCH_PALETTE = Object.freeze([
-  null,
-  COLOR.fireEmber,
-  COLOR.fireMid,
-  COLOR.fireHot,
-  COLOR.fireCore,
-  COLOR.woodDark,
-  COLOR.woodBright,
-  COLOR.ironLight,
-]);
-
-/** Gem icon, 7×7. 1 deep, 2 mid, 3 bright, 4 pale. */
-const GEM_ART = compileArt(
-  ['..343..', '.34443.', '3444443', '1344431', '.13331.', '..131..', '...1...'],
-  'gem',
-);
-
-/** Gem palette. */
-const GEM_PALETTE = Object.freeze([null, COLOR.gemDeep, COLOR.gemMid, COLOR.gemBright, COLOR.gemPale]);
-
-/** Oil flask icon, 7×9. 1 dark, 2 mid, 3 light, 4 pale, 5 cork. */
-const OIL_ART = compileArt(
-  ['..555..', '..151..', '..121..', '.12321.', '1233321', '1233321', '1222321', '.12221.', '..111..'],
-  'oil',
-);
-
-/** Oil palette. */
-const OIL_PALETTE = Object.freeze([
-  null,
-  COLOR.oilDeep,
-  COLOR.oilDark,
-  COLOR.oilMid,
-  COLOR.oilPale,
-  COLOR.woodBright,
-]);
-
-/** Torch palette with the hot tones removed — a torch that is nearly out. */
-const TORCH_PALETTE_DIM = Object.freeze([
-  null,
-  COLOR.fireDeep,
-  COLOR.fireEmber,
-  COLOR.fireMid,
-  COLOR.fireHot,
-]);
-
-/**
- * Minimap player arrow pointing "north" (up the screen), 7×7. 1 = outline, 2 = body.
- * The seven other headings are produced by rotating this and the diagonal variant at load, which
- * is exact for 90° steps and therefore stays pixel-perfect.
- */
-const ARROW_N = compileArt(
-  ['...1...', '..121..', '.12221.', '1222221', '.11211.', '...1...', '.......'],
-  'arrowN',
-);
-
-/** The 45° variant, pointing north-east. */
-const ARROW_NE = compileArt(
-  ['..11111', '...1221', '..12221', '.122211', '12211.1', '.11....', '1......'],
-  'arrowNE',
-);
-
-/**
- * Rotate indexed art 90° clockwise.
- * @param {Art} art
- * @returns {Art}
- */
-function rotateArt(art) {
-  const { w, h, data } = art;
-  const out = new Uint8Array(w * h);
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      // (x,y) → (h-1-y, x) in a w×h → h×w rotation; the arrows are square, so w === h.
-      out[x * h + (h - 1 - y)] = data[y * w + x];
-    }
-  }
-  return { w: h, h: w, data: out };
-}
-
-/**
- * Player arrows for the 8 compass headings, indexed by `round(angle / 45°) & 7` with 0 = east,
- * matching the sim's angle convention (0 = +x, +y = south).
- * @type {ReadonlyArray<Art>}
- */
-const ARROWS = (() => {
-  const n = ARROW_N;
-  const ne = ARROW_NE;
-  const e = rotateArt(n);
-  const se = rotateArt(ne);
-  const s = rotateArt(e);
-  const sw = rotateArt(se);
-  const w = rotateArt(s);
-  const nw = rotateArt(sw);
-  // Index order: E, SE, S, SW, W, NW, N, NE.
-  return Object.freeze([e, se, s, sw, w, nw, n, ne]);
-})();
-
-/** Arrow palette: outline then body. */
-const ARROW_PALETTE = Object.freeze([null, COLOR.void, COLOR.fireCore]);
-
-/**
- * Draw the animated torch icon.
- * @param {CanvasRenderingContext2D} ctx
- * @param {number} x left edge (UI px)
- * @param {number} y top edge
- * @param {number} scale integer pixels per art pixel
- * @param {number} frame 0..2
- * @param {number} strength 0..1 — below ~0.35 the flame is drawn in embers only
- * @returns {void}
- */
-export function drawTorchIcon(ctx, x, y, scale, frame, strength) {
-  const f = TORCH_FRAMES[((frame | 0) % TORCH_FRAMES.length + TORCH_FRAMES.length) % TORCH_FRAMES.length];
-  drawArt(ctx, TORCH_HANDLE, x, y + f.h * scale, scale, TORCH_PALETTE);
-  if (strength <= 0.02) return;
-  if (strength < 0.35) {
-    // A dying torch: the hot core and the bright mid-tone drop out first, so the icon visibly
-    // cools rather than just shrinking.
-    drawArt(ctx, f, x, y, scale, TORCH_PALETTE_DIM);
-    return;
-  }
-  drawArt(ctx, f, x, y, scale, TORCH_PALETTE);
-}
-
-/**
- * Draw the gem icon.
- * @param {CanvasRenderingContext2D} ctx
- * @param {number} x
- * @param {number} y
- * @param {number} scale
- * @returns {void}
- */
-export function drawGemIcon(ctx, x, y, scale) {
-  drawArt(ctx, GEM_ART, x, y, scale, GEM_PALETTE);
-}
-
-/**
- * Draw the oil flask icon.
- * @param {CanvasRenderingContext2D} ctx
- * @param {number} x
- * @param {number} y
- * @param {number} scale
- * @returns {void}
- */
-export function drawOilIcon(ctx, x, y, scale) {
-  drawArt(ctx, OIL_ART, x, y, scale, OIL_PALETTE);
-}
-
-/**
- * Draw a standalone flame (the menu cursor and the loading screen torch). Same art as the HUD
- * torch, without the handle.
- * @param {CanvasRenderingContext2D} ctx
- * @param {number} x left edge
- * @param {number} y top edge
- * @param {number} scale
- * @param {number} frame animation frame
- * @returns {void}
- */
-export function drawFlame(ctx, x, y, scale, frame) {
-  const i = ((frame | 0) % TORCH_FRAMES.length + TORCH_FRAMES.length) % TORCH_FRAMES.length;
-  drawArt(ctx, TORCH_FRAMES[i], x, y, scale, TORCH_PALETTE);
-}
-
-/** Size of the flame/torch art in art pixels, so callers can lay out around it. */
-export const ICON_SIZE = Object.freeze({
-  flameW: TORCH_FRAMES[0].w,
-  flameH: TORCH_FRAMES[0].h,
-  torchH: TORCH_FRAMES[0].h + TORCH_HANDLE.h,
-  gem: GEM_ART.w,
-  oilW: OIL_ART.w,
-  oilH: OIL_ART.h,
-  arrow: ARROW_N.w,
-});
-
 // ─── HUD ─────────────────────────────────────────────────────────────────────────────────────
 
-/** Number of segments in the fuel bar. 16 reads as a gauge; more looks like a progress bar. */
+/**
+ * Segments in the fuel bar. The torch is a **tank you refill**, not a level timer, so the bar is
+ * read as "how many swigs left" — 16 segments with a heavier tick every 4 gives the eye a quarter-
+ * tank grid to judge against without counting.
+ */
 const FUEL_SEGMENTS = 16;
+
+/** Segments between the heavy quarter-tank ticks. */
+const FUEL_TICK_EVERY = 4;
 
 /** Fraction of `fuelMax` at or below which the gauge goes red (mirrors `FUEL.LOW_FRACTION`). */
 const LOW_FUEL_FRACTION = 0.2;
+
+/**
+ * Seconds the refill flare lasts. Long enough to be felt as an event, short enough that chaining
+ * two flasks does not leave the gauge permanently white.
+ */
+const REFILL_FLARE_TIME = 0.75;
+
+/** Fuel-seconds gained in one frame below which a rise is drain jitter rather than a refuel. */
+const REFILL_MIN = 0.5;
 
 /** Score pops live in a fixed pool; more than this on screen at once is unreadable anyway. */
 const MAX_POPS = 8;
@@ -764,6 +422,10 @@ const MAX_FRAME_DT = 0.25;
  * @property {Surface} surface  the shared overlay surface
  * @property {(value:number, kind?:'score'|'fuel'|'gem') => void} pop  spawn a floating delta
  * @property {() => void} reset  forget animation state (level change, new run)
+ * @property {(settings?:any) => MapMode} cycleMap  advance the map OFF → CORNER → FULL and return
+ *   the new mode (the `map` hotkey; `src/main.js` then persists it — see the module header)
+ * @property {(settings?:any) => MapMode} mapMode  the mode in force right now
+ * @property {() => import('./map.js').MapStats} mapStats  live map cost accounting (reused object)
  * @property {() => void} dispose
  */
 
@@ -771,13 +433,28 @@ const MAX_FRAME_DT = 0.25;
  * Create the HUD.
  *
  * @param {HTMLCanvasElement|null} overlayCanvas the overlay canvas (may be null in tests/tools)
- * @param {{minimap?:boolean}} [options] reserved for future overrides; `minimap` forces the map on
- *   regardless of `state.settings.minimap` (used by the preview harness)
+ * @param {{minimap?:boolean|MapMode, map?:MapMode}} [options] `map` (or the legacy `minimap`)
+ *   forces a map mode regardless of the settings — the preview harness uses it to shoot every mode.
  * @returns {Hud}
  */
 export function createHud(overlayCanvas, options) {
   const surface = createSurface(overlayCanvas);
-  const forceMinimap = options !== undefined && options.minimap === true;
+  /**
+   * A forced map mode, or null to follow the settings. `minimap: true` is still accepted so an
+   * older caller keeps working; it means "corner".
+   * @type {MapMode|null}
+   */
+  const forcedMap =
+    options === undefined
+      ? null
+      : typeof options.map === 'string'
+        ? options.map
+        : options.minimap === true
+          ? 'corner'
+          : typeof options.minimap === 'string'
+            ? /** @type {MapMode} */ (options.minimap)
+            : null;
+  const mapView = createMapView();
 
   // ── Animation state ──
   const scoreCounter = createCounter(0);
@@ -793,6 +470,20 @@ export function createHud(overlayCanvas, options) {
   let fuelShown = 1;
   /** 0..1 ramp that fades the whole HUD in when a level starts. */
   let intro = 0;
+  /**
+   * Refill flare: 1 at the instant a flask lands, decaying to 0 over `REFILL_FLARE_TIME`. This is
+   * the tank economy's whole feedback loop — the player must *feel* the tank fill, because the
+   * thing they are managing is no longer a level timer but a chain of refuels.
+   */
+  let refillFlare = 0;
+  /** Bar fraction the last refill started from, so the surge can be drawn as a sweep. */
+  let refillFrom = 0;
+  /** Refuels taken this level (a fallback for when `state.run` does not carry the count). */
+  let refuelCount = 0;
+  /** Fuel panel box, from {@link measureFuelPanel}, so the full map can lay out clear of it. */
+  let fuelPanelW = 0;
+  let fuelPanelH = 0;
+  let fuelBarW = 0;
 
   /** @type {Pop[]} */
   const pops = new Array(MAX_POPS);
@@ -800,17 +491,6 @@ export function createHud(overlayCanvas, options) {
     pops[i] = { t: -1, x: 0, y: 0, drift: 0, text: '', color: 'hudBright', icon: 0 };
   }
   let popCursor = 0;
-
-  // ── Minimap cache ──
-  /** @type {HTMLCanvasElement|null} */
-  let mapCanvas = null;
-  /** @type {CanvasRenderingContext2D|null} */
-  let mapCtx = null;
-  let mapW = 0;
-  let mapH = 0;
-  let mapExplored = -1;
-  /** @type {object|null} */
-  let mapLevelRef = null;
 
   /**
    * @param {number} value
@@ -854,9 +534,11 @@ export function createHud(overlayCanvas, options) {
     lastGems = 0;
     fuelShown = 1;
     intro = 0;
+    refillFlare = 0;
+    refillFrom = 0;
+    refuelCount = 0;
     for (let i = 0; i < MAX_POPS; i++) pops[i].t = -1;
-    mapExplored = -1;
-    mapLevelRef = null;
+    mapView.reset();
   }
 
   /**
@@ -891,6 +573,8 @@ export function createHud(overlayCanvas, options) {
       lastFuel = run.fuel;
       fuelShown = run.fuelMax > 0 ? clamp01(run.fuel / run.fuelMax) : 0;
       intro = 0;
+      refillFlare = 0;
+      refuelCount = 0;
       for (let i = 0; i < MAX_POPS; i++) pops[i].t = -1;
     }
     if (run.score < lastScore) {
@@ -906,7 +590,14 @@ export function createHud(overlayCanvas, options) {
       const gained = run.score - lastScore;
       if (gained > 0) pop(gained, run.gems > lastGems ? 'gem' : 'score');
       const fuelGained = run.fuel - lastFuel;
-      if (fuelGained > 0.5) pop(fuelGained, 'fuel');
+      if (fuelGained > REFILL_MIN) {
+        pop(fuelGained, 'fuel');
+        // Arm the surge from wherever the bar currently *reads*, not from the true fuel: the bar
+        // is smoothed, and the flare has to start where the eye last saw the level.
+        refillFrom = fuelShown;
+        refillFlare = 1;
+        refuelCount++;
+      }
       if (intro < 1) intro = clamp01(intro + dt * 2.2);
     } else if (state.phase === 'paused') {
       // Hold the intro at full while paused so resuming does not re-fade the HUD in.
@@ -924,6 +615,8 @@ export function createHud(overlayCanvas, options) {
     // up in roughly a third of a second.
     fuelShown += (fuelTarget - fuelShown) * (1 - Math.exp(-9 * dt));
     if (Math.abs(fuelTarget - fuelShown) < 0.002) fuelShown = fuelTarget;
+
+    if (refillFlare > 0) refillFlare = Math.max(0, refillFlare - dt / REFILL_FLARE_TIME);
 
     for (let i = 0; i < MAX_POPS; i++) {
       const p = pops[i];
@@ -958,15 +651,46 @@ export function createHud(overlayCanvas, options) {
     ctx.globalAlpha = prevAlpha * globalAlpha;
 
     const reduced = state.settings !== undefined && state.settings.reducedMotion === true;
+    const mode = forcedMap !== null ? forcedMap : readMapMode(state.settings);
+
+    // The raster is maintained before anything is drawn, so the map and the "% mapped" readout
+    // agree within the same frame. It is skipped entirely when the map is off — switching it back
+    // on costs one rescan, not a frame of stale pixels.
+    if (mode !== 'off') mapView.update(state, clock);
+
+    // The full map takes the screen: drawing the play HUD under it would be noise over a diagram,
+    // so only the gauges that answer "can I afford to stand here reading this" stay.
+    if (mode === 'full') {
+      // The map's ground covers the whole surface, so the gauge is drawn *after* it — but the map
+      // needs the gauge's box first to lay its header out clear of it (beside it on a wide screen,
+      // under it on a phone). Hence the measurement is a pure function of the metrics, separate
+      // from the drawing.
+      measureFuelPanel(m);
+      mapView.drawFull(
+        ctx,
+        m,
+        state,
+        clock,
+        reduced,
+        m.narrow ? 0 : fuelPanelW + 3 * m.u,
+        m.narrow ? fuelPanelH + 2 * m.u : 0,
+      );
+      drawFuelGauge(ctx, state, m, reduced);
+      drawPops(ctx, m, reduced);
+      if (isDebug()) drawDebug(ctx, state, m, frameStats === undefined ? null : frameStats);
+      ctx.globalAlpha = prevAlpha;
+      return;
+    }
+
     // On a narrow surface the three top clusters cannot sit side by side, so the depth readout
     // tucks under the fuel gauge instead of holding the centre.
     const fuelH = drawFuelGauge(ctx, state, m, reduced);
+    // `drawFuelGauge` has just published `fuelPanelW`, which the score panel needs to know how much
+    // of the top row is left for it.
     drawScorePanel(ctx, state, m);
     drawDepthPanel(ctx, state, m, fuelH);
-    drawCompass(ctx, state, m, reduced);
-    if (forceMinimap || (state.settings !== undefined && state.settings.minimap === true)) {
-      drawMinimap(ctx, state, m, reduced);
-    }
+    const mapH = mode === 'corner' ? mapView.drawCorner(ctx, m, state, clock, reduced) : 0;
+    drawCompass(ctx, state, m, reduced, mapH);
     drawPops(ctx, m, reduced);
     if (isDebug()) drawDebug(ctx, state, m, frameStats === undefined ? null : frameStats);
 
@@ -974,45 +698,94 @@ export function createHud(overlayCanvas, options) {
   }
 
   /**
-   * Top-left: torch icon + segmented burning bar + remaining time.
+   * Top-left: the torch **tank** — torch icon, segmented bar with quarter-tank ticks, refuel
+   * count, remaining time.
+   *
+   * WHY it is drawn as a tank and not as a timer: `fuelMax` no longer scales with the maze, so the
+   * bar is a small vessel the player refills every 60–90 s rather than a countdown to the exit.
+   * Three things carry that reading: the quarter ticks (a tank has graduations), the refill surge
+   * (a flask visibly *fills* it — the bar sweeps up from where it was with a hot leading edge and
+   * the panel flares), and the low-tank alarm (the frame pulses red, the flame cools, a LOW chip
+   * appears) which now recurs many times per level instead of once per run.
    * @param {CanvasRenderingContext2D} ctx
    * @param {GameState} state
    * @param {SurfaceMetrics} m
    * @param {boolean} reduced reduced motion
    * @returns {number} the panel's height in UI pixels, so the next cluster can stack under it
    */
+  /**
+   * Size the fuel panel without drawing it.
+   *
+   * Pure arithmetic on the metrics, so the full map can reserve space for the gauge before the
+   * gauge is drawn on top of it. Writes the three closure fields rather than allocating a box.
+   * @param {SurfaceMetrics} m
+   * @returns {void}
+   */
+  function measureFuelPanel(m) {
+    const u = m.u;
+    const iconW = ICON_SIZE.flameW * u;
+    const barH = 7 * u;
+    const lineH = textHeight({ font: 'hud', size: u });
+    // On a narrow surface the gauge and the score panel share one row, and the score panel needs
+    // more than half of it for a six-figure number plus the gem tally — so the gauge is capped at
+    // 44 % of the width rather than being allowed to slide under it (measured at 390×844: the two
+    // panels used to overlap by ~35 UI pixels, eating the tank's own readout).
+    const cap = m.narrow ? m.w * 0.44 - iconW - 7 * u : Infinity;
+    fuelBarW = Math.min(64 * u, Math.max(20 * u, m.w * 0.28), cap);
+    fuelPanelW = iconW + fuelBarW + 7 * u;
+    // Tall enough for the torch beside the bar *and* the readout line under it.
+    fuelPanelH = Math.max(ICON_SIZE.torchH * u + 4 * u, barH + lineH + 8 * u);
+  }
+
   function drawFuelGauge(ctx, state, m, reduced) {
     const u = m.u;
     const pad = 3 * u;
     const iconScale = u;
     const iconW = ICON_SIZE.flameW * iconScale;
-    const barW = Math.min(64 * u, Math.max(26 * u, m.w * (m.narrow ? 0.34 : 0.28)));
+    measureFuelPanel(m);
+    const barW = fuelBarW;
     const barH = 7 * u;
     const lineH = textHeight({ font: 'hud', size: u });
-    const panelW = iconW + barW + 7 * u;
-    // Tall enough for the torch beside the bar *and* the remaining-time line under it.
-    const panelH = Math.max(ICON_SIZE.torchH * iconScale + 4 * u, barH + lineH + 8 * u);
+    const panelW = fuelPanelW;
+    const panelH = fuelPanelH;
 
     const low = fuelShown <= LOW_FUEL_FRACTION;
-    // The flame flickers on its own cycle; when the torch is low it stutters, which is the first
-    // cue the player gets that the run is nearly over.
+    const flare = reduced ? 0 : refillFlare;
+    // The flame flickers on its own cycle; when the tank is low it stutters, which is the first
+    // cue the player gets that the next flask has become urgent.
     const flicker = reduced ? 0.5 : noise(clock * (low ? 17 : 9));
     const frame = reduced ? 0 : ((clock * (low ? 14 : 8)) | 0) % 3;
 
     drawPanel(ctx, pad, pad, panelW, panelH, u, { frame: 'stone' });
+    // Alarm and flare both live on the panel edge, where they are visible in peripheral vision:
+    // the player is looking down a corridor, not at the gauge.
+    if (low && !reduced) {
+      const pulse = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(clock * 6));
+      ctx.fillStyle = withAlpha(COLOR.alarm, pulse * 0.7);
+      strokeRect(ctx, pad, pad, panelW, panelH, Math.max(1, u >> 1));
+    } else if (flare > 0) {
+      ctx.fillStyle = withAlpha(COLOR.fireCore, flare * 0.8);
+      strokeRect(ctx, pad, pad, panelW, panelH, Math.max(1, u >> 1));
+    }
 
     const iconX = pad + 3 * u;
     const iconY = pad + 2 * u;
-    drawTorchIcon(ctx, iconX, iconY, iconScale, frame, low ? 0.3 : 1);
+    // A refill relights the torch: the icon goes to full strength for the length of the flare
+    // however low the tank was, which is the reward for the pickup.
+    drawTorchIcon(ctx, iconX, iconY, iconScale, frame, low && flare < 0.2 ? 0.3 : 1);
 
     // Bar well.
     const barX = pad + iconW + 5 * u;
     const barY = pad + 3 * u;
-    drawWell(ctx, barX, barY, barW, barH, u, COLOR.void, COLOR.ironDark);
+    drawWell(ctx, barX, barY, barW, barH, u, COLOR.void, low ? COLOR.fireDeep : COLOR.ironDark);
 
     const inner = barW - 2 * u;
     const gap = Math.max(1, u >> 1);
-    const lit = fuelShown * FUEL_SEGMENTS;
+    // The surge: for the length of the flare the bar is drawn as if it were still filling, so the
+    // eye sees the level *travel* even though the state changed in a single step.
+    const surge = flare > 0 ? refillFrom + (fuelShown - refillFrom) * (1 - flare * flare) : fuelShown;
+    const shown = flare > 0 ? Math.min(fuelShown, surge) : fuelShown;
+    const lit = shown * FUEL_SEGMENTS;
     const fullSegs = Math.floor(lit);
     for (let i = 0; i < FUEL_SEGMENTS; i++) {
       // Segment edges are derived from the exact fraction rather than from a floored width, so the
@@ -1026,38 +799,75 @@ export function createHud(overlayCanvas, options) {
         // Solid part of the flame: hotter at the base of the bar, cooler at the tip, so the gauge
         // reads like burning fuel rather than a health bar.
         const t = i / FUEL_SEGMENTS;
-        ctx.fillStyle = low
-          ? i === fullSegs - 1 && !reduced && flicker > 0.55
-            ? COLOR.fireMid
-            : COLOR.alarm
-          : t < 0.55
-            ? COLOR.fireMid
-            : COLOR.fireHot;
+        const leadingEdge = flare > 0 && i === fullSegs - 1;
+        ctx.fillStyle = leadingEdge
+          ? COLOR.fireCore
+          : low
+            ? i === fullSegs - 1 && !reduced && flicker > 0.55
+              ? COLOR.fireMid
+              : COLOR.alarm
+            : t < 0.55
+              ? COLOR.fireMid
+              : COLOR.fireHot;
         ctx.fillRect(sx, barY + u, segW, barH - 2 * u);
         // Highlight the top row of each lit segment.
-        ctx.fillStyle = low ? COLOR.fireEmber : COLOR.fireCore;
+        ctx.fillStyle = low && flare <= 0 ? COLOR.fireEmber : COLOR.fireCore;
         ctx.fillRect(sx, barY + u, segW, gap);
       } else if (i === fullSegs) {
         // The burning edge: a partial segment whose brightness flickers.
         const frac = lit - fullSegs;
         if (frac > 0.08) {
           const wSeg = Math.max(1, Math.round(segW * frac));
-          ctx.fillStyle = low ? COLOR.alarm : flicker > 0.5 ? COLOR.fireHot : COLOR.fireEmber;
+          ctx.fillStyle =
+            flare > 0 ? COLOR.fireCore : low ? COLOR.alarm : flicker > 0.5 ? COLOR.fireHot : COLOR.fireEmber;
           ctx.fillRect(sx, barY + u, wSeg, barH - 2 * u);
         }
       }
+      // Quarter-tank graduations, drawn over the segments so a full bar still shows them.
+      if (i > 0 && i % FUEL_TICK_EVERY === 0) {
+        ctx.fillStyle = withAlpha(COLOR.void, 0.75);
+        ctx.fillRect(sx - gap, barY + u, Math.max(1, gap), barH - 2 * u);
+      }
     }
 
-    // Remaining time, under the bar and right-aligned with it — never over the segments, which
-    // would make both unreadable exactly when the gauge matters most.
+    // Under the bar: how much is left (right, where the eye goes first) and how many flasks this
+    // level has cost (left) — the two numbers the refill economy is played on.
     const run = state.run;
-    drawText(ctx, formatTime(run.fuel), barX + barW, barY + barH + 2 * u, {
+    const textY = barY + barH + 2 * u;
+    drawText(ctx, formatTime(run.fuel), barX + barW, textY, {
       font: 'hud',
       size: u,
-      color: low ? 'hudAlarm' : 'hudDim',
+      color: low ? 'hudAlarm' : flare > 0 ? 'hudBright' : 'hudDim',
       align: 'right',
     });
+    const refuels = refuelsOf(state);
+    // "TANK" until the first flask, then a tally of them. The word is dropped rather than allowed
+    // to collide with the clock when the bar is narrow (a phone at u = 3 has no room for both).
+    const tankLabel = low ? 'LOW' : refuels > 0 ? `×${refuels}` : 'TANK';
+    const timeW = measureLine(formatTime(run.fuel), { font: 'hud', size: u });
+    const labelW = measureLine(tankLabel, { font: 'hud', size: u });
+    if (labelW + timeW + 3 * u <= barW) {
+      drawText(ctx, tankLabel, barX, textY, {
+        font: 'hud',
+        size: u,
+        color: low ? 'hudAlarm' : 'hudDim',
+      });
+    }
     return panelH;
+  }
+
+  /**
+   * Refuels taken on this level.
+   *
+   * Prefers the sim's own count (`run.refuels`) when `src/state` carries one — see the integrator
+   * note in this wave's report — and otherwise falls back to the HUD's own tally of fuel rises,
+   * which is exact for every pickup the HUD has actually rendered through.
+   * @param {GameState} state
+   * @returns {number}
+   */
+  function refuelsOf(state) {
+    const fromRun = /** @type {any} */ (state.run).refuels;
+    return typeof fromRun === 'number' && Number.isFinite(fromRun) ? Math.max(0, fromRun | 0) : refuelCount;
   }
 
   /**
@@ -1073,14 +883,31 @@ export function createHud(overlayCanvas, options) {
     const run = state.run;
     const scoreText = formatInt(scoreCounter.value);
     const gemsText = formatCount(run.gems, run.gemsTotal);
-    // A six-figure score at double size does not fit beside the fuel gauge on a phone.
-    const scoreSize = m.narrow ? u : 2 * u;
+    // A six-figure score at double size does not fit beside the fuel gauge on a phone — and with
+    // the massive-maze item counts the gem line is now "8/820" rather than "8/12", so the panel is
+    // fitted to the room the gauge actually leaves instead of being assumed to fit. Measured at
+    // 390×844: the two panels used to overlap by ~35 UI pixels and ate the tank's own readout.
+    let scoreSize = m.narrow ? u : 2 * u;
+    let gemSize = u;
+    const room = m.narrow ? m.w - 3 * pad - fuelPanelW : m.w;
+    for (;;) {
+      const need =
+        Math.max(
+          measureLine(scoreText, { font: 'hud', size: scoreSize }),
+          measureLine(gemsText, { font: 'hud', size: gemSize }) + (ICON_SIZE.gem + 2) * gemSize,
+        ) + 8 * u;
+      if (need <= room) break;
+      if (scoreSize > gemSize && scoreSize > 1) scoreSize--;
+      else if (gemSize > 1) gemSize--;
+      else if (scoreSize > 1) scoreSize--;
+      else break;
+    }
     const scoreH = textHeight({ font: 'hud', size: scoreSize });
-    const gemH = textHeight({ font: 'hud', size: u });
+    const gemH = textHeight({ font: 'hud', size: gemSize });
 
     const scoreW = measureLine(scoreText, { font: 'hud', size: scoreSize });
-    const gemsTextW = measureLine(gemsText, { font: 'hud', size: u });
-    const gemsW = gemsTextW + (ICON_SIZE.gem + 2) * u;
+    const gemsTextW = measureLine(gemsText, { font: 'hud', size: gemSize });
+    const gemsW = gemsTextW + (ICON_SIZE.gem + 2) * gemSize;
     const inner = Math.max(scoreW, gemsW, 20 * u);
     const panelW = inner + 8 * u;
     const panelH = scoreH + gemH + 9 * u;
@@ -1097,13 +924,18 @@ export function createHud(overlayCanvas, options) {
     });
 
     const gemY = pad + 3 * u + scoreH + 2 * u;
-    drawText(ctx, gemsText, right, gemY, { font: 'hud', size: u, color: 'hudGem', align: 'right' });
-    drawGemIcon(ctx, right - gemsW, gemY, u);
+    drawText(ctx, gemsText, right, gemY, { font: 'hud', size: gemSize, color: 'hudGem', align: 'right' });
+    drawGemIcon(ctx, right - gemsW, gemY, gemSize);
   }
 
   /**
-   * Top-centre: the depth and the level clock. Deliberately small — the middle of the screen is
-   * where the game is.
+   * Top-centre: the depth, how big this labyrinth is, how much of it is mapped, and the level
+   * clock. Deliberately small — the middle of the screen is where the game is.
+   *
+   * The size line is new for the massive-maze wave and it is not decoration: `16×16` and `128×128`
+   * are two different games, and a player who has just descended needs to know which one they are
+   * standing in without opening the map. `MAPPED %` is free — `map.js` maintains the count
+   * incrementally — and it is the only honest progress bar a maze this size can offer.
    * @param {CanvasRenderingContext2D} ctx
    * @param {GameState} state
    * @param {SurfaceMetrics} m
@@ -1114,14 +946,36 @@ export function createHud(overlayCanvas, options) {
     const u = m.u;
     const pad = 3 * u;
     const depth = formatDepth(state.level);
+    const level = state.levelData;
+    const sizeText =
+      level !== null && level !== undefined && level.maze !== undefined
+        ? formatLabyrinth(level.maze.cols, level.maze.rows)
+        : '';
+    const mapped = mappedText(state);
     const clockText = formatClock(state.run.levelTime);
-    const lineH = textHeight({ font: 'hud', size: u });
-    const w = Math.max(
-      measureLine(depth, { font: 'hud', size: u }),
-      measureLine(clockText, { font: 'hud', size: u }),
-    );
-    const panelW = w + 8 * u;
-    const panelH = lineH * 2 + 9 * u;
+    // Wide: the clock and the mapped percentage share one row. Narrow: they get a row each, and
+    // the whole panel drops a text size — a phone at u = 3 cannot hold "01:42  MAPPED 94%" on one
+    // line and would otherwise run off the screen (measured at 390×844).
+    const stacked = m.narrow && mapped !== '';
+    const tailText = stacked || mapped === '' ? clockText : `${clockText}  ${mapped}`;
+    const lines = sizeText === '' ? [depth, tailText] : [depth, sizeText, tailText];
+    if (stacked) lines.push(mapped);
+    // Never wider than the screen: the size that fits wins over the size that was asked for.
+    const maxW = m.w - 2 * pad - 8 * u;
+    let size = m.narrow ? Math.max(1, u - 1) : u;
+    for (let i = 0; i < lines.length; i++) {
+      const fit = fitScale(lines[i], maxW, { font: 'hud' }, size, 1);
+      if (fit < size) size = fit;
+    }
+    const lineH = textHeight({ font: 'hud', size });
+    const rows = lines.length;
+    let w = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const lw = measureLine(lines[i], { font: 'hud', size });
+      if (lw > w) w = lw;
+    }
+    const panelW = Math.min(m.w - 2 * pad, w + 8 * u);
+    const panelH = lineH * rows + (rows + 1) * 2 * u + u;
     // Centre on a wide screen; stack under the fuel gauge when there is no room between the two
     // top clusters.
     const px = m.narrow ? pad : Math.round((m.w - panelW) / 2);
@@ -1129,18 +983,28 @@ export function createHud(overlayCanvas, options) {
 
     drawPanel(ctx, px, py, panelW, panelH, u, { frame: 'wood', rivets: false });
     const cx = px + Math.round(panelW / 2);
-    drawText(ctx, depth, cx, py + 4 * u, {
-      font: 'hud',
-      size: u,
-      color: 'hudGold',
-      align: 'center',
-    });
-    drawText(ctx, clockText, cx, py + 4 * u + lineH + 2 * u, {
-      font: 'hud',
-      size: u,
-      color: 'hudDim',
-      align: 'center',
-    });
+    // Depth is gold, the size is the bright fact under it, the rest is quiet.
+    const colors = ['hudGold', sizeText === '' ? 'hudDim' : 'hudBright', 'hudDim', 'hudDim'];
+    let y = py + 4 * u;
+    for (let i = 0; i < lines.length; i++) {
+      drawText(ctx, lines[i], cx, y, { font: 'hud', size, color: colors[i], align: 'center' });
+      y += lineH + 2 * u;
+    }
+  }
+
+  /**
+   * `"MAPPED 12%"`, or `''` when there is nothing to report (no level, or the map has never been
+   * opened so the incremental count has not been primed).
+   * @param {GameState} state
+   * @returns {string}
+   */
+  function mappedText(state) {
+    const level = state.levelData;
+    if (level === null || level === undefined || level.maze === undefined) return '';
+    const total = level.maze.width * level.maze.height;
+    const seen = mapView.exploredCount();
+    if (total <= 0 || seen <= 0) return '';
+    return 'MAPPED ' + formatPercent(seen / total);
   }
 
   /**
@@ -1150,13 +1014,20 @@ export function createHud(overlayCanvas, options) {
    * It only appears once the player has earned it: always on the first two depths while the rules
    * are still being learned, and from depth 3 only after half the gems are collected
    * (ARCHITECTURE.md §4.6).
+   *
+   * Under the dial sits the **distance to the exit in tiles**. In a 6×6 maze the needle alone was
+   * enough; across a 128×128 labyrinth "which way" without "how far" is nearly useless — 40 m and
+   * 900 m are the difference between pushing on and turning back to hunt for a flask. It is shown
+   * whenever the compass is (the compass is the earned instrument), and marked as a straight-line
+   * distance by being an `m` reading rather than a route.
    * @param {CanvasRenderingContext2D} ctx
    * @param {GameState} state
    * @param {SurfaceMetrics} m
    * @param {boolean} reduced
+   * @param {number} mapH height of the corner map, so the dial can step aside on a narrow screen
    * @returns {void}
    */
-  function drawCompass(ctx, state, m, reduced) {
+  function drawCompass(ctx, state, m, reduced, mapH) {
     const level = state.levelData;
     if (level === null) return;
     const run = state.run;
@@ -1165,8 +1036,12 @@ export function createHud(overlayCanvas, options) {
 
     const u = m.u;
     const r = 9 * u;
+    const lineH = textHeight({ font: 'hud', size: u });
     const cx = Math.round(m.w / 2);
-    const cy = Math.round(m.h - 4 * u - r);
+    // The readout hangs below the dial, so the dial itself lifts by a line. On a narrow surface the
+    // corner map is directly to the right; lift again so the two never touch.
+    const bottom = m.narrow && mapH > 0 ? m.h - mapH - 5 * u : m.h - 4 * u;
+    const cy = Math.round(bottom - lineH - 2 * u - r);
 
     // Dial: a ring of iron with a dark face.
     ctx.fillStyle = withAlpha(COLOR.void, 0.8);
@@ -1217,172 +1092,22 @@ export function createHud(overlayCanvas, options) {
     // Hub.
     ctx.fillStyle = COLOR.goldLight;
     ctx.fillRect(cx - u, cy - u, 2 * u, 2 * u);
-  }
 
-  /**
-   * Bottom-right: the explored map.
-   *
-   * The tile grid is rasterised once into an offscreen canvas at one pixel per tile and then blitted
-   * at an integer zoom, so a 81×81 maze costs one `drawImage` per frame instead of 6 561 fills. It
-   * is rebuilt only when the explored count changes (the set only ever grows, so the count is an
-   * exact dirty check) or when the level changes.
-   * @param {CanvasRenderingContext2D} ctx
-   * @param {GameState} state
-   * @param {SurfaceMetrics} m
-   * @param {boolean} reduced
-   * @returns {void}
-   */
-  function drawMinimap(ctx, state, m, reduced) {
-    const level = state.levelData;
-    const explored = state.explored;
-    if (level === null || explored === null) return;
-    const maze = level.maze;
-    const mw = maze.width;
-    const mh = maze.height;
-    // A mismatched explored buffer would be read out of bounds below (and `undefined !== 0` would
-    // paint the whole map as seen), so a malformed pair simply hides the map.
-    if (mw < 1 || mh < 1 || explored.length < mw * mh) return;
-
-    const u = m.u;
-    const pad = 3 * u;
-    // ≤ 30 % of the screen height (§4.6), and never more than a third of the width.
-    const maxH = Math.floor(m.h * 0.3);
-    const maxW = Math.floor(m.w * 0.32);
-    const zoom = Math.max(1, Math.min(Math.floor(maxW / mw), Math.floor(maxH / mh)));
-    const drawW = mw * zoom;
-    const drawH = mh * zoom;
-    const frame = 2 * u;
-    const px = m.w - pad - drawW - frame * 2;
-    const py = m.h - pad - drawH - frame * 2;
-
-    if (!ensureMapCanvas(mw, mh)) return;
-    const count = countExplored(explored);
-    if (count !== mapExplored || mapLevelRef !== level) {
-      rebuildMap(maze, explored);
-      mapExplored = count;
-      mapLevelRef = level;
-    }
-
-    drawPanel(ctx, px, py, drawW + frame * 2, drawH + frame * 2, u, {
-      frame: 'stone',
-      alpha: 0.82,
-      border: u,
-      rivets: false,
-      // No masonry behind the map: the courses would read as corridors.
-      texture: false,
+    // Distance to the exit. `derived.exitDist` is Infinity while no level is loaded, which
+    // `formatDistance` prints as "--" rather than as a lie.
+    const dist = state.derived !== undefined ? state.derived.exitDist : Infinity;
+    const distText = formatDistance(dist);
+    const distY = cy + r + 2 * u;
+    const distW = measureLine(distText, { font: 'hud', size: u });
+    ctx.fillStyle = withAlpha(COLOR.void, 0.72);
+    ctx.fillRect(Math.round(cx - distW / 2) - 2 * u, distY - u, distW + 4 * u, lineH + 2 * u);
+    drawText(ctx, distText, cx, distY, {
+      font: 'hud',
+      size: u,
+      // Close to the exit the readout turns arcane, matching the needle tip and the portal hum.
+      color: near > 0.5 ? 'hudBright' : 'hudDim',
+      align: 'center',
     });
-
-    const ox = px + frame;
-    const oy = py + frame;
-    if (mapCanvas !== null) {
-      ctx.drawImage(mapCanvas, 0, 0, mw, mh, ox, oy, drawW, drawH);
-    }
-
-    // Exit portal, once its tile has been seen.
-    const exitIdx = maze.exit.y * mw + maze.exit.x;
-    if (explored[exitIdx] !== 0) {
-      const pulse = reduced ? 1 : 0.55 + 0.45 * Math.sin(clock * 4);
-      ctx.fillStyle = withAlpha(COLOR.arcCyan, pulse);
-      const ez = Math.max(2, zoom + u);
-      ctx.fillRect(
-        Math.round(ox + (maze.exit.x + 0.5) * zoom - ez / 2),
-        Math.round(oy + (maze.exit.y + 0.5) * zoom - ez / 2),
-        ez,
-        ez,
-      );
-    }
-
-    // Player arrow, blinking so the eye finds it instantly on a busy map. Mostly on, briefly off:
-    // a marker that is missing half the time is a marker you have to hunt for.
-    const blink = reduced ? true : clock % 1.1 < 0.82;
-    if (blink) {
-      const p = state.player;
-      const octant = (Math.round(p.angle / (Math.PI / 4)) & 7) >>> 0;
-      const arrow = ARROWS[octant];
-      const scale = Math.max(1, Math.round(zoom / 2));
-      drawArt(
-        ctx,
-        arrow,
-        Math.round(ox + p.x * zoom - (arrow.w * scale) / 2),
-        Math.round(oy + p.y * zoom - (arrow.h * scale) / 2),
-        scale,
-        ARROW_PALETTE,
-      );
-    }
-  }
-
-  /**
-   * Make sure the offscreen minimap buffer exists and is the right size.
-   * @param {number} w tiles
-   * @param {number} h tiles
-   * @returns {boolean} false when no canvas implementation is available
-   */
-  function ensureMapCanvas(w, h) {
-    if (mapCanvas !== null && mapW === w && mapH === h) return true;
-    if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
-      return false;
-    }
-    try {
-      const c = document.createElement('canvas');
-      c.width = w;
-      c.height = h;
-      const context = c.getContext('2d');
-      if (context === null) return false;
-      mapCanvas = c;
-      mapCtx = context;
-      mapW = w;
-      mapH = h;
-      mapExplored = -1;
-      return true;
-    } catch (err) {
-      log.error('minimap canvas unavailable', err);
-      return false;
-    }
-  }
-
-  /**
-   * Repaint the offscreen minimap: one pixel per tile, explored only.
-   * @param {import('../core/types.js').Maze} maze
-   * @param {Uint8Array} explored
-   * @returns {void}
-   */
-  function rebuildMap(maze, explored) {
-    if (mapCtx === null || mapCanvas === null) return;
-    const w = maze.width;
-    const h = maze.height;
-    const tiles = maze.tiles;
-    const img = mapCtx.createImageData(w, h);
-    const px = img.data;
-    for (let i = 0, n = w * h; i < n; i++) {
-      if (explored[i] === 0) continue;
-      const o = i * 4;
-      if (tiles[i] === 0) {
-        // Explored floor: warm cobble grey.
-        px[o] = 0x5b;
-        px[o + 1] = 0x57;
-        px[o + 2] = 0x51;
-        px[o + 3] = 235;
-      } else {
-        // Explored wall: cool stone, dark enough that corridors read as the bright shape.
-        px[o] = 0x2b;
-        px[o + 1] = 0x34;
-        px[o + 2] = 0x46;
-        px[o + 3] = 235;
-      }
-    }
-    mapCtx.putImageData(img, 0, 0);
-  }
-
-  /**
-   * Count explored tiles. The explored set only grows, so its cardinality is a perfect and cheap
-   * dirty check (a 40×40 maze is 6 561 byte reads — a few microseconds).
-   * @param {Uint8Array} explored
-   * @returns {number}
-   */
-  function countExplored(explored) {
-    let n = 0;
-    for (let i = 0; i < explored.length; i++) n += explored[i] !== 0 ? 1 : 0;
-    return n;
   }
 
   /**
@@ -1456,16 +1181,45 @@ export function createHud(overlayCanvas, options) {
    * @returns {void}
    */
   function dispose() {
-    mapCanvas = null;
-    mapCtx = null;
-    mapW = 0;
-    mapH = 0;
+    mapView.dispose();
   }
 
-  return { render, resize, surface, pop, reset, dispose };
+  /**
+   * Advance the map OFF → CORNER → FULL.
+   *
+   * `src/main.js` calls this from the `map` action instead of toggling `settings.minimap`, then
+   * persists the result (see the integrator note): `setSetting('mapMode', mode)` **and**
+   * `setSetting('minimap', mode !== 'off')`. Passing the current settings lets the cycle start
+   * from whatever a fresh run loaded.
+   * @param {any} [settings]
+   * @returns {MapMode}
+   */
+  function cycleMap(settings) {
+    return cycleMapMode(settings);
+  }
+
+  /**
+   * @param {any} [settings]
+   * @returns {MapMode}
+   */
+  function mapMode(settings) {
+    return forcedMap !== null ? forcedMap : readMapMode(settings);
+  }
+
+  return {
+    render,
+    resize,
+    surface,
+    pop,
+    reset,
+    cycleMap,
+    mapMode,
+    mapStats: () => mapView.stats(),
+    dispose,
+  };
 }
 
-// ─── Small geometry helpers ──────────────────────────────────────────────────────────────────
+// ─── Small helpers ───────────────────────────────────────────────────────────────────────────
 
 /**
  * Deterministic 0..1 flicker noise. Two incommensurable sines: cheap, allocation free, and it
@@ -1475,73 +1229,4 @@ export function createHud(overlayCanvas, options) {
  */
 function noise(t) {
   return 0.5 + 0.25 * Math.sin(t) + 0.25 * Math.sin(t * 1.7 + 1.3);
-}
-
-/**
- * Fill a disc out of horizontal pixel runs (`fillRect` per scanline), so the edge is a hard pixel
- * staircase like the rest of the art instead of an anti-aliased arc.
- * @param {CanvasRenderingContext2D} ctx fill style must already be set
- * @param {number} cx centre x (UI px)
- * @param {number} cy centre y
- * @param {number} r radius
- * @param {number} step scanline height in UI px (the pixel size)
- * @returns {void}
- */
-export function fillDisc(ctx, cx, cy, r, step) {
-  const s = Math.max(1, Math.round(step));
-  for (let y = -r; y <= r; y += s) {
-    const half = Math.sqrt(Math.max(0, r * r - y * y));
-    if (half < 0.5) continue;
-    ctx.fillRect(Math.round(cx - half), Math.round(cy + y), Math.round(half * 2), s);
-  }
-}
-
-/**
- * Fill a ring (a disc with a `step`-thick rim).
- * @param {CanvasRenderingContext2D} ctx fill style must already be set
- * @param {number} cx
- * @param {number} cy
- * @param {number} r outer radius
- * @param {number} step rim thickness and scanline height
- * @returns {void}
- */
-export function fillRing(ctx, cx, cy, r, step) {
-  const s = Math.max(1, Math.round(step));
-  const inner = r - s;
-  for (let y = -r; y <= r; y += s) {
-    const outerHalf = Math.sqrt(Math.max(0, r * r - y * y));
-    if (outerHalf < 0.5) continue;
-    const innerHalf = Math.abs(y) <= inner ? Math.sqrt(Math.max(0, inner * inner - y * y)) : 0;
-    if (innerHalf < 0.5) {
-      ctx.fillRect(Math.round(cx - outerHalf), Math.round(cy + y), Math.round(outerHalf * 2), s);
-      continue;
-    }
-    const left = Math.round(cx - outerHalf);
-    const right = Math.round(cx + outerHalf);
-    const il = Math.round(cx - innerHalf);
-    const ir = Math.round(cx + innerHalf);
-    ctx.fillRect(left, Math.round(cy + y), il - left, s);
-    ctx.fillRect(ir, Math.round(cy + y), right - ir, s);
-  }
-}
-
-/**
- * The largest integer text scale at which `text` fits `maxWidth` UI pixels.
- *
- * Used everywhere a title or a menu label has to survive a 360-pixel-wide phone without being
- * clipped: the layout asks for the size it wants and takes what fits.
- * @param {string} text
- * @param {number} maxWidth UI pixels
- * @param {TextOptions} opts measured with this face (its `size` is ignored)
- * @param {number} maxScale the size the layout would like
- * @param {number} [minScale] floor, default 1
- * @returns {number} an integer scale in [minScale, maxScale]
- */
-export function fitScale(text, maxWidth, opts, maxScale, minScale = 1) {
-  const lo = Math.max(1, Math.round(minScale));
-  const hi = Math.max(lo, Math.round(maxScale));
-  const unit = measureLine(text, { font: opts.font, size: 1, tracking: opts.tracking });
-  if (unit <= 0) return hi;
-  const fits = Math.floor(maxWidth / unit);
-  return clamp(fits, lo, hi);
 }

@@ -85,6 +85,50 @@ test('start is cell (0,0) and the exit is a farthest cell on the odd lattice', (
   assert.ok(cellPath >= (v2.pathLength - 1) / 2, 'exit is not farther than an arbitrary neighbour cell');
 });
 
+test('the exit is EXACTLY a BFS-farthest cell, at every size the game ships', () => {
+  // The whole premise of a massive maze is a massive route, and that rests on this one property:
+  // the exit is the cell at maximum BFS distance from the start *in the final, braided maze*.
+  // Checked exhaustively (every cell, not a sample) across the shipped size range.
+  for (const [cols, rows, braid] of [[16, 16, 0], [40, 40, 0.3], [128, 128, 0.6], [128, 128, 1], [64, 33, 0.15]]) {
+    const m = generateMaze({ cols, rows, seed: cols * 31 + rows, braid });
+    const total = m.width * m.height;
+    const dist = new Int32Array(total).fill(-1);
+    const queue = new Int32Array(total);
+    const dx = [1, 0, -1, 0];
+    const dy = [0, 1, 0, -1];
+    let head = 0;
+    let tail = 0;
+    const from = m.start.y * m.width + m.start.x;
+    dist[from] = 0;
+    queue[tail++] = from;
+    while (head < tail) {
+      const idx = queue[head++];
+      const x = idx % m.width;
+      const y = (idx - x) / m.width;
+      for (let d = 0; d < 4; d++) {
+        const nx = x + dx[d];
+        const ny = y + dy[d];
+        if (nx < 0 || ny < 0 || nx >= m.width || ny >= m.height) continue;
+        const n = ny * m.width + nx;
+        if (m.tiles[n] !== TILE.FLOOR || dist[n] >= 0) continue;
+        dist[n] = dist[idx] + 1;
+        queue[tail++] = n;
+      }
+    }
+    let farthest = -1;
+    for (let cy = 0; cy < rows; cy++) {
+      const row = (cy * 2 + 1) * m.width;
+      for (let cx = 0; cx < cols; cx++) farthest = Math.max(farthest, dist[row + cx * 2 + 1]);
+    }
+    assert.equal(
+      dist[m.exit.y * m.width + m.exit.x],
+      farthest,
+      `${cols}×${rows} braid ${braid}: the exit is not the farthest cell`,
+    );
+    assert.ok(farthest > 0);
+  }
+});
+
 test('braiding only removes walls, so it can never disconnect a maze', () => {
   const base = generateMaze({ cols: 14, rows: 11, seed: 5, braid: 0 });
   for (const braid of [0.1, 0.5, 1]) {

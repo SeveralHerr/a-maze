@@ -1,0 +1,1334 @@
+// @ts-check
+/**
+ * @file The labyrinth map: a three-state view (OFF → CORNER → FULL) over the fog-of-war grid,
+ * and the incremental rasteriser that makes it free to draw at any maze size.
+ *
+ * ## Why this module exists
+ * A-MAZE's mazes are now **massive**: 16×16 cells on depth 1 growing to 128×128 cells (257×257
+ * tiles, ~66 000 of them, ~16 000 cells) at the cap. The old HUD minimap drew one pixel per tile
+ * into a corner box, rebuilt the whole raster whenever the explored count changed, and counted the
+ * explored set — a full 66 k scan — *every frame*. At the new sizes that is ~0.4 ms of pure
+ * bookkeeping per frame for a map that would be 257 px across in a 360 px tall overlay: unreadable
+ * and unaffordable at the same time. So the map is now three things, each with its own job:
+ *
+ * | Mode     | What it answers                                | Resolution                       |
+ * |----------|------------------------------------------------|----------------------------------|
+ * | `off`    | nothing — the screen is the game               | —                                |
+ * | `corner` | "what is around me right now?"                 | a ~25×25 **tile** window, zoomed |
+ * | `full`   | "where have I been, where is the exit?"        | the whole labyrinth, fitted      |
+ *
+ * ## How it stays cheap (the load-bearing part)
+ * One offscreen canvas holds the tile raster (one pixel per tile, explored tiles only). It is
+ * **never rebuilt wholesale** during play:
+ *
+ * 1. `src/state/sim.js` only ever reveals tiles within `REVEAL_RADIUS` (3) of the player, so each
+ *    frame we rescan a small box around the player — grown by however far the player moved since
+ *    the last update, so a slow frame cannot outrun it.
+ * 2. A **rolling sweep** of `SWEEP_BUDGET` tile indices per frame walks the whole grid on a cycle
+ *    (66 k tiles → ~16 frames), which catches anything a contract change upstream might reveal
+ *    outside that box. In normal play it finds nothing and costs one array read per tile.
+ * 3. The raster itself is the dirty-state: a tile is drawn iff its pixel is non-zero, so no shadow
+ *    copy of "what have I already painted" is needed, and `exploredCount` is maintained as an
+ *    increment instead of a scan.
+ * 4. Only the union of the touched pixels is pushed to the canvas, via the dirty-rectangle form of
+ *    `putImageData`.
+ *
+ * Items are **baked into the raster** rather than drawn per frame: with hundreds of flasks and
+ * gems per level, anything O(items) per frame is exactly what this wave forbids. A taken item is
+ * noticed by a low-frequency prune (twice a second) that repaints its one pixel.
+ *
+ * ## Full-map resolution
+ * ARCHITECTURE's brief for the full map is "one pixel per **cell**", which for 128×128 cells is a
+ * 128 px square — comfortable anywhere. But at cell resolution the walls are thinner than a pixel,
+ * so the labyrinth degrades to a silhouette of where you have been. Tile resolution (2 px per
+ * cell, the raster we already maintain) shows the real corridors, and it *fits* on a desktop
+ * overlay even at the 128-cell cap. So the scale adapts: {@link chooseFullScale} takes tile
+ * resolution whenever one whole pixel per tile fits the box, and falls back to cell resolution
+ * otherwise (only a very large maze on a phone). Both are pixel-exact integer scales.
+ *
+ * ## Mode storage
+ * The chosen mode is a single UI-wide preference, shadowing `settings.minimap`. See
+ * {@link readMapMode} for the compatibility rules — this module works whether `src/state` keeps
+ * `minimap` as a boolean or adopts a `mapMode` string.
+ */
+
+import { clamp } from '../core/math.js';
+import { createLogger } from '../core/log.js';
+import { COLOR, drawText, measureLine, textHeight } from './font.js';
+import { formatCount, formatDistance, formatPercent, formatLabyrinth } from './format.js';
+import {
+  ARROWS,
+  ARROW_PALETTE,
+  drawArt,
+  drawGemIcon,
+  drawOilIcon,
+  drawPanel,
+  drawPortalIcon,
+  hexToRgb,
+  ICON_SIZE,
+  withAlpha,
+} from './pixels.js';
+
+/** @typedef {import('../core/types.js').GameState} GameState */
+/** @typedef {import('../core/types.js').Maze} Maze */
+/** @typedef {import('../core/types.js').Item} Item */
+/** @typedef {import('../core/types.js').Settings} Settings */
+/** @typedef {import('./pixels.js').Art} Art */
+
+const log = createLogger('ui/map');
+
+// ─── Mode ────────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The three map states, in cycle order. The `map` action (M / Tab / the touch MAP button) steps
+ * through this list.
+ * @type {ReadonlyArray<'off'|'corner'|'full'>}
+ */
+export const MAP_MODES = Object.freeze(/** @type {const} */ (['off', 'corner', 'full']));
+
+/** @typedef {'off'|'corner'|'full'} MapMode */
+
+/** Human labels for the options screen. */
+export const MAP_MODE_LABEL = Object.freeze({ off: 'Off', corner: 'Corner', full: 'Full' });
+
+/**
+ * Coerce anything to a legal mode.
+ * @param {unknown} value
+ * @returns {MapMode|null} null when it is not one of the three modes
+ */
+export function normalizeMapMode(value) {
+  return value === 'off' || value === 'corner' || value === 'full' ? value : null;
+}
+
+/**
+ * The mode after this one in the cycle.
+ * @param {unknown} mode current mode (anything illegal behaves like `'off'`)
+ * @returns {MapMode}
+ */
+export function nextMapMode(mode) {
+  const m = normalizeMapMode(mode);
+  if (m === 'off') return 'corner';
+  if (m === 'corner') return 'full';
+  if (m === 'full') return 'off';
+  return 'corner';
+}
+
+/**
+ * What the *settings* say the mode is, ignoring any local choice.
+ *
+ * `settings.mapMode` wins when `src/state` carries it. Otherwise the legacy boolean
+ * `settings.minimap` maps to off/corner, which is what every build before this wave stored.
+ * @param {Settings|null|undefined} settings
+ * @returns {MapMode}
+ */
+export function mapModeFromSettings(settings) {
+  if (settings === null || settings === undefined) return 'corner';
+  const explicit = normalizeMapMode(/** @type {any} */ (settings).mapMode);
+  if (explicit !== null) return explicit;
+  return /** @type {any} */ (settings).minimap === false ? 'off' : 'corner';
+}
+
+/**
+ * The live UI-wide mode, and the settings-derived mode it was last reconciled against.
+ *
+ * WHY a module-level value rather than per-HUD instance state: the HUD draws the map, the options
+ * screen edits it and `src/main.js` cycles it from the `map` hotkey — three call sites that must
+ * agree, exactly like the settings field this shadows. There is one overlay per page.
+ * @type {MapMode}
+ */
+let localMode = 'corner';
+/** @type {MapMode} */
+let lastSettingsMode = 'corner';
+let localModeArmed = false;
+
+/**
+ * The mode to draw right now.
+ *
+ * Reconciliation rule: a **change** in what the settings say wins (the player edited the option,
+ * or a fresh run loaded a persisted preference); otherwise the local choice stands. That is what
+ * makes the three-state cycle work even while `src/state` still stores only a boolean: cycling
+ * `corner → full` writes `minimap: true`, the settings-derived mode does not change, and the local
+ * `full` survives. See ARCHITECTURE.md §4.6 / the contract note in this wave's report.
+ *
+ * @param {Settings|null|undefined} settings
+ * @returns {MapMode}
+ */
+export function readMapMode(settings) {
+  const derived = mapModeFromSettings(settings);
+  if (!localModeArmed) {
+    localMode = derived;
+    lastSettingsMode = derived;
+    localModeArmed = true;
+    return localMode;
+  }
+  if (derived !== lastSettingsMode) {
+    lastSettingsMode = derived;
+    localMode = derived;
+  }
+  return localMode;
+}
+
+/**
+ * Force the mode (the options screen, and tests).
+ * @param {unknown} mode
+ * @returns {MapMode} the mode now in force
+ */
+export function setMapMode(mode) {
+  const m = normalizeMapMode(mode);
+  if (m !== null) {
+    localMode = m;
+    localModeArmed = true;
+  }
+  return localMode;
+}
+
+/**
+ * Advance the cycle. The caller (main.js / the options screen) should then persist it with
+ * `setSetting('mapMode', mode)` **and** `setSetting('minimap', mode !== 'off')`, so the preference
+ * survives whichever shape `src/state` stores.
+ * @param {Settings|null|undefined} settings
+ * @returns {MapMode} the new mode
+ */
+export function cycleMapMode(settings) {
+  return setMapMode(nextMapMode(readMapMode(settings)));
+}
+
+/**
+ * Reset the module-level mode (tests, and `hud.reset()` on a brand-new run).
+ * @returns {void}
+ */
+export function resetMapMode() {
+  localMode = 'corner';
+  lastSettingsMode = 'corner';
+  localModeArmed = false;
+}
+
+// ─── Tuning ──────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Map tuning. Every number here is a measured trade-off rather than a taste call; the comments
+ * say against what.
+ * @type {Readonly<Record<string, number>>}
+ */
+export const MAP = Object.freeze({
+  /** Tiles across the corner window on a roomy surface. 25 ≈ four corridors each way. */
+  CORNER_TILES: 25,
+  /** Tiles across it on a narrow (phone) surface, where the box is physically smaller. */
+  CORNER_TILES_NARROW: 19,
+  /** Minimum UI pixels per tile in the corner window — below 2 the walls stop reading. */
+  CORNER_MIN_ZOOM: 2,
+  /** Maximum, so the window does not become a magnifying glass on a 4 K display. */
+  CORNER_MAX_ZOOM: 6,
+  /**
+   * Tile indices the rolling reconciliation sweep visits per update. 4096 covers a 257×257 grid
+   * in 17 frames (0.28 s) and costs ~4 k array reads — under 10 µs, measured.
+   */
+  SWEEP_BUDGET: 4096,
+  /** Reveal radius the sim uses (`WORLD.REVEAL_RADIUS`), mirrored: the local box must cover it. */
+  REVEAL_RADIUS: 3,
+  /** Extra tiles of slack on the local box, for rounding and for a pickup flash. */
+  BOX_SLACK: 2,
+  /** Seconds between item-liveness prunes. Twice a second is imperceptible and O(live items). */
+  PRUNE_INTERVAL: 0.5,
+  /**
+   * Seconds of not being updated after which the next update does a full rescan instead of a box
+   * scan. Covers the map being switched off for a while, a tab switch, or a teleport.
+   */
+  STALE_AFTER: 0.4,
+});
+
+// ─── Raster colours ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * Packed little-endian-agnostic RGBA for the raster. Index order must match {@link PAINT}.
+ * @type {Uint32Array}
+ */
+const PACKED = new Uint32Array(8);
+
+/** Symbolic indices into {@link PACKED}. */
+const PAINT = Object.freeze({
+  WALL: 0,
+  FLOOR: 1,
+  GEM: 2,
+  OIL: 3,
+  EXIT: 4,
+  START: 5,
+  PATH: 6,
+});
+
+/**
+ * Colours the raster is painted in. Deliberately *not* the world palette: a map is a diagram, so
+ * the floor has to be the bright shape and the wall the ground, which is the opposite of how the
+ * 3-D view reads.
+ */
+const RASTER_COLORS = Object.freeze([
+  { hex: '#151b26', a: 240 }, // WALL  — near-black cool stone: at one pixel per tile the map is
+  //                                   mostly wall, so the contrast against the floor has to be
+  //                                   brutal or the whole thing reads as noise
+  { hex: '#6e6455', a: 240 }, // FLOOR — warm cobble, the corridors you can walk
+  { hex: COLOR.gemBright, a: 255 }, // GEM
+  { hex: COLOR.oilLight, a: 255 }, // OIL
+  { hex: COLOR.arcPale, a: 255 }, // EXIT
+  { hex: COLOR.goldLight, a: 255 }, // START
+  { hex: '#8d8170', a: 240 }, // PATH — a floor tile you have actually stood on (unused reserve)
+]);
+
+(() => {
+  // Pack once. A Uint32Array view over a Uint8 buffer is byte-order dependent, so the byte order
+  // is measured rather than assumed — a big-endian host would otherwise get its channels mirrored.
+  const probe = new Uint8Array(4);
+  new Uint32Array(probe.buffer)[0] = 0x0a0b0c0d;
+  const littleEndian = probe[0] === 0x0d;
+  const rgb = new Uint8Array(3);
+  for (let i = 0; i < RASTER_COLORS.length; i++) {
+    hexToRgb(RASTER_COLORS[i].hex, rgb);
+    const a = RASTER_COLORS[i].a;
+    PACKED[i] = littleEndian
+      ? (a << 24) | (rgb[2] << 16) | (rgb[1] << 8) | rgb[0]
+      : ((rgb[0] << 24) | (rgb[1] << 16) | (rgb[2] << 8) | a) >>> 0;
+    PACKED[i] >>>= 0;
+  }
+})();
+
+/** Item layer codes. */
+const ITEM_NONE = 0;
+const ITEM_GEM = 1;
+const ITEM_OIL = 2;
+
+// ─── Pure raster maths (unit-tested) ─────────────────────────────────────────────────────────
+
+/**
+ * Paint every *newly explored* tile in a box into the raster.
+ *
+ * "Newly explored" is `explored[i] !== 0 && out32[i] === 0`: the raster is its own dirty-state, so
+ * no second buffer is needed and the pass is idempotent. Pure and DOM-free, which is why it can be
+ * tested in Node against a plain `Uint32Array`.
+ *
+ * @param {Uint32Array} out32 raster, `mw*mh` pixels, index = ty*mw+tx
+ * @param {number} mw raster width in tiles
+ * @param {number} mh raster height in tiles
+ * @param {number} x0 inclusive left of the box (clamped internally)
+ * @param {number} y0 inclusive top
+ * @param {number} x1 inclusive right
+ * @param {number} y1 inclusive bottom
+ * @param {Uint8Array} tiles the maze tiles (0 = floor)
+ * @param {Uint8Array} explored the fog-of-war grid
+ * @param {Uint8Array|null} itemLayer per-tile item code, or null for none
+ * @param {number} exitIdx tile index of the exit (−1 for none)
+ * @param {number} startIdx tile index of the start (−1 for none)
+ * @param {Int32Array} bounds length ≥ 4, in/out dirty rect `[x0,y0,x1,y1]`; an empty rect is
+ *   `[mw, mh, -1, -1]` and is expanded in place
+ * @returns {number} how many pixels were painted
+ */
+export function paintTiles(
+  out32,
+  mw,
+  mh,
+  x0,
+  y0,
+  x1,
+  y1,
+  tiles,
+  explored,
+  itemLayer,
+  exitIdx,
+  startIdx,
+  bounds,
+) {
+  const lx = x0 < 0 ? 0 : x0;
+  const ly = y0 < 0 ? 0 : y0;
+  const hx = x1 >= mw ? mw - 1 : x1;
+  const hy = y1 >= mh ? mh - 1 : y1;
+  if (lx > hx || ly > hy) return 0;
+  let painted = 0;
+  for (let ty = ly; ty <= hy; ty++) {
+    const row = ty * mw;
+    for (let tx = lx; tx <= hx; tx++) {
+      const idx = row + tx;
+      if (explored[idx] === 0 || out32[idx] !== 0) continue;
+      out32[idx] = colorFor(idx, tiles, itemLayer, exitIdx, startIdx);
+      painted++;
+      if (tx < bounds[0]) bounds[0] = tx;
+      if (ty < bounds[1]) bounds[1] = ty;
+      if (tx > bounds[2]) bounds[2] = tx;
+      if (ty > bounds[3]) bounds[3] = ty;
+    }
+  }
+  return painted;
+}
+
+/**
+ * The packed colour one explored tile should have.
+ * @param {number} idx tile index
+ * @param {Uint8Array} tiles
+ * @param {Uint8Array|null} itemLayer
+ * @param {number} exitIdx
+ * @param {number} startIdx
+ * @returns {number} packed RGBA (never 0, so it doubles as "painted")
+ */
+function colorFor(idx, tiles, itemLayer, exitIdx, startIdx) {
+  if (idx === exitIdx) return PACKED[PAINT.EXIT];
+  if (tiles[idx] !== 0) return PACKED[PAINT.WALL];
+  if (itemLayer !== null) {
+    const it = itemLayer[idx];
+    if (it === ITEM_GEM) return PACKED[PAINT.GEM];
+    if (it === ITEM_OIL) return PACKED[PAINT.OIL];
+  }
+  if (idx === startIdx) return PACKED[PAINT.START];
+  return PACKED[PAINT.FLOOR];
+}
+
+/**
+ * Count the explored tiles. O(n) — call it on a screen transition, never per frame (the map view
+ * maintains the same number incrementally while it is open).
+ * @param {Uint8Array|null|undefined} explored
+ * @param {number} [limit] only consider the first `limit` entries (the maze may be smaller than
+ *   the buffer); defaults to the whole buffer
+ * @returns {number}
+ */
+export function countExplored(explored, limit) {
+  if (explored === null || explored === undefined) return 0;
+  const n = limit === undefined ? explored.length : Math.min(limit, explored.length);
+  let seen = 0;
+  for (let i = 0; i < n; i++) seen += explored[i] !== 0 ? 1 : 0;
+  return seen;
+}
+
+/**
+ * Pick the resolution and integer scale for the full-screen map.
+ *
+ * Prefers **tile** resolution (walls are real pixels, the map reads as a labyrinth) and falls back
+ * to **cell** resolution (one pixel per maze cell: the explored silhouette, walls sub-pixel) only
+ * when a whole pixel per tile will not fit the box. See the file header for why.
+ *
+ * @param {number} cols maze cells across
+ * @param {number} rows maze cells down
+ * @param {number} boxW available width, in the units the caller draws in (the full map passes
+ *   **device** pixels — see `drawFull`)
+ * @param {number} boxH available height, same units
+ * @returns {{res:'tile'|'cell', scale:number, w:number, h:number}} `scale` is target pixels per
+ *   raster pixel (an integer ≥ 1); `w`/`h` are the drawn size in the same units as `boxW`/`boxH`
+ */
+export function chooseFullScale(cols, rows, boxW, boxH) {
+  const c = Math.max(1, Math.floor(cols));
+  const r = Math.max(1, Math.floor(rows));
+  const tw = c * 2 + 1;
+  const th = r * 2 + 1;
+  const tileScale = Math.min(Math.floor(boxW / tw), Math.floor(boxH / th));
+  if (tileScale >= 1) {
+    return { res: 'tile', scale: tileScale, w: tw * tileScale, h: th * tileScale };
+  }
+  const cellScale = Math.max(1, Math.min(Math.floor(boxW / c), Math.floor(boxH / r)));
+  return { res: 'cell', scale: cellScale, w: c * cellScale, h: r * cellScale };
+}
+
+/**
+ * The tile window the corner map shows, clamped so it never scrolls past the edges of a small
+ * maze (a 33×33 level-1 maze would otherwise sit in the corner of a mostly-empty box).
+ *
+ * @param {number} px player tile x
+ * @param {number} py player tile y
+ * @param {number} span tiles across the window
+ * @param {number} mw raster width
+ * @param {number} mh raster height
+ * @param {Int32Array} out length ≥ 2; receives the window's top-left tile
+ * @returns {void}
+ */
+export function cornerWindow(px, py, span, mw, mh, out) {
+  const half = (span - 1) / 2;
+  let x = Math.round(px - half);
+  let y = Math.round(py - half);
+  // A maze narrower than the window is centred rather than pinned to 0.
+  x = mw <= span ? Math.floor((mw - span) / 2) : clamp(x, 0, mw - span);
+  y = mh <= span ? Math.floor((mh - span) / 2) : clamp(y, 0, mh - span);
+  out[0] = x;
+  out[1] = y;
+}
+
+// ─── The view ────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Per-frame cost accounting, surfaced by `?debug=1` and by the verification tools.
+ * @typedef {Object} MapStats
+ * @property {number} updateMs   last raster maintenance cost
+ * @property {number} drawMs     last draw cost
+ * @property {number} painted    pixels painted by the last update
+ * @property {number} scanned    tile indices read by the last update
+ * @property {number} flushes    dirty-rect uploads in the last update (0 or 1)
+ * @property {number} explored   tiles currently explored
+ * @property {number} tiles      tiles in the level
+ * @property {number} rebuilds   full rescans since the last reset
+ */
+
+/**
+ * @typedef {Object} MapView
+ * @property {(state:GameState, clock:number) => void} update  maintain the raster; call once per
+ *   frame while the map is visible, before drawing
+ * @property {(ctx:CanvasRenderingContext2D, m:any, state:GameState, clock:number, reduced:boolean) => number}
+ *   drawCorner  draw the corner window; returns its height in UI pixels (0 if it drew nothing)
+ * @property {(ctx:CanvasRenderingContext2D, m:any, state:GameState, clock:number, reduced:boolean) => void}
+ *   drawFull  draw the full-screen labyrinth map
+ * @property {() => number} exploredCount  explored tiles, maintained incrementally
+ * @property {() => MapStats} stats  live, reused object — never retain a copy
+ * @property {() => void} reset
+ * @property {() => void} dispose
+ */
+
+/**
+ * Create the map view.
+ *
+ * @param {{createCanvas?:(w:number,h:number)=>HTMLCanvasElement|null, now?:()=>number}} [options]
+ *   injectables for tests and for headless tools; both default to the browser's.
+ * @returns {MapView}
+ */
+export function createMapView(options) {
+  const makeCanvas =
+    options !== undefined && typeof options.createCanvas === 'function'
+      ? options.createCanvas
+      : defaultCreateCanvas;
+  const now =
+    options !== undefined && typeof options.now === 'function'
+      ? options.now
+      : typeof performance !== 'undefined' && typeof performance.now === 'function'
+        ? () => performance.now()
+        : () => Date.now();
+
+  // ── Tile raster (one pixel per tile, incrementally maintained) ──
+  /** @type {HTMLCanvasElement|null} */
+  let tileCanvas = null;
+  /** @type {CanvasRenderingContext2D|null} */
+  let tileCtx = null;
+  /** @type {ImageData|null} */
+  let tileImg = null;
+  /** @type {Uint32Array|null} */
+  let tile32 = null;
+  let mw = 0;
+  let mh = 0;
+
+  // ── Cell raster (one pixel per cell; rebuilt on demand, only for the full map) ──
+  /** @type {HTMLCanvasElement|null} */
+  let cellCanvas = null;
+  /** @type {CanvasRenderingContext2D|null} */
+  let cellCtx = null;
+  /** @type {ImageData|null} */
+  let cellImg = null;
+  /** @type {Uint32Array|null} */
+  let cell32 = null;
+  let cellCols = 0;
+  let cellRows = 0;
+  let cellStamp = -1;
+
+  // ── Level bookkeeping ──
+  /** @type {object|null} */
+  let levelRef = null;
+  /** @type {Uint8Array|null} */
+  let itemLayer = null;
+  /** @type {Int32Array} */
+  let liveIdx = new Int32Array(0);
+  /** @type {Item[]} */
+  let liveItems = [];
+  let liveCount = 0;
+  let exitIdx = -1;
+  let startIdx = -1;
+
+  let explored = 0;
+  let sweepCursor = 0;
+  let lastPlayerX = 0;
+  let lastPlayerY = 0;
+  let lastUpdate = -1;
+  let lastPrune = -1;
+  let needsFullScan = true;
+
+  /** Dirty rect of the raster, `[x0,y0,x1,y1]`; empty when `[mw,mh,-1,-1]`. */
+  const dirty = new Int32Array(4);
+  /** Scratch for {@link cornerWindow}. */
+  const win = new Int32Array(2);
+
+  /** @type {MapStats} */
+  const stats = {
+    updateMs: 0,
+    drawMs: 0,
+    painted: 0,
+    scanned: 0,
+    flushes: 0,
+    explored: 0,
+    tiles: 0,
+    rebuilds: 0,
+  };
+
+  /**
+   * @param {number} w
+   * @param {number} h
+   * @returns {HTMLCanvasElement|null}
+   */
+  function defaultCreateCanvas(w, h) {
+    if (typeof document === 'undefined' || typeof document.createElement !== 'function') return null;
+    try {
+      const c = document.createElement('canvas');
+      c.width = w;
+      c.height = h;
+      return c;
+    } catch (err) {
+      log.error('map canvas unavailable', err);
+      return null;
+    }
+  }
+
+  /**
+   * @returns {void}
+   */
+  function clearDirty() {
+    dirty[0] = mw;
+    dirty[1] = mh;
+    dirty[2] = -1;
+    dirty[3] = -1;
+  }
+
+  /**
+   * Point the view at a level, allocating the raster and the item index.
+   *
+   * Everything that is O(maze) or O(items) happens here — once per level, never per frame.
+   * @param {object} level the `LevelData`
+   * @param {Maze} maze
+   * @returns {boolean} false when no raster could be created (no DOM)
+   */
+  function adoptLevel(level, maze) {
+    const w = maze.width;
+    const h = maze.height;
+    if (!(w > 0) || !(h > 0)) return false;
+
+    if (tileCanvas === null || mw !== w || mh !== h) {
+      const c = makeCanvas(w, h);
+      if (c === null) return false;
+      c.width = w;
+      c.height = h;
+      let context = null;
+      try {
+        context = c.getContext('2d');
+      } catch (err) {
+        log.error('map 2d context unavailable', err);
+        return false;
+      }
+      if (context === null) return false;
+      tileCanvas = c;
+      tileCtx = context;
+      tileImg = context.createImageData(w, h);
+      tile32 = new Uint32Array(tileImg.data.buffer);
+      mw = w;
+      mh = h;
+      // The cell raster is per-level too; drop it so it is rebuilt at the new size.
+      cellCanvas = null;
+      cellCtx = null;
+      cellImg = null;
+      cell32 = null;
+      cellCols = 0;
+      cellRows = 0;
+    } else if (tile32 !== null) {
+      tile32.fill(0);
+    }
+
+    levelRef = level;
+    exitIdx = maze.exit.y * w + maze.exit.x;
+    startIdx = maze.start.y * w + maze.start.x;
+    explored = 0;
+    sweepCursor = 0;
+    cellStamp = -1;
+    needsFullScan = true;
+    stats.tiles = w * h;
+    buildItemIndex(/** @type {any} */ (level).items, w, h);
+    clearDirty();
+    return true;
+  }
+
+  /**
+   * Build the per-tile item layer and the live-item list.
+   * @param {Item[]|undefined} items
+   * @param {number} w
+   * @param {number} h
+   * @returns {void}
+   */
+  function buildItemIndex(items, w, h) {
+    const n = w * h;
+    if (itemLayer === null || itemLayer.length < n) itemLayer = new Uint8Array(n);
+    else itemLayer.fill(0, 0, n);
+    liveCount = 0;
+    if (!Array.isArray(items)) return;
+    if (liveIdx.length < items.length) liveIdx = new Int32Array(items.length);
+    liveItems.length = items.length;
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      if (it === null || it === undefined || it.taken === true) continue;
+      const tx = Math.floor(it.x);
+      const ty = Math.floor(it.y);
+      if (tx < 0 || ty < 0 || tx >= w || ty >= h) continue;
+      const idx = ty * w + tx;
+      itemLayer[idx] = it.kind === 'oil' ? ITEM_OIL : ITEM_GEM;
+      liveIdx[liveCount] = idx;
+      liveItems[liveCount] = it;
+      liveCount++;
+    }
+    liveItems.length = liveCount;
+  }
+
+  /**
+   * Drop taken items from the layer and repaint their pixels.
+   *
+   * O(live items), run twice a second — not per frame, and never per item per frame. Each item is
+   * removed exactly once over a level, so the amortised cost is nothing.
+   * @param {Uint8Array} tiles
+   * @returns {void}
+   */
+  function pruneItems(tiles) {
+    if (itemLayer === null || tile32 === null) return;
+    let write = 0;
+    for (let i = 0; i < liveCount; i++) {
+      const it = liveItems[i];
+      const idx = liveIdx[i];
+      if (it !== undefined && it !== null && it.taken !== true) {
+        if (write !== i) {
+          liveIdx[write] = idx;
+          liveItems[write] = it;
+        }
+        write++;
+        continue;
+      }
+      // Taken: the tile goes back to being ordinary floor. Repaint in place rather than clearing,
+      // so `tile32[idx] !== 0` stays exactly equivalent to "counted as explored".
+      itemLayer[idx] = ITEM_NONE;
+      if (tile32[idx] !== 0) {
+        tile32[idx] = colorFor(idx, tiles, itemLayer, exitIdx, startIdx);
+        markDirty(idx % mw, (idx / mw) | 0);
+      }
+    }
+    liveCount = write;
+    liveItems.length = write;
+  }
+
+  /**
+   * @param {number} tx
+   * @param {number} ty
+   * @returns {void}
+   */
+  function markDirty(tx, ty) {
+    if (tx < dirty[0]) dirty[0] = tx;
+    if (ty < dirty[1]) dirty[1] = ty;
+    if (tx > dirty[2]) dirty[2] = tx;
+    if (ty > dirty[3]) dirty[3] = ty;
+  }
+
+  /**
+   * Maintain the raster. Safe to call with any state; it simply does nothing when there is no
+   * level, no explored grid or no canvas.
+   * @param {GameState} state
+   * @param {number} clock seconds (the HUD's smoothed sim clock)
+   * @returns {void}
+   */
+  function update(state, clock) {
+    const t0 = now();
+    stats.painted = 0;
+    stats.scanned = 0;
+    stats.flushes = 0;
+
+    const level = state === null || state === undefined ? null : state.levelData;
+    const grid = state === null || state === undefined ? null : state.explored;
+    if (level === null || level === undefined || grid === null || grid === undefined) {
+      stats.updateMs = now() - t0;
+      return;
+    }
+    const maze = level.maze;
+    if (maze === null || maze === undefined) {
+      stats.updateMs = now() - t0;
+      return;
+    }
+    if (level !== levelRef && !adoptLevel(level, maze)) {
+      stats.updateMs = now() - t0;
+      return;
+    }
+    if (tile32 === null || grid.length < mw * mh) {
+      // A mismatched explored buffer would be read out of bounds; refuse rather than guess.
+      stats.updateMs = now() - t0;
+      return;
+    }
+
+    const tiles = maze.tiles;
+    const p = state.player;
+    const px = p.x;
+    const py = p.y;
+
+    // A gap in updates (map switched off, tab hidden, a teleport) invalidates the local box, so
+    // fall back to the exact answer.
+    const stale = lastUpdate < 0 || clock - lastUpdate > MAP.STALE_AFTER || clock < lastUpdate;
+    if (needsFullScan || stale) {
+      stats.painted += paintTiles(
+        tile32, mw, mh, 0, 0, mw - 1, mh - 1, tiles, grid, itemLayer, exitIdx, startIdx, dirty,
+      );
+      stats.scanned += mw * mh;
+      explored += stats.painted;
+      needsFullScan = false;
+      stats.rebuilds++;
+    } else {
+      // Local box: the reveal radius plus however far the player travelled since the last update,
+      // so a 10 fps frame or a sprint cannot leave a hole behind.
+      const moved = Math.max(Math.abs(px - lastPlayerX), Math.abs(py - lastPlayerY));
+      const r = MAP.REVEAL_RADIUS + Math.ceil(moved) + MAP.BOX_SLACK;
+      const bx = Math.floor(px);
+      const by = Math.floor(py);
+      const before = stats.painted;
+      stats.painted += paintTiles(
+        tile32, mw, mh, bx - r, by - r, bx + r, by + r, tiles, grid, itemLayer, exitIdx, startIdx, dirty,
+      );
+      const span = 2 * r + 1;
+      stats.scanned += span * span;
+      explored += stats.painted - before;
+
+      // Rolling reconciliation: a slice of the grid per frame, so anything revealed outside the
+      // box (a contract change upstream, a prefilled grid) still lands within a fraction of a
+      // second. In steady state this paints nothing.
+      const total = mw * mh;
+      let budget = MAP.SWEEP_BUDGET > total ? total : MAP.SWEEP_BUDGET;
+      let cursor = sweepCursor;
+      let swept = 0;
+      while (budget-- > 0) {
+        if (cursor >= total) cursor = 0;
+        if (grid[cursor] !== 0 && tile32[cursor] === 0) {
+          tile32[cursor] = colorFor(cursor, tiles, itemLayer, exitIdx, startIdx);
+          markDirty(cursor % mw, (cursor / mw) | 0);
+          explored++;
+          stats.painted++;
+        }
+        cursor++;
+        swept++;
+      }
+      sweepCursor = cursor;
+      stats.scanned += swept;
+    }
+
+    if (lastPrune < 0 || clock - lastPrune >= MAP.PRUNE_INTERVAL || clock < lastPrune) {
+      pruneItems(tiles);
+      lastPrune = clock;
+    }
+
+    lastPlayerX = px;
+    lastPlayerY = py;
+    lastUpdate = clock;
+    stats.explored = explored;
+
+    // Push only what changed. `putImageData`'s dirty-rectangle form uploads that sub-rect alone,
+    // which is the difference between ~200 µs and ~2 µs at 257×257.
+    if (dirty[2] >= dirty[0] && dirty[3] >= dirty[1] && tileCtx !== null && tileImg !== null) {
+      tileCtx.putImageData(
+        tileImg, 0, 0, dirty[0], dirty[1], dirty[2] - dirty[0] + 1, dirty[3] - dirty[1] + 1,
+      );
+      stats.flushes = 1;
+      clearDirty();
+      // Any raster change invalidates the cell downsample.
+      cellStamp = -1;
+    }
+    stats.updateMs = now() - t0;
+  }
+
+  /**
+   * Rebuild the cell-resolution raster from the tile raster.
+   *
+   * Only the full map at its smallest scale needs this, and only when the explored set has moved,
+   * so it is an on-demand `cols*rows` pass (16 k for the 128-cell cap, ~25 µs measured) rather
+   * than another incremental structure to keep correct.
+   * @param {number} cols
+   * @param {number} rows
+   * @returns {boolean}
+   */
+  function ensureCellRaster(cols, rows) {
+    if (tile32 === null) return false;
+    if (cellCanvas === null || cellCols !== cols || cellRows !== rows) {
+      const c = makeCanvas(cols, rows);
+      if (c === null) return false;
+      c.width = cols;
+      c.height = rows;
+      let context = null;
+      try {
+        context = c.getContext('2d');
+      } catch (err) {
+        log.error('cell raster context unavailable', err);
+        return false;
+      }
+      if (context === null) return false;
+      cellCanvas = c;
+      cellCtx = context;
+      cellImg = context.createImageData(cols, rows);
+      cell32 = new Uint32Array(cellImg.data.buffer);
+      cellCols = cols;
+      cellRows = rows;
+      cellStamp = -1;
+    }
+    if (cellStamp === explored || cell32 === null || cellCtx === null || cellImg === null) {
+      return cell32 !== null;
+    }
+    // Cell (cx,cy) lives at tile (2cx+1, 2cy+1) in a thick-wall maze (ARCHITECTURE.md §6).
+    for (let cy = 0; cy < rows; cy++) {
+      const trow = (cy * 2 + 1) * mw;
+      const crow = cy * cols;
+      for (let cx = 0; cx < cols; cx++) {
+        cell32[crow + cx] = tile32[trow + cx * 2 + 1];
+      }
+    }
+    cellCtx.putImageData(cellImg, 0, 0);
+    cellStamp = explored;
+    return true;
+  }
+
+  // ── Drawing ──
+
+  /**
+   * The corner window: a zoomed, player-centred slice of the raster.
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {any} m surface metrics
+   * @param {GameState} state
+   * @param {number} clock
+   * @param {boolean} reduced reduced motion
+   * @returns {number} the box height in UI pixels, 0 when nothing was drawn
+   */
+  function drawCorner(ctx, m, state, clock, reduced) {
+    if (tileCanvas === null || levelRef === null || levelRef !== state.levelData) return 0;
+    const t0 = now();
+    const u = m.u;
+    const pad = 3 * u;
+    const span = m.narrow ? MAP.CORNER_TILES_NARROW : MAP.CORNER_TILES;
+    // The box is bounded by both axes: a third of the width, under a third of the height.
+    const room = Math.min(Math.floor(m.w * 0.34), Math.floor(m.h * 0.32));
+    const zoom = clamp(Math.floor(room / span), MAP.CORNER_MIN_ZOOM, MAP.CORNER_MAX_ZOOM);
+    const size = span * zoom;
+    const frame = Math.max(1, u);
+    const bx = m.w - pad - size - frame * 2;
+    const by = m.h - pad - size - frame * 2;
+
+    // Stone, not iron: on a phone the corner map sits on the black control deck below the world,
+    // where an iron frame (#2f343d) is invisible. The stone bevel's highlight reads on both the
+    // lit corridor of a desktop layout and that black deck.
+    drawPanel(ctx, bx, by, size + frame * 2, size + frame * 2, u, {
+      frame: 'stone',
+      alpha: 0.9,
+      border: frame,
+      rivets: false,
+      // No masonry behind a map: the courses read as corridors.
+      texture: false,
+    });
+
+    const ox = bx + frame;
+    const oy = by + frame;
+    const p = state.player;
+    cornerWindow(p.x, p.y, span, mw, mh, win);
+    blitWindow(ctx, ox, oy, size, win[0], win[1], span, zoom);
+
+    // Exit, once its tile has been seen — it is the one thing worth over-drawing.
+    const maze = /** @type {any} */ (state.levelData).maze;
+    if (state.explored !== null && state.explored[exitIdx] !== 0) {
+      const ex = maze.exit.x - win[0];
+      const ey = maze.exit.y - win[1];
+      if (ex >= 0 && ey >= 0 && ex < span && ey < span) {
+        const pulse = reduced ? 1 : 0.6 + 0.4 * Math.sin(clock * 4);
+        ctx.fillStyle = withAlpha(COLOR.arcCyan, pulse);
+        const s = Math.max(2, zoom);
+        ctx.fillRect(ox + ex * zoom, oy + ey * zoom, s, s);
+      }
+    }
+
+    drawPlayerArrow(
+      ctx, ox + (p.x - win[0]) * zoom, oy + (p.y - win[1]) * zoom, p.angle, zoom * 3, clock, reduced,
+    );
+    stats.drawMs = now() - t0;
+    return size + frame * 2;
+  }
+
+  /**
+   * Blit a tile window, clipped to the raster, over a void ground.
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {number} ox destination left (UI px)
+   * @param {number} oy destination top
+   * @param {number} size destination size (UI px)
+   * @param {number} wx window left in tiles
+   * @param {number} wy window top in tiles
+   * @param {number} span window size in tiles
+   * @param {number} zoom UI pixels per tile
+   * @returns {void}
+   */
+  function blitWindow(ctx, ox, oy, size, wx, wy, span, zoom) {
+    // Unexplored ground is a dark stone grey, not black: at the start of a level the window is
+    // almost entirely unknown, and on a phone the map sits on a black control deck — a black
+    // rectangle there reads as a broken widget rather than as fog. It stays far enough below the
+    // explored floor tone (#6e6455) that corridors still read as the bright shape.
+    ctx.fillStyle = withAlpha(COLOR.stoneShadow, 0.88);
+    ctx.fillRect(ox, oy, size, size);
+    if (tileCanvas === null) return;
+    const sx = wx < 0 ? 0 : wx;
+    const sy = wy < 0 ? 0 : wy;
+    const ex = Math.min(mw, wx + span);
+    const ey = Math.min(mh, wy + span);
+    const sw = ex - sx;
+    const sh = ey - sy;
+    if (sw <= 0 || sh <= 0) return;
+    ctx.drawImage(
+      tileCanvas, sx, sy, sw, sh,
+      ox + (sx - wx) * zoom, oy + (sy - wy) * zoom, sw * zoom, sh * zoom,
+    );
+  }
+
+  /**
+   * The full-screen labyrinth map: header, fitted map, legend.
+   *
+   * The layout is measured rather than assumed, because the two targets are wildly different
+   * boxes: 640×360 UI pixels on a desktop (where a 257-pixel map and a three-item legend sit side
+   * by side comfortably) and 234×506 on a phone at dpr 3, where the same text at the same scale
+   * is twice the width of the screen. Every string here is fitted with {@link fitScale} and the
+   * map is centred in whatever is left.
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {any} m surface metrics
+   * @param {GameState} state
+   * @param {number} clock
+   * @param {boolean} reduced
+   * @param {number} [headerLeft] left edge for the header line, so it clears the fuel gauge
+   * @param {number} [topInset] vertical space already taken at the top (the gauge, on a phone)
+   * @returns {void}
+   */
+  function drawFull(ctx, m, state, clock, reduced, headerLeft, topInset) {
+    const level = /** @type {any} */ (state.levelData);
+    if (tileCanvas === null || level === null || level !== levelRef) return;
+    const t0 = now();
+    const maze = level.maze;
+    const u = m.u;
+
+    // Ground: dark enough that the corridors glow, translucent enough that the world behind still
+    // says "you are standing in a maze with the torch burning".
+    ctx.fillStyle = withAlpha(COLOR.void, 0.88);
+    ctx.fillRect(0, 0, m.w, m.h);
+
+    const margin = 3 * u;
+    const frame = Math.max(1, u);
+    const inset = topInset === undefined ? 0 : topInset;
+    const hx = headerLeft === undefined || headerLeft <= 0 ? margin : headerLeft;
+
+    // ── Header: depth, size, how much of it you have seen ──
+    const total = mw * mh;
+    const pct = total > 0 ? explored / total : 0;
+    const head = `DEPTH ${state.level}  ·  ${formatLabyrinth(maze.cols, maze.rows)}`;
+    const mapped = `MAPPED ${formatPercent(pct)}`;
+    const headRoom = m.w - hx - margin;
+    // One scale for both halves of the header, shrunk until they fit side by side.
+    let headSize = Math.max(1, u);
+    for (;;) {
+      const hw = measureLine(head, { font: 'hud', size: headSize });
+      const mwid = measureLine(mapped, { font: 'hud', size: headSize });
+      if (hw + mwid + 4 * u <= headRoom || headSize <= 1) break;
+      headSize--;
+    }
+    const headH = textHeight({ font: 'hud', size: headSize });
+    const headY = margin + inset;
+    drawText(ctx, head, hx, headY, { font: 'hud', size: headSize, color: 'hudGold' });
+    drawText(ctx, mapped, m.w - margin, headY, {
+      font: 'hud',
+      size: headSize,
+      color: 'hudDim',
+      align: 'right',
+    });
+
+    // ── Box: everything between the header and the legend, with the map centred in it ──
+    const legendSize = legendScale(m, state, u);
+    const legendH = textHeight({ font: 'hud', size: legendSize });
+    const legendY = m.h - margin - legendH;
+    const boxTop = headY + headH + 3 * u;
+    const boxBottom = legendY - 3 * u;
+    const boxW = m.w - margin * 2 - frame * 2;
+    const boxH = boxBottom - boxTop - frame * 2;
+    if (boxW < 16 || boxH < 16) {
+      stats.drawMs = now() - t0;
+      return;
+    }
+
+    // The map is fitted in **device** pixels rather than in UI pixels.
+    //
+    // WHY: the overlay's UI grid is deliberately chunky (one UI pixel is `m.px` device pixels — 5
+    // of them on a 390×844 phone at dpr 3) because that is what keeps the lettering pixel-art. A
+    // map is a diagram, not lettering: measuring it in UI pixels there would cap a 128-cell maze
+    // at 128 UI pixels — 55 % of the screen width, and *below* tile resolution, so the corridors
+    // vanish. Fitting in device pixels gives the same maze 4 device pixels per tile: the whole
+    // labyrinth, walls and all, across 88 % of the screen. It stays pixel-exact because the scale
+    // is still an integer number of device pixels per raster pixel; the grid is simply finer than
+    // the font's. On a desktop (`m.px` = 2) this changes nothing — the arithmetic gives the same
+    // answer it did in UI pixels.
+    const dev = Math.max(1, m.px);
+    const fit = chooseFullScale(maze.cols, maze.rows, boxW * dev, boxH * dev);
+    const drawW = fit.w;
+    const drawH = fit.h;
+    // The frame is drawn on the UI grid around the device-space raster, so it is the enclosing
+    // whole number of UI pixels; the raster is then centred inside it.
+    const panelW = Math.ceil(drawW / dev) + frame * 2;
+    const panelH = Math.ceil(drawH / dev) + frame * 2;
+    const px = Math.round((m.w - panelW) / 2);
+    const py = Math.round(boxTop + (boxH + frame * 2 - panelH) / 2);
+
+    // ── The map ──
+    drawPanel(ctx, px, py, panelW, panelH, u, {
+      frame: 'stone',
+      alpha: 0.92,
+      border: frame,
+      rivets: true,
+      texture: false,
+    });
+    ctx.fillStyle = withAlpha(COLOR.stoneShadow, 0.92);
+    ctx.fillRect(px + frame, py + frame, panelW - frame * 2, panelH - frame * 2);
+
+    // Raster space: identity transform, offset by the surface's letterbox origin, so one unit is
+    // one device pixel. Everything inside the frame is drawn here and the UI transform is put back
+    // immediately afterwards — `menus.render()` and the rest of the HUD depend on it.
+    const ox = (px + frame) * dev;
+    const oy = (py + frame) * dev;
+    // `save`/`restore` brackets it, which also puts the UI transform back, and a clip rectangle
+    // keeps the exit crosshair — whose arms reach well past the tile it marks — inside the frame
+    // instead of drawing a stray line across the legend.
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, m.originX, m.originY);
+    ctx.beginPath();
+    ctx.rect(ox, oy, panelW * dev - frame * 2 * dev, panelH * dev - frame * 2 * dev);
+    ctx.clip();
+
+    /** Raster pixels per tile, for placing the live markers (device pixels). */
+    let perTileX = 0;
+    let perTileY = 0;
+    if (fit.res === 'tile') {
+      ctx.drawImage(tileCanvas, 0, 0, mw, mh, ox, oy, drawW, drawH);
+      perTileX = fit.scale;
+      perTileY = fit.scale;
+    } else if (ensureCellRaster(maze.cols, maze.rows) && cellCanvas !== null) {
+      ctx.drawImage(cellCanvas, 0, 0, cellCols, cellRows, ox, oy, drawW, drawH);
+      // A cell is two tiles wide in the tile grid, so a tile is half a cell pixel.
+      perTileX = fit.scale / 2;
+      perTileY = fit.scale / 2;
+    } else {
+      ctx.restore();
+      stats.drawMs = now() - t0;
+      return;
+    }
+
+    // Exit: a real glyph when there is room for one, otherwise a pulsing block **inside a
+    // crosshair** — at one pixel per cell a two-pixel dot in a 128-pixel field of noise is
+    // genuinely impossible to find, and finding the exit is the entire point of opening the map.
+    if (state.explored !== null && state.explored[exitIdx] !== 0) {
+      const exx = ox + (maze.exit.x - (fit.res === 'cell' ? 1 : 0)) * perTileX;
+      const exy = oy + (maze.exit.y - (fit.res === 'cell' ? 1 : 0)) * perTileY;
+      const pulse = reduced ? 1 : 0.55 + 0.45 * Math.sin(clock * 4);
+      // A crosshair first, always: a few bright pixels somewhere in a 66 000-tile field are
+      // invisible, and "where is the way out" is the question the map exists to answer. The arms
+      // reach out of the maze texture, so the eye finds them from across the screen.
+      const arm = clamp(Math.round(perTileX * 8), 8 * dev, 20 * dev);
+      const thick = Math.max(2, Math.round(dev));
+      // Dark backing first: the map's floor is a light warm grey, so a thin cyan line alone would
+      // half disappear into it. Two passes cost four fills and make the marker read on any ground.
+      ctx.fillStyle = withAlpha(COLOR.void, 0.85);
+      ctx.fillRect(Math.round(exx - arm), Math.round(exy - thick), arm * 2, thick * 2);
+      ctx.fillRect(Math.round(exx - thick), Math.round(exy - arm), thick * 2, arm * 2);
+      ctx.fillStyle = withAlpha(COLOR.arcCyan, 0.35 + 0.65 * pulse);
+      ctx.fillRect(Math.round(exx - arm), Math.round(exy - thick / 2), arm * 2, thick);
+      ctx.fillRect(Math.round(exx - thick / 2), Math.round(exy - arm), thick, arm * 2);
+      const glyph = Math.max(1, Math.round(perTileX * 4));
+      if (glyph >= ICON_SIZE.portal) {
+        const s = Math.max(1, Math.floor(glyph / ICON_SIZE.portal));
+        drawPortalIcon(
+          ctx,
+          Math.round(exx - (ICON_SIZE.portal * s) / 2),
+          Math.round(exy - (ICON_SIZE.portal * s) / 2),
+          s,
+        );
+      } else {
+        ctx.fillStyle = withAlpha(COLOR.arcPale, pulse);
+        const s = Math.max(2 * dev, Math.round(perTileX * 2));
+        ctx.fillRect(Math.round(exx - s / 2), Math.round(exy - s / 2), s, s);
+      }
+    }
+
+    // Player.
+    const p = state.player;
+    const ax = ox + (p.x - (fit.res === 'cell' ? 1 : 0)) * perTileX;
+    const ay = oy + (p.y - (fit.res === 'cell' ? 1 : 0)) * perTileY;
+    // The marker is sized in absolute pixels, not in tiles: at 12 device pixels per tile a
+    // "five tiles wide" arrow would be a 60-pixel cream blot over the corner of the map.
+    drawPlayerArrow(ctx, ax, ay, p.angle, clamp(Math.round(perTileX * 4), 6 * dev, 14 * dev), clock, reduced);
+
+    // Back to the UI grid (and out of the clip) before anything else draws.
+    ctx.restore();
+
+    // ── Legend ──
+    drawLegend(ctx, m, state, margin, legendY, legendSize);
+    stats.drawMs = now() - t0;
+  }
+
+  /**
+   * Has the exit been seen? The map must not leak where it is before then — the compass is earned,
+   * not given (ARCHITECTURE.md §4.6).
+   * @param {GameState} state
+   * @returns {boolean}
+   */
+  function exitSeen(state) {
+    return state.explored !== null && exitIdx >= 0 && state.explored[exitIdx] !== 0;
+  }
+
+  /**
+   * The text scale the legend strip can afford.
+   *
+   * Measured, not guessed: at u = 3 on a phone the full strip is nearly twice the width of the
+   * screen, and a legend that overlaps itself is worse than no legend. Measuring at scale 1 and
+   * dividing is exact, because every width in the strip is linear in the scale.
+   * @param {any} m
+   * @param {GameState} state
+   * @param {number} u
+   * @returns {number} an integer scale ≥ 1
+   */
+  function legendScale(m, state, u) {
+    // Widths have two parts: text and icons (linear in `size`) and the `u`-based gaps (which are
+    // not), so the fit is solved by trying the sizes — `u` is at most 6, so this is at most six
+    // measurements of four short strings.
+    for (let size = Math.max(1, u); size > 1; size--) {
+      if (legendWidth(m, state, size, u) <= m.w - 6 * u) return size;
+    }
+    return 1;
+  }
+
+  /**
+   * Width of the legend strip at a given text scale.
+   * @param {any} m
+   * @param {GameState} state
+   * @param {number} size
+   * @param {number} u
+   * @returns {number} UI pixels
+   */
+  function legendWidth(m, state, size, u) {
+    const run = state.run;
+    const seen = exitSeen(state);
+    let w = ICON_SIZE.gem * size + 2 * u + measureLine(formatCount(run.gems, run.gemsTotal), { font: 'hud', size }) + 5 * u;
+    w += ICON_SIZE.oilW * size + 2 * u + measureLine('OIL', { font: 'hud', size }) + 5 * u;
+    if (!seen) {
+      w += ICON_SIZE.portal * size + 2 * u + measureLine('EXIT', { font: 'hud', size }) + 5 * u;
+    }
+    w += measureLine(seen ? `EXIT ${formatDistance(state.derived.exitDist)}` : 'M TO CLOSE', { font: 'hud', size });
+    return w;
+  }
+
+  /**
+   * The legend strip under the full map: what the colours mean, plus the number a player in a
+   * 16 000-cell labyrinth actually wants — how far away the exit is.
+   *
+   * The EXIT swatch is shown only while the exit has *not* been found: once it has, the distance
+   * readout on the right says the same thing better, and the two together overflow a phone.
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {any} m
+   * @param {GameState} state
+   * @param {number} x left edge
+   * @param {number} y top edge
+   * @param {number} size text scale
+   * @returns {void}
+   */
+  function drawLegend(ctx, m, state, x, y, size) {
+    const u = m.u;
+    const iconScale = Math.max(1, size);
+    let cx = x;
+    const run = state.run;
+    const seen = exitSeen(state);
+
+    // Gems, then flasks, then the exit — the order they matter in.
+    drawGemIcon(ctx, cx, y, iconScale);
+    cx += ICON_SIZE.gem * iconScale + 2 * u;
+    const gemText = formatCount(run.gems, run.gemsTotal);
+    drawText(ctx, gemText, cx, y, { font: 'hud', size, color: 'hudGem' });
+    cx += measureLine(gemText, { font: 'hud', size }) + 5 * u;
+
+    drawOilIcon(ctx, cx, y - u, iconScale);
+    cx += ICON_SIZE.oilW * iconScale + 2 * u;
+    drawText(ctx, 'OIL', cx, y, { font: 'hud', size, color: 'hudGold' });
+    cx += measureLine('OIL', { font: 'hud', size }) + 5 * u;
+
+    if (!seen) {
+      drawPortalIcon(ctx, cx, y, iconScale);
+      cx += ICON_SIZE.portal * iconScale + 2 * u;
+      drawText(ctx, 'EXIT', cx, y, { font: 'hud', size, color: 'hudBright' });
+    }
+
+    drawText(ctx, seen ? `EXIT ${formatDistance(state.derived.exitDist)}` : 'M TO CLOSE', m.w - x, y, {
+      font: 'hud',
+      size,
+      color: seen ? 'hudBright' : 'hudDim',
+      align: 'right',
+    });
+  }
+
+  /**
+   * The player marker: the 8-heading arrow, blinking so the eye finds it on a busy map.
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {number} cx centre x in UI pixels
+   * @param {number} cy centre y
+   * @param {number} angle radians (0 = east)
+   * @param {number} sizePx how wide the marker should be, in the units the caller is drawing in
+   * @param {number} clock
+   * @param {boolean} reduced
+   * @returns {void}
+   */
+  function drawPlayerArrow(ctx, cx, cy, angle, sizePx, clock, reduced) {
+    // Mostly on, briefly off: a marker that is missing half the time is one you have to hunt for.
+    if (!reduced && clock % 1.1 >= 0.82) return;
+    const octant = (Math.round(angle / (Math.PI / 4)) & 7) >>> 0;
+    const arrow = ARROWS[octant];
+    const scale = Math.max(1, Math.round(sizePx / arrow.w));
+    drawArt(
+      ctx,
+      arrow,
+      Math.round(cx - (arrow.w * scale) / 2),
+      Math.round(cy - (arrow.h * scale) / 2),
+      scale,
+      ARROW_PALETTE,
+    );
+  }
+
+  /**
+   * @returns {void}
+   */
+  function reset() {
+    levelRef = null;
+    explored = 0;
+    sweepCursor = 0;
+    lastUpdate = -1;
+    lastPrune = -1;
+    needsFullScan = true;
+    cellStamp = -1;
+    liveCount = 0;
+    liveItems.length = 0;
+    stats.rebuilds = 0;
+    if (tile32 !== null) tile32.fill(0);
+    clearDirty();
+  }
+
+  /**
+   * @returns {void}
+   */
+  function dispose() {
+    reset();
+    tileCanvas = null;
+    tileCtx = null;
+    tileImg = null;
+    tile32 = null;
+    cellCanvas = null;
+    cellCtx = null;
+    cellImg = null;
+    cell32 = null;
+    mw = 0;
+    mh = 0;
+    itemLayer = null;
+    liveIdx = new Int32Array(0);
+  }
+
+  return {
+    update,
+    drawCorner,
+    drawFull,
+    exploredCount: () => explored,
+    stats: () => stats,
+    reset,
+    dispose,
+  };
+}

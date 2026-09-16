@@ -1,8 +1,8 @@
 {
-  "updated": "2026-09-16T02:32:09.641Z",
-  "iteration": 4,
+  "updated": "2026-09-16T04:46:41.394Z",
+  "iteration": 5,
   "passThreshold": 8.5,
-  "wave": "integration",
+  "wave": "massive-mazes",
   "waves": {
     "0-scaffold": {
       "status": "done",
@@ -541,24 +541,87 @@
     },
     "stress": {
       "status": "pending"
+    },
+    "5-massive-mazes": {
+      "status": "done",
+      "owner": "integrator + state/maze/renderer/ui builders",
+      "notes": "MASSIVE MAZES + the refillable torch economy. Level 1 is 16x16 cells (33x33 tiles) growing +8 cells/side to a 128x128-cell cap (257x257 tiles, 16,384 cells) at level 15; past the cap levels get harder, not bigger. The torch is a 110-150 s TANK independent of maze area and oil flasks are the economy, with a placement guarantee that the solution path never contains a fuel desert. Every per-frame and per-step cost was re-cut to be independent of maze size: a bucket grid for pickups, a spatial index for sprites and lights, an incremental raster for the new three-state map.",
+      "modules": [
+        "state",
+        "maze",
+        "renderer",
+        "ui",
+        "main.js",
+        "tools"
+      ],
+      "selfScores": {
+        "state": 9,
+        "maze": 9,
+        "renderer": 9.2,
+        "ui": 9
+      },
+      "seamFixes": [
+        "settings.mapMode (state <-> ui): the UI shipped a three-state map (off/corner/full) but src/state had only the legacy `minimap` boolean, so FULL could not survive a reload and the M key only reached two states. SETTING_SPEC gained a third kind, `enum`, plus settings.mapMode; coerceSetting takes only a listed value and ignores anything else rather than snapping to the default. `minimap` is kept as the legacy mirror and main.js writes both.",
+        "src/main.js map hotkey: replaced the `minimap` toggle with hud.cycleMap() + both setSettings, which is what makes the FULL map reachable in the shipped game at all. The touch MAP button emits the same action, so it gets all three states for free.",
+        "run.refuels / run.distance (state <-> ui): the HUD tank tally and the level-complete / game-over expedition strip were written against fields that did not exist. Added in src/state: refuels per LEVEL (reset by levelReady), distance per RUN (reset by newGame, measured after collision so wall-scraping cannot inflate it).",
+        "src/main.js level install: a completed build is now queued and dispatched from step() after MIN_LOAD_S (0.8 s). A 128x128 level comes back in ~25-60 ms, so the loading screen used to exist for three frames - the iris started its wipe and snapped back open and the banner naming the labyrinth was never readable. It is a floor on the loading phase, not a delay added to a slow build, and the watchdog/stale-token/retry paths all go through it.",
+        "src/main.js DEMO_LEVEL 3 -> 1: the title maze is now 16x16 cells, under the maze client 400-cell worker threshold, so the title costs no worker spin-up at boot and carries the smallest sprite load.",
+        "tools/verify.mjs wall-clock budgets: LEVEL1/LEVEL2 were 60 s/45 s against a level 1 that now takes the autopilot ~115 s. Raised to 400/500 and the gate extended to the size cap."
+      ],
+      "files": [
+        "ARCHITECTURE.md (sections 1, 2, 3, 4.2, 4.4, 4.5, 4.6, 4.7, 5, 6)",
+        "CLAUDE.md",
+        "src/core/types.js (Settings.mapMode, RunStats.refuels/distance, MapMode)",
+        "src/state/balance.js (MAP_MODES, SETTING_SPEC enum kind, coerceSetting, defaultSettings)",
+        "src/state/game.js (run.refuels/distance lifecycle)",
+        "src/state/sim.js (refuel tally, odometer)",
+        "src/main.js (map cycle, queued level install, DEMO_LEVEL)",
+        "index.html (modulepreload for the three new files, map hotkey aria text)",
+        "tools/verify.mjs (cap-level soak, rAF-gap gate, map screenshots, refuel-economy gate)",
+        "docs/STATUS.json"
+      ],
+      "supersedes": [
+        "integration: 'Difficulty plateaus after level ~18: the maze is capped at 40x40 cells and the fuel-per-cell rate has finished decaying' — the cap is now 128x128 at level 15 and past it braid, drain and oil density keep moving, which is exactly the late-game pressure that issue asked for.",
+        "integration/maze: the fuel seam ('balance.js supplies a size-based floor that always wins over populate's path-derived budget') — there is one owner of the tank now and no floor to win."
+      ]
     }
   },
   "modules": {},
   "metrics": {
-    "source": "tools/verify.mjs --tag integ (1280x720, headless Chrome)",
-    "fpsVsyncLimited": 120.2,
-    "fpsUnlimited": 630.6,
-    "renderMsAvgFull": 1.236,
-    "renderMsAvgWorld": 0.958,
-    "renderMsP99World": 1.4,
-    "stepMsAvg": 0.1417,
-    "heapGrowthMB20s": 0.07,
+    "source": "tools/verify.mjs --tag massive (1280x720 headless Chrome) + npm test + validate-mazes + stress",
+    "sizeCurve": "L1 16x16 cells / 33x33 tiles; +8 cells/side/level; cap 128x128 cells / 257x257 tiles at L15",
+    "tankSeconds": "L1 110 s -> cap 150 s, independent of maze area",
+    "fpsVsyncLimited": 120,
+    "fpsUnlimited": 611.1,
+    "renderMsAvgFull": 1.239,
+    "renderMsAvgWorld": 0.986,
+    "renderMsP99World": 1.7,
+    "stepMsAvg": 0.075,
+    "heapGrowthMB20s": 0.03,
+    "capLevel": {
+      "level": 15,
+      "cells": "128x128",
+      "tiles": "257x257",
+      "items": 819,
+      "torches": 1290,
+      "exploredBytes": 66049,
+      "buildRafGapMaxMs": 19.3,
+      "soakSeconds": 60.01,
+      "soakFps": 623.4,
+      "soakStepMsAvg": 0.1091,
+      "soakRenderMsAvg": 1.2,
+      "soakWorldMsP99": 1.9,
+      "soakHeapGrowthMB": 0.21
+    },
+    "refuelsObserved": 36,
+    "fuelSecondsRecovered": 348,
     "consoleErrors": 0,
     "consoleWarnings": 0,
-    "tests": 359,
+    "tests": 523,
     "mazesValidated": 117306,
+    "campaignLevelsValidated": 750,
     "mazeFailures": 0,
-    "fps": 120.2
+    "fps": 120
   },
   "blocking": [],
   "history": [
@@ -585,6 +648,19 @@
       "wave": "integration",
       "updated": "2026-09-16T02:32:09.641Z",
       "summary": "Integration wave marked done. src/main.js (830 lines) wires every module behind a guarded boot; nine seam fixes applied (overlay canvas sizing, layer order, touch bar class, pointer-lock pause, fuel budget decision, loading-phase recovery, test tally regex); index.html, styles.css, tools/verify.mjs and the CI quality gate shipped; ARCHITECTURE.md reconciled with the code. verify/tests/validate/stress all pass: 359 tests, 120.2 fps vsync-limited, 1.236 ms average render, 1.4 ms world p99, +0.07 MB heap over a 20 s soak, 0 console errors. No blockers; remaining issues are portrait letterboxing and a late-game difficulty plateau."
+    },
+    {
+      "iteration": 5,
+      "wave": "massive-mazes",
+      "updated": "2026-09-16T04:46:41.394Z",
+      "summary": "Massive mazes shipped: level 1 is 16x16 cells and the curve caps at 128x128 cells (257x257 tiles, ~820 items, ~1300 torches) at level 15, with the torch converted from a whole-level budget into a 110-150 s tank refilled from oil flasks whose placement along the solution path is a proven guarantee rather than a balance note. Every per-frame and per-step cost is now independent of maze size. Gates: 523 tests, 117306 mazes + 750 campaign levels, stress clean, and a browser run that descends to the cap and drives it for 60.01 s at 623.4 fps with a 19.3 ms worst build frame gap and zero console output."
     }
+  ],
+  "openIssues": [
+    "populate.js and feasibility.test.mjs measure the oil gap with slightly different reachability definitions, so they report numbers a few tiles apart. Both pass their own (stricter) bound and the campaign has a 70% torch reserve at its worst point, but the two should be reconciled so validate-mazes and feasibility.test.mjs report the same figure.",
+    "LEVEL.PATH_TILES_PER_SIDE = 13 overestimates the shipped route at the deepest braid (~7.1 measured). It feeds only the par FLOOR, which populate.js overrides with the real path, so nothing is wrong today - but the constant reads stale.",
+    "gatherLights still picks the nearest 8 torches. At the new density (~1300 on level 15) more than 8 sconces can be within lighting range in a braided junction. MAX_LIGHTS is the knob and the ring search makes 12 or 16 nearly free.",
+    "No typecheck runs anywhere in the repo (no tsconfig, no tsc dependency), so // @ts-check is enforced only by an editor.",
+    "The phone depth panel is four rows tall and its lower edge sits close to the top of the 3-D band in portrait. Cosmetic, within tolerance, but it is the tightest spot in the mobile layout."
   ]
 }

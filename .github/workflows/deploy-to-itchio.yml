@@ -65,8 +65,12 @@ jobs:
       run: npm test
 
     # 117k mazes across the seed/size matrix: every one must be solvable, fully
-    # connected and sealed (ARCHITECTURE.md §5). Runs in ~5 s.
-    - name: Maze solvability matrix
+    # connected and sealed. Then the real 750-level campaign (levels 1-30 x 25
+    # seeds), which additionally asserts the refuel chain: a level whose solution
+    # path contains a stretch too long to cross on one tank is unwinnable, and
+    # that is a deploy blocker, not a balance note (ARCHITECTURE.md §1, §5).
+    # Runs in ~14 s.
+    - name: Maze solvability matrix and refuel chain
       run: node tools/validate-mazes.mjs
 
     # Extreme grid sizes: no throw, no stack overflow, bounded time and memory.

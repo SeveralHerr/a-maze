@@ -19,6 +19,13 @@
  * second and stops about as fast, so corridors can be threaded precisely at 60 Hz without
  * momentum fighting the input. Everything else (bob cadence, bump threshold, torch economy) is
  * derived from `PLAYER.WALK_SPEED` so re-tuning the walk speed keeps the game coherent.
+ *
+ * ## Massive mazes (design change)
+ * Levels are now 16×16 cells (33×33 tiles) growing to 128×128 cells (257×257 tiles, ≈ 33 000 floor
+ * tiles) at `CAP_LEVEL`, and the torch is a **small tank you keep refilling** rather than a budget
+ * for the whole level. The two tables that carry that change are `LEVEL` (size, braid, item
+ * densities) and `FUEL` (tank, flask value, the chainability arithmetic). Read those two doc
+ * comments before touching a number in either.
  */
 
 import { clamp, clamp01, lerp } from '../core/math.js';
@@ -120,12 +127,26 @@ export const WORLD = Object.freeze({
    * Maximum line-of-sight probes per step. The reveal pass only probes tiles that are still
    * unexplored, so in steady state it costs nothing; the budget bounds the worst case (entering a
    * large open area) and the cursor resumes where it stopped so nothing is starved.
+   *
+   * **Size-independent by construction** (massive-maze audit): the pass only ever visits the
+   * `(2·REVEAL_RADIUS+1)² = 49` tiles of the window around the player, and probes at most
+   * `REVEAL_BUDGET` of them, whether the maze is 33×33 tiles or 257×257.
    */
   REVEAL_BUDGET: 24,
   /** Hard cap on DDA cells walked by one line-of-sight probe (safety valve, never reached). */
   LOS_MAX_CELLS: 64,
   /** Distance in tiles at which `derived.nearExit` starts ramping up from 0. */
   NEAR_EXIT_RANGE: 8,
+  /**
+   * Side of one bucket of the item lookup grid, in tiles (`sim.js`).
+   *
+   * A level now carries hundreds of items (≈ 820 at the size cap), so the pickup test may not scan
+   * them. The grid is built once per level and queried with the 2×2 buckets that can overlap the
+   * pickup disc. 4 tiles is the sweet spot: `PICKUP_RADIUS` (0.45) is far below it, so the query
+   * can never touch more than 2 buckets per axis, while a bucket still covers only 16 tiles and
+   * therefore holds a handful of items at any density the level curve can produce.
+   */
+  ITEM_GRID_TILES: 4,
 });
 
 // ─── Simulation limits ───────────────────────────────────────────────────────────────────────
@@ -148,49 +169,93 @@ export const SIM = Object.freeze({
 // ─── Fuel economy ────────────────────────────────────────────────────────────────────────────
 
 /**
- * The torch: fuel *is* the timer, so this table is the difficulty curve.
+ * The torch: a **small tank you must keep refilling**, not a budget for the whole level.
+ *
+ * ## Why the tank is independent of maze area (the massive-maze design change)
+ * A tank sized to cover a level turns a big maze into one long countdown: the first two minutes
+ * are free and the last thirty seconds are the game. With mazes up to 128×128 cells (≈ 33 000
+ * floor tiles) that failure mode is total — a level-15 budget would have to be ~11 minutes of
+ * fuel, and nothing would ever be tense. So the tank is **fixed at ~110 s (level 1) rising to
+ * ~150 s (the size cap)** whatever the maze measures, and *oil flasks are the economy*: their
+ * count scales with area so their density is roughly constant, and the player is always 60–90 s
+ * from darkness no matter how deep they are.
+ *
+ * ## The arithmetic that makes a level chainable
+ * Measured on the real generator (`logs/state-braidlaw.mjs`), the optimal route of a level at the
+ * shipped braid is ≈ `PATH_TILES_PER_SIDE` tiles per cell-side. A player who cannot see the maze
+ * walks `WANDER` (2.0) times that. Walking a tile costs `TRAVEL_OVERHEAD / PLAYER.WALK_SPEED`
+ * seconds (the overhead covers turning and re-acceleration at junctions), multiplied by the
+ * level's `drain`. So one flask, worth `oilFuel(tank)` seconds, pays for
+ *
+ *     gap = oilSeconds · WALK_SPEED / (TRAVEL_OVERHEAD · drain · WANDER)      tiles of *path*
+ *
+ * and `oilTargetGap` is that distance with `GAP_SAFETY` headroom. As long as the gap between
+ * consecutive reachable flasks never exceeds it, a competent player can chain refuels for ever —
+ * which is exactly the placement guarantee `src/maze/populate.js` owes the game and
+ * `feasibility.test.mjs` proves end-to-end on real mazes.
  * @type {Readonly<Record<string, number>>}
  */
 export const FUEL = Object.freeze({
-  /** Base drain in fuel-seconds per real second. */
+  /** Base drain in fuel-seconds per real second, before the per-level `drain` multiplier. */
   DRAIN: 1,
   /** Drain multiplier while sprinting (ARCHITECTURE.md §1). */
   SPRINT_MULT: 1.5,
-  /** Fraction of `fuelMax` at or below which `derived.lowFuel` is true. */
+  /**
+   * Fraction of `fuelMax` at or below which `derived.lowFuel` is true (mirrored by `src/ui/hud.js`).
+   * On the new tank that is 22 s at level 1 and 30 s at the cap — ~70–96 tiles of walking, i.e.
+   * a warning long enough to reach the next flask but short enough to feel like an alarm.
+   */
   LOW_FRACTION: 0.2,
   /**
    * Fraction of `fuelMax` the player must climb back above before the one-shot `lowFuel` event
    * re-arms. The gap (0.26 vs 0.20) is hysteresis: without it, hovering at exactly 20 % would
-   * re-fire the heartbeat cue every few frames.
+   * re-fire the heartbeat cue every few frames. One flask (35 % of the tank) always clears it,
+   * so every refuel re-arms the alarm — that is the 60–90 s tension loop.
    */
   REARM_FRACTION: 0.26,
-  /** Fuel-seconds an oil flask restores, as a fraction of the level's `fuelMax`. */
-  OIL_FRACTION: 0.16,
-  /** Lower clamp on an oil flask's value, in fuel-seconds. */
-  OIL_MIN: 12,
-  /** Upper clamp on an oil flask's value, in fuel-seconds. */
-  OIL_MAX: 45,
-  /** Flat fuel-seconds granted to every level regardless of size (the "get oriented" budget). */
-  BASE_SECONDS: 55,
-  /** Fuel-seconds per cell on level 1 — deliberately generous while the player is learning. */
-  PER_CELL_START: 1.15,
   /**
-   * Fuel-seconds per cell once the difficulty curve has fully ramped.
-   *
-   * Calibrated against real generated mazes (`logs/state-integration.mjs`): the resulting budget
-   * is ~4.8× the time a *direct* run down the solution path takes on level 1, settling to ~2.2–2.6×
-   * from level 6 on. Since a player cannot see the path, that multiplier is the real difficulty
-   * knob — it is how much wandering the torch pays for.
+   * Fuel-seconds an oil flask restores, as a fraction of the level's `fuelMax`. At 35 % of a
+   * 110–150 s tank a flask is 38–53 s: a real reprieve, but never a whole level.
    */
-  PER_CELL_END: 0.22,
-  /** Levels over which the per-cell budget decays from PER_CELL_START to PER_CELL_END. */
-  DECAY_LEVELS: 12,
-  /** Fuel-seconds per tile of the *solution path* on level 1 (used by maze/populate.js). */
-  PER_PATH_TILE_START: 1.6,
-  /** Fuel-seconds per tile of the solution path once fully ramped. */
-  PER_PATH_TILE_END: 0.75,
-  /** Par time as a fraction of the level's fuel budget (the summary screen's target). */
-  PAR_FRACTION: 0.5,
+  OIL_FRACTION: 0.35,
+  /** Lower clamp on an oil flask's value, in fuel-seconds. */
+  OIL_MIN: 25,
+  /** Upper clamp on an oil flask's value, in fuel-seconds. */
+  OIL_MAX: 60,
+  /** Tank size on level 1, in fuel-seconds. */
+  TANK_START: 110,
+  /** Tank size once the maze stops growing (`CAP_LEVEL`), in fuel-seconds. */
+  TANK_END: 150,
+  /**
+   * Extra drain per level **past the size cap**. Beyond `CAP_LEVEL` a level cannot get bigger
+   * (`LEVEL.MAX_CELLS` is a single knob), so difficulty comes from the torch burning faster, the
+   * flasks thinning out and the braid rising.
+   */
+  DRAIN_PER_LEVEL_PAST_CAP: 0.02,
+  /** Hard ceiling on the drain multiplier — past this the game is unreadable, not hard. */
+  DRAIN_MAX: 1.35,
+  /**
+   * How far a player who cannot see the maze walks, as a multiple of the optimal route. 2.0 is
+   * the figure the feasibility autopilot is held to: it walks the real solution path and spends
+   * one further path-length on detours.
+   */
+  WANDER: 2,
+  /**
+   * Multiplier on the direct route time for turning, acceleration and wall-scraping overhead.
+   * Mirrors `CORNER_FACTOR` in `src/maze/populate.js` (§2 forbids importing it from here).
+   */
+  TRAVEL_OVERHEAD: 1.18,
+  /**
+   * Headroom on `oilTargetGap`: the placement guarantee is 20 % tighter than the distance a flask
+   * strictly pays for, so a player who arrives at a flask on fumes still has slack for the next leg.
+   */
+  GAP_SAFETY: 0.8,
+  /**
+   * Par-time wander factor. `levelParams().par` is only a **floor** — `src/maze/populate.js` knows
+   * the level's real shortest path and derives the honest par from it — so this stays deliberately
+   * conservative (a competent, non-omniscient run is nearer `WANDER`).
+   */
+  PAR_WANDER: 1,
 });
 
 // ─── Score ───────────────────────────────────────────────────────────────────────────────────
@@ -198,6 +263,14 @@ export const FUEL = Object.freeze({
 /**
  * Score constants. The formulas are fixed by ARCHITECTURE.md §1:
  * `gem = 100 × level`, `clear = 500 × level + floor(fuelRemaining) × 10 × level`.
+ *
+ * ## What the massive-maze change does to the pacing (deliberately left alone)
+ * The clear bonus is dominated by `fuelRemaining`, and the tank no longer grows with the maze, so
+ * clearing a level is worth roughly `500·lv + 1000·lv` however big it is — while gems scale with
+ * area (6 on level 1, 273 at the cap). The mix therefore tips from "get out fast" early to
+ * "explore" deep, which is the right incentive for a 14-minute labyrinth: the fuel bonus rewards
+ * efficiency on a small map and the gems reward covering a big one. The formulas themselves are
+ * pinned by §1 and mirrored in `src/ui/menus.js`, so changing them is an integrator decision.
  * @type {Readonly<Record<string, number>>}
  */
 export const SCORE = Object.freeze({
@@ -251,72 +324,203 @@ export const ATTRACT = Object.freeze({
 // ─── Level progression ───────────────────────────────────────────────────────────────────────
 
 /**
- * Maze size / contents curve.
+ * Maze size / contents curve — **massive mazes** (supersedes the 6×6…40×40 curve).
+ *
+ * Level 1 is 16×16 cells (33×33 tiles, ≈ 4× the area of the old level 1) and every level adds 8
+ * cells per side up to `MAX_CELLS` = 128 (257×257 tiles, 16 384 cells, ≈ 33 000 floor tiles),
+ * reached at `CAP_LEVEL`. Generating **and** validating a 128×128 maze measures ~5 ms, and
+ * `tools/stress.mjs` proves the engine to 2000×2000 cells, so the cap is purely a balance
+ * decision: `MAX_CELLS` is the single documented knob for it.
  * @type {Readonly<Record<string, number>>}
  */
 export const LEVEL = Object.freeze({
-  /** Logical cells per side on level 1 (ARCHITECTURE.md §6). */
-  BASE_CELLS: 6,
+  /** Logical cells per side on level 1. */
+  BASE_CELLS: 16,
   /** Cells added per side per level. */
-  GROWTH: 2,
-  /** Cap on cells per side (§6) — beyond this a level grows in difficulty, not in area. */
-  MAX_CELLS: 40,
-  /** Braid fraction (dead ends removed) once the ramp completes. */
-  BRAID_MAX: 0.25,
-  /** Levels over which braid ramps from 0 to BRAID_MAX. */
-  BRAID_RAMP_LEVELS: 10,
+  GROWTH: 8,
+  /**
+   * Cap on cells per side — **the single size knob**. Past `CAP_LEVEL` a level grows in
+   * difficulty (braid, drain, thinner flasks), never in area.
+   */
+  MAX_CELLS: 128,
+  /** Braid fraction (dead ends opened) once the ramp completes. */
+  BRAID_MAX: 0.6,
+  /**
+   * Levels over which braid ramps from 0 to `BRAID_MAX`. Longer than the size ramp on purpose, so
+   * braid **keeps rising past the size cap** (0.49 at `CAP_LEVEL`, 0.6 from level 18).
+   *
+   * The ramp is steep early for a measured reason: in a *perfect* maze the farthest-cell route
+   * grows ~`side^1.6`, so an unbraided 72×72 level would carry a 3 900-tile route (≈ 48 minutes at
+   * the 2× wander factor) — longer than the level cap. Braiding cuts shortcuts into it and brings
+   * the route back to ≈ `PATH_TILES_PER_SIDE · side`, which is what keeps the curve monotone in
+   * *feel* instead of exploding in the middle. Measured: 72×72 at braid 0 = 3 903 tiles,
+   * at braid 0.25 = 907 (`logs/state-braidlaw.mjs`).
+   */
+  BRAID_RAMP_LEVELS: 17,
+  /**
+   * Shape of the braid ramp: `braid = BRAID_MAX · t^BRAID_RAMP_SHAPE` with `t` the linear ramp
+   * position. Below 1 it front-loads the braid, which is what removes the mid-curve hump the
+   * measurements exposed: with a linear ramp, levels 3–4 carried 765- and 1048-tile routes (up to
+   * 18 minutes) against level 15's 1014, because the maze was still nearly perfect while the side
+   * was already 32–40 cells. A square-root ramp brings those two down to ≈ 490 and ≈ 505 tiles and
+   * leaves the curve rising from ~4 minutes (level 1) to ~14 (the cap).
+   */
+  BRAID_RAMP_SHAPE: 0.5,
   /**
    * Dead ends as a fraction of cells, for a randomized-DFS maze before braiding. Empirically the
-   * recursive backtracker leaves ~10 % of cells as dead ends; item counts are derived from this
-   * estimate so they scale with how much *hiding space* a level actually has.
+   * recursive backtracker leaves ~10 % of cells as dead ends. Item counts no longer derive from
+   * this (they are density-based now), but it is what makes the gem quota *placeable*: at the cap
+   * a braided level still offers ≈ 835 dead ends for ≈ 273 gems.
    */
   DEAD_END_RATIO: 0.1,
-  /** Gems requested per estimated dead end. */
-  GEM_PER_DEAD_END: 0.55,
-  /** Oil flasks requested per estimated dead end. */
-  OIL_PER_DEAD_END: 0.22,
-  /** Clamps on the requested item counts (populate may place fewer if the maze has no room). */
-  GEM_MIN: 4,
-  GEM_MAX: 40,
-  OIL_MIN: 2,
-  OIL_MAX: 14,
+  /**
+   * Optimal route length in tiles per cell-side, at the shipped braid. Measured across the size
+   * curve (`logs/state-braidlaw.mjs`): 16×16 → 321 tiles, 40×40 → 790, 96×96 → 1 060,
+   * 128×128 → 1 100. Used only for *estimates* (par floor, the documented reach arithmetic); the
+   * real path is known to `src/maze/populate.js` and to `Validation.pathLength`.
+   */
+  PATH_TILES_PER_SIDE: 13,
+  /**
+   * How far off the solution path a flask may sit and still count as *reachable* while walking it
+   * (tiles). Mirrors `OIL_BRANCH_RADIUS` in `src/maze/populate.js`: a flask one to three tiles down
+   * a side passage is visible from the route and worth a two-second detour; one six tiles away is
+   * a different expedition. The chainability guarantee is stated in terms of this radius.
+   */
+  OIL_REACH_TILES: 3,
+  /** Cells per oil flask on level 1 (density ≈ one flask per 20 cells). */
+  OIL_CELLS_START: 20,
+  /** Cells per oil flask once the density ramp completes — the flasks thin out with depth. */
+  OIL_CELLS_END: 30,
+  /** Cells per gem on level 1. */
+  GEM_CELLS_START: 50,
+  /** Cells per gem once the density ramp completes. */
+  GEM_CELLS_END: 60,
+  /** Levels over which the item densities ramp from START to END (matches the size ramp). */
+  DENSITY_RAMP_LEVELS: 14,
+  /**
+   * Clamps on the requested item counts (populate may place fewer if the maze has no room).
+   * The maxima are safety rails on memory and on the renderer's sprite list, not balance: the
+   * shipped curve tops out at 546 flasks and 273 gems, so they never bind unless `MAX_CELLS` is
+   * raised past ~150.
+   */
+  GEM_MIN: 6,
+  GEM_MAX: 512,
+  OIL_MIN: 6,
+  OIL_MAX: 768,
 });
+
+/**
+ * The first level at which the maze reaches `LEVEL.MAX_CELLS` cells per side (15 as shipped).
+ * Derived, never typed in twice, so `MAX_CELLS` stays the one size knob.
+ * @type {number}
+ */
+export const CAP_LEVEL =
+  1 + Math.max(0, Math.ceil((LEVEL.MAX_CELLS - LEVEL.BASE_CELLS) / LEVEL.GROWTH));
+
+/**
+ * Coerce an untrusted level number to a 1-based integer. `levelParams` and friends are called from
+ * the UI and from tools as well as from the reducer.
+ * @param {number} level
+ * @returns {number} an integer ≥ 1
+ */
+function levelNumber(level) {
+  return Number.isFinite(level) ? Math.max(1, Math.floor(level)) : 1;
+}
+
+/**
+ * The torch's tank for a level, in fuel-seconds — **independent of the maze's size**.
+ * @param {number} level 1-based
+ * @returns {number} seconds, `FUEL.TANK_START`…`FUEL.TANK_END`
+ */
+export function tankSeconds(level) {
+  const lv = levelNumber(level);
+  // The tank finishes ramping exactly when the maze stops growing, so one knob moves both.
+  return lerp(FUEL.TANK_START, FUEL.TANK_END, clamp01((lv - 1) / Math.max(1, CAP_LEVEL - 1)));
+}
+
+/**
+ * Drain multiplier for a level. 1 up to the size cap; past it the torch burns faster, because a
+ * level that cannot get bigger has to get harder some other way.
+ * @param {number} level 1-based
+ * @returns {number} ≥ 1, at most `FUEL.DRAIN_MAX`
+ */
+export function drainRate(level) {
+  const lv = levelNumber(level);
+  const past = Math.max(0, lv - CAP_LEVEL);
+  return Math.min(FUEL.DRAIN_MAX, 1 + past * FUEL.DRAIN_PER_LEVEL_PAST_CAP);
+}
+
+/**
+ * Tiles of *travel* the player can cover with `seconds` of fuel, at walking speed and including
+ * the turning/acceleration overhead.
+ * @param {number} seconds fuel-seconds
+ * @param {number} [drain=1] the level's drain multiplier
+ * @returns {number} tiles
+ */
+export function travelTiles(seconds, drain = 1) {
+  const s = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
+  const d = Number.isFinite(drain) && drain > 0 ? drain : 1;
+  return (s * PLAYER.WALK_SPEED) / (FUEL.TRAVEL_OVERHEAD * d);
+}
+
+/**
+ * Estimated optimal route of a level, in tiles. See `LEVEL.PATH_TILES_PER_SIDE`.
+ * @param {number} level 1-based
+ * @returns {number} tiles (≥ 1)
+ */
+export function estimatedPathTiles(level) {
+  const lv = levelNumber(level);
+  const side = Math.min(LEVEL.MAX_CELLS, LEVEL.BASE_CELLS + (lv - 1) * LEVEL.GROWTH);
+  return Math.max(1, Math.round(side * LEVEL.PATH_TILES_PER_SIDE));
+}
 
 /**
  * Per-level maze parameters (ARCHITECTURE.md §4.2).
  *
- * `fuelSeconds` here is a **size-based budget**: base + cells × per-cell, with the per-cell rate
- * decaying as the player descends. `src/maze/populate.js` may refine it once the real solution
- * path is known, using `fuelBase + pathLength × fuelPerPathTile`; both are returned so the two
- * sites cannot drift. The extra fields are additive — the seven contract fields are unchanged.
+ * `fuelSeconds` is now the **tank** (see `FUEL`): a fixed number of seconds the torch holds, not a
+ * budget for the level. `oilTargetGap`, `oilDensity` and `gemDensity` are what `src/maze/populate.js`
+ * needs to place the economy: scatter by density over the *area*, and never leave a stretch of the
+ * solution path longer than `oilTargetGap` tiles without a reachable flask.
  *
- * Total ordering guarantees (relied on by tests and by the difficulty curve):
- * size is non-decreasing in `level`, braid is non-decreasing, per-cell fuel is non-increasing.
+ * Total ordering guarantees (relied on by tests and by the difficulty curve): size is
+ * non-decreasing in `level`, braid is non-decreasing, the tank is non-decreasing, drain is
+ * non-decreasing, and per-cell fuel is non-increasing (the tank grows far more slowly than the area).
  *
  * @param {number} level 1-based level number; non-finite or < 1 is treated as 1
  * @returns {{cols:number, rows:number, braid:number, gems:number, oil:number, fuelSeconds:number,
- *   par:number, fuelBase:number, fuelPerCell:number, fuelPerPathTile:number, cells:number}}
+ *   par:number, fuelBase:number, fuelPerCell:number, fuelPerPathTile:number, cells:number,
+ *   drain:number, oilTargetGap:number, oilDensity:number, gemDensity:number,
+ *   oilRefuelSeconds:number, pathTiles:number}}
  */
 export function levelParams(level) {
-  // Defensive coercion: this is called from UI/tools as well as the reducer.
-  const lv = Number.isFinite(level) ? Math.max(1, Math.floor(level)) : 1;
+  const lv = levelNumber(level);
 
   const side = Math.min(LEVEL.MAX_CELLS, LEVEL.BASE_CELLS + (lv - 1) * LEVEL.GROWTH);
   const cells = side * side;
 
-  const braid = clamp01((lv - 1) / LEVEL.BRAID_RAMP_LEVELS) * LEVEL.BRAID_MAX;
+  const braid =
+    Math.pow(clamp01((lv - 1) / LEVEL.BRAID_RAMP_LEVELS), LEVEL.BRAID_RAMP_SHAPE) * LEVEL.BRAID_MAX;
 
-  // Braiding removes dead ends, so the item budget shrinks with it — fewer hiding places.
-  const deadEnds = cells * LEVEL.DEAD_END_RATIO * (1 - braid);
-  const gems = clamp(Math.round(deadEnds * LEVEL.GEM_PER_DEAD_END), LEVEL.GEM_MIN, LEVEL.GEM_MAX);
-  const oil = clamp(Math.round(deadEnds * LEVEL.OIL_PER_DEAD_END), LEVEL.OIL_MIN, LEVEL.OIL_MAX);
+  // Density ramp: t = 0 on level 1, 1 once the maze has stopped growing.
+  const t = clamp01((lv - 1) / LEVEL.DENSITY_RAMP_LEVELS);
+  const oilDensity = 1 / lerp(LEVEL.OIL_CELLS_START, LEVEL.OIL_CELLS_END, t);
+  const gemDensity = 1 / lerp(LEVEL.GEM_CELLS_START, LEVEL.GEM_CELLS_END, t);
+  const gems = clamp(Math.round(cells * gemDensity), LEVEL.GEM_MIN, LEVEL.GEM_MAX);
+  const oil = clamp(Math.round(cells * oilDensity), LEVEL.OIL_MIN, LEVEL.OIL_MAX);
 
-  // Difficulty ramp: t = 0 on level 1, 1 once DECAY_LEVELS levels have been cleared.
-  const t = clamp01((lv - 1) / FUEL.DECAY_LEVELS);
-  const fuelPerCell = lerp(FUEL.PER_CELL_START, FUEL.PER_CELL_END, t);
-  const fuelPerPathTile = lerp(FUEL.PER_PATH_TILE_START, FUEL.PER_PATH_TILE_END, t);
-  const fuelSeconds = Math.round(FUEL.BASE_SECONDS + cells * fuelPerCell);
-  const par = Math.round(fuelSeconds * FUEL.PAR_FRACTION);
+  const fuelSeconds = Math.round(tankSeconds(lv));
+  const drain = drainRate(lv);
+  const pathTiles = estimatedPathTiles(lv);
+
+  // One flask buys `travelTiles(oilFuel(tank))` tiles of walking; at WANDER× the optimal route
+  // that is `/ WANDER` tiles of *path*, and the guarantee keeps GAP_SAFETY in hand.
+  const oilTargetGap = Math.max(
+    1,
+    Math.floor((travelTiles(oilFuel(fuelSeconds), drain) / FUEL.WANDER) * FUEL.GAP_SAFETY),
+  );
+
+  // Par is a floor only (see FUEL.PAR_WANDER): the direct traversal time of the estimated route.
+  const par = Math.round((pathTiles * FUEL.PAR_WANDER * FUEL.TRAVEL_OVERHEAD) / PLAYER.WALK_SPEED);
 
   return {
     cols: side,
@@ -326,10 +530,18 @@ export function levelParams(level) {
     oil,
     fuelSeconds,
     par,
-    fuelBase: FUEL.BASE_SECONDS,
-    fuelPerCell,
-    fuelPerPathTile,
+    // Retained §4.2 fields, now *derived from* the tank rather than inputs to it: the whole tank is
+    // the flat budget, and the two rates are what it works out to per cell / per path tile.
+    fuelBase: fuelSeconds,
+    fuelPerCell: fuelSeconds / cells,
+    fuelPerPathTile: fuelSeconds / pathTiles,
     cells,
+    drain,
+    oilTargetGap,
+    oilDensity,
+    gemDensity,
+    oilRefuelSeconds: oilFuel(fuelSeconds),
+    pathTiles,
   };
 }
 
@@ -368,19 +580,51 @@ export function oilFuel(fuelMax) {
   return clamp(max * FUEL.OIL_FRACTION, FUEL.OIL_MIN, FUEL.OIL_MAX);
 }
 
+/**
+ * The tank a level actually starts with, given what the level data offers.
+ *
+ * `src/state` owns the tank now. A `LevelData` may hand the sim a **smaller** one — a tutorial
+ * maze, the title demo, a test fixture — but never a larger one: the torch economy's whole premise
+ * is a small tank that is independent of maze area, and `src/maze/populate.js` still derives a
+ * path-sized budget (`fuelBudget`) that would be ~650 s on a 128×128 level. Clamping here means the
+ * two modules cannot drift into an unbalanced game, whichever one is re-tuned first.
+ *
+ * @param {number} level 1-based level number
+ * @param {number} [offered] `LevelData.fuel` as built by `src/maze`; ignored when not a positive
+ *   finite number
+ * @returns {number} fuel-seconds > 0
+ */
+export function resolveTank(level, offered) {
+  const tank = Math.round(tankSeconds(level));
+  if (typeof offered !== 'number' || !Number.isFinite(offered) || offered <= 0) return tank;
+  return Math.min(offered, tank);
+}
+
 // ─── Settings ────────────────────────────────────────────────────────────────────────────────
 
 /**
- * Validation spec for every `Settings` key. `min`/`max` apply to numbers only; `def` is both the
- * factory default and the fallback for a value that cannot be coerced.
- * @type {Readonly<Record<string, {kind:'number'|'boolean', def:number|boolean, min?:number, max?:number}>>}
+ * Legal values of `settings.mapMode`, in cycle order. Mirrors `MAP_MODES` in `src/ui/map.js`
+ * (§2 forbids `src/ui` from importing this file, so the list exists on both sides); the UI owns the
+ * behaviour of each state, `src/state` only owns persisting the choice.
+ * @type {ReadonlyArray<string>}
+ */
+export const MAP_MODES = Object.freeze(['off', 'corner', 'full']);
+
+/**
+ * Validation spec for every `Settings` key. `min`/`max` apply to numbers only, `values` to enums;
+ * `def` is both the factory default and the fallback for a value that cannot be coerced.
+ * @type {Readonly<Record<string, {kind:'number'|'boolean'|'enum', def:number|boolean|string, min?:number, max?:number, values?:ReadonlyArray<string>}>>}
  */
 export const SETTING_SPEC = Object.freeze({
   volume: Object.freeze({ kind: 'number', def: 0.8, min: 0, max: 1 }),
   music: Object.freeze({ kind: 'number', def: 0.55, min: 0, max: 1 }),
   sensitivity: Object.freeze({ kind: 'number', def: 1, min: 0.2, max: 3 }),
   scanlines: Object.freeze({ kind: 'boolean', def: true }),
+  // Legacy two-state switch, kept in lockstep with `mapMode` by main.js and the options row: audio,
+  // touch and any older call site still read it, and dropping it would silently change their
+  // behaviour. `mapMode` is the value the three-state map actually restores from.
   minimap: Object.freeze({ kind: 'boolean', def: true }),
+  mapMode: Object.freeze({ kind: 'enum', def: 'corner', values: MAP_MODES }),
   reducedMotion: Object.freeze({ kind: 'boolean', def: false }),
   invertLook: Object.freeze({ kind: 'boolean', def: false }),
 });
@@ -398,12 +642,14 @@ export const SETTING_KEYS = Object.freeze(
  *
  * Numbers are clamped into range (non-finite → the default). Booleans accept `true`/`false` and
  * `1`/`0` (the shapes a URL parameter or a persisted JSON can take) and reject everything else, so
- * a garbage `setSetting` is ignored instead of writing `"yes"` into the state.
+ * a garbage `setSetting` is ignored instead of writing `"yes"` into the state. Enums accept only a
+ * string listed in `spec.values` — an unknown one is rejected rather than snapped to the default,
+ * because silently rewriting a value the caller chose is worse than ignoring it.
  *
  * @param {string} key a `Settings` property name
  * @param {unknown} value candidate value
- * @returns {number|boolean|undefined} the coerced value, or `undefined` if the key is unknown or
- *   the value cannot be coerced (the caller must then leave the setting untouched)
+ * @returns {number|boolean|string|undefined} the coerced value, or `undefined` if the key is unknown
+ *   or the value cannot be coerced (the caller must then leave the setting untouched)
  */
 export function coerceSetting(key, value) {
   const spec = Object.prototype.hasOwnProperty.call(SETTING_SPEC, key)
@@ -414,6 +660,11 @@ export function coerceSetting(key, value) {
     if (value === true || value === 1) return true;
     if (value === false || value === 0) return false;
     return undefined;
+  }
+  if (spec.kind === 'enum') {
+    if (typeof value !== 'string') return undefined;
+    const values = spec.values;
+    return values !== undefined && values.indexOf(value) >= 0 ? value : undefined;
   }
   if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
   return clamp(value, /** @type {number} */ (spec.min), /** @type {number} */ (spec.max));
@@ -430,6 +681,9 @@ export function defaultSettings() {
     sensitivity: /** @type {number} */ (SETTING_SPEC.sensitivity.def),
     scanlines: /** @type {boolean} */ (SETTING_SPEC.scanlines.def),
     minimap: /** @type {boolean} */ (SETTING_SPEC.minimap.def),
+    mapMode: /** @type {import('../core/types.js').MapMode} */ (
+      /** @type {any} */ (SETTING_SPEC.mapMode.def)
+    ),
     reducedMotion: /** @type {boolean} */ (SETTING_SPEC.reducedMotion.def),
     invertLook: /** @type {boolean} */ (SETTING_SPEC.invertLook.def),
   };

@@ -59,14 +59,33 @@ const log = createLogger('main');
 
 // ─── Tuning (composition-root feel; gameplay numbers live in state/balance.js) ────────────────
 
-/** Logical size of the maze the attract camera wanders on the title screen. */
-const DEMO_LEVEL = 3;
+/**
+ * Level whose parameters build the maze the attract camera wanders on the title screen.
+ *
+ * 1, deliberately, now that level 1 is 16×16 cells (33×33 tiles): that is already a substantial
+ * labyrinth for a camera that walks one corridor at a time, it stays under the maze client's
+ * 400-cell worker threshold so the title costs no worker spin-up at boot, and it keeps the title's
+ * item/torch load — the things the renderer sorts every frame — at its smallest.
+ */
+const DEMO_LEVEL = 1;
 
 /** Fixed seed for the title maze, so the title screen is identical every load (and screenshotable). */
 const DEMO_SEED = 0xa11a2e;
 
 /** Seconds before a level that has not arrived is requested again. */
 const LOAD_TIMEOUT_S = 12;
+
+/**
+ * Minimum time the loading screen stays up, in seconds.
+ *
+ * A 128×128-cell level is built in a worker and comes back in ~25–60 ms, so without this the
+ * loading screen would exist for three frames: the iris would start closing, snap back open, and
+ * the banner naming the depth and the size of the labyrinth you are about to enter would never be
+ * readable. Holding the answer for {@link MIN_LOAD_S} lets the iris complete its wipe and gives the
+ * player the one moment in the loop where the game tells them how big this one is. It is a *floor*
+ * on the loading phase, never a delay added to a slow build.
+ */
+const MIN_LOAD_S = 0.8;
 
 /** Iris open/close rates, 1/s (the level-transition wipe of §1). */
 const IRIS_OPEN_RATE = 2.4;
@@ -247,6 +266,15 @@ function boot() {
   let loadWait = 0;
   /** Retries used for the level currently loading. */
   let loadRetries = 0;
+  /**
+   * A built level waiting for {@link MIN_LOAD_S} to elapse before it is installed.
+   * Holding the *data* rather than delaying the *request* means the build still starts immediately
+   * and a slow build is never made slower.
+   * @type {LevelData|null}
+   */
+  let pendingLevel = null;
+  /** The build token `pendingLevel` belongs to, so a superseded answer is still dropped. */
+  let pendingToken = -1;
 
   /**
    * Per-level seed. Derived from the run seed through a named fork so levels differ within a run
@@ -269,12 +297,18 @@ function boot() {
     const level = st.level;
     const token = ++buildToken;
     loadWait = 0;
+    pendingLevel = null;
+    pendingToken = -1;
     const seed = (seedForLevel(st.seed, level) + (salt || 0)) >>> 0;
     mazeClient.build(levelParams(level), seed).then(
       (data) => {
         if (token !== buildToken) return; // a newer request superseded this one
         if (store.getState().phase !== 'loading') return; // the player left the loading screen
-        store.dispatch({ type: 'levelReady', data });
+        // Queue it for `step()` rather than installing it here. Two reasons: the loading screen
+        // gets its MIN_LOAD_S, and `levelReady` is O(items) + a 66 kB allocation at the size cap,
+        // which belongs on a sim step rather than in a promise callback landing mid-render.
+        pendingLevel = data;
+        pendingToken = token;
       },
       (err) => {
         if (token !== buildToken) return;
@@ -444,6 +478,7 @@ function boot() {
     appliedSettings.invertLook = settings.invertLook;
     appliedSettings.scanlines = settings.scanlines;
     appliedSettings.minimap = settings.minimap;
+    appliedSettings.mapMode = settings.mapMode;
     appliedSettings.reducedMotion = settings.reducedMotion;
     persist(store.getState());
   }
@@ -505,7 +540,12 @@ function boot() {
       store.dispatch({ type: 'pause' });
     }
     if (pressed.has('map')) {
-      store.dispatch({ type: 'setSetting', key: 'minimap', value: !state.settings.minimap });
+      // Three states now (§4.6): OFF → CORNER → FULL. The HUD owns the cycle because it owns the
+      // overlay that draws it; main.js only persists the result. Both keys are written: `mapMode`
+      // is what the map restores from, `minimap` is the legacy mirror other consumers still read.
+      const mode = hud.cycleMap(state.settings);
+      store.dispatch({ type: 'setSetting', key: 'mapMode', value: mode });
+      store.dispatch({ type: 'setSetting', key: 'minimap', value: mode !== 'off' });
     }
     if (pressed.has('mute')) {
       const on = state.settings.volume > 0;
@@ -668,13 +708,27 @@ function boot() {
     // phase machine has no exit from `loading` (documented in ARCHITECTURE.md §4.2).
     if (store.getState().phase === 'loading') {
       loadWait += dt;
-      if (loadWait > LOAD_TIMEOUT_S) {
+      if (pendingLevel !== null) {
+        // A built level is in hand — install it once the loading screen has had its moment. The
+        // token is re-checked here because a retry may have superseded this answer while it waited.
+        if (loadWait >= MIN_LOAD_S) {
+          const data = pendingLevel;
+          const token = pendingToken;
+          pendingLevel = null;
+          pendingToken = -1;
+          if (token === buildToken) store.dispatch({ type: 'levelReady', data });
+        }
+      } else if (loadWait > LOAD_TIMEOUT_S) {
         log.error('level build timed out; retrying');
         loadRetries = 0;
         requestLevel(loadWait | 0);
       }
     } else {
       loadWait = 0;
+      // Leaving `loading` any other way (a retry, quitting to the title) abandons the answer, so a
+      // level built for a run the player already left can never be installed later.
+      pendingLevel = null;
+      pendingToken = -1;
     }
   }
 
@@ -766,6 +820,11 @@ function boot() {
       stats: () => loop.stats(),
       renderStats: () => raycaster.stats(),
       audioStats: () => audio.stats(),
+      // Which menu screen is up. A tool driving the menus through the real input path has no other
+      // way to know whether a keypress landed, and "the options screen opened" is exactly the kind
+      // of thing a gate should assert rather than assume.
+      screen: () => menus.screen(),
+      mapMode: () => hud.mapMode(store.getState().settings),
       errors,
       loop,
       input: {

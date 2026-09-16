@@ -33,14 +33,21 @@ const timeParam = params.get('t');
 const frozen = timeParam !== null;
 const levelParam = Number(params.get('level') || '3');
 const lowFuel = params.get('low') === '1';
-const showMinimap = params.get('minimap') !== '0';
+const mapParam = params.get('map');
+/** Cells per side of the demo maze. `?cells=128` shoots the 128×128 cap — the worst case. */
+const cellsParam = Number(params.get('cells') || '24');
 const reducedMotion = params.get('reduced') === '1';
 const showHint = params.get('hint') === '1';
 
 // ─── A hand-built level ──────────────────────────────────────────────────────────────────────
 
-/** Logical cells per side of the demo maze. 10 gives a 21×21 tile map — a realistic minimap. */
-const CELLS = 10;
+/**
+ * Logical cells per side of the demo maze.
+ *
+ * The default (24) is depth 2 of the shipped curve; `?cells=128` builds the 128×128 cap — 257×257
+ * tiles, the worst case the map has to stay legible and under a millisecond at.
+ */
+const CELLS = Number.isFinite(cellsParam) ? clamp(Math.round(cellsParam), 4, 200) : 24;
 /** Tile map size for a "thick wall" maze of `CELLS` cells (ARCHITECTURE.md §6). */
 const MAP_W = CELLS * 2 + 1;
 const MAP_H = CELLS * 2 + 1;
@@ -131,7 +138,11 @@ const items = (() => {
   const out = [];
   const rng = createRng(0xbeef);
   let id = 1;
-  for (let i = 0; i < 14; i++) {
+  // Density, not a fixed handful: the shipped curve puts one flask per ~20 cells and one gem
+  // per ~50, so a 128-cell level carries ~900 items. The preview matches that, because "nothing
+  // may be O(items) per frame" is only tested by actually having the items.
+  const wanted = Math.max(8, Math.round((CELLS * CELLS) / 16));
+  for (let i = 0; i < wanted; i++) {
     for (let tries = 0; tries < 40; tries++) {
       const tx = 1 + rng.int(MAP_W - 2);
       const ty = 1 + rng.int(MAP_H - 2);
@@ -196,7 +207,7 @@ const state = {
   seed: 0x5eed,
   levelData: /** @type {any} */ (levelData),
   player: { x: 1.5, y: 1.5, angle: 0, px: 1.5, py: 1.5, pangle: 0, vx: 0, vy: 0, bob: 0, bobAmp: 0, shake: 0 },
-  explored: floodExplored(110),
+  explored: floodExplored(Math.round(MAP_W * MAP_H * 0.45)),
   run: {
     score: 4820,
     gems: 7,
@@ -207,6 +218,10 @@ const state = {
     totalTime: 320,
     levelScore: 0,
     bestCombo: 3,
+    // Optional fields the end screens show when `src/state` carries them (see the integrator note
+    // for this wave). The preview supplies them so the four-row summary layout is exercised.
+    refuels: 4,
+    distance: 1240,
   },
   best: { score: 12750, level: 6 },
   settings: {
@@ -214,7 +229,7 @@ const state = {
     music: 0.55,
     sensitivity: 1,
     scanlines: true,
-    minimap: showMinimap,
+    minimap: mapParam !== 'off',
     reducedMotion,
     invertLook: false,
   },
@@ -228,7 +243,7 @@ const backCanvas = /** @type {HTMLCanvasElement} */ (document.getElementById('ba
 const overlay = /** @type {HTMLCanvasElement} */ (document.getElementById('overlay'));
 const hintEl = document.getElementById('hint');
 
-const hud = createHud(overlay);
+const hud = createHud(overlay, mapParam === null ? undefined : { map: /** @type {any} */ (mapParam) });
 const menus = createMenus(overlay, {
   onNewGame: () => {
     state.phase = 'loading';
@@ -654,9 +669,16 @@ function step(dt) {
   if (showHint && hintEl !== null) {
     hintEl.hidden = false;
     const m = hud.surface.metrics;
+    const ms = hud.mapStats();
     hintEl.textContent =
-      `screen ${menus.screen()}  phase ${state.phase}\n` +
-      `ui ${m.w}x${m.h} @${m.px}  u${m.u}  dpr${(m.devW / m.cssW).toFixed(2)}\n` +
+      `screen ${menus.screen()}  phase ${state.phase}  map ${hud.mapMode(state.settings)}
+` +
+      `ui ${m.w}x${m.h} @${m.px}  u${m.u}  dpr${(m.devW / m.cssW).toFixed(2)}
+` +
+      `maze ${CELLS}x${CELLS} (${MAP_W}x${MAP_H} tiles)  items ${items.length}
+` +
+      `map upd ${ms.updateMs.toFixed(3)}ms draw ${ms.drawMs.toFixed(3)}ms  scan ${ms.scanned} paint ${ms.painted} seen ${ms.explored}/${ms.tiles}
+` +
       `sfx ${uiSounds.join(' ')}`;
   }
 }
@@ -693,4 +715,14 @@ if (frozen) {
   step,
   sfx: uiSounds,
   sfxCount: () => uiSoundCount,
+  /** Map cost accounting, for the screenshot driver's performance assertions. */
+  mapStats: () => hud.mapStats(),
+  /** Force a map state without walking the options screen. */
+  setMap: (mode) => {
+    let now = hud.mapMode(state.settings);
+    for (let i = 0; i < 3 && now !== mode; i++) now = hud.cycleMap(state.settings);
+    return now;
+  },
+  /** What the demo level actually is, so the driver can label its measurements. */
+  maze: { cells: CELLS, tiles: MAP_W, items: items.length },
 };

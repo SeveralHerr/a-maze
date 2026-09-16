@@ -1,52 +1,82 @@
 // @ts-check
 /**
- * @file Level population: gems, oil flasks, wall torches, and the fuel/par budget
+ * @file Level population: oil flasks, gems, wall torches, and the torch **tank** + par budget
  * (ARCHITECTURE.md §4.4). Pure, deterministic, Node- and worker-safe.
  *
  * Everything here is a function of `(maze, validation, params, seed)` only — no clocks, no
  * `Math.random`, no DOM — so a level is byte-identical on every machine and can be rebuilt from a
  * seed instead of stored.
  *
- * ## Placement rules (the "why", the "what" is in each function)
- * - **Gems** go at dead ends, farthest from the start first: the reward for the risk of leaving
- *   the solution path. Never on the first three tiles of the path (no free points for standing
- *   still), never on the start or exit tile, and spread out so a single dead end never holds two.
- * - **Oil flasks** sit on *branches off* the solution path, at even intervals along it. A player
- *   who runs straight for the exit can still see and grab them with a short detour, so the fuel
- *   economy is a choice ("is that two-second detour worth it?") rather than a lottery.
- * - **Torches** are mounted on corridor walls at least `TORCH_SPACING` tiles apart, so the
+ * ## The massive-maze torch economy (why this file was rewritten)
+ * Levels now run from 16×16 cells (33×33 tiles) to 128×128 cells (257×257 tiles, 16 384 cells,
+ * ~33 000 floor tiles). A tank sized to cover a whole level would turn a 20-minute labyrinth into
+ * one long countdown that is decided in its first minute. So the torch is a **small tank you must
+ * keep refilling**:
+ *
+ * - `fuel` is a **tank size**, independent of maze area (~110 s early, ~150 s at the size cap).
+ *   `src/state/balance.js` owns the curve and passes it as `params.fuelSeconds`; this file only
+ *   supplies a documented fallback for callers that do not (tests, tools, the title demo).
+ * - **Oil flasks are the economy.** Their count scales with *area* so their density is roughly
+ *   constant (~1 per 20 cells early, thinning to ~1 per 30 at the cap), and each restores ~35 % of
+ *   the tank. The player therefore meets the "I need oil" moment every 60–90 s at every maze size.
+ * - The **refuel chain** below is the guarantee that makes that fair.
+ *
+ * ## Placement rules (the "why"; the "what" is on each function)
+ * - **Oil flasks** are placed in two passes. The *chain* pass walks the solution path and drops a
+ *   flask (on the path, or on a side passage within {@link OIL_BRANCH_RADIUS} tiles of it) before
+ *   the gap since the last one could ever exceed the tank's honest reach. The *scatter* pass then
+ *   tops the level up to its density quota, preferring branches just off the route, so exploring
+ *   pays and the route itself is never a fuel desert.
+ * - **Gems** are the score currency: dead ends first, then tiles far from the solution path — the
+ *   reward for the risk of leaving the route. They are scattered by area density so a 128×128 maze
+ *   is not a 16×16 maze with the same handful of gems in it.
+ * - **Torches** are mounted on corridor walls at least {@link TORCH_SPACING} tiles apart, so the
  *   renderer's point lights never stack up into a flat, evenly lit room, and so the count stays
  *   proportional to floor area rather than to tile count.
  *
- * ## Fuel budget formula (the guarantee this module owes the game)
- * The torch *is* the timer, so the fuel handed to a level has to be tied to that level's actual
- * shortest route, not to its nominal size — two 24×24 mazes can differ by 3× in path length.
+ * ## THE REFUEL CHAIN GUARANTEE (proof)
+ * Let
+ *   - `T`  = tank size in seconds (`fuel`),
+ *   - `R`  = seconds one flask restores (~0.35·T, clamped — mirrors `FUEL.OIL_*` in balance.js),
+ *   - `spt` = fuel-seconds burned per tile actually walked = `c/v · drain`, where `v` =
+ *            {@link WALK_SPEED}, `c` = {@link CORNER_FACTOR} (turn/accel overhead) and `drain` is
+ *            the level's torch-drain multiplier (1 up to the size cap, `params.drain` past it),
+ *   - `w`  = {@link WANDER_FACTOR} = 2.0, the "competent player who cannot see the maze" factor:
+ *            advancing one tile *along the solution path* costs `w` tiles of actual walking,
+ *   - `k`  ≤ {@link OIL_BRANCH_RADIUS} = the flask's distance off the path (walked out and back, so
+ *            `2k` extra tiles, at no wander penalty — the player can see the flask by then).
  *
- *     directTime = pathLength · CORNER_FACTOR / WALK_SPEED          (seconds, no pickups, no detours)
- *     usage      = clamp(USAGE_COEFF · pathLength^USAGE_EXPONENT, USAGE_MIN, USAGE_MAX)
- *     fuel       = max(directTime / usage, MIN_FUEL)
+ * Advancing `d` path tiles and detouring `k` off it costs `t(d,k) = (d·w + 2k)·spt` fuel-seconds.
+ * The chain pass places flasks so that **every** consecutive pair — and the start→first and
+ * last→exit segments — satisfies
  *
- * `usage` is the fraction of the starting fuel a flawless direct run burns. It *rises* with path
- * length (exponent < 1 ⇒ fuel grows more slowly than the route), which is precisely the difficulty
- * ramp the design asks for:
+ *     Δq = (path index advanced) ≤ G,   where  G = ⌊(R·S/spt − 2·OIL_BRANCH_RADIUS) / w⌋
  *
- * | level | maze  | typical path | usage |
- * |-------|-------|--------------|-------|
- * | 1     | 6×6   | ~55 tiles    | ~50 % |
- * | 5     | 14×14 | ~167 tiles   | ~76 % |
- * | 10    | 24×24 | ~250 tiles   | ~85 % |
- * | 11+   | 26×26+| ≥ 277 tiles  | 88 % (ceiling) |
+ * (`S` = {@link CHAIN_SAFETY}; `G` is `params.oilTargetGap` when the state module supplies a
+ * *tighter* one — see {@link resolveGap}). By construction `t(G, k) ≤ R·S ≤ R` for every `k ≤ 3`.
  *
- * The level-1 bound is *provable*, not statistical: a shortest path is simple, so it visits each
- * of the 36 cells at most once and `pathLength ≤ 2·36−1 = 71` tiles; with the constants below,
- * `usage(71) = 54.9 % ≤ 55 %`. `USAGE_MAX = 0.88` keeps even a 40×40 outlier maze winnable
- * without a single pickup, leaving gems and oil as score/fuel *upside* rather than a requirement.
+ * **Claim.** A player who walks the solution path with wander factor `w` and takes each chain flask
+ * never runs dry.
+ * **Proof.** Induction over the chain. Fuel at the start (q = 0) is `T`. If fuel on reaching flask
+ * `i` is `T`, the walk to flask `i+1` costs `t(Δq, k) ≤ R ≤ 0.35·T < T`, so the player arrives with
+ * `T − t ≥ T − R > 0` — never zero — and the flask restores `min(T, (T−t) + R) = T`, re-establishing
+ * the hypothesis. The final segment costs `≤ R` as well, so the exit is reached with `≥ T − R > 0`. ∎
  *
- * `WALK_SPEED` and `CORNER_FACTOR` are gameplay constants that duplicate knowledge owned by
+ * Two notes on rigour. (1) The flask a player actually picks up first is the one reachable at the
+ * *smallest* path index, which is exactly what {@link nearestPathFrom} measures, so placement and
+ * verification agree on where a flask "is". (2) Extra scatter flasks can only shrink a gap: they
+ * split `Δq` and add fuel, and fuel is clamped to the tank, so they can never invalidate the chain.
+ * `tools/validate-mazes.mjs` re-checks both the gap bound and a walked-fuel simulation for levels
+ * 1..30 across ≥ 25 seeds each; a level where the chain cannot be walked is a release blocker.
+ *
+ * ## Cost at the gameplay maximum (128×128 cells = 257×257 tiles)
+ * Four `Int32Array(width·height)` scratch buffers (~1 MB, all released on return), a handful of
+ * O(tiles) passes, and ≤ {@link MAX_ITEMS_PER_KIND} items per kind. No pass is O(items²).
+ *
+ * `WALK_SPEED`, `CORNER_FACTOR` and the oil-refuel constants duplicate knowledge owned by
  * `src/state/balance.js`; `src/maze` may not import `src/state` (ARCHITECTURE.md §2), so they live
- * here as documented, independently tunable values. If balance.js changes the player's speed, the
- * override path below (`params.fuelSeconds`) exists so the state module can impose its own budget
- * without this file changing.
+ * here as documented, independently tunable **mirrors**. `params.fuelSeconds`, `params.oilRefuelSeconds`
+ * and `params.oilTargetGap` are the seams through which the state module overrides them.
  */
 
 import { createRng, hash2 } from '../core/rng.js';
@@ -56,17 +86,30 @@ import { TILE, DIR_COUNT, DIR_DX, DIR_DY, DIR_OPPOSITE } from './constants.js';
 /** @typedef {import('../core/types.js').Maze} Maze */
 /** @typedef {import('../core/types.js').Validation} Validation */
 /** @typedef {import('../core/types.js').Item} Item */
+/** @typedef {import('../core/types.js').ItemKind} ItemKind */
 /** @typedef {import('../core/types.js').Torch} Torch */
 
 /**
- * Tuning knobs for {@link populateLevel}. Extra properties (the rest of the §4.4 `params` object)
- * are ignored.
+ * Tuning knobs for {@link populateLevel}, as produced by `levelParams(level)` in
+ * `src/state/balance.js`. **Every field is optional**: this module is never blocked by a state
+ * module that has not shipped a field yet, it falls back to the documented curves below. Extra
+ * properties are ignored.
  * @typedef {Object} PopulateParams
- * @property {number} [gems=0]        number of gems to place
- * @property {number} [oil=0]         number of oil flasks to place
- * @property {number} [fuelSeconds=0] optional floor for the computed fuel budget, in seconds;
- *   ≤ 0 or non-finite means "derive it entirely from the path" (the normal case)
- * @property {number} [par=0]         optional floor for the computed par time, in seconds
+ * @property {number} [cells]        logical cell count (`cols·rows`); only used to size fallbacks
+ * @property {number} [gems]         gem count. Preferred over `gemDensity` — see {@link resolveCount}
+ * @property {number} [oil]          flask count, a **floor**: the refuel chain may place more when
+ *   the level needs them
+ * @property {number} [gemDensity]   gems per cell (≤ 1) **or** cells per gem (> 1); used when no
+ *   explicit `gems` is given
+ * @property {number} [oilDensity]   flasks per cell (≤ 1) **or** cells per flask (> 1); used when no
+ *   explicit `oil` is given
+ * @property {number} [oilTargetGap] maximum path tiles between consecutive reachable flasks. Honoured
+ *   when it is *tighter* than this module's sustainable bound (see {@link resolveGap}).
+ * @property {number} [oilRefuelSeconds] seconds one flask restores (mirror of `oilFuel(fuelMax)`)
+ * @property {number} [drain]        torch-drain multiplier (> 1 past the size cap); 1 when absent
+ * @property {number} [fuelSeconds]  **the tank size in seconds.** ≤ 0 or non-finite ⇒ use the
+ *   fallback curve in {@link tankFor}
+ * @property {number} [par=0]        floor for the derived par time, in seconds
  */
 
 /**
@@ -75,36 +118,92 @@ import { TILE, DIR_COUNT, DIR_DX, DIR_DY, DIR_OPPOSITE } from './constants.js';
  * @typedef {Object} Population
  * @property {Item[]} items
  * @property {Torch[]} torches
- * @property {number} fuel
+ * @property {number} fuel    tank size in seconds (`run.fuelMax`)
  * @property {number} par
  */
 
-/** Nominal sustained walking speed, tiles per second (no sprint). Mirrors src/state/balance.js. */
+/**
+ * Fuel/par budget and the numbers the refuel chain is built from.
+ * @typedef {Object} FuelBudget
+ * @property {number} fuel       tank size, seconds
+ * @property {number} par        target completion time, seconds (a `w`-wander run down the path)
+ * @property {number} directTime seconds a *perfect* run down the solution path takes
+ * @property {number} usage      `directTime / fuel` — **tanks burned by a perfect run.** Above 1.0
+ *   for any large maze; that is the design, not a bug (the player refuels on the way).
+ * @property {number} reach      path tiles one full tank covers at `WANDER_FACTOR` and this level's drain
+ * @property {number} refuel     seconds one flask restores
+ * @property {number} gap        the refuel-chain gap actually used, in path tiles
+ */
+
+// ─── Mirrored gameplay constants (see the file header) ───────────────────────────────────────
+
+/** Nominal sustained walking speed, tiles per second (no sprint). Mirrors `PLAYER.WALK_SPEED`. */
 const WALK_SPEED = 3.2;
 
 /** Multiplier on the direct route time for turning, acceleration and wall-hugging overhead. */
 const CORNER_FACTOR = 1.18;
 
-/** Coefficient of the usage curve — calibrated so a worst-case 6×6 level 1 lands at 54.9 %. */
-const USAGE_COEFF = 0.1255;
+/**
+ * How much a competent player who cannot see the maze actually walks per tile of progress along
+ * the solution path. 2.0 = "one wrong turn, discovered and reversed, per corridor". Every fuel
+ * promise in this file is made at this factor; the validator re-checks them at it.
+ */
+const WANDER_FACTOR = 2;
 
-/** Exponent of the usage curve — < 1, so deeper (longer) levels get proportionally less fuel. */
-const USAGE_EXPONENT = 0.346;
+/** Safety margin applied to the refuel-chain gap: the wander model is nominal, players are not. */
+const CHAIN_SAFETY = 0.9;
 
-/** Never demand more than this fraction of the fuel for a direct run: every level stays winnable. */
-const USAGE_MAX = 0.88;
+/** Tank size on the smallest gameplay maze, seconds (side ≤ {@link TANK_SIDE_LO} cells). */
+const TANK_MIN_SECONDS = 110;
 
-/** Never hand out an absurdly generous budget on a trivially short maze. */
-const USAGE_MIN = 0.25;
+/** Tank size at and past the size cap, seconds (side ≥ {@link TANK_SIDE_HI} cells). */
+const TANK_MAX_SECONDS = 150;
 
-/** Absolute floor on a level's fuel, seconds — enough to orient even in a 1×1 test maze. */
-const MIN_FUEL = 20;
+/** Cell side at which the fallback tank curve starts (level 1 of the shipped curve). */
+const TANK_SIDE_LO = 16;
 
-/** Absolute ceiling on a level's fuel, seconds (a 4096×4096 maze would otherwise ask for hours). */
-const MAX_FUEL = 3600;
+/** Cell side at which the fallback tank curve tops out (the shipped `LEVEL.MAX_CELLS`). */
+const TANK_SIDE_HI = 128;
 
-/** Par = a competent run: the direct route plus this much exploration overhead. */
-const PAR_FACTOR = 1.6;
+/** Fraction of the tank one oil flask restores. Mirrors `FUEL.OIL_FRACTION`. */
+const OIL_REFUEL_FRACTION = 0.35;
+
+/** Lower clamp on a flask's value, seconds. Mirrors `FUEL.OIL_MIN`. */
+const OIL_REFUEL_MIN = 25;
+
+/** Upper clamp on a flask's value, seconds. Mirrors `FUEL.OIL_MAX`. */
+const OIL_REFUEL_MAX = 60;
+
+/**
+ * Measured ratio between a maze's optimal route and its side in cells (13 path tiles per cell of
+ * side, across the whole shipped size range). Only used to guess `cells` when a caller gives
+ * neither `params.cells` nor a maze — i.e. in `fuelBudget()` called bare from a tool or a test.
+ */
+const PATH_TILES_PER_CELL_SIDE = 13;
+
+// ─── Population knobs ───────────────────────────────────────────────────────────────────────
+
+/** Fallback flask density on a small maze: one per this many cells. */
+const OIL_CELLS_PER_FLASK_LO = 20;
+
+/** Fallback flask density at the size cap: one per this many cells (the economy thins with depth). */
+const OIL_CELLS_PER_FLASK_HI = 30;
+
+/** Fallback gem density on a small maze: one per this many cells. */
+const GEM_CELLS_PER_GEM_LO = 50;
+
+/** Fallback gem density at the size cap: one per this many cells. */
+const GEM_CELLS_PER_GEM_HI = 60;
+
+/** How far off the solution path an oil flask may be planted (tiles). */
+const OIL_BRANCH_RADIUS = 3;
+
+/**
+ * Hard cap on items of one kind. The gameplay maximum needs ~550 flasks and ~300 gems; 4096 leaves
+ * three levels of headroom for a tool building something far past the shipped curve while keeping
+ * the worst case bounded (4096 items ≈ 260 KB of `Item` objects in V8 — see `tools/stress.mjs`).
+ */
+const MAX_ITEMS_PER_KIND = 4096;
 
 /** Minimum Chebyshev tile distance between two torches. */
 const TORCH_SPACING = 6;
@@ -112,55 +211,20 @@ const TORCH_SPACING = 6;
 /** Hard cap on torches so a huge maze cannot produce a million sprite objects. */
 const MAX_TORCHES = 4096;
 
-/** Hard cap on items of one kind, for the same reason. */
-const MAX_ITEMS_PER_KIND = 1024;
+/** Absolute floor on a level's tank, seconds — enough to orient even in a 1×1 test maze. */
+const MIN_FUEL = 20;
 
-/** Stand-in for the distance field when no gems are requested and the BFS is skipped. */
-const EMPTY_DIST = new Int32Array(0);
-
-/** Gem separation attempts, in tiles: try well-spread first, relax until the quota is met. */
-const GEM_SEPARATIONS = Int32Array.of(8, 5, 3, 0);
-
-/** How far off the solution path an oil flask may be planted (tiles). */
-const OIL_BRANCH_RADIUS = 3;
-
-/** Upper bound on the bounded BFS used to find branch tiles along a stretch of path. */
-const OIL_SCRATCH = 1024;
-
-/** Longest half-window of path tiles seeded into one flask's branch search. */
-const OIL_WINDOW_MAX = 96;
+/** Absolute ceiling on a level's tank, seconds (a stress-test maze would otherwise ask for hours). */
+const MAX_FUEL = 3600;
 
 /**
- * Fuel and par budget for a level, derived from its shortest path. Exported so `src/state` and
- * the headless tools can reason about the curve without re-deriving it.
- *
- * @param {number} pathLength shortest start→exit distance in tiles (`Validation.pathLength`);
- *   values ≤ 0 (unsolvable maze) are treated as 1
- * @param {PopulateParams} [params] optional per-level floors (`fuelSeconds`, `par`)
- * @returns {{fuel:number, par:number, directTime:number, usage:number}} seconds (fuel/par/directTime)
- *   and the fraction of the fuel a direct run burns (usage)
+ * Capacity of the bounded-BFS scratch used by the chain pass. A radius-3 flood over a thick-wall
+ * maze can reach at most 25 tiles (the L1 ball), so 64 is more than twice the headroom needed and
+ * every push is still bounds-checked.
  */
-export function fuelBudget(pathLength, params) {
-  const len = Number.isFinite(pathLength) && pathLength > 0 ? pathLength : 1;
-  const directTime = (len * CORNER_FACTOR) / WALK_SPEED;
-  const usage = clamp(USAGE_COEFF * Math.pow(len, USAGE_EXPONENT), USAGE_MIN, USAGE_MAX);
+const PROBE_SCRATCH = 64;
 
-  let fuel = clamp(directTime / usage, MIN_FUEL, MAX_FUEL);
-  const fuelFloor = Number(params?.fuelSeconds);
-  if (Number.isFinite(fuelFloor) && fuelFloor > fuel) fuel = Math.min(fuelFloor, MAX_FUEL);
-
-  // Par must stay inside the fuel budget — a par you cannot physically reach is not a target.
-  let par = Math.min(directTime * PAR_FACTOR, fuel * 0.95);
-  const parFloor = Number(params?.par);
-  if (Number.isFinite(parFloor) && parFloor > par) par = Math.min(parFloor, fuel);
-
-  return {
-    fuel: round1(fuel),
-    par: round1(par),
-    directTime: round1(directTime),
-    usage: Math.round((directTime / fuel) * 1e4) / 1e4,
-  };
-}
+// ─── Fuel budget ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * Round to one decimal place (fuel and par are displayed to a tenth of a second).
@@ -172,26 +236,204 @@ function round1(v) {
 }
 
 /**
- * Clamp an item/torch count to a sane integer.
- * @param {unknown} v
- * @param {number} max
- * @returns {number}
+ * Fallback tank size for a maze of `cells` cells, seconds.
+ *
+ * The tank is deliberately **almost** flat: it is a tank, not a level budget. The small rise with
+ * size buys the deeper levels a slightly longer leash between flasks, which is what keeps a 257×257
+ * maze from feeling like the same 110 s panic with more corners.
+ *
+ * @param {number} cells logical cell count
+ * @returns {number} seconds in [TANK_MIN_SECONDS, TANK_MAX_SECONDS]
  */
-function count(v, max) {
-  const n = Number(v);
-  if (!Number.isFinite(n) || n <= 0) return 0;
-  return Math.min(Math.floor(n), max);
+function tankFor(cells) {
+  const side = Math.sqrt(Math.max(1, cells));
+  const t = clamp((side - TANK_SIDE_LO) / (TANK_SIDE_HI - TANK_SIDE_LO), 0, 1);
+  return TANK_MIN_SECONDS + (TANK_MAX_SECONDS - TANK_MIN_SECONDS) * t;
 }
 
 /**
- * Place items and torches, and compute the level's fuel/par budget.
+ * Seconds one oil flask restores on a level with tank `tank`.
+ * @param {PopulateParams|undefined} params
+ * @param {number} tank
+ * @returns {number} seconds in (0, tank]
+ */
+function resolveRefuel(params, tank) {
+  const given = Number(params?.oilRefuelSeconds);
+  if (Number.isFinite(given) && given > 0) return Math.min(given, tank);
+  return Math.min(tank, clamp(tank * OIL_REFUEL_FRACTION, OIL_REFUEL_MIN, OIL_REFUEL_MAX));
+}
+
+/**
+ * Fuel-seconds burned per tile actually walked, at the level's drain multiplier.
+ *
+ * Past the size cap a level gets harder by burning the torch faster (`drain > 1`), which shortens
+ * every distance this module reasons about. Read defensively: a missing or nonsensical `drain` is
+ * 1, which is the shipped value for every level up to the cap.
+ *
+ * @param {PopulateParams|undefined} params
+ * @returns {number} seconds per walked tile
+ */
+function secondsPerTile(params) {
+  const drain = Number(/** @type {{drain?:number}} */ (params)?.drain);
+  const d = Number.isFinite(drain) && drain > 0 ? drain : 1;
+  return (CORNER_FACTOR * d) / WALK_SPEED;
+}
+
+/**
+ * The refuel-chain gap: the largest path advance allowed between two consecutive reachable flasks.
+ *
+ * Derivation (file header): one flask must pay for the walk to the next one, including the worst
+ * legal detour off the path, at {@link WANDER_FACTOR} and the level's drain:
+ *
+ *     (G·w + 2·OIL_BRANCH_RADIUS)·spt ≤ R·S   ⇒   G = ⌊(R·S/spt − 2·OIL_BRANCH_RADIUS) / w⌋
+ *
+ * `params.oilTargetGap` (owned by `src/state/balance.js`) may **tighten** this, never loosen it:
+ * a looser gap would silently break the guarantee this module exists to make, and an unwalkable
+ * chain is a blocker, not a balance choice. A state module that wants a longer leash must hand out
+ * a bigger tank or richer flasks — both of which move `G` honestly.
+ *
+ * @param {PopulateParams|undefined} params
+ * @param {number} refuel seconds one flask restores
+ * @returns {number} integer ≥ 1, path tiles
+ */
+function resolveGap(params, refuel) {
+  const spt = secondsPerTile(params);
+  const sustainable = Math.max(
+    1,
+    Math.floor(((refuel * CHAIN_SAFETY) / spt - 2 * OIL_BRANCH_RADIUS) / WANDER_FACTOR),
+  );
+  const asked = Number(params?.oilTargetGap);
+  if (Number.isFinite(asked) && asked >= 1) return Math.max(1, Math.min(Math.floor(asked), sustainable));
+  return sustainable;
+}
+
+/**
+ * Tank, par and the chain numbers for a level. Exported so `src/state` and the headless tools can
+ * reason about the economy without re-deriving it.
+ *
+ * **Contract change (massive mazes):** `fuel` is now a *tank size*, not a level budget, and
+ * `params.fuelSeconds` **is** that tank (it used to be a floor under a path-derived budget). A
+ * caller that supplies no `fuelSeconds` gets the documented fallback curve in {@link tankFor}.
+ * `usage` therefore means "tanks a perfect run burns" and is routinely > 1 — see {@link FuelBudget}.
+ *
+ * @param {number} pathLength shortest start→exit distance in tiles (`Validation.pathLength`);
+ *   values ≤ 0 (unsolvable maze) are treated as 1
+ * @param {PopulateParams} [params] per-level overrides
+ * @param {number} [cells] logical cell count; defaults to `params.cells`, then to an estimate from
+ *   `pathLength` ({@link PATH_TILES_PER_CELL_SIDE})
+ * @returns {FuelBudget}
+ */
+export function fuelBudget(pathLength, params, cells) {
+  const len = Number.isFinite(pathLength) && pathLength > 0 ? pathLength : 1;
+  const directTime = (len * CORNER_FACTOR) / WALK_SPEED;
+
+  let n = Number(cells);
+  if (!Number.isFinite(n) || n <= 0) n = Number(params?.cells);
+  if (!Number.isFinite(n) || n <= 0) {
+    const side = Math.max(1, len / PATH_TILES_PER_CELL_SIDE);
+    n = side * side;
+  }
+
+  const asked = Number(params?.fuelSeconds);
+  const fuel = clamp(Number.isFinite(asked) && asked > 0 ? asked : tankFor(n), MIN_FUEL, MAX_FUEL);
+  const refuel = resolveRefuel(params, fuel);
+  const gap = resolveGap(params, refuel);
+
+  // Par is what a competent run costs: the optimal route walked at the same wander factor every
+  // fuel promise in this file is made at. It is NOT clamped to the tank any more — on a big maze a
+  // run legitimately spans several tanks.
+  let par = directTime * WANDER_FACTOR;
+  const parFloor = Number(params?.par);
+  if (Number.isFinite(parFloor) && parFloor > par) par = parFloor;
+
+  return {
+    fuel: round1(fuel),
+    par: round1(par),
+    directTime: round1(directTime),
+    usage: Math.round((directTime / fuel) * 1e4) / 1e4,
+    reach: Math.floor(fuel / (WANDER_FACTOR * secondsPerTile(params))),
+    refuel: round1(refuel),
+    gap,
+  };
+}
+
+// ─── Item counts ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Resolve one item count from the level parameters — a count, a density, or neither.
+ *
+ * Priority, and why:
+ * 1. **An explicit count** (`params.gems` / `params.oil`) — *including an explicit 0*, which means
+ *    "none", not "unspecified". `src/state/balance.js` derives the count from its own density and
+ *    then clamps it (`GEM_MIN`…`GEM_MAX`), so the count it ships is the density *plus* information
+ *    this module does not have. Re-deriving from the raw density would quietly undo those clamps.
+ * 2. **The density**, read defensively in both plausible units because the field is owned by a
+ *    module that ships in parallel: a value ≤ 1 is read as *items per cell* (0.05 ⇒ one per 20
+ *    cells) and a value > 1 as *cells per item* (20 ⇒ the same). The two agree at 1.0, so there is
+ *    no ambiguous case.
+ * 3. **The fallback curve below**, keyed on maze size, so a level is never under-populated just
+ *    because a parameter has not landed yet.
+ *
+ * Whatever comes out is a *floor* for oil: the refuel chain may place more (see the file header).
+ *
+ * @param {unknown} density  `params.gemDensity` / `params.oilDensity`
+ * @param {unknown} explicit `params.gems` / `params.oil`
+ * @param {number} cells     logical cell count
+ * @param {number} perLo     fallback cells-per-item on a small maze
+ * @param {number} perHi     fallback cells-per-item at the size cap
+ * @returns {number} integer in [0, MAX_ITEMS_PER_KIND]
+ */
+function resolveCount(density, explicit, cells, perLo, perHi) {
+  const e = Number(explicit);
+  if (explicit !== undefined && explicit !== null && Number.isFinite(e) && e >= 0) {
+    return clamp(Math.floor(e), 0, MAX_ITEMS_PER_KIND);
+  }
+  const d = Number(density);
+  if (Number.isFinite(d) && d > 0) {
+    const n = d <= 1 ? cells * d : cells / d;
+    return clamp(Math.round(n), 0, MAX_ITEMS_PER_KIND);
+  }
+
+  // Fallback: the same "thins out with depth" curve the design asks for, keyed on cell side so it
+  // tracks the size cap rather than a level number this module does not know.
+  const side = Math.sqrt(Math.max(1, cells));
+  const t = clamp((side - TANK_SIDE_LO) / (TANK_SIDE_HI - TANK_SIDE_LO), 0, 1);
+  const per = perLo + (perHi - perLo) * t;
+  return clamp(Math.round(cells / per), 0, MAX_ITEMS_PER_KIND);
+}
+
+// ─── Population ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The per-call working set. One fixed-shape object so every helper below stays monomorphic, and
+ * one place to see the entire transient memory cost of a build.
+ * @typedef {Object} Ctx
+ * @property {Uint8Array} tiles
+ * @property {number} width
+ * @property {number} height
+ * @property {number} total          `width · height`
+ * @property {Uint8Array} occupied   1 = reserved or already carrying an item
+ * @property {Int32Array} pathDist   tiles to the nearest solution-path tile; −1 = wall/unreachable
+ * @property {Int32Array} pathIndexOf index into `validation.path`, −1 when the tile is not on it
+ * @property {Int32Array} stamp      visited marker for the bounded probes (one id per probe)
+ * @property {number} stampId
+ * @property {Int32Array} frontier      probe BFS queue (tile index)
+ * @property {Int32Array} frontierDist  probe BFS queue (depth)
+ * @property {Int32Array} cand          candidate tiles collected by one chain probe
+ * @property {Int32Array} out2          two-slot return buffer (tile index, path index)
+ */
+
+/**
+ * Place items and torches, and compute the level's tank/par budget.
  *
  * Deterministic for a given `(maze, validation, params, seed)`. Items are placed on FLOOR tiles
- * only and never twice on the same tile — `tools/validate-mazes.mjs` asserts both for every level
- * it builds. Runs in O(width·height + k log k) where k is a bounded candidate set.
+ * only and never twice on the same tile — `tools/validate-mazes.mjs` asserts both, plus the refuel
+ * chain, for every level it builds.
+ *
+ * Cost: O(width·height) plus O(path length) — no pass is quadratic in the item count.
  *
  * @param {Maze} maze
- * @param {Validation} validation result of `validateMaze(maze)` (its `path` drives oil placement)
+ * @param {Validation} validation result of `validateMaze(maze)` (its `path` drives the refuel chain)
  * @param {PopulateParams} params
  * @param {number} seed
  * @returns {Population}
@@ -211,84 +453,447 @@ export function populateLevel(maze, validation, params, seed) {
     throw new TypeError(`populateLevel: tiles length ${tiles.length} does not match ${width}×${height}`);
   }
 
-  const gemQuota = count(params?.gems, MAX_ITEMS_PER_KIND);
-  const oilQuota = count(params?.oil, MAX_ITEMS_PER_KIND);
+  // Cell count: from the maze itself (authoritative), not from params — a caller may hand us
+  // `cells` from a different level entirely and the densities must follow the maze in front of us.
+  const cols = Number.isFinite(maze.cols) && maze.cols > 0 ? maze.cols : (width - 1) >> 1;
+  const rows = Number.isFinite(maze.rows) && maze.rows > 0 ? maze.rows : (height - 1) >> 1;
+  const cells = Math.max(1, cols * rows);
+
   const rootSeed = Number.isFinite(Number(seed)) ? Number(seed) : 0;
   const root = createRng(rootSeed);
-  const gemRng = root.fork('items.gem');
+  const chainRng = root.fork('items.oil.chain');
   const oilRng = root.fork('items.oil');
+  const gemRng = root.fork('items.gem');
   const torchSeed = root.fork('torches').u32() | 0;
 
-  const startIdx = start.y * width + start.x;
-  const exitIdx = exit.y * width + exit.x;
+  const budget = fuelBudget(validation && validation.pathLength > 0 ? validation.pathLength : 1, params, cells);
 
-  // `occupied` is the single source of truth for "something is already on this tile": it starts
-  // out reserving the tiles gameplay needs kept clear, so no later pass can double-book a tile.
-  const occupied = new Uint8Array(total);
-  const onPath = new Uint8Array(total);
-  const path = validation && validation.path ? validation.path : null;
+  const path = validation && validation.path && validation.path.length > 0 ? validation.path : null;
+
+  /** @type {Ctx} */
+  const ctx = {
+    tiles,
+    width,
+    height,
+    total,
+    occupied: new Uint8Array(total),
+    pathDist: new Int32Array(total),
+    pathIndexOf: new Int32Array(total),
+    stamp: new Int32Array(total),
+    stampId: 0,
+    frontier: new Int32Array(PROBE_SCRATCH),
+    frontierDist: new Int32Array(PROBE_SCRATCH),
+    cand: new Int32Array(PROBE_SCRATCH),
+    out2: new Int32Array(2),
+  };
+
+  // `occupied` is the single source of truth for "something is already on this tile": it starts out
+  // reserving the tiles gameplay needs kept clear, so no later pass can double-book a tile.
+  const occupied = ctx.occupied;
+  occupied[start.y * width + start.x] = 1;
+  occupied[exit.y * width + exit.x] = 1;
   if (path) {
-    for (let i = 0; i < path.length; i++) onPath[path[i]] = 1;
     // No pickups on the first three tiles of the route: they would be free score at spawn.
     for (let i = 0; i < 3 && i < path.length; i++) occupied[path[i]] = 1;
   }
-  occupied[startIdx] = 1;
-  occupied[exitIdx] = 1;
 
-  // Only gem ranking needs distances, and the BFS costs a full Int32Array over the grid — skip it
-  // entirely for a level without gems (the title-screen demo maze, for one).
-  const dist = gemQuota > 0 ? bfsDistances(tiles, width, height, startIdx) : EMPTY_DIST;
+  buildPathFields(ctx, path);
 
   /** @type {Item[]} */
   const items = [];
-  placeGems(items, gemQuota, tiles, width, height, dist, occupied, gemRng);
-  placeOil(items, oilQuota, tiles, width, height, path, onPath, occupied, oilRng);
+
+  // 1. The guarantee first — it has the only hard constraint, so it gets first pick of the tiles.
+  const chain = path ? placeRefuelChain(items, ctx, path, budget.gap, chainRng) : 0;
+
+  // 2. Density top-up. `oil`/`gems` from params are floors, never ceilings: the chain may already
+  //    have placed more flasks than a stale count asked for, and we never take one away.
+  const oilTopUp =
+    resolveCount(params?.oilDensity, params?.oil, cells, OIL_CELLS_PER_FLASK_LO, OIL_CELLS_PER_FLASK_HI) - chain;
+  const oil = scatterByBuckets(items, 'oil', oilTopUp, ctx, false, oilRng);
+  if (oil < oilTopUp) fillByStride(items, 'oil', oilTopUp - oil, ctx, oilRng);
+
+  // 3. Gems: dead ends first, then anywhere off the beaten track.
+  const gemQuota = resolveCount(params?.gemDensity, params?.gems, cells, GEM_CELLS_PER_GEM_LO, GEM_CELLS_PER_GEM_HI);
+  let gems = scatterByBuckets(items, 'gem', gemQuota, ctx, true, gemRng);
+  if (gems < gemQuota) gems += scatterByBuckets(items, 'gem', gemQuota - gems, ctx, false, gemRng);
+  if (gems < gemQuota) fillByStride(items, 'gem', gemQuota - gems, ctx, gemRng);
 
   const torches = placeTorches(tiles, width, height, torchSeed);
-
-  const pathLength = validation && validation.pathLength > 0 ? validation.pathLength : 1;
-  const budget = fuelBudget(pathLength, params);
 
   return { items, torches, fuel: budget.fuel, par: budget.par };
 }
 
 /**
- * Breadth-first distance in tiles from `fromIdx` over FLOOR tiles.
- * @param {Uint8Array} tiles
- * @param {number} width
- * @param {number} height
- * @param {number} fromIdx
- * @returns {Int32Array} distance per tile, −1 where unreachable (including every wall tile)
+ * Walk a populated level the way the guarantee promises and report what actually happens.
+ *
+ * This is the **verification twin** of {@link placeRefuelChain}, and it ships in the module rather
+ * than in the tool on purpose: a guarantee is only as good as the agreement between the code that
+ * makes it and the code that checks it, and "where along the route is this flask?" is exactly the
+ * kind of definition two files drift on. `tools/validate-mazes.mjs` and `populate.test.mjs` both
+ * call this, so there is one answer.
+ *
+ * The simulated player walks the solution path at {@link WANDER_FACTOR}, and picks up every flask
+ * the moment it comes within {@link OIL_BRANCH_RADIUS} tiles of them (paying `2·depth` tiles for
+ * the detour). Flasks further off the route are ignored — they are exploration upside, and counting
+ * them would weaken the very bound this function exists to measure.
+ *
+ * Allocates O(width·height); it is a tool/test helper, never called by the game.
+ *
+ * @param {Maze} maze
+ * @param {Validation} validation
+ * @param {Item[]} items
+ * @param {PopulateParams} [params] the same params the level was built with
+ * @returns {{flasks:number, maxGap:number, gap:number, tank:number, refuel:number, walked:number,
+ *   minFuel:number, minFuelFraction:number, ok:boolean}} `walked` is in tiles; `ok` is the verdict
+ *   (`maxGap ≤ gap` and the torch never reached 0). An unsolvable maze reports `ok:false`.
  */
-function bfsDistances(tiles, width, height, fromIdx) {
-  const total = width * height;
-  const dist = new Int32Array(total).fill(-1);
-  if (tiles[fromIdx] !== TILE.FLOOR) return dist;
+export function walkRefuelChain(maze, validation, items, params) {
+  const width = maze.width;
+  const total = width * maze.height;
+  const path = validation && validation.path && validation.path.length > 0 ? validation.path : null;
+  const cols = Number.isFinite(maze.cols) && maze.cols > 0 ? maze.cols : (width - 1) >> 1;
+  const rows = Number.isFinite(maze.rows) && maze.rows > 0 ? maze.rows : (maze.height - 1) >> 1;
+  const budget = fuelBudget(validation ? validation.pathLength : 1, params, Math.max(1, cols * rows));
+  const empty = {
+    flasks: 0,
+    maxGap: -1,
+    gap: budget.gap,
+    tank: budget.fuel,
+    refuel: budget.refuel,
+    walked: 0,
+    minFuel: budget.fuel,
+    minFuelFraction: 1,
+    ok: false,
+  };
+  if (!path) return empty;
 
-  let floorCount = 0;
-  for (let i = 0; i < total; i++) if (tiles[i] === TILE.FLOOR) floorCount++;
-  const queue = new Int32Array(floorCount);
+  /** @type {Ctx} */
+  const ctx = {
+    tiles: maze.tiles,
+    width,
+    height: maze.height,
+    total,
+    occupied: new Uint8Array(0),
+    pathDist: new Int32Array(total),
+    pathIndexOf: new Int32Array(total),
+    stamp: new Int32Array(total),
+    stampId: 0,
+    frontier: new Int32Array(PROBE_SCRATCH),
+    frontierDist: new Int32Array(PROBE_SCRATCH),
+    cand: new Int32Array(PROBE_SCRATCH),
+    out2: new Int32Array(2),
+  };
+  buildPathFields(ctx, path);
+
+  // Collect (path index, detour) for every flask the route passes, then sort by path index: the
+  // order the player meets them in.
+  const hits = [];
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (it.kind !== 'oil') continue;
+    const idx = (it.y - 0.5) * width + (it.x - 0.5);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= total) continue;
+    const packed = nearestPathFrom(ctx, idx, OIL_BRANCH_RADIUS);
+    if (packed < 0) continue;
+    hits.push({ q: (packed / 4) | 0, d: packed & 3 });
+  }
+  hits.sort((a, b) => a.q - b.q || a.d - b.d);
+
+  const secPerTile = secondsPerTile(params);
+  const last = path.length - 1;
+  let fuel = budget.fuel;
+  let minFuel = fuel;
+  let walked = 0;
+  let maxGap = 0;
+  let prev = 0;
+  for (let i = 0; i < hits.length; i++) {
+    const h = hits[i];
+    if (h.q < prev) continue; // already passed (two flasks on the same stretch)
+    const tiles = (h.q - prev) * WANDER_FACTOR + 2 * h.d;
+    if (h.q - prev > maxGap) maxGap = h.q - prev;
+    walked += tiles;
+    fuel -= tiles * secPerTile;
+    if (fuel < minFuel) minFuel = fuel;
+    fuel = Math.min(budget.fuel, fuel + budget.refuel);
+    prev = h.q;
+  }
+  const tail = last - prev;
+  if (tail > maxGap) maxGap = tail;
+  walked += tail * WANDER_FACTOR;
+  fuel -= tail * WANDER_FACTOR * secPerTile;
+  if (fuel < minFuel) minFuel = fuel;
+
+  return {
+    flasks: hits.length,
+    maxGap,
+    gap: budget.gap,
+    tank: budget.fuel,
+    refuel: budget.refuel,
+    walked: Math.round(walked),
+    minFuel: round1(minFuel),
+    minFuelFraction: Math.round((minFuel / budget.fuel) * 1e4) / 1e4,
+    ok: maxGap <= budget.gap && minFuel > 0,
+  };
+}
+
+/**
+ * Fill `pathIndexOf` (tile → index along the solution path) and `pathDist` (tiles to the nearest
+ * path tile) with one multi-source BFS seeded from every path tile.
+ *
+ * Both fields exist because at 16 000 cells "near the route" and "off the beaten track" are the
+ * only meaningful ways to rank a tile: distance from the *start* stopped being informative once a
+ * level became a labyrinth rather than an out-and-back.
+ *
+ * With no path (an unsolvable maze — only reachable through a hand-built test fixture, since
+ * `buildLevel` refuses to populate one) every tile reports distance 0 and index −1, which degrades
+ * the scatter passes to "spread evenly, no preference" instead of throwing.
+ *
+ * @param {Ctx} ctx
+ * @param {Uint32Array|null} path
+ * @returns {void}
+ */
+function buildPathFields(ctx, path) {
+  const { tiles, width, height, total, pathDist, pathIndexOf } = ctx;
+  pathIndexOf.fill(-1);
+  if (!path || path.length === 0) {
+    pathDist.fill(0);
+    return;
+  }
+  pathDist.fill(-1);
+
+  // The queue holds at most every floor tile once; sizing it at `total` costs 4 bytes per tile for
+  // the duration of one BFS and removes the need to count floors first.
+  const queue = new Int32Array(total);
   let head = 0;
   let tail = 0;
-  dist[fromIdx] = 0;
-  queue[tail++] = fromIdx;
-
+  for (let i = 0; i < path.length; i++) {
+    const idx = path[i];
+    if (idx < 0 || idx >= total) continue;
+    pathIndexOf[idx] = i;
+    if (pathDist[idx] < 0) {
+      pathDist[idx] = 0;
+      queue[tail++] = idx;
+    }
+  }
   while (head < tail) {
     const idx = queue[head++];
     const x = idx % width;
     const y = (idx - x) / width;
-    const nd = dist[idx] + 1;
+    const nd = pathDist[idx] + 1;
     for (let d = 0; d < DIR_COUNT; d++) {
       const nx = x + DIR_DX[d];
       const ny = y + DIR_DY[d];
       if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
       const nIdx = ny * width + nx;
-      if (tiles[nIdx] !== TILE.FLOOR || dist[nIdx] >= 0) continue;
-      dist[nIdx] = nd;
+      if (tiles[nIdx] !== TILE.FLOOR || pathDist[nIdx] >= 0) continue;
+      pathDist[nIdx] = nd;
       queue[tail++] = nIdx;
     }
   }
-  return dist;
+}
+
+/**
+ * Smallest path index reachable from `idx` within `radius` tiles, and the depth at which it was
+ * found — i.e. **where the player first meets this tile while walking the route**, which is the
+ * only sensible answer to "how far along is this flask?" when a corridor doubles back on itself.
+ *
+ * Packed into one number (`q * 4 + depth`, `depth ≤ 3 < 4`) to stay allocation-free in a helper
+ * that runs once per candidate tile. `q` is bounded by the path length (≤ 2·4096² ≈ 3.4e7), so the
+ * product stays far inside int32.
+ *
+ * @param {Ctx} ctx
+ * @param {number} idx    tile index to probe from
+ * @param {number} radius maximum BFS depth (≤ 3 — see the packing above)
+ * @returns {number} `q * 4 + depth`, or −1 when no path tile is within `radius`
+ */
+function nearestPathFrom(ctx, idx, radius) {
+  const { tiles, width, height, pathIndexOf, stamp, frontier, frontierDist } = ctx;
+  const id = ++ctx.stampId;
+  let head = 0;
+  let tail = 0;
+  stamp[idx] = id;
+  frontier[0] = idx;
+  frontierDist[0] = 0;
+  tail = 1;
+
+  let bestQ = -1;
+  let bestDepth = 0;
+  while (head < tail) {
+    const t = frontier[head];
+    const d = frontierDist[head];
+    head++;
+    const q = pathIndexOf[t];
+    // BFS order means the first visit to a tile is at its minimal depth, so the depth recorded
+    // alongside the minimal path index is that index's true detour cost.
+    if (q >= 0 && (bestQ < 0 || q < bestQ)) {
+      bestQ = q;
+      bestDepth = d;
+    }
+    if (d >= radius) continue;
+    const x = t % width;
+    const y = (t - x) / width;
+    for (let dir = 0; dir < DIR_COUNT; dir++) {
+      const nx = x + DIR_DX[dir];
+      const ny = y + DIR_DY[dir];
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+      const nIdx = ny * width + nx;
+      if (tiles[nIdx] !== TILE.FLOOR || stamp[nIdx] === id || tail >= PROBE_SCRATCH) continue;
+      stamp[nIdx] = id;
+      frontier[tail] = nIdx;
+      frontierDist[tail] = d + 1;
+      tail++;
+    }
+  }
+  return bestQ < 0 ? -1 : bestQ * 4 + bestDepth;
+}
+
+/**
+ * Collect the free floor tiles within {@link OIL_BRANCH_RADIUS} of path tile `p` into `ctx.cand`.
+ *
+ * Kept separate from the evaluation below because both use `ctx.stamp`: the probe must be finished
+ * before {@link nearestPathFrom} starts stamping the same buffer with a newer id.
+ *
+ * @param {Ctx} ctx
+ * @param {number} from tile index of the path tile to fan out from
+ * @returns {number} number of candidates written to `ctx.cand`
+ */
+function collectBranchCandidates(ctx, from) {
+  const { tiles, width, height, occupied, stamp, frontier, frontierDist, cand } = ctx;
+  const id = ++ctx.stampId;
+  let head = 0;
+  let tail = 1;
+  let n = 0;
+  stamp[from] = id;
+  frontier[0] = from;
+  frontierDist[0] = 0;
+
+  while (head < tail) {
+    const t = frontier[head];
+    const d = frontierDist[head];
+    head++;
+    if (occupied[t] === 0 && n < PROBE_SCRATCH) {
+      cand[n] = t;
+      n++;
+    }
+    if (d >= OIL_BRANCH_RADIUS) continue;
+    const x = t % width;
+    const y = (t - x) / width;
+    for (let dir = 0; dir < DIR_COUNT; dir++) {
+      const nx = x + DIR_DX[dir];
+      const ny = y + DIR_DY[dir];
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+      const nIdx = ny * width + nx;
+      if (tiles[nIdx] !== TILE.FLOOR || stamp[nIdx] === id || tail >= PROBE_SCRATCH) continue;
+      stamp[nIdx] = id;
+      frontier[tail] = nIdx;
+      frontierDist[tail] = d + 1;
+      tail++;
+    }
+  }
+  return n;
+}
+
+/**
+ * Best flask spot hanging off path tile `p`, or none.
+ *
+ * "Best" prefers, in order: a tile **off** the path (a side pocket the player can see from the
+ * route and choose to step into), then the one furthest along the route (so one flask covers as
+ * much of the chain as the gap allows), then the shallowest detour. Candidates whose first
+ * reachable path index is not past `lastQ` are rejected outright — a flask the player would have
+ * walked past *before* the previous one buys the chain nothing.
+ *
+ * @param {Ctx} ctx
+ * @param {Uint32Array} path
+ * @param {number} p      path index to fan out from
+ * @param {number} lastQ  path index of the previous chain flask (0 = the start, full tank)
+ * @param {number} gap    maximum allowed advance (`q − lastQ`)
+ * @param {import('../core/rng.js').Rng} rng
+ * @returns {boolean} true when `ctx.out2` holds `[tileIndex, q]`
+ */
+function chainSpotNear(ctx, path, p, lastQ, gap, rng) {
+  const n = collectBranchCandidates(ctx, path[p]);
+  if (n === 0) return false;
+
+  let bestScore = -0x7fffffff;
+  let bestTile = -1;
+  let bestQ = -1;
+  let ties = 0;
+  for (let i = 0; i < n; i++) {
+    const tile = ctx.cand[i];
+    const packed = nearestPathFrom(ctx, tile, OIL_BRANCH_RADIUS);
+    if (packed < 0) continue;
+    const q = (packed / 4) | 0;
+    const depth = packed & 3;
+    if (q <= lastQ || q - lastQ > gap) continue;
+
+    // Off-path outranks everything (a flask in the corridor is a fallback, not a design); the
+    // ×8 then puts a tile further along the route ahead of a shallower detour, without either term
+    // ever being able to overflow the other (q − lastQ ≤ gap, depth ≤ 3).
+    const score = (ctx.pathIndexOf[tile] < 0 ? 1 << 20 : 0) + Math.min(65535, q - lastQ) * 8 - depth;
+    if (score > bestScore) {
+      bestScore = score;
+      bestTile = tile;
+      bestQ = q;
+      ties = 1;
+    } else if (score === bestScore) {
+      // Reservoir tie-break: every equally good spot is equally likely, without sorting or
+      // allocating a candidate list.
+      ties++;
+      if (rng.int(ties) === 0) {
+        bestTile = tile;
+        bestQ = q;
+      }
+    }
+  }
+  if (bestTile < 0) return false;
+  ctx.out2[0] = bestTile;
+  ctx.out2[1] = bestQ;
+  return true;
+}
+
+/**
+ * The refuel chain (see the proof in the file header).
+ *
+ * Walks the solution path placing a flask whenever the remaining distance to the exit exceeds
+ * `gap`, always as far along the route as a legal spot allows, so the chain uses the fewest flasks
+ * that satisfy the guarantee and the density pass is free to spend the rest on exploration.
+ *
+ * Termination: every iteration sets `lastQ` to a strictly larger path index, so the loop runs at
+ * most `path.length` times; the `guard` is belt and braces against a future edit breaking that.
+ * Failure to find any spot (every tile within a whole `gap` of the route already occupied — only
+ * possible on a degenerate maze) stops the chain rather than looping; `tools/validate-mazes.mjs`
+ * turns the resulting gap into a loud failure instead of a quiet one.
+ *
+ * @param {Item[]} out
+ * @param {Ctx} ctx
+ * @param {Uint32Array} path
+ * @param {number} gap
+ * @param {import('../core/rng.js').Rng} rng
+ * @returns {number} flasks placed
+ */
+function placeRefuelChain(out, ctx, path, gap, rng) {
+  const last = path.length - 1;
+  if (last < 1 || gap < 1) return 0;
+
+  let lastQ = 0;
+  let placed = 0;
+  let guard = 0;
+  while (last - lastQ > gap && placed < MAX_ITEMS_PER_KIND) {
+    if (++guard > path.length) break;
+    const aim = Math.min(last - 1, lastQ + gap);
+    let found = false;
+    for (let p = aim; p > lastQ; p--) {
+      if (chainSpotNear(ctx, path, p, lastQ, gap, rng)) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) break;
+    pushItem(out, ctx.occupied, 'oil', ctx.out2[0], ctx.width);
+    lastQ = ctx.out2[1];
+    placed++;
+  }
+  return placed;
 }
 
 /**
@@ -309,120 +914,129 @@ function floorNeighbours(tiles, width, idx) {
 }
 
 /**
- * Gems: dead ends first, farthest from the start first, well separated.
+ * Scatter `quota` items by **stratified sampling**: cut the grid into roughly `quota` square
+ * buckets, keep the best-scoring eligible tile in each, then take buckets in a seeded order.
  *
- * Candidate selection is O(tiles) even on a 4096² maze: a histogram of dead-end distances yields a
- * distance cutoff that keeps only the farthest `CANDIDATE_BUDGET` dead ends, and only those are
- * sorted. Ties in distance are broken by a position hash so two equally distant dead ends are
- * chosen in a seed-dependent — but reproducible — order.
+ * This is the pass that makes density mean something at 16 000 cells. Ranking every candidate
+ * globally (the old farthest-first sort) concentrates items wherever the metric happens to peak and
+ * costs O(n log n) on a candidate set that is now tens of thousands of tiles; bucketing gives an
+ * even spread over the whole maze for two O(tiles) passes and `O(buckets)` memory, and the
+ * per-bucket score still decides *which* tile in that neighbourhood gets the item:
  *
- * @param {Item[]} out         items are appended here (ids are assigned from `out.length`)
+ * - **oil** prefers `pathDist ≈ 2`: a visible side pocket one step off the route.
+ * - **gems** prefer a large `pathDist`: off the beaten track, where the risk is.
+ *
+ * Ties (very common — a whole corridor can share a distance) are broken by a position hash so the
+ * choice is seed-dependent but reproducible.
+ *
+ * @param {Item[]} out
+ * @param {ItemKind} kind
  * @param {number} quota
- * @param {Uint8Array} tiles
- * @param {number} width
- * @param {number} height
- * @param {Int32Array} dist    BFS distance from start, −1 = unreachable
- * @param {Uint8Array} occupied mutated: accepted tiles are marked
+ * @param {Ctx} ctx
+ * @param {boolean} deadEndOnly only accept dead-end tiles (used for the gems' first pass)
  * @param {import('../core/rng.js').Rng} rng
- * @returns {void}
+ * @returns {number} items placed
  */
-function placeGems(out, quota, tiles, width, height, dist, occupied, rng) {
-  if (quota <= 0) return;
-  const candidateBudget = Math.min(4096, Math.max(64, quota * 16));
+function scatterByBuckets(out, kind, quota, ctx, deadEndOnly, rng) {
+  if (quota <= 0) return 0;
+  const { tiles, width, height, occupied, pathDist } = ctx;
+  // `floor` (not `ceil`): it errs toward *more* buckets than the quota, so the usual case is a
+  // choice of spots rather than a shortfall the stride fallback has to mop up.
+  const side = Math.max(1, Math.floor(Math.sqrt((width * height) / quota)));
+  const gw = Math.ceil(width / side);
+  const gh = Math.ceil(height / side);
+  const buckets = gw * gh;
+  const best = new Int32Array(buckets).fill(-1);
+  const bestScore = new Int32Array(buckets);
   const tieSeed = rng.u32() | 0;
+  const isGem = kind === 'gem';
 
-  // Pass 1 — histogram of dead-end distances (index = distance, value = how many).
-  let maxDist = 0;
-  for (let i = 0; i < dist.length; i++) if (dist[i] > maxDist) maxDist = dist[i];
-  const histogram = new Int32Array(maxDist + 1);
-  let deadTotal = 0;
   for (let y = 1; y < height - 1; y++) {
     const row = y * width;
+    const bRow = ((y / side) | 0) * gw;
     for (let x = 1; x < width - 1; x++) {
       const idx = row + x;
-      if (tiles[idx] !== TILE.FLOOR || occupied[idx] !== 0 || dist[idx] < 0) continue;
-      if (floorNeighbours(tiles, width, idx) !== 1) continue;
-      histogram[dist[idx]]++;
-      deadTotal++;
-    }
-  }
-
-  // Pass 2 — walk the histogram down from the farthest distance until the budget is covered.
-  let cutoff = 0;
-  let kept = 0;
-  for (let d = maxDist; d >= 0; d--) {
-    kept += histogram[d];
-    if (kept >= candidateBudget) {
-      cutoff = d;
-      break;
-    }
-  }
-  if (kept < candidateBudget) kept = deadTotal; // budget never reached: keep them all
-
-  // Pass 3 — collect the survivors and order them farthest-first.
-  const candidates = [];
-  if (kept > 0) {
-    for (let y = 1; y < height - 1; y++) {
-      const row = y * width;
-      for (let x = 1; x < width - 1; x++) {
-        const idx = row + x;
-        if (tiles[idx] !== TILE.FLOOR || occupied[idx] !== 0 || dist[idx] < cutoff) continue;
-        if (floorNeighbours(tiles, width, idx) !== 1) continue;
-        candidates.push(idx);
+      if (tiles[idx] !== TILE.FLOOR || occupied[idx] !== 0) continue;
+      if (deadEndOnly && floorNeighbours(tiles, width, idx) !== 1) continue;
+      const pd = pathDist[idx] < 0 ? 0 : pathDist[idx];
+      const rank = isGem ? Math.min(pd, 255) : 255 - Math.min(Math.abs(pd - 2), 255);
+      const score = (rank << 6) | (hash2(x, y, tieSeed) & 63);
+      const b = bRow + ((x / side) | 0);
+      if (best[b] < 0 || score > bestScore[b]) {
+        best[b] = idx;
+        bestScore[b] = score;
       }
     }
-    candidates.sort((a, b) => dist[b] - dist[a] || hash2(a, 0, tieSeed) - hash2(b, 0, tieSeed) || a - b);
   }
+
+  // Take the buckets in a shuffled order: when there are fewer usable buckets than the quota (a
+  // maze that is mostly wall), a row-major sweep would crowd every leftover item into the top rows.
+  const order = new Int32Array(buckets);
+  for (let i = 0; i < buckets; i++) order[i] = i;
+  rng.shuffle(order);
 
   let placed = 0;
-  // Relaxing separation passes: prefer well-spread gems, but always meet the quota if tiles exist.
-  for (let s = 0; s < GEM_SEPARATIONS.length && placed < quota; s++) {
-    const sep = GEM_SEPARATIONS[s];
-    for (let i = 0; i < candidates.length && placed < quota; i++) {
-      const idx = candidates[i];
-      if (occupied[idx] !== 0) continue;
-      if (sep > 0 && !isFarFromItems(out, idx, width, sep)) continue;
-      pushItem(out, occupied, 'gem', idx, width);
-      placed++;
-    }
-  }
-
-  // Degenerate mazes (1×2, 2×2 with a large gem quota) may not have enough dead ends; fall back to
-  // any free floor tile so the level still contains the promised number of gems.
-  for (let idx = 0; idx < tiles.length && placed < quota; idx++) {
-    if (tiles[idx] !== TILE.FLOOR || occupied[idx] !== 0 || dist[idx] < 0) continue;
-    pushItem(out, occupied, 'gem', idx, width);
+  for (let i = 0; i < buckets && placed < quota; i++) {
+    const idx = best[order[i]];
+    if (idx < 0 || occupied[idx] !== 0) continue;
+    pushItem(out, occupied, kind, idx, width);
     placed++;
   }
+  return placed;
 }
 
 /**
- * True when `idx` is at least `sep` tiles (Chebyshev) from every item already placed.
- * O(items); the item list is bounded by `MAX_ITEMS_PER_KIND`, so this stays cheap.
- * @param {Item[]} items
- * @param {number} idx
- * @param {number} width
- * @param {number} sep
- * @returns {boolean}
+ * Last-resort fill: take every `stride`-th free floor tile until the quota is met.
+ *
+ * Only runs when the bucket passes could not meet the quota — a degenerate or tiny maze, or a
+ * caller asking for more items than the level has interesting tiles. Striding (rather than taking
+ * the first N) keeps even that case spread out instead of piling items in the first corridor.
+ *
+ * @param {Item[]} out
+ * @param {ItemKind} kind
+ * @param {number} quota
+ * @param {Ctx} ctx
+ * @param {import('../core/rng.js').Rng} rng
+ * @returns {number} items placed
  */
-function isFarFromItems(items, idx, width, sep) {
-  const x = idx % width;
-  const y = (idx - x) / width;
-  for (let i = 0; i < items.length; i++) {
-    const it = items[i];
-    // Item coordinates are tile centres, hence the −0.5 to recover the tile index.
-    const dx = Math.abs(it.x - 0.5 - x);
-    const dy = Math.abs(it.y - 0.5 - y);
-    if (dx < sep && dy < sep) return false;
+function fillByStride(out, kind, quota, ctx, rng) {
+  if (quota <= 0) return 0;
+  const { tiles, width, total, occupied } = ctx;
+  let free = 0;
+  for (let i = 0; i < total; i++) if (tiles[i] === TILE.FLOOR && occupied[i] === 0) free++;
+  if (free === 0) return 0;
+
+  const stride = Math.max(1, Math.floor(free / quota));
+  const offset = rng.int(stride);
+  let seen = 0;
+  let placed = 0;
+  for (let i = 0; i < total && placed < quota; i++) {
+    if (tiles[i] !== TILE.FLOOR || occupied[i] !== 0) continue;
+    if (seen++ % stride === offset) {
+      pushItem(out, occupied, kind, i, width);
+      placed++;
+    }
   }
-  return true;
+  // Integer division can leave the quota a few short; mop up whatever is left, in order.
+  for (let i = 0; i < total && placed < quota; i++) {
+    if (tiles[i] !== TILE.FLOOR || occupied[i] !== 0) continue;
+    pushItem(out, occupied, kind, i, width);
+    placed++;
+  }
+  return placed;
 }
 
 /**
  * Append an item at a tile index and mark the tile occupied.
+ *
+ * The `Item` shape is fixed by ARCHITECTURE.md §3 and deliberately flat: five own properties, no
+ * nested objects, one interned string. At the gameplay maximum a level carries ~850 of them
+ * (~55 KB in V8), which is why the renderer/sim contract is "never iterate items per frame" rather
+ * than "keep items small" — they are already as small as the contract allows.
+ *
  * @param {Item[]} out
  * @param {Uint8Array} occupied
- * @param {import('../core/types.js').ItemKind} kind
+ * @param {ItemKind} kind
  * @param {number} idx
  * @param {number} width
  * @returns {void}
@@ -432,125 +1046,6 @@ function pushItem(out, occupied, kind, idx, width) {
   const y = (idx - x) / width;
   occupied[idx] = 1;
   out.push({ id: out.length, kind, x: x + 0.5, y: y + 0.5, taken: false });
-}
-
-/**
- * Oil flasks: on branches hanging off the solution path, spaced evenly along it.
- *
- * Flask k of n is anchored at the path tile at fraction (k+1)/(n+1) and searches the *stretch* of
- * path around that anchor (a non-overlapping window, so the flasks stay spread along the route).
- * A multi-source BFS seeded with every path tile in the window expands `OIL_BRANCH_RADIUS` tiles
- * and collects floor tiles that are **not** on the path; the closest of those wins. The flask
- * therefore lands on a side passage that opens off the route the player is already walking —
- * visible, one or two steps off, optional.
- *
- * Searching a window rather than a single tile matters: a long serpentine path can fill its own
- * neighbourhood completely, so a point search finds no branch at all surprisingly often.
- *
- * Fallbacks, in order: a free path tile near the anchor (a stretch that genuinely has no side
- * passage is a plain corridor, and a flask standing in it is still correct), then any free floor
- * tile (only reachable when the maze has no usable path at all).
- *
- * @param {Item[]} out
- * @param {number} quota
- * @param {Uint8Array} tiles
- * @param {number} width
- * @param {number} height
- * @param {Uint32Array|null} path
- * @param {Uint8Array} onPath
- * @param {Uint8Array} occupied
- * @param {import('../core/rng.js').Rng} rng
- * @returns {void}
- */
-function placeOil(out, quota, tiles, width, height, path, onPath, occupied, rng) {
-  if (quota <= 0) return;
-  const total = width * height;
-  const stamp = new Int32Array(total); // visited marker for the bounded BFS (stamp id per anchor)
-  const frontier = new Int32Array(OIL_SCRATCH);
-  const frontierDist = new Int32Array(OIL_SCRATCH);
-  const found = new Int32Array(OIL_SCRATCH);
-  const foundDist = new Int32Array(OIL_SCRATCH);
-  let stampId = 0;
-  let placed = 0;
-
-  if (path && path.length > 0) {
-    // Half-width of each flask's stretch of path: windows tile the route without overlapping.
-    const half = Math.min(OIL_WINDOW_MAX, Math.max(0, Math.floor(path.length / (2 * (quota + 1)))));
-    for (let k = 0; k < quota; k++) {
-      const anchorPos = Math.min(path.length - 1, Math.round(((k + 1) * path.length) / (quota + 1)));
-      stampId++;
-
-      // Seed the multi-source BFS with the whole stretch of path around the anchor.
-      let head = 0;
-      let tail = 0;
-      let nFound = 0;
-      for (let i = Math.max(0, anchorPos - half); i <= Math.min(path.length - 1, anchorPos + half); i++) {
-        const idx = path[i];
-        if (stamp[idx] === stampId || tail >= OIL_SCRATCH) continue;
-        stamp[idx] = stampId;
-        frontier[tail] = idx;
-        frontierDist[tail] = 0;
-        tail++;
-      }
-      while (head < tail && nFound < OIL_SCRATCH) {
-        const idx = frontier[head];
-        const d0 = frontierDist[head];
-        head++;
-        if (d0 >= OIL_BRANCH_RADIUS) continue;
-        const x = idx % width;
-        const y = (idx - x) / width;
-        for (let d = 0; d < DIR_COUNT; d++) {
-          const nx = x + DIR_DX[d];
-          const ny = y + DIR_DY[d];
-          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-          const nIdx = ny * width + nx;
-          if (tiles[nIdx] !== TILE.FLOOR || stamp[nIdx] === stampId) continue;
-          stamp[nIdx] = stampId;
-          if (tail < OIL_SCRATCH) {
-            frontier[tail] = nIdx;
-            frontierDist[tail] = d0 + 1;
-            tail++;
-          }
-          if (onPath[nIdx] === 0 && occupied[nIdx] === 0 && nFound < OIL_SCRATCH) {
-            found[nFound] = nIdx;
-            foundDist[nFound] = d0 + 1;
-            nFound++;
-          }
-        }
-      }
-
-      if (nFound > 0) {
-        // Keep only the closest branch tiles, then draw one: the flask ends up on the nearest
-        // side passage rather than wherever the BFS happened to wander.
-        let nearest = foundDist[0];
-        for (let i = 1; i < nFound; i++) if (foundDist[i] < nearest) nearest = foundDist[i];
-        let nClosest = 0;
-        for (let i = 0; i < nFound; i++) if (foundDist[i] === nearest) found[nClosest++] = found[i];
-        pushItem(out, occupied, 'oil', found[rng.int(nClosest)], width);
-        placed++;
-        continue;
-      }
-      // No branch nearby: walk outward along the path for the closest free tile.
-      let fallback = -1;
-      for (let step = 0; step < path.length && fallback < 0; step++) {
-        const a = anchorPos + step;
-        const b = anchorPos - step;
-        if (a < path.length && occupied[path[a]] === 0) fallback = path[a];
-        else if (b >= 0 && occupied[path[b]] === 0) fallback = path[b];
-      }
-      if (fallback >= 0) {
-        pushItem(out, occupied, 'oil', fallback, width);
-        placed++;
-      }
-    }
-  }
-
-  // Last resort (unsolvable maze, or a path with no room left): any free floor tile.
-  for (let idx = 0; idx < total && placed < quota; idx++) {
-    if (tiles[idx] !== TILE.FLOOR || occupied[idx] !== 0) continue;
-    pushItem(out, occupied, 'oil', idx, width);
-    placed++;
-  }
 }
 
 /**

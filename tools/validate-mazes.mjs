@@ -1,22 +1,36 @@
 // @ts-check
 /**
- * @file `node tools/validate-mazes.mjs` — the 100 %-solvability gate (ARCHITECTURE.md §4.4, §5).
+ * @file `node tools/validate-mazes.mjs` — the 100 %-solvability + playability gate
+ * (ARCHITECTURE.md §4.4, §5).
  *
- * Generates thousands of mazes across a size × braid × seed matrix and asserts, for every single
- * one, the properties the rest of the game takes for granted:
+ * Two sweeps, both of which exit non-zero on any single failure.
  *
+ * **1. The size × braid × seed matrix.** Thousands of mazes from the degenerate extremes up to
+ * 512×512 cells, each asserted for:
  *   • `solvable`, `fullyConnected`, `bordersSealed`, and an empty `errors[]`
  *   • start and exit on FLOOR tiles, on the odd cell lattice, inside the grid
  *   • `loops === 0` whenever `braid === 0` (a perfect maze is a spanning tree)
  *   • determinism: the same seed replays a bit-identical tile map
  *
- * Then it builds real levels for 1..30 with the balance curve from ARCHITECTURE.md §6 and asserts
- * items land on floor tiles, never twice on the same tile, and that the fuel budget keeps its
- * difficulty promise (level 1 ≤ 55 % of the fuel for a direct run, level 10 ≈ 85 %, never > 88 %).
+ * **2. The campaign sweep** — levels 1..30, {@link LEVEL_SEEDS} seeds each, built through the real
+ * `levelParams()` from `src/state/balance.js`. The maze module may not import `src/state`
+ * (ARCHITECTURE.md §2) but this **tool** may, and doing so removes the hand-matched twin that used
+ * to drift away from the shipped curve. Every level is asserted for:
+ *   • **the refuel chain** — walking the solution path at the documented 2.0× wander factor and
+ *     taking every flask within 3 tiles of it, the torch never reaches 0 and no two consecutive
+ *     reachable flasks are further apart than `oilTargetGap`. A level a competent player cannot
+ *     chain refuels through is a **release blocker**, so this is the assertion that matters most.
+ *   • the walked-feasibility number: seconds of walking at 2.0× wander vs. seconds of fuel the
+ *     chain actually hands out (tank + flasks × refuel). Reported per level, asserted < 1.
+ *   • every item on a floor tile, on a tile centre, inside the grid, not `taken`
+ *   • no two items on the same tile
+ *   • every item reachable from the start (a gem behind a wall is a lie the HUD tells)
+ *   • the exit is still the **BFS-farthest** cell, so a massive maze has a massive route
+ *   • torches on wall tiles facing a corridor; the level replays exactly from its seed
  *
- * Exit code is 1 on any failure. Results are written to `logs/validate-mazes.json`.
- * The run is bounded to ~60 s: if the deadline hits, the remaining matrix cells are skipped and
- * the report is marked `truncated` (still a pass — the gate is about failures, not coverage count).
+ * Results are written to `logs/validate-mazes.json`. The run is bounded to ~90 s: if the matrix
+ * deadline hits, its remaining cells are skipped and the report is marked `truncated` (still a pass
+ * — the gate is about failures, not coverage count). The campaign sweep is never truncated.
  *
  * Flags: `--quick` (a small matrix, for a fast local loop), `--seeds=N` (override the seed budget).
  */
@@ -27,15 +41,16 @@ import { fileURLToPath } from 'node:url';
 import { generateMaze } from '../src/maze/generator.js';
 import { validateMaze } from '../src/maze/validator.js';
 import { buildLevel } from '../src/maze/level.js';
-import { fuelBudget } from '../src/maze/populate.js';
-import { TILE } from '../src/maze/constants.js';
+import { fuelBudget, walkRefuelChain } from '../src/maze/populate.js';
+import { TILE, DIR_DX, DIR_DY } from '../src/maze/constants.js';
+import { levelParams } from '../src/state/balance.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const QUICK = process.argv.includes('--quick');
 const SEED_OVERRIDE = Number((process.argv.find((a) => a.startsWith('--seeds=')) || '').slice(8));
 
-/** Wall-clock budget for the whole matrix, milliseconds. */
-const TIME_BUDGET_MS = QUICK ? 8000 : 60000;
+/** Wall-clock budget for the matrix half of the run, milliseconds (the campaign half is bounded by its own size). */
+const TIME_BUDGET_MS = QUICK ? 8000 : 45000;
 
 /** The size matrix (cols × rows), from the degenerate extremes up to 512×512. */
 const SIZES = QUICK
@@ -48,8 +63,13 @@ const BRAIDS = [0, 0.1, 0.5, 1];
 /** Levels built end-to-end through `buildLevel`. */
 const LEVELS = 30;
 
-/** Seeds per level in the buildLevel sweep. */
+/** Seeds per level in the buildLevel sweep (the contract asks for ≥ 25). */
 const LEVEL_SEEDS = QUICK ? 4 : 25;
+
+/** Walking model, mirrored from `src/maze/populate.js` for the feasibility arithmetic. */
+const WALK_SPEED = 3.2;
+const CORNER_FACTOR = 1.18;
+const WANDER_FACTOR = 2;
 
 /**
  * Seed budget for a size: small mazes are cheap, so they get the statistical weight; huge ones
@@ -94,10 +114,10 @@ function fail(where, message) {
 
 /**
  * Assert every structural property of one maze.
- * @param {import('../core/types.js').Maze} maze
+ * @param {import('../src/core/types.js').Maze} maze
  * @param {number} braid
  * @param {string} where
- * @returns {void}
+ * @returns {import('../src/core/types.js').Validation}
  */
 function checkMaze(maze, braid, where) {
   const v = validateMaze(maze);
@@ -116,6 +136,7 @@ function checkMaze(maze, braid, where) {
   if (v.pathLength > 0 && v.pathLength > 2 * maze.cols * maze.rows - 1) {
     fail(where, `path of ${v.pathLength} tiles is longer than the maze has cells`);
   }
+  return v;
 }
 
 /**
@@ -169,99 +190,216 @@ function runMatrix(deadline) {
   return { mazes, truncated };
 }
 
+// ── Campaign sweep ─────────────────────────────────────────────────────────────────────────────
+
+/** Reusable scratch for {@link bfsFromStart} / the duplicate check, grown as the levels grow. */
+let distScratch = new Int32Array(0);
+let queueScratch = new Int32Array(0);
+let usedScratch = new Uint8Array(0);
+
 /**
- * Level parameters matching ARCHITECTURE.md §6 (level 1 = 6×6, +2 cells per level, capped at
- * 40×40). `src/state/balance.js` owns the real curve; this is the hand-matched twin used to prove
- * the maze module behaves across the whole campaign.
- * @param {number} level 1-based
- * @returns {import('../src/maze/level.js').LevelParams}
+ * BFS distance in tiles from the start over FLOOR tiles, into a reused buffer.
+ *
+ * Reused rather than freshly allocated because the campaign sweep runs it 750 times over grids of
+ * up to 66 049 tiles, and a tool that allocates 200 MB of short-lived Int32Arrays measures the GC
+ * as much as the maze.
+ *
+ * @param {import('../src/core/types.js').Maze} maze
+ * @returns {Int32Array} distance per tile, −1 where unreachable (valid for `width*height` entries)
  */
-function levelParams(level) {
-  const side = Math.min(40, 6 + 2 * (level - 1));
-  return {
-    cols: side,
-    rows: side,
-    braid: Math.min(0.4, 0.06 * (level - 1)),
-    gems: 3 + level,
-    oil: 1 + Math.floor(level / 3),
-    fuelSeconds: 0,
-    par: 0,
-  };
+function bfsFromStart(maze) {
+  const { width, height, tiles, start } = maze;
+  const total = width * height;
+  if (distScratch.length < total) {
+    distScratch = new Int32Array(total);
+    queueScratch = new Int32Array(total);
+    usedScratch = new Uint8Array(total);
+  }
+  const dist = distScratch;
+  const queue = queueScratch;
+  dist.fill(-1, 0, total);
+  let head = 0;
+  let tail = 0;
+  const from = start.y * width + start.x;
+  dist[from] = 0;
+  queue[tail++] = from;
+  while (head < tail) {
+    const idx = queue[head++];
+    const x = idx % width;
+    const y = (idx - x) / width;
+    const nd = dist[idx] + 1;
+    for (let d = 0; d < 4; d++) {
+      const nx = x + DIR_DX[d];
+      const ny = y + DIR_DY[d];
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+      const n = ny * width + nx;
+      if (tiles[n] !== TILE.FLOOR || dist[n] >= 0) continue;
+      dist[n] = nd;
+      queue[tail++] = n;
+    }
+  }
+  return dist;
 }
 
 /**
- * Build every level 1..30 several times and assert the population and fuel guarantees.
- * @returns {{levels:Array<{level:number, size:string, path:number, fuel:number, usage:number, items:number, torches:number}>, built:number}}
+ * Every per-level assertion: items, reachability, the exit's farthest-cell property, torches, and
+ * the refuel chain.
+ *
+ * @param {import('../src/core/types.js').LevelData} data
+ * @param {ReturnType<typeof levelParams>} params
+ * @param {string} where
+ * @returns {{gems:number, oils:number, walk:ReturnType<typeof walkRefuelChain>, feasibility:number}}
+ */
+function checkLevel(data, params, where) {
+  const { maze, items } = data;
+  const { width, height, tiles } = maze;
+  const total = width * height;
+  const dist = bfsFromStart(maze);
+  const used = usedScratch;
+  used.fill(0, 0, total);
+
+  // ── Items: on a floor tile centre, inside the grid, unique, reachable, not pre-taken ──────────
+  let gems = 0;
+  let oils = 0;
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const tx = item.x - 0.5;
+    const ty = item.y - 0.5;
+    if (!Number.isInteger(tx) || !Number.isInteger(ty)) {
+      fail(where, `item ${item.id} is not on a tile centre`);
+      continue;
+    }
+    if (tx < 0 || ty < 0 || tx >= width || ty >= height) {
+      fail(where, `item ${item.id} is outside the maze`);
+      continue;
+    }
+    const idx = ty * width + tx;
+    if (tiles[idx] !== TILE.FLOOR) fail(where, `item ${item.id} is inside a wall`);
+    if (used[idx] !== 0) fail(where, `two items share tile ${idx}`);
+    used[idx] = 1;
+    if (dist[idx] < 0) fail(where, `item ${item.id} at tile ${idx} is unreachable from the start`);
+    if (item.taken) fail(where, `item ${item.id} starts taken`);
+    if (item.kind === 'gem') gems++;
+    else if (item.kind === 'oil') oils++;
+    else fail(where, `item ${item.id} has unknown kind ${String(item.kind)}`);
+  }
+  if (items.length > 0 && items[items.length - 1].id !== items.length - 1) {
+    fail(where, 'item ids are not a dense 0..n-1 range');
+  }
+
+  // Counts are floors, never ceilings: the refuel chain may add flasks, and the scatter may add
+  // gems, but a level must never ship with fewer than the curve asked for.
+  if (gems < params.gems) fail(where, `expected at least ${params.gems} gems, got ${gems}`);
+  if (oils < params.oil) fail(where, `expected at least ${params.oil} oil flasks, got ${oils}`);
+
+  // ── The exit is the farthest cell: a massive maze must have a massive route ──────────────────
+  let farthest = -1;
+  for (let cy = 0; cy < maze.rows; cy++) {
+    const row = (cy * 2 + 1) * width;
+    for (let cx = 0; cx < maze.cols; cx++) {
+      const d = dist[row + cx * 2 + 1];
+      if (d > farthest) farthest = d;
+    }
+  }
+  const exitDist = dist[maze.exit.y * width + maze.exit.x];
+  if (exitDist !== farthest) {
+    fail(where, `exit is ${exitDist} tiles from the start but the farthest cell is ${farthest}`);
+  }
+
+  // ── Torches: on wall tiles, facing a corridor ────────────────────────────────────────────────
+  for (const t of data.torches) {
+    if (tiles[t.y * width + t.x] !== TILE.WALL) fail(where, 'torch is not on a wall tile');
+    else if (tiles[(t.y + DIR_DY[t.face]) * width + (t.x + DIR_DX[t.face])] !== TILE.FLOOR) {
+      fail(where, 'torch faces solid rock');
+    }
+  }
+
+  // ── THE REFUEL CHAIN ─────────────────────────────────────────────────────────────────────────
+  const walk = walkRefuelChain(maze, data.validation, items, params);
+  // A route shorter than one chain hop needs no flask at all; anything longer must have one.
+  if (walk.flasks === 0 && data.validation.pathLength - 1 > walk.gap) {
+    fail(where, 'no oil flask is reachable from the solution path');
+  }
+  if (walk.maxGap > walk.gap) {
+    fail(where, `refuel chain broken: ${walk.maxGap} tiles between reachable flasks, limit ${walk.gap}`);
+  }
+  const asked = Number(/** @type {{oilTargetGap?:number}} */ (params).oilTargetGap);
+  if (Number.isFinite(asked) && asked >= 1 && walk.maxGap > asked) {
+    fail(where, `refuel chain exceeds the requested oilTargetGap: ${walk.maxGap} > ${asked}`);
+  }
+  if (walk.minFuel <= 0) {
+    fail(where, `the torch dies on the way: ${walk.minFuel}s at the worst point of the chain`);
+  }
+  if (!walk.ok) fail(where, 'walkRefuelChain reported the level as not walkable');
+
+  // Walked feasibility: seconds of walking at 2.0× wander vs seconds of fuel the chain hands out.
+  const needed = walk.walked * (CORNER_FACTOR / WALK_SPEED);
+  const available = walk.tank + walk.flasks * walk.refuel;
+  const feasibility = needed / available;
+  if (!(feasibility < 1)) {
+    fail(where, `walked ${Math.round(needed)}s of route against ${Math.round(available)}s of fuel`);
+  }
+
+  // ── Fuel budget agreement ────────────────────────────────────────────────────────────────────
+  const budget = fuelBudget(data.validation.pathLength, params, maze.cols * maze.rows);
+  if (Math.abs(budget.fuel - data.fuel) > 1e-9) fail(where, 'LevelData.fuel disagrees with fuelBudget');
+  if (!(data.par > 0 && Number.isFinite(data.par))) fail(where, `par ${data.par} is not a usable target`);
+  if (data.par < budget.directTime) fail(where, `par ${data.par} is below the optimal route time ${budget.directTime}`);
+
+  return { gems, oils, walk, feasibility };
+}
+
+/**
+ * Build every level 1..30 several times and assert the population, chain and fuel guarantees.
+ * @returns {{levels:Array<Object>, built:number, worstReserve:number, worstFeasibility:number}}
  */
 function runLevels() {
   const levels = [];
   let built = 0;
+  let worstReserve = 1;
+  let worstFeasibility = 0;
 
   for (let level = 1; level <= LEVELS; level++) {
     const params = levelParams(level);
     let pathSum = 0;
-    let fuelSum = 0;
-    let usageSum = 0;
-    let worstUsage = 0;
+    let walkedSum = 0;
+    let reserveWorst = 1;
+    let gapWorst = 0;
+    let gapLimit = 0;
+    let feasWorst = 0;
     let items = 0;
+    let gems = 0;
+    let oils = 0;
     let torches = 0;
+    let flasks = 0;
+    let ms = 0;
 
     for (let s = 0; s < LEVEL_SEEDS; s++) {
       const seed = level * 7919 + s * 104729;
       const where = `level ${level} seed ${seed}`;
       let data;
+      const t0 = performance.now();
       try {
         data = buildLevel(params, seed);
       } catch (err) {
         fail(where, `buildLevel threw ${String(err)}`);
         continue;
       }
+      ms += performance.now() - t0;
       built++;
       checkMaze(data.maze, params.braid ?? 0, where);
-
-      // Items: on floor, inside the grid, on a tile centre, never duplicated.
-      const used = new Set();
-      for (const item of data.items) {
-        const tx = item.x - 0.5;
-        const ty = item.y - 0.5;
-        if (!Number.isInteger(tx) || !Number.isInteger(ty)) fail(where, `item ${item.id} is not on a tile centre`);
-        if (tx < 0 || ty < 0 || tx >= data.maze.width || ty >= data.maze.height) {
-          fail(where, `item ${item.id} is outside the maze`);
-          continue;
-        }
-        const idx = ty * data.maze.width + tx;
-        if (data.maze.tiles[idx] !== TILE.FLOOR) fail(where, `item ${item.id} is inside a wall`);
-        if (used.has(idx)) fail(where, `two items share tile ${idx}`);
-        used.add(idx);
-        if (item.taken) fail(where, `item ${item.id} starts taken`);
-      }
-      const gems = data.items.filter((i) => i.kind === 'gem').length;
-      const oils = data.items.filter((i) => i.kind === 'oil').length;
-      if (gems !== params.gems) fail(where, `expected ${params.gems} gems, got ${gems}`);
-      if (oils !== params.oil) fail(where, `expected ${params.oil} oil flasks, got ${oils}`);
-
-      // Torches: on wall tiles, facing a corridor.
-      const dx = [1, 0, -1, 0];
-      const dy = [0, 1, 0, -1];
-      for (const t of data.torches) {
-        if (data.maze.tiles[t.y * data.maze.width + t.x] !== TILE.WALL) fail(where, 'torch is not on a wall tile');
-        else if (data.maze.tiles[(t.y + dy[t.face]) * data.maze.width + (t.x + dx[t.face])] !== TILE.FLOOR) {
-          fail(where, 'torch faces solid rock');
-        }
-      }
-
-      // Fuel budget: winnable without pickups, and tightening with depth.
-      const budget = fuelBudget(data.validation.pathLength, params);
-      if (Math.abs(budget.fuel - data.fuel) > 1e-9) fail(where, 'LevelData.fuel disagrees with fuelBudget');
-      if (!(data.par > 0 && data.par <= data.fuel)) fail(where, `par ${data.par} does not fit inside fuel ${data.fuel}`);
-      if (budget.usage > 0.881) fail(where, `a direct run needs ${(budget.usage * 100).toFixed(1)} % of the fuel`);
-      if (level === 1 && budget.usage > 0.55) fail(where, `level 1 usage ${(budget.usage * 100).toFixed(1)} % exceeds 55 %`);
+      const r = checkLevel(data, params, where);
 
       pathSum += data.validation.pathLength;
-      fuelSum += data.fuel;
-      usageSum += budget.usage;
-      worstUsage = Math.max(worstUsage, budget.usage);
+      walkedSum += r.walk.walked;
+      reserveWorst = Math.min(reserveWorst, r.walk.minFuelFraction);
+      gapWorst = Math.max(gapWorst, r.walk.maxGap);
+      gapLimit = r.walk.gap;
+      feasWorst = Math.max(feasWorst, r.feasibility);
       items = data.items.length;
+      gems = r.gems;
+      oils = r.oils;
+      flasks = r.walk.flasks;
       torches = data.torches.length;
 
       // Determinism of the whole level, not just the maze.
@@ -274,26 +412,29 @@ function runLevels() {
     }
 
     const n = Math.max(1, LEVEL_SEEDS);
+    worstReserve = Math.min(worstReserve, reserveWorst);
+    worstFeasibility = Math.max(worstFeasibility, feasWorst);
     levels.push({
       level,
       size: `${params.cols}x${params.rows}`,
+      cells: params.cols * params.rows,
       path: Math.round(pathSum / n),
-      fuel: Math.round((fuelSum / n) * 10) / 10,
-      usage: Math.round((usageSum / n) * 1000) / 1000,
+      tank: params.fuelSeconds,
+      gems,
+      oils,
+      chainFlasks: flasks,
       items,
       torches,
+      maxGap: gapWorst,
+      gapLimit,
+      walked: Math.round(walkedSum / n),
+      reserve: Math.round(reserveWorst * 1000) / 1000,
+      feasibility: Math.round(feasWorst * 1000) / 1000,
+      msPerBuild: Math.round((ms / n) * 100) / 100,
     });
   }
 
-  // The campaign-level promise: level 10 should be tight but fair.
-  const l10 = levels[9];
-  if (l10 && !(l10.usage > 0.78 && l10.usage <= 0.881)) {
-    fail('campaign', `level 10 average usage is ${(l10.usage * 100).toFixed(1)} %, expected ~85 %`);
-  }
-  const l1 = levels[0];
-  if (l1 && !(l1.usage <= 0.55)) fail('campaign', `level 1 average usage is ${(l1.usage * 100).toFixed(1)} %`);
-
-  return { levels, built };
+  return { levels, built, worstReserve, worstFeasibility };
 }
 
 // ── Run ────────────────────────────────────────────────────────────────────────────────────────
@@ -302,6 +443,9 @@ const started = performance.now();
 const matrix = runMatrix(started + TIME_BUDGET_MS);
 const campaign = runLevels();
 const ms = Math.round(performance.now() - started);
+
+const probe = levelParams(1);
+const hasDensity = ['gemDensity', 'oilDensity', 'oilTargetGap'].filter((k) => Number.isFinite(Number(/** @type {Record<string, unknown>} */ (probe)[k])));
 
 console.log(`\nA-MAZE maze validation${QUICK ? ' (quick)' : ''}\n`);
 console.log(`  ${'size'.padEnd(10)}${'cells'.padStart(9)}${'mazes'.padStart(9)}${'fails'.padStart(8)}${'ms'.padStart(8)}`);
@@ -314,15 +458,28 @@ for (const e of bySize.values()) {
 console.log(`  ${'-'.repeat(43)}`);
 console.log(`  ${'total'.padEnd(10)}${''.padStart(9)}${String(matrix.mazes).padStart(9)}${String(failures.length).padStart(8)}${String(ms).padStart(8)}`);
 
-console.log(`\n  levels (${LEVEL_SEEDS} seeds each, averages)\n`);
-console.log(`  ${'lvl'.padEnd(5)}${'size'.padEnd(9)}${'path'.padStart(7)}${'fuel s'.padStart(9)}${'usage'.padStart(8)}${'items'.padStart(7)}${'torches'.padStart(9)}`);
-console.log(`  ${'-'.repeat(54)}`);
+console.log(`\n  campaign — src/state/balance.js levelParams(), ${LEVEL_SEEDS} seeds per level`);
+console.log(
+  `  density fields supplied by balance.js: ${hasDensity.length > 0 ? hasDensity.join(', ') : 'none (src/maze fallbacks in use)'}\n`,
+);
+console.log(
+  `  ${'lvl'.padEnd(4)}${'size'.padEnd(9)}${'path'.padStart(6)}${'tank'.padStart(6)}${'gems'.padStart(6)}${'oil'.padStart(6)}` +
+    `${'chain'.padStart(7)}${'torch'.padStart(7)}${'maxgap'.padStart(7)}${'limit'.padStart(7)}${'walked'.padStart(8)}${'reserve'.padStart(9)}${'feas'.padStart(7)}${'ms'.padStart(7)}`,
+);
+console.log(`  ${'-'.repeat(95)}`);
 for (const l of campaign.levels) {
-  if (l.level > 12 && l.level % 6 !== 0 && l.level !== LEVELS) continue; // keep the table readable
+  if (l.level > 12 && l.level % 3 !== 0 && l.level !== LEVELS) continue; // keep the table readable
   console.log(
-    `  ${String(l.level).padEnd(5)}${l.size.padEnd(9)}${String(l.path).padStart(7)}${l.fuel.toFixed(1).padStart(9)}${`${(l.usage * 100).toFixed(1)}%`.padStart(8)}${String(l.items).padStart(7)}${String(l.torches).padStart(9)}`,
+    `  ${String(l.level).padEnd(4)}${l.size.padEnd(9)}${String(l.path).padStart(6)}${String(l.tank).padStart(6)}` +
+      `${String(l.gems).padStart(6)}${String(l.oils).padStart(6)}${String(l.chainFlasks).padStart(7)}${String(l.torches).padStart(7)}` +
+      `${String(l.maxGap).padStart(7)}${String(l.gapLimit).padStart(7)}${String(l.walked).padStart(8)}${`${(l.reserve * 100).toFixed(0)}%`.padStart(9)}` +
+      `${l.feasibility.toFixed(2).padStart(7)}${l.msPerBuild.toFixed(1).padStart(7)}`,
   );
 }
+console.log(
+  `\n  worst torch reserve across the campaign: ${(campaign.worstReserve * 100).toFixed(1)} % of the tank` +
+    `   ·   worst walked/available fuel: ${campaign.worstFeasibility.toFixed(2)}`,
+);
 
 const report = {
   total: matrix.mazes + campaign.built,
@@ -332,6 +489,10 @@ const report = {
   matrixMazes: matrix.mazes,
   levelsBuilt: campaign.built,
   truncated: matrix.truncated,
+  levelSeeds: LEVEL_SEEDS,
+  balanceDensityFields: hasDensity,
+  worstReserve: campaign.worstReserve,
+  worstFeasibility: campaign.worstFeasibility,
   levels: campaign.levels,
   errors: failures.slice(0, 50),
   node: process.version,

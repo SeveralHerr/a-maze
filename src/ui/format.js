@@ -197,13 +197,57 @@ export function formatPercent(f) {
 /**
  * A distance in tiles for the compass readout: `"12m"`. Tiles are read as metres because a
  * corridor is roughly a metre wide — a unit the player already understands.
+ *
+ * Distances are grouped past a thousand (`"1,240m"`), because a walk across a 128-cell labyrinth
+ * really does run into four figures and `1240m` is a wall of digits at HUD size.
  * @param {number} tiles non-finite (no level loaded) reads as `"--"`
  * @returns {string}
  */
 export function formatDistance(tiles) {
   if (typeof tiles !== 'number' || !Number.isFinite(tiles)) return '--';
   const v = tiles < 0 ? 0 : tiles;
-  return Math.round(v) + 'm';
+  return formatInt(Math.round(v)) + 'm';
+}
+
+/**
+ * A maze's size as the player reads it: `"80×80"` — **cells**, not tiles, because cells are the
+ * unit the difficulty curve is expressed in and the number a player can compare between depths.
+ *
+ * The `×` is a real glyph in both bitmap faces (`font.js` covers `© × … ·`), so this never falls
+ * back to an `x`.
+ * @param {number} cols cell columns
+ * @param {number} rows cell rows
+ * @returns {string}
+ */
+export function formatLabyrinth(cols, rows) {
+  const c = Math.max(1, safeInt(cols));
+  const r = Math.max(1, safeInt(rows));
+  return c + '×' + r;
+}
+
+/**
+ * The level-start banner: `"DEPTH 7 · 80×80 LABYRINTH"`.
+ *
+ * The separator is a middle dot, not an em dash: the bitmap faces cover 0x20…0x7E plus `© × … ·`
+ * only (`font.js`), and an em dash would silently render as a hole in the line.
+ * @param {number} level 1-based
+ * @param {number} cols
+ * @param {number} rows
+ * @returns {string}
+ */
+export function formatLevelBanner(level, cols, rows) {
+  return formatDepth(level) + ' · ' + formatLabyrinth(cols, rows) + ' LABYRINTH';
+}
+
+/**
+ * A count of things with a unit that has to pluralise: `"3 REFUELS"`, `"1 REFUEL"`.
+ * @param {number} n
+ * @param {string} unit singular, upper case
+ * @returns {string}
+ */
+export function formatUnits(n, unit) {
+  const v = safeInt(n);
+  return formatInt(v) + ' ' + unit + (v === 1 ? '' : 'S');
 }
 
 // ─── Rolling counter ─────────────────────────────────────────────────────────────────────────

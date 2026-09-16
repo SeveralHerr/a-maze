@@ -29,7 +29,23 @@
 import { clamp, clamp01 } from '../core/math.js';
 import { createLogger } from '../core/log.js';
 import { COLOR, drawText, lineHeight, measureLine, textHeight } from './font.js';
-import { createCounter, formatCount, formatInt, formatPercent, formatTime } from './format.js';
+import {
+  createCounter,
+  formatCount,
+  formatDistance,
+  formatInt,
+  formatLabyrinth,
+  formatLevelBanner,
+  formatPercent,
+  formatTime,
+} from './format.js';
+import {
+  MAP_MODES,
+  MAP_MODE_LABEL,
+  countExplored,
+  readMapMode,
+  setMapMode,
+} from './map.js';
 import {
   createSurface,
   drawArt,
@@ -69,6 +85,37 @@ const SCORE_RULES = Object.freeze({
   FUEL_UNIT: 10,
 });
 
+/**
+ * The maze size curve of `LEVEL` in `src/state/balance.js`, mirrored for the **loading screen**.
+ *
+ * WHY it has to be mirrored rather than read: during `loading` the state deliberately still holds
+ * the *previous* level's `levelData` (ARCHITECTURE.md §4.2), so the size of the labyrinth being
+ * carved is not in the state at all — it is a function of `state.level`. And `src/ui` may not
+ * import `src/state` (§2). Every other size readout in the UI (the HUD's depth panel, the map
+ * header, the end screens) uses the real `maze.cols`/`maze.rows`; this mirror is used for exactly
+ * one line of text, so a drift shows up as a wrong banner on the loading screen and nowhere else.
+ * It must be updated together with `balance.js`.
+ * @type {Readonly<Record<string, number>>}
+ */
+const LEVEL_RULES = Object.freeze({
+  /** `LEVEL.BASE_CELLS` — cells per side on depth 1. */
+  BASE_CELLS: 16,
+  /** `LEVEL.GROWTH` — cells added per side per depth. */
+  GROWTH: 8,
+  /** `LEVEL.MAX_CELLS` — the single size knob; past it, levels get harder, not bigger. */
+  MAX_CELLS: 128,
+});
+
+/**
+ * Cells per side of the labyrinth at a given depth (the mirror of `levelParams().cols`).
+ * @param {number} level 1-based
+ * @returns {number}
+ */
+export function cellsForLevel(level) {
+  const lv = Number.isFinite(level) ? Math.max(1, Math.floor(level)) : 1;
+  return Math.min(LEVEL_RULES.MAX_CELLS, LEVEL_RULES.BASE_CELLS + (lv - 1) * LEVEL_RULES.GROWTH);
+}
+
 // ─── Timing ──────────────────────────────────────────────────────────────────────────────────
 
 /** Seconds a screen takes to fade/slide in. */
@@ -89,12 +136,18 @@ const TALLY_ROWS = 4;
  * @typedef {Object} MenuItem
  * @property {string} id            stable identifier; `activate` switches on it
  * @property {string} label         display text
- * @property {'action'|'slider'|'toggle'|'back'} kind
+ * @property {'action'|'slider'|'toggle'|'choice'|'back'} kind
  * @property {keyof Settings} [key] the setting a slider/toggle edits
  * @property {number} [min]         slider minimum
  * @property {number} [max]         slider maximum
  * @property {number} [step]        slider increment per keypress
  * @property {'percent'|'mult'} [format] how a slider's value is written
+ * @property {ReadonlyArray<string>} [values] `choice`: the cycle, in order
+ * @property {(v:string) => string} [labelOf] `choice`: value → display word
+ * @property {(state:GameState) => string} [read] `choice`: the value in force
+ * @property {(v:string, set:(key:string, value:unknown) => void) => void} [write] `choice`: apply a
+ *   value. It is handed the settings writer rather than calling `onSetting` itself, so a choice
+ *   that shadows more than one stored field (the map does — see `map.js`) stays declarative.
  * @property {(state:GameState) => boolean} [enabled] defaults to always enabled
  */
 
@@ -127,7 +180,23 @@ const OPTION_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
   { id: 'music', label: 'Music', kind: 'slider', key: 'music', min: 0, max: 1, step: 0.1, format: 'percent' },
   { id: 'sensitivity', label: 'Look Speed', kind: 'slider', key: 'sensitivity', min: 0.2, max: 3, step: 0.1, format: 'mult' },
   { id: 'scanlines', label: 'Scanlines', kind: 'toggle', key: 'scanlines' },
-  { id: 'minimap', label: 'Minimap', kind: 'toggle', key: 'minimap' },
+  {
+    // The map is three states now (off → corner → full), so it cannot be a switch any more.
+    // `write` shadows both the new `mapMode` string and the legacy `minimap` boolean, which is
+    // what lets the cycle work whichever of the two `src/state` actually stores.
+    id: 'map',
+    label: 'Map',
+    kind: 'choice',
+    key: 'minimap',
+    values: MAP_MODES,
+    labelOf: (v) => /** @type {any} */ (MAP_MODE_LABEL)[v] || v,
+    read: (state) => readMapMode(state.settings),
+    write: (v, set) => {
+      setMapMode(v);
+      set('mapMode', v);
+      set('minimap', v !== 'off');
+    },
+  },
   { id: 'reducedMotion', label: 'Reduced Motion', kind: 'toggle', key: 'reducedMotion' },
   { id: 'invertLook', label: 'Invert Look', kind: 'toggle', key: 'invertLook' },
   { id: 'back', label: 'Back', kind: 'back' },
@@ -498,6 +567,10 @@ export function createMenus(overlayCanvas, callbacks) {
         invoke(cb.onSetting, 'onSetting', key, next);
         return true;
       }
+      case 'choice':
+        // Confirm steps the cycle forward, exactly like the `map` hotkey does in-game.
+        stepChoice(item, state, 1, true);
+        return true;
       case 'slider':
         // Confirm on a slider nudges it up and wraps at the top, which is the only way to change
         // it on a device with no left/right (a d-pad-less gamepad, a single-button remote).
@@ -555,6 +628,7 @@ export function createMenus(overlayCanvas, callbacks) {
   function adjust(screen, row, dir, state, wrap) {
     const item = screen.items[row];
     if (item === undefined || !itemEnabled(item, state)) return false;
+    if (item.kind === 'choice') return stepChoice(item, state, dir, wrap === true);
     if (item.kind === 'toggle') {
       const key = /** @type {keyof Settings} */ (item.key);
       const next = dir > 0;
@@ -578,6 +652,45 @@ export function createMenus(overlayCanvas, callbacks) {
     }
     sound('uiMove');
     invoke(cb.onSetting, 'onSetting', key, next);
+    return true;
+  }
+
+  /**
+   * Step a `choice` row by `dir`, wrapping at both ends.
+   *
+   * Left/right at the ends wrap too: a three-state cycle read out of a list of words has no
+   * meaningful "end", and a dead key on a three-item cycle just reads as broken.
+   * @param {MenuItem} item
+   * @param {GameState} state
+   * @param {number} dir −1 or +1
+   * @param {boolean} confirm true when this came from `confirm` (a different sound)
+   * @returns {boolean} true when the value changed
+   */
+  function stepChoice(item, state, dir, confirm) {
+    const values = item.values;
+    const read = item.read;
+    const write = item.write;
+    if (values === undefined || values.length === 0 || read === undefined || write === undefined) {
+      sound('uiDeny');
+      return false;
+    }
+    let current = 0;
+    try {
+      const v = read(state);
+      const at = values.indexOf(v);
+      current = at < 0 ? 0 : at;
+    } catch (err) {
+      log.error('choice read failed', err);
+    }
+    const step = dir < 0 ? -1 : 1;
+    const next = values[(current + step + values.length) % values.length];
+    sound(confirm ? 'uiConfirm' : 'uiMove');
+    try {
+      write(next, (key, value) => invoke(cb.onSetting, 'onSetting', key, value));
+    } catch (err) {
+      log.error('choice write failed', err);
+      return false;
+    }
     return true;
   }
 
@@ -1449,6 +1562,59 @@ export function createMenus(overlayCanvas, callbacks) {
         continue;
       }
 
+      if (item.kind === 'choice') {
+        // A cycle reads best as its three words with the live one lit: the player sees what the
+        // other states are without pressing anything, which a switch can never show.
+        const values = item.values === undefined ? [] : item.values;
+        const labelOf = item.labelOf;
+        const readFn = item.read;
+        let current = '';
+        try {
+          current = readFn === undefined ? '' : readFn(state);
+        } catch (err) {
+          log.error('choice read failed', err);
+        }
+        const cy2 = rowY + Math.round(labelH / 2);
+        if (stacked) {
+          // A phone has no room for three words beside the label, so it shows the live one only —
+          // the same trade the toggle makes when it drops its ON/OFF word.
+          const word = labelOf === undefined ? current : labelOf(current);
+          const wOfWord = measureLine(word, { font: 'hud', size: u });
+          ctx.fillStyle = withAlpha(COLOR.goldMid, selected ? 0.5 : 0.32);
+          ctx.fillRect(right - wOfWord - 2 * u, cy2 - Math.round(labelH / 2) + u, wOfWord + 4 * u, labelH);
+          drawText(ctx, word, right, cy2, {
+            font: 'hud',
+            size: u,
+            color: selected ? 'hud' : 'hudGold',
+            align: 'right',
+            baseline: 'middle',
+          });
+          y += rowH;
+          continue;
+        }
+        // Right-aligned, laid out back to front so the live word always ends at the value column.
+        let cxw = right;
+        for (let v = values.length - 1; v >= 0; v--) {
+          const word = labelOf === undefined ? values[v] : labelOf(values[v]);
+          const wOfWord = measureLine(word, { font: 'hud', size: u });
+          const on = values[v] === current;
+          if (on) {
+            ctx.fillStyle = withAlpha(COLOR.goldMid, selected ? 0.5 : 0.32);
+            ctx.fillRect(cxw - wOfWord - 2 * u, cy2 - Math.round(labelH / 2) + u, wOfWord + 4 * u, labelH);
+          }
+          drawText(ctx, word, cxw, cy2, {
+            font: 'hud',
+            size: u,
+            color: on ? (selected ? 'hud' : 'hudGold') : 'hudDim',
+            align: 'right',
+            baseline: 'middle',
+          });
+          cxw -= wOfWord + 5 * u;
+        }
+        y += rowH;
+        continue;
+      }
+
       // Slider.
       const min = item.min === undefined ? 0 : item.min;
       const max = item.max === undefined ? 1 : item.max;
@@ -1625,13 +1791,119 @@ export function createMenus(overlayCanvas, callbacks) {
       ctx.fillRect(Math.round(cx - totalW / 2 + i * (dotSize + gap)), y, dotSize, dotSize);
     }
 
-    drawText(ctx, `DEPTH ${state.level}`, cx, y + 8 * u, {
+    // What is being carved, in the numbers that matter: which depth, and how big. A player who
+    // has just taken the stairs down into a 96×96 labyrinth should learn that here and not by
+    // walking for ten minutes.
+    const side = cellsForLevel(state.level);
+    const banner = formatLevelBanner(state.level, side, side);
+    const bannerSize = fitScale(banner, m.w * 0.9, { font: 'hud' }, Math.max(1, u), 1);
+    drawText(ctx, banner, cx, y + 8 * u, {
       font: 'hud',
-      size: Math.max(1, u),
+      size: bannerSize,
+      color: 'hudGold',
+      align: 'center',
+    });
+    const cells = side * side;
+    drawText(ctx, `${formatInt(cells)} CELLS`, cx, y + 8 * u + textHeight({ font: 'hud', size: bannerSize }) + 2 * u, {
+      font: 'hud',
+      size: bannerSize,
       color: 'hudDim',
       align: 'center',
     });
     rowCount = 0;
+  }
+
+  // ── Run statistics (shared by level complete and game over) ──
+
+  /**
+   * Labels and values of the expedition summary, filled by {@link buildRunStats}. Fixed-size
+   * arrays, reused: these screens re-render every frame like everything else here.
+   * @type {string[]}
+   */
+  const statLabels = ['', '', '', ''];
+  /** @type {string[]} */
+  const statValues = ['', '', '', ''];
+  let statCount = 0;
+  /** Cache key for the explored count: the level object identity it was measured on. */
+  let statLevelRef = null;
+  let statExplored = 0;
+
+  /**
+   * Collect the "what did that expedition cost" rows.
+   *
+   * Only rows whose data actually exists are emitted — a summary with four `--` in it reads as a
+   * broken screen, not as an honest one. Maze size and the mapped fraction are always available
+   * (the maze and the fog grid are both in the state); refuels and distance walked need
+   * `run.refuels` / `run.distance`, which `src/state` does not carry yet (see the integrator note
+   * in this wave's report) and which appear automatically the day it does.
+   *
+   * The explored count is an O(tiles) scan, so it is taken **once per screen entry** and cached on
+   * the level's identity — never per frame, which at 66 000 tiles would cost more than the rest of
+   * the screen put together.
+   * @param {GameState} state
+   * @returns {number} how many rows were filled
+   */
+  function buildRunStats(state) {
+    statCount = 0;
+    const level = state.levelData;
+    const run = /** @type {any} */ (state.run);
+    if (level !== null && level !== undefined && level.maze !== undefined) {
+      const maze = level.maze;
+      statLabels[statCount] = 'LABYRINTH';
+      statValues[statCount] = formatLabyrinth(maze.cols, maze.rows);
+      statCount++;
+
+      const total = maze.width * maze.height;
+      if (state.explored !== null && state.explored !== undefined && total > 0) {
+        if (statLevelRef !== level) {
+          statExplored = countExplored(state.explored, total);
+          statLevelRef = level;
+        }
+        statLabels[statCount] = 'EXPLORED';
+        statValues[statCount] = formatPercent(statExplored / total);
+        statCount++;
+      }
+    }
+    if (typeof run.refuels === 'number' && Number.isFinite(run.refuels) && statCount < statLabels.length) {
+      statLabels[statCount] = 'REFUELS';
+      statValues[statCount] = formatInt(run.refuels);
+      statCount++;
+    }
+    if (typeof run.distance === 'number' && Number.isFinite(run.distance) && statCount < statLabels.length) {
+      statLabels[statCount] = 'WALKED';
+      statValues[statCount] = formatDistance(run.distance);
+      statCount++;
+    }
+    return statCount;
+  }
+
+  /**
+   * Draw the stat rows as a two-column strip: label above value, so four numbers fit on one line
+   * of a phone and two lines of a desktop panel without a table.
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {number} left
+   * @param {number} right
+   * @param {number} y top edge
+   * @param {number} u
+   * @param {number} size text scale
+   * @param {number} alpha
+   * @returns {number} the height drawn
+   */
+  function drawStatStrip(ctx, left, right, y, u, size, alpha) {
+    if (statCount === 0) return 0;
+    const lineH = textHeight({ font: 'hud', size });
+    const perRow = statCount >= 3 ? 2 : statCount;
+    const colW = Math.floor((right - left) / perRow);
+    const rows = Math.ceil(statCount / perRow);
+    for (let i = 0; i < statCount; i++) {
+      const col = i % perRow;
+      const row = (i / perRow) | 0;
+      const x = left + col * colW;
+      const ry = y + row * (lineH * 2 + 2 * u);
+      drawText(ctx, statLabels[i], x, ry, { font: 'hud', size, color: 'hudDim', alpha });
+      drawText(ctx, statValues[i], x, ry + lineH + u, { font: 'hud', size, color: 'hudBright', alpha });
+    }
+    return rows * (lineH * 2 + 4 * u);
   }
 
   // ── Level complete ──
@@ -1695,8 +1967,12 @@ export function createMenus(overlayCanvas, callbacks) {
     const lineH = textHeight({ font: 'hud', size: totalScale }) + 4 * u;
     const itemScale = fitScale('Quit to Title', panelW * 0.7, { font: 'display' }, scaleCap(m, 150), 1);
     const rowH = textHeight({ font: 'display', size: itemScale }) + 4 * u;
+    // The expedition summary sits between the tally and the buttons: it is the record of the maze
+    // you just walked, which at these sizes is a bigger story than the score.
+    const statRows = buildRunStats(state);
+    const statH = statRows === 0 ? 0 : (statRows >= 3 ? 2 : 1) * (textHeight({ font: 'hud', size: rowScale }) * 2 + 4 * u) + 4 * u;
     const panelH =
-      headH + 13 * u + lineH * TALLY_ROWS + 4 * u + rowH * screen.items.length + 6 * u;
+      headH + 13 * u + lineH * TALLY_ROWS + 4 * u + statH + rowH * screen.items.length + 6 * u;
     const px = Math.round(cx - panelW / 2);
     const py = Math.max(2 * u, Math.round((m.h - panelH) / 2)) + panelSlide(enter, u, reduced);
 
@@ -1741,6 +2017,15 @@ export function createMenus(overlayCanvas, callbacks) {
     }
 
     y += 4 * u;
+    if (statH > 0) {
+      ctx.fillStyle = withAlpha(COLOR.stoneDark, 0.5);
+      ctx.fillRect(left, Math.round(y) - 2 * u, right - left, Math.max(1, u >> 1));
+      // The strip fades in with the last tally row rather than arriving with the panel, so the
+      // eye finishes the score before it is offered the expedition numbers.
+      const statAlpha = tallyDone ? 1 : clamp01((tallyT - TALLY_DELAY - TALLY_ROWS * TALLY_STAGGER) * 2);
+      if (statAlpha > 0) drawStatStrip(ctx, left, right, Math.round(y + 2 * u), u, rowScale, statAlpha);
+      y += statH;
+    }
     if (tallyDone) {
       drawItemList(ctx, m, state, screen, Math.round(y), itemScale, rowH, reduced);
     } else {
@@ -1794,7 +2079,9 @@ export function createMenus(overlayCanvas, callbacks) {
     const lineH = textHeight({ font: 'hud', size: scoreScale }) + 4 * u;
     const itemScale = fitScale('Try Again', panelW * 0.6, { font: 'display' }, scaleCap(m, 150), 1);
     const rowH = textHeight({ font: 'display', size: itemScale }) + 4 * u;
-    const panelH = headH + 14 * u + lineH * 3 + rowH * screen.items.length + 6 * u;
+    const statRows = buildRunStats(state);
+    const statH = statRows === 0 ? 0 : (statRows >= 3 ? 2 : 1) * (textHeight({ font: 'hud', size: rowScale }) * 2 + 4 * u) + 4 * u;
+    const panelH = headH + 14 * u + lineH * 3 + statH + rowH * screen.items.length + 6 * u;
     const px = Math.round(cx - panelW / 2);
     const py = Math.max(2 * u, Math.round((m.h - panelH) / 2)) + panelSlide(enter, u, reduced);
 
@@ -1830,6 +2117,15 @@ export function createMenus(overlayCanvas, callbacks) {
       flash,
     );
     y += lineH + 2 * u;
+
+    // Where the torch went out: how big the labyrinth was and how much of it was ever seen. On a
+    // 128×128 level "explored 31 %" is the whole story of the run in one number.
+    if (statH > 0) {
+      ctx.fillStyle = withAlpha(COLOR.stoneDark, 0.5);
+      ctx.fillRect(left, Math.round(y) - 2 * u, right - left, Math.max(1, u >> 1));
+      drawStatStrip(ctx, left, right, Math.round(y + 2 * u), u, rowScale, 1);
+      y += statH;
+    }
 
     drawItemList(ctx, m, state, screen, Math.round(y), itemScale, rowH, reduced);
   }

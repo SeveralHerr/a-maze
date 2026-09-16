@@ -31,8 +31,19 @@
 
 import { clamp, damp } from '../core/math.js';
 import { createLogger } from '../core/log.js';
-import { BOB, SETTING_KEYS, SIM, coerceSetting, sanitizeBest, sanitizeSettings } from './balance.js';
 import {
+  BOB,
+  SETTING_KEYS,
+  SIM,
+  coerceSetting,
+  drainRate,
+  resolveTank,
+  sanitizeBest,
+  sanitizeSettings,
+} from './balance.js';
+import {
+  allocExplored,
+  buildItemGrid,
   completeLevel,
   createSimScratch,
   placePlayerAtStart,
@@ -123,6 +134,11 @@ export function createInitialState(settings, best) {
       totalTime: 0,
       levelScore: 0,
       bestCombo: 0,
+      // Massive-maze statistics (§3 RunStats): flasks burned this level, tiles walked this run.
+      // On a 14-minute labyrinth these are what describe the run; the HUD shows the refuel tally
+      // live and the end screens show both.
+      refuels: 0,
+      distance: 0,
     },
     best: sanitizedBest,
     settings: sanitizeSettings(settings),
@@ -301,6 +317,8 @@ function applyNewGame(state, rawSeed) {
   run.totalTime = 0;
   run.levelScore = 0;
   run.bestCombo = 0;
+  run.refuels = 0;
+  run.distance = 0;
 
   resetSimScratch(state.sim);
   state.sim.rng = null;
@@ -377,8 +395,11 @@ function applyLevelReady(state, data) {
 
   state.levelData = level;
   // Sized to the new maze; allocated together with levelData so the pair is always consistent.
-  state.explored = new Uint8Array(maze.width * maze.height);
+  // A 257×257 level needs 66 kB of it, so it comes from a pool rather than the allocator.
+  state.explored = allocExplored(state, maze.width * maze.height);
   resetSimScratch(state.sim);
+  // Once per level, never per step: a level carries up to ~820 items (ARCHITECTURE.md §4.2).
+  buildItemGrid(state);
 
   if (phase === 'title') {
     startAttract(state);
@@ -394,17 +415,20 @@ function applyLevelReady(state, data) {
   }
 
   const run = state.run;
-  const fuel =
-    typeof level.fuel === 'number' && Number.isFinite(level.fuel) && level.fuel > 0
-      ? level.fuel
-      : 60;
+  // The tank is `src/state`'s number, not the maze's (see balance.resolveTank): the torch economy
+  // depends on it being small and independent of the maze's area.
+  const fuel = resolveTank(state.level, level.fuel);
   run.fuelMax = fuel;
   run.fuel = fuel;
   run.gems = 0;
   run.gemsTotal = gems;
   run.levelTime = 0;
   run.levelScore = 0;
+  // Refuels are a per-level statistic (the HUD's TANK ×N tally); `distance` is per run and is
+  // deliberately *not* reset here, so "WALKED" on the game-over screen covers the whole descent.
+  run.refuels = 0;
 
+  state.sim.drain = drainRate(state.level);
   state.sim.rng = null;
   placePlayerAtStart(state);
   revealAround(state);

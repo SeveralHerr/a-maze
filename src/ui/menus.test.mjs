@@ -8,7 +8,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createMenus, hitTest, menuStep, sliderValueAt } from './menus.js';
+import { cellsForLevel, createMenus, hitTest, menuStep, sliderValueAt } from './menus.js';
+import { resetMapMode } from './map.js';
 
 // ─── Pure helpers ────────────────────────────────────────────────────────────────────────────
 
@@ -340,4 +341,104 @@ test('menus built with no callbacks at all are inert, not broken', () => {
   const state = makeState('title');
   assert.doesNotThrow(() => menus.render(state));
   assert.equal(menus.handleInput(press('confirm'), state), true, 'still consumes the key');
+});
+
+// ─── The three-state map option ──────────────────────────────────────────────────────────────
+
+test('the map row cycles through its three states and writes both settings shapes', () => {
+  resetMapMode();
+  const { menus, settings } = harness();
+  const state = makeState('title');
+  // Walk into Options and down to the Map row.
+  menus.render(state);
+  menus.handleInput(press('down'), state);
+  menus.handleInput(press('confirm'), state);
+  menus.render(state);
+  assert.equal(menus.screen(), 'options');
+
+  // Rows: Sound, Music, Look Speed, Scanlines, Map, …
+  for (let i = 0; i < 4; i++) menus.handleInput(press('down'), state);
+  settings.length = 0;
+  menus.handleInput(press('confirm'), state);
+
+  // One confirm must write the new-style string *and* the legacy boolean, so the preference
+  // survives whichever of the two `src/state` actually stores.
+  const keys = settings.map(([k]) => k);
+  assert.ok(keys.includes('mapMode'), `expected a mapMode write, got ${keys.join(',')}`);
+  assert.ok(keys.includes('minimap'), 'the legacy boolean is kept in step');
+  const mode = settings.find(([k]) => k === 'mapMode')[1];
+  assert.equal(mode, 'full', 'corner → full');
+  assert.equal(settings.find(([k]) => k === 'minimap')[1], true);
+
+  // Again: full → off, and the boolean follows it down.
+  settings.length = 0;
+  menus.handleInput(press('confirm'), state);
+  assert.equal(settings.find(([k]) => k === 'mapMode')[1], 'off');
+  assert.equal(settings.find(([k]) => k === 'minimap')[1], false);
+  resetMapMode();
+});
+
+test('left and right step the map row in both directions and wrap', () => {
+  resetMapMode();
+  const { menus, settings } = harness();
+  const state = makeState('title');
+  menus.render(state);
+  menus.handleInput(press('down'), state);
+  menus.handleInput(press('confirm'), state);
+  menus.render(state);
+  for (let i = 0; i < 4; i++) menus.handleInput(press('down'), state);
+
+  settings.length = 0;
+  menus.handleInput(press('left'), state);
+  assert.equal(settings.find(([k]) => k === 'mapMode')[1], 'off', 'corner → off going back');
+  settings.length = 0;
+  menus.handleInput(press('left'), state);
+  assert.equal(settings.find(([k]) => k === 'mapMode')[1], 'full', 'and wraps past the start');
+  resetMapMode();
+});
+
+test('the loading screen size mirror matches the shipped curve', () => {
+  // These are the numbers ARCHITECTURE.md §6 / balance.js LEVEL publish: 16 + 8 per depth, capped
+  // at 128 (depth 15). If balance.js moves, this test is the tripwire.
+  assert.equal(cellsForLevel(1), 16);
+  assert.equal(cellsForLevel(2), 24);
+  assert.equal(cellsForLevel(8), 72);
+  assert.equal(cellsForLevel(15), 128);
+  assert.equal(cellsForLevel(30), 128, 'past the cap a level gets harder, not bigger');
+  assert.equal(cellsForLevel(0), 16);
+  assert.equal(cellsForLevel(NaN), 16);
+});
+
+test('the end screens survive a run with no optional stat fields', () => {
+  const { menus } = harness();
+  for (const phase of ['levelComplete', 'gameOver']) {
+    const state = makeState(phase);
+    assert.doesNotThrow(() => menus.render(state), `${phase} with no levelData`);
+    // And with a maze and a fog grid, which is when the stat strip actually appears.
+    const width = 33;
+    state.levelData = {
+      maze: {
+        width,
+        height: width,
+        cols: 16,
+        rows: 16,
+        tiles: new Uint8Array(width * width),
+        start: { x: 1, y: 1 },
+        exit: { x: 31, y: 31 },
+        seed: 1,
+      },
+      validation: {},
+      items: [],
+      torches: [],
+      fuel: 110,
+      par: 55,
+    };
+    state.explored = new Uint8Array(width * width);
+    for (let i = 0; i < 300; i++) state.explored[i] = 1;
+    assert.doesNotThrow(() => menus.render(state), `${phase} with a maze`);
+    // Optional fields the integrator may add later must not break anything when they appear.
+    state.run.refuels = 4;
+    state.run.distance = 1240;
+    assert.doesNotThrow(() => menus.render(state), `${phase} with refuels and distance`);
+  }
 });

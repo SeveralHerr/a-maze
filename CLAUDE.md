@@ -11,10 +11,11 @@ tool dependency). `index.html` loads `src/main.js`. Deployed to itch.io
 ## Commands
 ```sh
 npm run serve                     # static dev server http://localhost:5173 — keep it running
-npm test                          # every src/*/*.test.mjs in its own Node process (359 tests)
-node tools/validate-mazes.mjs     # 117k-maze solvability matrix (exit≠0 on any failure); --quick
-node tools/stress.mjs             # extreme grid sizes: time/memory/no stack overflow; --quick
+npm test                          # every src/*/*.test.mjs in its own Node process (523 tests)
+node tools/validate-mazes.mjs     # 117k mazes + the 750-level campaign incl. the refuel chain; --quick
+node tools/stress.mjs             # extreme grid sizes + the gameplay maximum + leak loops; --quick
 node tools/verify.mjs --tag x     # headless Chrome autopilot run → logs/x.json + logs/shot-x-*.png
+                                  #   descends to the size cap and drives it for 60s (~8 min total)
                                   #   needs `npm run serve` running and Chrome (CHROME_PATH)
                                   #   --seed N --soak 20 --fps 5 --url ... --keep-open
 ```
@@ -29,6 +30,14 @@ and `/src/ui/preview.html` (module harnesses).
 - `src/core`, `src/maze`, `src/state` must run in Node (no DOM at import time).
 - The reducer mutates store-owned state in place; renderer/ui/audio are read-only consumers.
 - Zero allocations per frame in the raycaster and sim hot paths; all tuning numbers live in `src/state/balance.js`; all colours in `src/renderer/palette.js`.
+- **Massive mazes:** a level is up to 128×128 cells (257×257 tiles, ~820 items, ~1 300 torches, a
+  66 kB `explored` grid). **Nothing may be O(items) or O(tiles) per frame or per step** — pickups
+  use a bucket grid, sprites and lights use a spatial index, the map keeps an incremental raster.
+  A scan added here looks free on level 1 and costs the frame at the cap.
+- The torch is a **tank you refill** (110–150 s, independent of maze area), not a budget for the
+  level; oil flasks are the economy and their placement guarantee is a hard gate, not a balance note.
+- `tools/` and `src/state`'s `perf`/`feasibility` tests may import across module lines (they drive
+  the real curve against real mazes on purpose); runtime modules may not.
 - `?headless=1` exposes `window.__game` for tools; `?debug=1` shows FPS/logs.
 - Events are routed from a **store subscriber**, never after the tick dispatch: `state.events` is
   cleared at the top of every dispatch, so anything read later has already been clobbered.

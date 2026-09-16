@@ -220,3 +220,189 @@ test('createHud is inert but safe without a DOM', () => {
   assert.doesNotThrow(() => hud.reset());
   assert.doesNotThrow(() => hud.dispose());
 });
+
+// ─── Recording context: the layout code actually runs ─────────────────────────────────────────
+
+/**
+ * A 2-D context that records every fill it is asked for. Glyph blits no-op in Node (the font
+ * atlas needs a canvas), but every layout calculation, panel, bar segment and marker runs for
+ * real — which is what makes this a regression test for the gauge and the map plumbing rather
+ * than a smoke test.
+ * @returns {any}
+ */
+function recordingCtx() {
+  const calls = { fills: 0, draws: 0, transforms: 0, clears: 0, rects: [] };
+  return {
+    calls,
+    globalAlpha: 1,
+    imageSmoothingEnabled: true,
+    fillStyle: '#000',
+    setTransform: () => {
+      calls.transforms++;
+    },
+    clearRect: () => {
+      calls.clears++;
+    },
+    fillRect: (x, y, w, h) => {
+      calls.fills++;
+      if (calls.rects.length < 4096) calls.rects.push([x, y, w, h]);
+    },
+    drawImage: () => {
+      calls.draws++;
+    },
+    createImageData: (w, h) => ({ width: w, height: h, data: new Uint8ClampedArray(w * h * 4) }),
+    putImageData: () => {},
+    save: () => {},
+    restore: () => {},
+    beginPath: () => {},
+    rect: () => {},
+    clip: () => {},
+  };
+}
+
+/**
+ * A canvas whose context records.
+ * @param {number} cssW
+ * @param {number} cssH
+ * @returns {any}
+ */
+function drawableCanvas(cssW, cssH) {
+  const ctx = recordingCtx();
+  return {
+    width: 0,
+    height: 0,
+    __ctx: ctx,
+    getContext: () => ctx,
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: cssW, height: cssH }),
+  };
+}
+
+/**
+ * A playable state over a small thick-wall maze.
+ * @param {object} [over] fields to merge into `run`
+ * @returns {any}
+ */
+function playingState(over) {
+  const cols = 16;
+  const width = cols * 2 + 1;
+  const tiles = new Uint8Array(width * width).fill(1);
+  for (let cy = 0; cy < cols; cy++) {
+    for (let cx = 0; cx < cols; cx++) tiles[(cy * 2 + 1) * width + cx * 2 + 1] = 0;
+  }
+  const explored = new Uint8Array(width * width);
+  for (let i = 0; i < 200; i++) explored[i] = 1;
+  return {
+    phase: 'playing',
+    time: 3,
+    phaseTime: 3,
+    level: 4,
+    seed: 1,
+    levelData: {
+      maze: {
+        width,
+        height: width,
+        cols,
+        rows: cols,
+        tiles,
+        start: { x: 1, y: 1 },
+        exit: { x: width - 2, y: width - 2 },
+        seed: 1,
+      },
+      validation: {},
+      items: [],
+      torches: [],
+      fuel: 110,
+      par: 55,
+    },
+    player: { x: 1.5, y: 1.5, angle: 0.3, px: 1.5, py: 1.5, pangle: 0.3, vx: 0, vy: 0, bob: 0, bobAmp: 0, shake: 0 },
+    explored,
+    run: Object.assign(
+      { score: 4200, gems: 6, gemsTotal: 12, fuel: 60, fuelMax: 110, levelTime: 42, totalTime: 90, levelScore: 0, bestCombo: 2 },
+      over,
+    ),
+    best: { score: 9000, level: 5 },
+    settings: { volume: 1, music: 1, sensitivity: 1, scanlines: true, minimap: true, reducedMotion: false, invertLook: false },
+    derived: { exitDist: 37.2, nearExit: 0, lowFuel: false },
+    events: [],
+  };
+}
+
+test('the HUD draws the tank, the depth panel and the compass without a map', () => {
+  const canvas = drawableCanvas(1280, 720);
+  const hud = createHud(canvas, { map: 'off' });
+  hud.resize(1280, 720, 1);
+  const state = playingState();
+  hud.render(state, null, 0);
+  const calls = canvas.__ctx.calls;
+  assert.ok(calls.clears >= 1, 'the overlay frame is cleared');
+  assert.ok(calls.fills > 40, `the HUD drew something substantial (${calls.fills} fills)`);
+  assert.equal(calls.draws, 0, 'no map means no blit');
+});
+
+test('a refill flares the gauge and counts as a refuel', () => {
+  const canvas = drawableCanvas(1280, 720);
+  const hud = createHud(canvas, { map: 'off' });
+  hud.resize(1280, 720, 1);
+  const state = playingState({ fuel: 40 });
+  hud.render(state, null, 0);
+  const quiet = canvas.__ctx.calls.fills;
+
+  // A flask lands: the bar surges and the panel edge flares, so the frame after a pickup must be
+  // visibly busier than the frame before it.
+  state.time += 0.016;
+  state.run.fuel = 78;
+  hud.render(state, null, 0);
+  assert.ok(canvas.__ctx.calls.fills - quiet > 0, 'the refill frame drew more, not less');
+  // The pop carries the gained fuel, so the HUD must not have been reset by it.
+  assert.doesNotThrow(() => hud.render(state, null, 0));
+});
+
+test('the map hotkey cycles the three states and reports the new one', () => {
+  const hud = createHud(null);
+  const settings = { minimap: true };
+  assert.equal(hud.mapMode(settings), 'corner');
+  assert.equal(hud.cycleMap(settings), 'full');
+  assert.equal(hud.cycleMap(settings), 'off');
+  assert.equal(hud.cycleMap(settings), 'corner');
+  assert.equal(hud.mapMode(settings), 'corner');
+});
+
+test('a forced map mode ignores the settings (the preview harness)', () => {
+  const hud = createHud(null, { map: 'full' });
+  assert.equal(hud.mapMode({ minimap: false }), 'full');
+  // The legacy boolean option still means "corner".
+  const legacy = createHud(null, { minimap: true });
+  assert.equal(legacy.mapMode({ minimap: false }), 'corner');
+});
+
+test('map statistics are exposed and start empty', () => {
+  const hud = createHud(null);
+  const stats = hud.mapStats();
+  assert.equal(typeof stats.updateMs, 'number');
+  assert.equal(stats.explored, 0);
+  assert.equal(hud.mapStats(), stats, 'the stats object is reused, never reallocated');
+});
+
+test('every map mode renders without throwing at both layouts', () => {
+  for (const mode of ['off', 'corner', 'full']) {
+    for (const [w, h, dpr] of [[1280, 720, 1], [390, 844, 3]]) {
+      const canvas = drawableCanvas(w, h);
+      const hud = createHud(canvas, { map: mode });
+      hud.resize(w, h, dpr);
+      const state = playingState();
+      assert.doesNotThrow(() => hud.render(state, null, 0), `${mode} @ ${w}x${h}`);
+      state.phase = 'paused';
+      assert.doesNotThrow(() => hud.render(state, null, 0), `${mode} paused @ ${w}x${h}`);
+    }
+  }
+});
+
+test('the HUD survives a level with no data and a low tank', () => {
+  const canvas = drawableCanvas(1280, 720);
+  const hud = createHud(canvas, { map: 'corner' });
+  hud.resize(1280, 720, 1);
+  const state = playingState({ fuel: 3 });
+  state.levelData = null;
+  state.explored = null;
+  assert.doesNotThrow(() => hud.render(state, null, 0));
+});

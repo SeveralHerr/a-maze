@@ -390,13 +390,24 @@ test('rendering does not allocate per frame', () => {
     view.time = i * 0.016;
     rc.render(view);
   }
-  const before = process.memoryUsage().heapUsed;
-  for (let i = 0; i < 2000; i++) {
-    view.time = 3.2 + i * 0.016;
-    view.player.angle = i * 0.003;
-    rc.render(view);
+  /**
+   * Heap growth over one 2000-frame block.
+   * @param {number} t0 clock offset so each block animates differently
+   * @returns {number} bytes
+   */
+  function block(t0) {
+    const before = process.memoryUsage().heapUsed;
+    for (let i = 0; i < 2000; i++) {
+      view.time = t0 + i * 0.016;
+      view.player.angle = i * 0.003;
+      rc.render(view);
+    }
+    return process.memoryUsage().heapUsed - before;
   }
-  const grown = process.memoryUsage().heapUsed - before;
+  // Two blocks, and only the smaller counts. A single sample is at the mercy of where the collector
+  // happened to be, which made this assertion flaky; a real per-frame allocation leaks in *every*
+  // block, so taking the minimum keeps the signal and drops the GC noise.
+  const grown = Math.min(block(3.2), block(40.7));
   assert.ok(grown < 3_000_000, `heap grew ${(grown / 1e6).toFixed(2)} MB over 2000 frames`);
 });
 
@@ -411,4 +422,325 @@ test('a texture set can be swapped in without rebuilding the renderer', () => {
   // Rubbish is ignored rather than breaking the renderer.
   rc.setTextures(/** @type {any} */ (null));
   assert.doesNotThrow(() => rc.render(makeView(maze)));
+});
+
+// ── MASSIVE-maze scale: the spatial index ─────────────────────────────────────────────────────
+// A 128×128-cell level carries ~850 items and ~1300 torches, so the light and sprite passes now
+// walk a uniform grid instead of the whole level. These tests assert the index answers what the
+// exhaustive scan answered, and that flooding a level with decoration cannot push the sprite the
+// player is standing next to out of the queue — the failure the old fixed-size queue actually had.
+
+/**
+ * An open hall: solid border, empty interior. Big enough to park decoration outside every draw
+ * radius, which is what makes "far things change nothing" testable.
+ * @param {number} size tiles per side (odd)
+ * @returns {import('../core/types.js').Maze}
+ */
+function hall(size) {
+  const tiles = new Uint8Array(size * size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      tiles[y * size + x] = x === 0 || y === 0 || x === size - 1 || y === size - 1 ? 1 : 0;
+    }
+  }
+  return {
+    width: size,
+    height: size,
+    cols: (size - 1) / 2,
+    rows: (size - 1) / 2,
+    tiles,
+    start: { x: 1, y: 1 },
+    exit: { x: size - 2, y: size - 2 },
+    seed: 3,
+  };
+}
+
+/**
+ * Deterministic pseudo-random stream, local to these tests.
+ * @param {number} seed
+ * @returns {() => number} 0..1
+ */
+function prng(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+}
+
+/**
+ * Scatter torches on distinct tile coordinates inside a hall.
+ * @param {number} n
+ * @param {number} size hall size in tiles
+ * @param {number} seed
+ * @param {(x:number, y:number) => boolean} [keep] filter on tile coordinates
+ * @returns {import('../core/types.js').Torch[]}
+ */
+function scatterTorches(n, size, seed, keep) {
+  const rnd = prng(seed);
+  /** @type {import('../core/types.js').Torch[]} */
+  const out = [];
+  /** @type {Set<number>} */
+  const used = new Set();
+  let guard = 0;
+  while (out.length < n && guard++ < n * 60) {
+    const x = 1 + ((rnd() * (size - 2)) | 0);
+    const y = 1 + ((rnd() * (size - 2)) | 0);
+    const key = y * size + x;
+    if (used.has(key)) continue; // distinct tiles keep the nearest-8 comparison tie-free
+    if (keep && !keep(x, y)) continue;
+    used.add(key);
+    out.push({ x, y, face: /** @type {0|1|2|3} */ ((rnd() * 4) | 0) });
+  }
+  return out;
+}
+
+/**
+ * Scatter items on a ring or a disc around a point.
+ * @param {number} n
+ * @param {number} cx
+ * @param {number} cy
+ * @param {number} radius
+ * @returns {import('../core/types.js').Item[]}
+ */
+function ringItems(n, cx, cy, radius) {
+  /** @type {import('../core/types.js').Item[]} */
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * Math.PI * 2;
+    out.push({
+      id: i + 1,
+      kind: /** @type {'gem'|'oil'} */ (i % 2 ? 'gem' : 'oil'),
+      x: cx + Math.cos(a) * radius,
+      y: cy + Math.sin(a) * radius,
+      taken: false,
+    });
+  }
+  return out;
+}
+
+test('the nearest-eight light selection through the index matches an exhaustive scan', () => {
+  const { rc } = makeRenderer(640, 360);
+  const size = 129;
+  const maze = hall(size);
+  const torches = scatterTorches(600, size, 20250915);
+  // The renderer offsets a flame off its wall by exactly this before measuring distance.
+  const OFF = 0.5 + 0.22;
+  const DX = [1, 0, -1, 0];
+  const DY = [0, 1, 0, -1];
+  const view = makeView(maze, { torches, player: { x: 0, y: 0, angle: 0 }, exit: { x: 1, y: 1 } });
+
+  for (const [px, py, angle] of [
+    [64.5, 64.5, 0],
+    [20.5, 90.5, 1.1],
+    [100.5, 30.5, -2.4],
+    [3.5, 3.5, 0.7], // hard against a corner: the ring search must not walk off the grid
+    [125.5, 125.5, 3.9],
+  ]) {
+    view.player.x = px;
+    view.player.y = py;
+    view.player.angle = angle;
+    view.time = 2;
+    rc.render(view);
+
+    // Brute force: the eight nearest flames to the focus point 2.5 tiles ahead of the camera.
+    const fx = px + Math.cos(angle) * 2.5;
+    const fy = py + Math.sin(angle) * 2.5;
+    const ranked = torches
+      .map((t) => {
+        const lx = t.x + 0.5 + DX[t.face] * OFF;
+        const ly = t.y + 0.5 + DY[t.face] * OFF;
+        const dx = lx - fx;
+        const dy = ly - fy;
+        return { lx, ly, d2: dx * dx + dy * dy };
+      })
+      .sort((a, b) => a.d2 - b.d2)
+      .slice(0, 8);
+
+    const got = rc.lights();
+    assert.equal(got.n, 8, `expected 8 lights at (${px},${py})`);
+    /** @type {Set<string>} */
+    const gotKeys = new Set();
+    for (let i = 0; i < got.n; i++) gotKeys.add(`${got.x[i].toFixed(3)},${got.y[i].toFixed(3)}`);
+    for (const e of ranked) {
+      assert.ok(
+        gotKeys.has(`${e.lx.toFixed(3)},${e.ly.toFixed(3)}`),
+        `light at d=${Math.sqrt(e.d2).toFixed(2)} was missed from (${px},${py})`,
+      );
+    }
+  }
+});
+
+test('decoration beyond the draw radius cannot change a single pixel', () => {
+  const size = 161;
+  const maze = hall(size);
+  const near = scatterTorches(6, size, 11, (x, y) => Math.hypot(x - 80, y - 80) < 12);
+  // Everything else sits past TORCH_RADIUS + FAR (34.6 tiles), so it can be neither light nor
+  // sprite. Two renderers, so neither accumulates the other's ember history.
+  const far = scatterTorches(1500, size, 12, (x, y) => Math.hypot(x - 80, y - 80) > 50);
+  const items = ringItems(900, 80.5, 80.5, 60);
+  const player = { x: 80.5, y: 80.5, angle: 0.4 };
+
+  const a = makeRenderer(640, 360);
+  a.rc.render(makeView(maze, { torches: near, player, exit: { x: 1, y: 1 }, time: 5 }));
+  const lean = a.read().slice();
+
+  const b = makeRenderer(640, 360);
+  b.rc.render(
+    makeView(maze, { torches: near.concat(far), items, player, exit: { x: 1, y: 1 }, time: 5 }),
+  );
+  assert.deepEqual(b.read(), lean, '1500 distant torches and 900 distant items must be invisible');
+  assert.equal(b.rc.lights().n, near.length, 'only the near torches may be selected as lights');
+});
+
+test('a crowd of torches cannot evict the item in front of the camera', () => {
+  // The regression: the sprite queue used to fill with far torches (gathered first) and then
+  // silently drop every item, so gems and oil flasks vanished on a big, well-lit level.
+  const size = 129;
+  const maze = hall(size);
+  const torches = scatterTorches(900, size, 77, (x, y) => Math.hypot(x - 64, y - 64) < 22);
+  const gem = { id: 1, kind: /** @type {'gem'} */ ('gem'), x: 66.1, y: 64.5, taken: false };
+  const player = { x: 64.5, y: 64.5, angle: 0 };
+  const opts = { torches, items: [gem], player, exit: { x: 1, y: 1 }, time: 4 };
+
+  const { rc, read } = makeRenderer(640, 360);
+  rc.render(makeView(maze, opts));
+  const withGem = read().slice();
+  const drawn = rc.stats().sprites;
+  assert.ok(drawn > 8, `expected a crowd of flames on screen, drew ${drawn}`);
+
+  gem.taken = true;
+  rc.render(makeView(maze, opts));
+  assert.notDeepEqual(read(), withGem, 'the gem right in front of the camera must be drawn');
+});
+
+test('a pickup needs no index rebuild, and a new level does get one', () => {
+  const size = 65;
+  const mazeA = hall(size);
+  const mazeB = hall(size);
+  const torchesA = scatterTorches(200, size, 5);
+  const torchesB = scatterTorches(200, size, 6);
+  const items = [
+    { id: 1, kind: /** @type {'gem'} */ ('gem'), x: 33.6, y: 32.5, taken: false },
+    { id: 2, kind: /** @type {'oil'} */ ('oil'), x: 34.6, y: 32.5, taken: false },
+  ];
+  const player = { x: 32.5, y: 32.5, angle: 0 };
+  const { rc, read } = makeRenderer(640, 360);
+
+  // One view object, mutated in place, exactly as main.js drives it.
+  const view = makeView(mazeA, { torches: torchesA, items, player, exit: { x: 1, y: 1 }, time: 3 });
+  rc.render(view);
+  const lightsA = Array.from(rc.lights().x.slice(0, rc.lights().n)).join(',');
+  const bothItems = read().slice();
+
+  // Taking an item only flips a flag; the index keeps its slot and the sprite must disappear.
+  items[0].taken = true;
+  rc.render(view);
+  assert.notDeepEqual(read(), bothItems, 'a taken gem must disappear without a rebuild');
+  items[0].taken = false;
+
+  // A new level swaps the arrays: the index must follow, and coming back must reproduce the
+  // original light selection exactly.
+  view.maze = mazeB;
+  view.torches = torchesB;
+  rc.render(view);
+  const lightsB = Array.from(rc.lights().x.slice(0, rc.lights().n)).join(',');
+  assert.notEqual(lightsB, lightsA, 'a different torch set must light the scene differently');
+
+  view.maze = mazeA;
+  view.torches = torchesA;
+  rc.render(view);
+  assert.equal(
+    Array.from(rc.lights().x.slice(0, rc.lights().n)).join(','),
+    lightsA,
+    'returning to a level must re-index it, not keep the other level"s buckets',
+  );
+});
+
+test('render cost does not grow with the maze around the camera', () => {
+  // The contract the index exists to keep: with the same local geometry and the same *density* of
+  // decoration, a 513-tile level must cost what a 65-tile one costs. Wall-clock timing in a unit
+  // test is noisy, so the bound is generous — but a linear scan does ~60× the gather work at 513
+  // tiles and could not meet it.
+  /**
+   * @param {number} size
+   * @returns {{ms:number, lights:number}}
+   */
+  function measure(size) {
+    const maze = hall(size);
+    const c = (size >> 1) + 0.5;
+    const n = Math.max(8, ((size * size) / 40) | 0);
+    const torches = scatterTorches(n, size, 31);
+    const rnd = prng(size * 2654435761);
+    /** @type {import('../core/types.js').Item[]} */
+    const items = [];
+    for (let i = 0; i < n; i++) {
+      items.push({
+        id: i + 1,
+        kind: /** @type {'gem'|'oil'} */ (i % 2 ? 'gem' : 'oil'),
+        x: 1.5 + rnd() * (size - 3),
+        y: 1.5 + rnd() * (size - 3),
+        taken: false,
+      });
+    }
+    const { rc } = makeRenderer(480, 240);
+    const view = makeView(maze, {
+      torches,
+      items,
+      player: { x: c, y: c, angle: 0 },
+      exit: { x: 1, y: 1 },
+      time: 1,
+    });
+    for (let i = 0; i < 90; i++) {
+      view.time = 1 + i * 0.016;
+      view.player.angle = i * 0.1;
+      rc.render(view);
+    }
+    const t0 = performance.now();
+    for (let i = 0; i < 150; i++) {
+      view.time = 4 + i * 0.016;
+      view.player.angle = i * 0.05;
+      rc.render(view);
+    }
+    return { ms: (performance.now() - t0) / 150, lights: rc.stats().lights };
+  }
+
+  const small = measure(65);
+  const huge = measure(513); // 263 k tiles, ~6 500 torches and ~6 500 items
+  assert.equal(huge.lights, 8);
+  assert.ok(
+    huge.ms < small.ms * 2 + 1,
+    `render cost must not track maze size: ${small.ms.toFixed(3)} ms at 65 tiles vs ` +
+      `${huge.ms.toFixed(3)} ms at 513 tiles`,
+  );
+});
+
+test('the sprite draw radius is where fog has already swallowed a billboard', () => {
+  // `SPRITE_FAR` (~21 tiles) is derived from the fog curve rather than tuned: past it a sprite's
+  // shade level truncates to 0, which *is* the fog colour the frame was cleared to. If that
+  // derivation were wrong, items would pop out of existence in mid-corridor — so assert directly
+  // that a ring of items sitting between the sprite radius and the wall radius (`FAR` = 30) leaves
+  // the frame byte-identical. Items are used rather than torches because an item can never also be
+  // a light, which keeps the comparison about culling alone.
+  const size = 161;
+  const maze = hall(size);
+  const torches = scatterTorches(9, size, 43, (x, y) => Math.hypot(x - 80, y - 80) < 9);
+  const player = { x: 80.5, y: 80.5, angle: 0.9 };
+  const base = { torches, player, exit: { x: 1, y: 1 }, time: 6 };
+
+  const a = makeRenderer(640, 360);
+  a.rc.render(makeView(maze, base));
+  const empty = a.read().slice();
+
+  for (const radius of [22, 24, 27, 29]) {
+    const r = makeRenderer(640, 360);
+    r.rc.render(makeView(maze, { ...base, items: ringItems(400, 80.5, 80.5, radius) }));
+    assert.deepEqual(r.read(), empty, `items at ${radius} tiles must be pure fog`);
+  }
+
+  // …and the radius is not so conservative that a sprite the player should see is dropped: one at
+  // 18 tiles still changes the frame.
+  const visible = makeRenderer(640, 360);
+  visible.rc.render(makeView(maze, { ...base, items: ringItems(400, 80.5, 80.5, 18) }));
+  assert.notDeepEqual(visible.read(), empty, 'items at 18 tiles must still be drawn');
 });

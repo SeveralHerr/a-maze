@@ -30,10 +30,14 @@ test('buildLevel returns a complete LevelData with every contract field', () => 
   assert.deepEqual(data.validation.errors, []);
   assert.ok(data.validation.solvable && data.validation.fullyConnected && data.validation.bordersSealed);
   assert.equal(data.items.filter((i) => i.kind === 'gem').length, 8);
-  assert.equal(data.items.filter((i) => i.kind === 'oil').length, 3);
+  // `oil` is a floor, not a count: the refuel-chain guarantee in populate.js may add flasks so the
+  // level stays walkable (ARCHITECTURE.md §4.4).
+  assert.ok(data.items.filter((i) => i.kind === 'oil').length >= 3);
   assert.ok(data.torches.length > 0);
   assert.ok(data.fuel > 0 && Number.isFinite(data.fuel));
-  assert.ok(data.par > 0 && data.par <= data.fuel);
+  // `fuel` is a TANK size now, and `par` is a target time for the whole level — on a big maze par
+  // legitimately spans several tanks, so par is no longer bounded by fuel.
+  assert.ok(data.par > 0 && Number.isFinite(data.par));
   assert.equal(data.maze.tiles[data.maze.start.y * data.maze.width + data.maze.start.x], TILE.FLOOR);
   assert.equal(data.maze.tiles[data.maze.exit.y * data.maze.width + data.maze.exit.x], TILE.FLOOR);
 });

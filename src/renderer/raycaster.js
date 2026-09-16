@@ -49,6 +49,7 @@ import { DIR_DX, DIR_DY, TILE } from '../maze/constants.js';
 import { C, LITTLE_ENDIAN, PALETTE_RGB, PALETTE_SIZE, pack } from './palette.js';
 import { createTextures, SIZE as TEX } from './textures.js';
 import { createParticles, PARTICLE, PARTICLE_COLORS } from './particles.js';
+import { createSpriteIndex } from './sprite-index.js';
 
 // ─── Tunables ──────────────────────────────────────────────────────────────────────────────────
 
@@ -75,8 +76,51 @@ const MAX_DDA_STEPS = 160;
 /** Wall torches considered as point lights, nearest first (ARCHITECTURE §4.5). */
 const MAX_LIGHTS = 8;
 
-/** Sprite slots. Far culling at `FAR` keeps real scenes an order of magnitude below this. */
-const MAX_SPRITES = 192;
+/**
+ * Sprite slots.
+ *
+ * Sized against the worst neighbourhood measured on a real 128×128-cell level (the gameplay cap):
+ * ~850 items + ~1300 torches, densest disc of radius `SPRITE_FAR` holding ~130 of them. 384 is
+ * three times that, and the queue degrades by dropping the *farthest* sprite rather than the next
+ * one offered (see `addSprite`), so even an overflow can only cost distant decoration.
+ */
+const MAX_SPRITES = 384;
+
+/**
+ * Radius in tiles inside which a billboard can still change a pixel.
+ *
+ * Derived, not guessed: a sprite's shade level is `illum × fog(d) × 63` truncated (sprites carry no
+ * dither), the brightest thing any sprite is given is `illum = 1.25` (a gem), and level 0 of the
+ * colormap *is* the fog colour — which is exactly what the frame was cleared to and what every
+ * surface at that distance already shades to. So once `fog(d) × 1.3 × 63 < 1` a sprite can only
+ * paint fog onto fog. Solving `exp(-(d/9)^1.9) < 1/(1.3×63)` gives ≈19.6 tiles; the margin below
+ * rounds that up. Culling here instead of at `FAR` (30) shrinks the queried area by 2.2×.
+ */
+const SPRITE_FAR = (() => {
+  for (let i = 0; i < 4096; i++) {
+    const d = i * 0.02;
+    if (Math.exp(-Math.pow(d / 9, 1.9)) * 1.3 * (LEVELS - 1) < 1) return Math.min(d + 1.5, FAR);
+  }
+  return FAR;
+})();
+
+/**
+ * Positional slack, in tiles, between a torch's **bucket key** and the points derived from it.
+ *
+ * The spatial index buckets a torch by its tile centre, but its flame sprite sits `0.5 + 0.02`
+ * outward and its light `0.5 + 0.22` outward. Queries widen by this so a torch whose derived point
+ * falls inside the search radius can never be missed because its tile centre fell outside.
+ */
+const TORCH_SLACK = 0.75;
+
+/**
+ * Slack, in camera-plane units, on the horizontal frustum test in `inFrustum`.
+ *
+ * A billboard is on screen while `|tX| ≤ tY + height×scale/width`. The tallest sprite is the portal
+ * (scale 0.95) and the narrowest internal buffer is 320×240, so that term never exceeds 0.72; 1.0
+ * keeps the test conservative at every window shape.
+ */
+const FRUSTUM_MARGIN = 1;
 
 /**
  * Pixels between full lighting evaluations along a floor/ceiling row. Light varies smoothly, so
@@ -187,6 +231,10 @@ const INV_U32 = 2.3283064365386963e-10;
  * greenery reads as decoration only while it stays the exception, exactly as in the reference.
  */
 const WALL_VARIANT = Uint8Array.of(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 3);
+
+/** Stand-ins for a view with no items/torches, so the index never sees `null` or a fresh `[]`. */
+const EMPTY_ITEMS = /** @type {import('../core/types.js').Item[]} */ ([]);
+const EMPTY_TORCHES = /** @type {import('../core/types.js').Torch[]} */ ([]);
 
 // ─── Lookup-table construction ─────────────────────────────────────────────────────────────────
 
@@ -309,6 +357,8 @@ function tnoise(t, seed) {
  * @property {TextureSet} textures                the painted set in use
  * @property {(set:TextureSet) => void} setTextures
  * @property {() => Float32Array} depth           per-column wall distance from the last frame
+ * @property {() => {n:number, x:Float32Array, y:Float32Array}} lights  wall torches lighting the
+ *   last frame (reused object and arrays; diagnostic)
  * @property {() => void} dispose
  */
 
@@ -379,6 +429,11 @@ export function createRaycaster(canvas, options) {
   const lightPow = new Float32Array(MAX_LIGHTS);
   const lightD2 = new Float32Array(MAX_LIGHTS);
   let lightN = 0;
+  /**
+   * Largest squared distance among the slots currently held. Only meaningful once all
+   * `MAX_LIGHTS` slots are full; it is the radius the ring search prunes against.
+   */
+  let lightWorstD2 = Infinity;
   /** Per-row subset of `light*`, refilled by `cullRowLights`. */
   const rowLights = new Int32Array(MAX_LIGHTS);
   /** The identity list `[0..MAX_LIGHTS)`, for callers that want every light. */
@@ -395,6 +450,31 @@ export function createRaycaster(canvas, options) {
   /** @type {Texture[]} reused slots; assignment only, never a fresh array */
   const sprTex = new Array(MAX_SPRITES);
   let sprN = 0;
+
+  // ── Spatial index over the level's decoration ──
+  // Rebuilt only when the level changes (see `syncIndexes`); every frame after that, the light and
+  // sprite passes walk buckets near the camera instead of the whole level.
+  const itemIndex = createSpriteIndex();
+  const torchIndex = createSpriteIndex();
+  /** @type {import('../core/types.js').Item[]} */
+  let idxItems = EMPTY_ITEMS;
+  /** @type {import('../core/types.js').Torch[]} */
+  let idxTorches = EMPTY_TORCHES;
+  /** Level identity last indexed. `null` forces a rebuild on the first real frame. */
+  let idxMaze = /** @type {any} */ (null);
+  let idxItemCount = -1;
+  let idxTorchCount = -1;
+  // Stable readers so `build` never allocates a closure. They read the *indexed* arrays, which are
+  // assigned immediately before the build call.
+  const readItemX = (/** @type {number} */ i) => idxItems[i].x;
+  const readItemY = (/** @type {number} */ i) => idxItems[i].y;
+  const readTorchX = (/** @type {number} */ i) => idxTorches[i].x + 0.5;
+  const readTorchY = (/** @type {number} */ i) => idxTorches[i].y + 0.5;
+  /** Bucket window of the current query, written by `queryCells`. */
+  let qx0 = 0;
+  let qy0 = 0;
+  let qx1 = -1;
+  let qy1 = -1;
 
   // ── Flash LUTs ──
   const flashR = new Uint8Array(256);
@@ -439,6 +519,8 @@ export function createRaycaster(canvas, options) {
   let dirY = 0;
   let planeX = 0;
   let planeY = 1;
+  /** Half the view width at unit distance — the camera plane's length. Set once per frame. */
+  let planeLen = 1;
   let horizon = 0;
   let torchInvR = 1 / TORCH_MAX_R;
   let torchPower = 1;
@@ -500,12 +582,82 @@ export function createRaycaster(canvas, options) {
     buf.fill(fogPacked);
   }
 
+  // ── Spatial index ───────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Re-bucket the level's items and torches if — and only if — the level changed.
+   *
+   * There is no explicit level token on `RenderView`, so identity *is* the token: `src/main.js`
+   * assigns `view.maze`, `view.items` and `view.torches` straight from `state.levelData`, which the
+   * reducer swaps atomically on `levelReady`. Comparing the three array identities (plus their
+   * lengths, in case a future producer mutates an array in place rather than replacing it) detects
+   * a new level exactly, and costs five comparisons on every other frame.
+   *
+   * Item pickups do **not** invalidate the index: a taken item keeps its position and is skipped at
+   * query time, so play never rebuilds anything.
+   * @param {RenderView} view
+   * @returns {void}
+   */
+  function syncIndexes(view) {
+    const maze = view.maze;
+    const items = view.items || EMPTY_ITEMS;
+    const torches = view.torches || EMPTY_TORCHES;
+    if (
+      maze === idxMaze &&
+      items === idxItems &&
+      torches === idxTorches &&
+      items.length === idxItemCount &&
+      torches.length === idxTorchCount
+    ) {
+      return;
+    }
+    idxMaze = maze;
+    idxItems = items;
+    idxTorches = torches;
+    idxItemCount = items.length;
+    idxTorchCount = torches.length;
+    itemIndex.build(items.length, readItemX, readItemY, maze.width, maze.height);
+    torchIndex.build(torches.length, readTorchX, readTorchY, maze.width, maze.height);
+  }
+
+  /**
+   * Clip the axis-aligned square `(cx±r, cy±r)` to `index`'s buckets, into `qx0…qy1`.
+   *
+   * Writing the window into closure variables rather than returning a rectangle is what keeps the
+   * query allocation-free; the two callers read it immediately.
+   * @param {import('./sprite-index.js').SpriteIndex} index
+   * @param {number} cx tiles
+   * @param {number} cy tiles
+   * @param {number} r tiles
+   * @returns {boolean} false when the square misses the grid entirely
+   */
+  function queryCells(index, cx, cy, r) {
+    const inv = 1 / index.cell;
+    qx0 = Math.floor((cx - r) * inv);
+    qx1 = Math.floor((cx + r) * inv);
+    qy0 = Math.floor((cy - r) * inv);
+    qy1 = Math.floor((cy + r) * inv);
+    if (qx0 < 0) qx0 = 0;
+    if (qy0 < 0) qy0 = 0;
+    if (qx1 > index.cols - 1) qx1 = index.cols - 1;
+    if (qy1 > index.rows - 1) qy1 = index.rows - 1;
+    // NaN camera coordinates make every comparison false, so test for a *valid* window positively.
+    return qx1 >= qx0 && qy1 >= qy0;
+  }
+
   // ── Lighting ────────────────────────────────────────────────────────────────────────────────
 
   /**
    * Pick the wall torches that matter this frame: the `MAX_LIGHTS` nearest to a point 2.5 tiles
    * *ahead* of the camera, so the lights that survive are the ones lighting what is on screen
    * rather than the one behind the player's shoulder.
+   *
+   * At the new scale a level carries up to `MAX_TORCHES` (4096) sconces, so this walks the spatial
+   * index in **expanding rings** of buckets around the focus point instead of scanning them all.
+   * Every bucket on ring `r` is at least `(r-1) × cell` from the focus (the focus can sit anywhere
+   * inside its own bucket), so once eight lights are held and the eighth is nearer than that bound,
+   * no later ring can improve the set and the search stops — typically after two or three rings.
+   * The answer is identical to the exhaustive scan it replaces, just without the scan.
    * @param {RenderView} view
    * @param {number} time seconds
    * @returns {void}
@@ -513,45 +665,134 @@ export function createRaycaster(canvas, options) {
   function gatherLights(view, time) {
     lightN = 0;
     const torches = view.torches;
-    if (!torches) return;
+    const index = torchIndex;
+    if (!torches || index.count === 0) return;
     const focusX = camX + dirX * 2.5;
     const focusY = camY + dirY * 2.5;
-    for (let i = 0; i < torches.length; i++) {
-      const t = torches[i];
-      // `Torch.face` uses the maze module's direction numbering (0=E, 1=S, 2=W, 3=N), so its
-      // tables give the outward normal of the mounting wall face directly. `& 3` keeps a malformed
-      // face from indexing off the end.
-      const face = (t.face | 0) & 3;
-      const nx = DIR_DX[face];
-      const ny = DIR_DY[face];
-      const lx = t.x + 0.5 + nx * (0.5 + TORCH_LIGHT_OFFSET);
-      const ly = t.y + 0.5 + ny * (0.5 + TORCH_LIGHT_OFFSET);
-      const dx = lx - focusX;
-      const dy = ly - focusY;
-      const d2 = dx * dx + dy * dy;
-      if (d2 > (TORCH_RADIUS + FAR) * (TORCH_RADIUS + FAR)) continue;
+    const cell = index.cell;
+    const cols = index.cols;
+    const rows = index.rows;
+    const cellStart = index.cellStart;
+    const entries = index.entries;
+    // Same hard cut as the exhaustive version: a torch further than this can reach nothing drawn.
+    const maxR = TORCH_RADIUS + FAR;
+    const maxR2 = maxR * maxR;
+    let fcx = Math.floor(focusX / cell);
+    let fcy = Math.floor(focusY / cell);
+    if (!(fcx >= 0)) fcx = 0;
+    else if (fcx > cols - 1) fcx = cols - 1;
+    if (!(fcy >= 0)) fcy = 0;
+    else if (fcy > rows - 1) fcy = rows - 1;
+    lightWorstD2 = Infinity;
+    const maxRing = (cols > rows ? cols : rows) + 1;
 
-      // Insertion sort into the fixed slot array: no allocation, and `lightN` is at most 8 so the
-      // shuffling is cheaper than any comparison-based sort would be.
-      let slot = lightN < MAX_LIGHTS ? lightN : -1;
-      if (slot < 0) {
-        // Full: replace the farthest entry if this one is nearer.
-        let worst = 0;
-        for (let k = 1; k < MAX_LIGHTS; k++) if (lightD2[k] > lightD2[worst]) worst = k;
-        if (lightD2[worst] <= d2) continue;
-        slot = worst;
-      } else {
-        lightN++;
+    for (let r = 0; r <= maxRing; r++) {
+      // Lower bound on the distance from the focus to anything in this ring or any ring beyond it.
+      const ringMin = (r - 1) * cell - TORCH_SLACK;
+      if (ringMin > 0) {
+        if (ringMin > maxR) break;
+        if (lightN >= MAX_LIGHTS && ringMin * ringMin >= lightWorstD2) break;
       }
-      lightX[slot] = lx;
-      lightY[slot] = ly;
-      lightNX[slot] = nx;
-      lightNY[slot] = ny;
-      lightD2[slot] = d2;
-      // Each torch flickers on its own phase, seeded from its tile so it is stable frame to frame.
-      const phase = (t.x * 7 + t.y * 13) & 63;
-      lightPow[slot] = 0.85 + 0.32 * tnoise(time * 6.2 + phase, 0x71c5);
+      const cx0 = fcx - r;
+      const cx1 = fcx + r;
+      const cy0 = fcy - r;
+      const cy1 = fcy + r;
+      // Once the ring encloses the whole grid there is nothing further out to find.
+      if (r > 0 && cx0 < 0 && cy0 < 0 && cx1 >= cols && cy1 >= rows) break;
+
+      const yFrom = cy0 < 0 ? 0 : cy0;
+      const yTo = cy1 > rows - 1 ? rows - 1 : cy1;
+      for (let cy = yFrom; cy <= yTo; cy++) {
+        const rowBase = cy * cols;
+        if (cy === cy0 || cy === cy1) {
+          // Top/bottom edge of the ring: every bucket in the row belongs to it.
+          const xFrom = cx0 < 0 ? 0 : cx0;
+          const xTo = cx1 > cols - 1 ? cols - 1 : cx1;
+          for (let cx = xFrom; cx <= xTo; cx++) {
+            scanLightBucket(cellStart, entries, torches, rowBase + cx, focusX, focusY, maxR2, time);
+          }
+        } else {
+          // Interior row: only the two side buckets are new this ring.
+          if (cx0 >= 0) {
+            scanLightBucket(cellStart, entries, torches, rowBase + cx0, focusX, focusY, maxR2, time);
+          }
+          if (cx1 < cols && cx1 !== cx0) {
+            scanLightBucket(cellStart, entries, torches, rowBase + cx1, focusX, focusY, maxR2, time);
+          }
+        }
+      }
     }
+  }
+
+  /**
+   * Offer every torch in one index bucket to the light slots.
+   * @param {Int32Array} cellStart
+   * @param {Int32Array} entries
+   * @param {import('../core/types.js').Torch[]} torches
+   * @param {number} c bucket index
+   * @param {number} focusX
+   * @param {number} focusY
+   * @param {number} maxR2 squared cut-off distance
+   * @param {number} time seconds
+   * @returns {void}
+   */
+  function scanLightBucket(cellStart, entries, torches, c, focusX, focusY, maxR2, time) {
+    const to = cellStart[c + 1];
+    for (let k = cellStart[c]; k < to; k++) {
+      considerLight(torches[entries[k]], focusX, focusY, maxR2, time);
+    }
+  }
+
+  /**
+   * Offer one torch to the eight light slots, updating `lightWorstD2`.
+   * @param {import('../core/types.js').Torch} t
+   * @param {number} focusX
+   * @param {number} focusY
+   * @param {number} maxR2 squared cut-off distance
+   * @param {number} time seconds
+   * @returns {void}
+   */
+  function considerLight(t, focusX, focusY, maxR2, time) {
+    // `Torch.face` uses the maze module's direction numbering (0=E, 1=S, 2=W, 3=N), so its
+    // tables give the outward normal of the mounting wall face directly. `& 3` keeps a malformed
+    // face from indexing off the end.
+    const face = (t.face | 0) & 3;
+    const nx = DIR_DX[face];
+    const ny = DIR_DY[face];
+    const lx = t.x + 0.5 + nx * (0.5 + TORCH_LIGHT_OFFSET);
+    const ly = t.y + 0.5 + ny * (0.5 + TORCH_LIGHT_OFFSET);
+    const dx = lx - focusX;
+    const dy = ly - focusY;
+    const d2 = dx * dx + dy * dy;
+    if (d2 > maxR2) return;
+
+    // Insertion into the fixed slot array: no allocation, and `lightN` is at most 8 so rescanning
+    // for the farthest entry is cheaper than maintaining a heap.
+    let slot;
+    if (lightN < MAX_LIGHTS) {
+      slot = lightN++;
+    } else {
+      let worst = 0;
+      for (let k = 1; k < MAX_LIGHTS; k++) if (lightD2[k] > lightD2[worst]) worst = k;
+      if (lightD2[worst] <= d2) return;
+      slot = worst;
+    }
+    lightX[slot] = lx;
+    lightY[slot] = ly;
+    lightNX[slot] = nx;
+    lightNY[slot] = ny;
+    lightD2[slot] = d2;
+    // Each torch flickers on its own phase, seeded from its tile so it is stable frame to frame.
+    const phase = (t.x * 7 + t.y * 13) & 63;
+    lightPow[slot] = 0.85 + 0.32 * tnoise(time * 6.2 + phase, 0x71c5);
+
+    if (lightN < MAX_LIGHTS) {
+      lightWorstD2 = Infinity;
+      return;
+    }
+    let w = lightD2[0];
+    for (let k = 1; k < MAX_LIGHTS; k++) if (lightD2[k] > w) w = lightD2[k];
+    lightWorstD2 = w;
   }
 
   /**
@@ -791,6 +1032,12 @@ export function createRaycaster(canvas, options) {
       // same photograph repeated — the block courses still line up, but the joints no longer do.
       const hv = hash2(mapX, mapY, variantSeed);
       const tIdx = wallTex[WALL_VARIANT[hv & 15]].indices;
+      // A third use of the same hash: mirror the course horizontally on half the tiles. Four wall
+      // paintings across 64 offsets already gave plenty of variety in a 13-tile corridor; at 257
+      // tiles the eye starts to recognise individual blocks, and mirroring doubles the vocabulary
+      // for one comparison per column — far cheaper than painting more textures, and it cannot
+      // break the tiling, because the offset above has already displaced every joint anyway.
+      if (hv & 0x100000) texX = TEX - 1 - texX;
       texX = (texX + ((hv >>> 8) & (TEX - 1))) & (TEX - 1);
 
       const lineH = h / dist;
@@ -901,6 +1148,14 @@ export function createRaycaster(canvas, options) {
       let fIdx = floorTex[0].indices;
       /** @type {Uint8Array} */
       let cIdx = ceilTex[0].indices;
+      /**
+       * Per-tile XOR applied to the floor's texel index. Because the index is `(v << 6) | u` with
+       * both fields 6 bits, XOR-ing with `(63 << 6)` flips v and `63` flips u — so one mask gives
+       * the four dihedral flips of a cobble tile for a single operation per pixel. Two cobble
+       * paintings became eight looks, which is what stops a 257-tile floor reading as wallpaper.
+       * The ceiling is deliberately left unflipped: its beams have to stay aligned across tiles.
+       */
+      let flatMask = 0;
 
       let segStart = 0;
       let illum = illumFlat(wx, wy, rowLights, rowN);
@@ -935,10 +1190,12 @@ export function createRaycaster(canvas, options) {
               fIdx = floorTex[(hv & 15) === 5 ? 2 : (hv >>> 4) & 1].indices;
               // Beams every third row of tiles read as structure rather than as noise.
               cIdx = ceilTex[cy - 3 * Math.floor(cy / 3) === 0 ? 1 : 0].indices;
+              flatMask = ((hv >>> 20) & 1 ? 63 << 6 : 0) | ((hv >>> 21) & 1 ? 63 : 0);
             }
             const ti = (((fy >> 10) & 63) << 6) | ((fx >> 10) & 63);
             if (drawF) {
-              buf[rowF + x] = colormap[(((levF + BAYER16[bayerF | (x & 3)]) >> 16) << 8) | fIdx[ti]];
+              buf[rowF + x] =
+                colormap[(((levF + BAYER16[bayerF | (x & 3)]) >> 16) << 8) | fIdx[ti ^ flatMask]];
             }
             if (drawC) {
               buf[rowC + x] = colormap[(((levC + BAYER16[bayerC | (x & 3)]) >> 16) << 8) | cIdx[ti]];
@@ -962,8 +1219,13 @@ export function createRaycaster(canvas, options) {
   // ── Sprites ─────────────────────────────────────────────────────────────────────────────────
 
   /**
-   * Queue one billboard. Silently drops the sprite when the (generously sized) slot array is full,
-   * which is the right failure mode for decoration.
+   * Queue one billboard.
+   *
+   * When the slot array is full the **farthest** queued sprite is evicted rather than the new one
+   * dropped. That ordering matters at the new scale: torches are queued before items, and a level
+   * with ~1300 sconces used to fill the queue with distant flames and then silently discard the gem
+   * at the player's feet. Eviction costs a scan of the slots, but only in an overflow the sizing of
+   * `MAX_SPRITES` makes rare, and it turns "the pickup vanished" into "a speck in the fog vanished".
    * @param {number} x world x
    * @param {number} y world y
    * @param {Texture} tex
@@ -974,8 +1236,15 @@ export function createRaycaster(canvas, options) {
    * @returns {void}
    */
   function addSprite(x, y, tex, scale, vOff, level, dist2) {
-    if (sprN >= MAX_SPRITES) return;
-    const i = sprN++;
+    let i;
+    if (sprN < MAX_SPRITES) {
+      i = sprN++;
+    } else {
+      let worst = 0;
+      for (let k = 1; k < MAX_SPRITES; k++) if (sprDist[k] > sprDist[worst]) worst = k;
+      if (sprDist[worst] <= dist2) return;
+      i = worst;
+    }
     sprX[i] = x;
     sprY[i] = y;
     sprTex[i] = tex;
@@ -987,78 +1256,137 @@ export function createRaycaster(canvas, options) {
   }
 
   /**
+   * Would a billboard at this camera-relative offset put anything on screen?
+   *
+   * A sprite outside the horizontal frustum is invisible, but it would still be queued, shaded and
+   * carried through the distance sort. At the new scale the camera sits inside a disc holding
+   * ~130 sprites while the 90°-ish view shows a quarter of them, so this test is what keeps the
+   * sort small. The horizontal bound is exact up to `FRUSTUM_MARGIN`, which covers the widest
+   * sprite (the portal) at the narrowest internal aspect — it can over-accept, never over-reject.
+   * @param {number} dx world x minus camera x
+   * @param {number} dy world y minus camera y
+   * @returns {boolean}
+   */
+  function inFrustum(dx, dy) {
+    // `tY` here is exactly `renderSprites`' depth term: with the plane perpendicular to the view
+    // direction the transform collapses to the dot product with `dir`.
+    const tY = dx * dirX + dy * dirY;
+    if (tY < 0.18) return false; // behind the eye or inside the near plane
+    const tX = (dirX * dy - dirY * dx) / planeLen;
+    const bound = tY + FRUSTUM_MARGIN;
+    return tX < bound && tX > -bound;
+  }
+
+  /**
    * Collect every billboard for this frame: wall torches, uncollected items, and the exit portal.
+   *
+   * Both item and torch passes walk the spatial index, so the cost tracks the number of sprites
+   * within `SPRITE_FAR` of the camera — a constant set by the fog — rather than the level's
+   * population. At 128×128 cells that is ~130 candidates out of ~2100.
    * @param {RenderView} view
    * @param {number} time seconds
    * @returns {void}
    */
   function gatherSprites(view, time) {
     sprN = 0;
-    const far2 = FAR * FAR;
+    const far2 = SPRITE_FAR * SPRITE_FAR;
 
+    // Wall torches. The query radius is widened by `TORCH_SLACK` because the index keys a torch by
+    // its tile centre while the flame hangs just outside the wall face.
     const torches = view.torches;
-    if (torches) {
-      for (let i = 0; i < torches.length; i++) {
-        const t = torches[i];
-        const face = (t.face | 0) & 3;
-        const nx = DIR_DX[face];
-        const ny = DIR_DY[face];
-        const x = t.x + 0.5 + nx * (0.5 + TORCH_OFFSET);
-        const y = t.y + 0.5 + ny * (0.5 + TORCH_OFFSET);
-        const dx = x - camX;
-        const dy = y - camY;
-        const d2 = dx * dx + dy * dy;
-        if (d2 > far2) continue;
-        const phase = (t.x * 3 + t.y * 5) & 7;
-        const frame = ((time * 11 + phase) | 0) & 3;
-        // Emissive: the flame is a light source, so only distance fog dims it.
-        const flick = 0.88 + 0.12 * tnoise(time * 9 + phase, 0x2c1a);
-        // Scale 0.5 makes the sconce about half a tile tall; the offset lifts the flame to head
-        // height, where a real wall bracket sits.
-        addSprite(x, y, textures.torch[frame], 0.5, -0.17, levelFx(flick, Math.sqrt(d2), 1), d2);
+    const tReach = SPRITE_FAR + TORCH_SLACK;
+    const tReach2 = tReach * tReach;
+    if (torches && torchIndex.count > 0 && queryCells(torchIndex, camX, camY, tReach)) {
+      const cellStart = torchIndex.cellStart;
+      const entries = torchIndex.entries;
+      const tpx = torchIndex.px;
+      const tpy = torchIndex.py;
+      const cols = torchIndex.cols;
+      for (let cy = qy0; cy <= qy1; cy++) {
+        const rowBase = cy * cols;
+        // Buckets within one row are contiguous in `entries`, so the row's whole window of buckets
+        // is a single flat walk rather than one loop per bucket.
+        const kEnd = cellStart[rowBase + qx1 + 1];
+        for (let k = cellStart[rowBase + qx0]; k < kEnd; k++) {
+          // Reject on the flat position arrays first: most candidates never touch their object,
+          // which is what keeps a thousand-torch level out of the cache.
+          const bx = tpx[k] - camX;
+          const by = tpy[k] - camY;
+          if (bx * bx + by * by > tReach2) continue;
+          const t = torches[entries[k]];
+          const face = (t.face | 0) & 3;
+          const nx = DIR_DX[face];
+          const ny = DIR_DY[face];
+          const x = t.x + 0.5 + nx * (0.5 + TORCH_OFFSET);
+          const y = t.y + 0.5 + ny * (0.5 + TORCH_OFFSET);
+          const dx = x - camX;
+          const dy = y - camY;
+          const d2 = dx * dx + dy * dy;
+          if (d2 > far2 || !inFrustum(dx, dy)) continue;
+          const phase = (t.x * 3 + t.y * 5) & 7;
+          const frame = ((time * 11 + phase) | 0) & 3;
+          // Emissive: the flame is a light source, so only distance fog dims it.
+          const flick = 0.88 + 0.12 * tnoise(time * 9 + phase, 0x2c1a);
+          // Scale 0.5 makes the sconce about half a tile tall; the offset lifts the flame to head
+          // height, where a real wall bracket sits.
+          addSprite(x, y, textures.torch[frame], 0.5, -0.17, levelFx(flick, Math.sqrt(d2), 1), d2);
+        }
       }
     }
 
+    // Items. Taken flasks and gems keep their slot in the index (their position never changes), so
+    // a pickup costs a boolean test here instead of a rebuild.
     const items = view.items;
-    if (items) {
-      for (let i = 0; i < items.length; i++) {
-        const it = items[i];
-        if (it.taken) continue;
-        const dx = it.x - camX;
-        const dy = it.y - camY;
-        const d2 = dx * dx + dy * dy;
-        if (d2 > far2) continue;
-        const isGem = it.kind === 'gem';
-        const frames = isGem ? textures.gem : textures.oil;
-        const phase = (it.id | 0) * 0.7;
-        // Gentle bob and a slow spin — enough life that a pickup catches the eye down a corridor.
-        const spin = ((time * (isGem ? 6 : 3) + phase) | 0) % frames.length;
-        const bobZ = Math.sin(time * 2.2 + phase) * 0.045;
-        const d = Math.sqrt(d2);
-        const lvl = levelFx(illumFlat(it.x, it.y, allLights, lightN) * (isGem ? 1.25 : 1.1), d, 1);
-        // Gems twinkle: a slow mote drifting off the crystal. In a corridor lit only by a failing
-        // torch, that movement is what makes a pickup readable from a distance.
-        if (isGem && d2 < GEM_SPARKLE_RANGE2) {
-          sparkleAcc += frameDt * GEM_SPARKLE_RATE;
-          if (sparkleAcc >= 1) {
-            sparkleAcc -= 1;
-            particles.spawn(
-              PARTICLE.DUST,
-              it.x + emberRng.range(-0.12, 0.12),
-              it.y + emberRng.range(-0.12, 0.12),
-              0.24 + emberRng.range(0, 0.16),
-              0,
-              0,
-              emberRng.range(0.08, 0.2),
-              emberRng.range(0.5, 1.1),
-              emberRng.chance(0.35) ? PARTICLE_COLORS.sparkPale : PARTICLE_COLORS.spark,
-              1,
-            );
+    if (items && itemIndex.count > 0 && queryCells(itemIndex, camX, camY, SPRITE_FAR)) {
+      const cellStart = itemIndex.cellStart;
+      const entries = itemIndex.entries;
+      const ipx = itemIndex.px;
+      const ipy = itemIndex.py;
+      const cols = itemIndex.cols;
+      for (let cy = qy0; cy <= qy1; cy++) {
+        const rowBase = cy * cols;
+        const kEnd = cellStart[rowBase + qx1 + 1];
+        for (let k = cellStart[rowBase + qx0]; k < kEnd; k++) {
+          const dx = ipx[k] - camX;
+          const dy = ipy[k] - camY;
+          const d2 = dx * dx + dy * dy;
+          if (d2 > far2) continue;
+          const it = items[entries[k]];
+          if (it.taken) continue;
+          const isGem = it.kind === 'gem';
+          const d = Math.sqrt(d2);
+          // Gems twinkle: a slow mote drifting off the crystal. In a corridor lit only by a failing
+          // torch, that movement is what makes a pickup readable from a distance. Emitted before
+          // the frustum test so a gem just off-screen still seeds the motes that drift into view.
+          if (isGem && d2 < GEM_SPARKLE_RANGE2) {
+            sparkleAcc += frameDt * GEM_SPARKLE_RATE;
+            if (sparkleAcc >= 1) {
+              sparkleAcc -= 1;
+              particles.spawn(
+                PARTICLE.DUST,
+                it.x + emberRng.range(-0.12, 0.12),
+                it.y + emberRng.range(-0.12, 0.12),
+                0.24 + emberRng.range(0, 0.16),
+                0,
+                0,
+                emberRng.range(0.08, 0.2),
+                emberRng.range(0.5, 1.1),
+                emberRng.chance(0.35) ? PARTICLE_COLORS.sparkPale : PARTICLE_COLORS.spark,
+                1,
+              );
+            }
           }
+          if (!inFrustum(dx, dy)) continue;
+          const frames = isGem ? textures.gem : textures.oil;
+          const phase = (it.id | 0) * 0.7;
+          // Gentle bob and a slow spin — enough life that a pickup catches the eye down a corridor.
+          const spin = ((time * (isGem ? 6 : 3) + phase) | 0) % frames.length;
+          const bobZ = Math.sin(time * 2.2 + phase) * 0.045;
+          const lvl = levelFx(illumFlat(it.x, it.y, allLights, lightN) * (isGem ? 1.25 : 1.1), d, 1);
+          // Gems hover at knee height and bob; flasks stand on the floor. `vOff` is `0.5 - z`,
+          // the world height of the sprite's centre below the eye.
+          addSprite(it.x, it.y, frames[spin], isGem ? 0.34 : 0.42, (isGem ? 0.2 : 0.375) - bobZ, lvl, d2);
         }
-        // Gems hover at knee height and bob; flasks stand on the floor. `vOff` is `0.5 - z`,
-        // the world height of the sprite's centre below the eye.
-        addSprite(it.x, it.y, frames[spin], isGem ? 0.34 : 0.42, (isGem ? 0.2 : 0.375) - bobZ, lvl, d2);
       }
     }
 
@@ -1289,7 +1617,7 @@ export function createRaycaster(canvas, options) {
     dirY = Math.sin(angle);
     // Plane length = half the view width at unit distance. Tying it to the aspect ratio keeps
     // pixels square at every window shape (vertical FOV is fixed at 2·atan(0.5) ≈ 53°).
-    const planeLen = (0.5 * width) / height;
+    planeLen = (0.5 * width) / height;
     planeX = -dirY * planeLen;
     planeY = dirX * planeLen;
 
@@ -1310,6 +1638,8 @@ export function createRaycaster(canvas, options) {
       (1 - flickAmp * (0.09 * (1 - tnoise(time * 6.7, 0x3c2f)) + 0.05 * (1 - tnoise(time * 15.3, 0x77b1))));
 
     buf.fill(fogPacked);
+    // Cheap identity check; a real rebuild happens only on a level change (§4.5).
+    syncIndexes(view);
     gatherLights(view, time);
     renderWalls(view);
     renderFlats();
@@ -1369,6 +1699,23 @@ export function createRaycaster(canvas, options) {
     return zbuf;
   }
 
+  /** @type {{n:number, x:Float32Array, y:Float32Array}} reused; see `lights()` */
+  const lightsObj = { n: 0, x: lightX, y: lightY };
+
+  /**
+   * The wall torches selected as point lights on the last frame, as world positions of the
+   * *flames* (already offset off their wall).
+   *
+   * Diagnostic, and the seam the tests need: the nearest-8 selection now runs through the spatial
+   * index, and the only way to prove it still answers what the exhaustive scan answered is to read
+   * the answer. The object and both arrays are **reused** — read `n` entries, do not stash them.
+   * @returns {{n:number, x:Float32Array, y:Float32Array}}
+   */
+  function lights() {
+    lightsObj.n = lightN;
+    return lightsObj;
+  }
+
   /** Drop the framebuffer references. The canvas itself belongs to the page. */
   function dispose() {
     image = null;
@@ -1394,6 +1741,7 @@ export function createRaycaster(canvas, options) {
     },
     setTextures,
     depth,
+    lights,
     dispose,
   };
 }

@@ -35,10 +35,27 @@ const MIN_FPS = 55;
 const MAX_RENDER_MS_AVG = 8;
 const MAX_RENDER_MS_P99 = 16;
 const MAX_HEAP_GROWTH_MB = 5;
+// Massive mazes: level 1 is 16×16 cells with a ~290-tile solution path, not 6×6 with ~40. The
+// autopilot walks it at sprint speed with item detours; measured at ~150 s, so these are ~2.5×
+// the measured time rather than a tight fit. They are *wall-clock* budgets for the test, not
+// gameplay targets — the gameplay budget is the torch, and that is asserted separately.
 /** Wall-clock budget for the autopilot to finish level 1, seconds. */
-const LEVEL1_BUDGET_S = 60;
+const LEVEL1_BUDGET_S = 400;
 /** Wall-clock budget for the autopilot to finish a later level, seconds. */
-const LEVEL2_BUDGET_S = 45;
+const LEVEL2_BUDGET_S = 500;
+/** The level the deep-descent phase forces its way down to — the size cap (`balance.CAP_LEVEL`). */
+const CAP_LEVEL = 15;
+/** Seconds the autopilot drives the maximum-size level while fps/step/heap are sampled. */
+const CAP_SOAK_S = 60;
+/**
+ * Longest gap between animation frames tolerated while a level is generated and installed,
+ * in milliseconds. A 128×128-cell build runs in a worker, so the main thread only pays the
+ * structured-clone deserialisation and the `levelReady` reducer; anything approaching 50 ms would
+ * be a visible hitch on the loading screen.
+ */
+const MAX_BUILD_RAF_GAP_MS = 50;
+/** Minimum times the autopilot's torch must visibly refill for the economy to count as working. */
+const MIN_REFUELS = 2;
 
 fs.mkdirSync(OUT, { recursive: true });
 
@@ -74,6 +91,12 @@ const report = {
   level1: null,
   level2: null,
   pickups: null,
+  /** The biggest level in the game, played for real (massive-maze gate). */
+  capLevel: null,
+  /** Longest animation-frame gap while that level was generated and installed. */
+  buildGap: null,
+  /** Oil flasks burned and fuel-seconds recovered across the whole run. */
+  fuelEconomy: null,
   fps: null,
   fpsUncapped: null,
   loopStats: null,
@@ -93,6 +116,21 @@ const shot = async (page, name) => {
   return file;
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Put the three-state map (§4.6) into one state, the way the game does it.
+ *
+ * Both keys are written because both exist: `mapMode` is what the map restores from, `minimap` is
+ * the legacy boolean other consumers still read. Driving it through `setSetting` rather than a UI
+ * call means the test exercises the same path the `map` hotkey does.
+ * @param {import('puppeteer-core').Page} page
+ * @param {'off'|'corner'|'full'} mode
+ */
+const setMap = (page, mode) =>
+  page.evaluate((m) => {
+    window.__game.dispatch({ type: 'setSetting', key: 'mapMode', value: m });
+    window.__game.dispatch({ type: 'setSetting', key: 'minimap', value: m !== 'off' });
+  }, mode);
 
 /**
  * Wait until the camera is looking down an open corridor rather than at a wall a foot away.
@@ -147,6 +185,10 @@ function installAutopilot() {
     replans: 0,
     frames: 0,
     pickupsWanted: 2,
+    /** Fraction of the tank below which finding a flask outranks reaching the exit. */
+    refuelAt: 0.55,
+    /** Manhattan tiles the low-tank search looks over. Wide: a big maze is mostly not nearby. */
+    refuelRange: 40,
     log: [],
   };
 
@@ -184,15 +226,46 @@ function installAutopilot() {
     return out;
   }
 
-  /** Choose the next goal: a nearby uncollected item while we still want pickups, else the exit. */
+  /**
+   * Choose the next goal.
+   *
+   * Three rules, in order — this is the whole difference between an autopilot that proves a small
+   * maze and one that proves a massive one:
+   * 1. **Refuel when the tank is low.** Below `REFUEL_AT` of the tank the nearest reachable oil
+   *    flask becomes the goal, searched over a wide radius. That is what a competent player does in
+   *    a labyrinth they cannot cross on one tank, and it is the behaviour the placement guarantee
+   *    in `src/maze/populate.js` is written against.
+   * 2. A nearby item while we still want pickups (exercises the pickup path for real).
+   * 3. Otherwise the exit.
+   */
   function chooseGoal(s) {
     const maze = s.levelData.maze;
     const px = Math.floor(s.player.x);
     const py = Math.floor(s.player.y);
+    const items = s.levelData.items;
+
+    const tank = s.run.fuelMax > 0 ? s.run.fuel / s.run.fuelMax : 1;
+    if (tank < ap.refuelAt) {
+      let best = null;
+      let bestD = Infinity;
+      for (const it of items) {
+        if (it.taken || it.kind !== 'oil') continue;
+        const d = Math.abs(it.x - s.player.x) + Math.abs(it.y - s.player.y);
+        if (d < ap.refuelRange && d < bestD) {
+          bestD = d;
+          best = it;
+        }
+      }
+      if (best !== null) {
+        const r = route(maze, px, py, Math.floor(best.x), Math.floor(best.y));
+        if (r !== null) return { kind: 'oil', x: Math.floor(best.x), y: Math.floor(best.y), route: r };
+      }
+    }
+
     if (ap.pickupsWanted > 0) {
       let best = null;
       let bestD = Infinity;
-      for (const it of s.levelData.items) {
+      for (const it of items) {
         if (it.taken) continue;
         const d = Math.abs(it.x - s.player.x) + Math.abs(it.y - s.player.y);
         // Only a genuine detour: something close enough that a player would obviously grab it.
@@ -233,11 +306,18 @@ function installAutopilot() {
     ap.frames++;
     const p = s.player;
 
-    // Replan when the goal is gone (item collected), the route ran out, or we are stuck.
+    // Replan when the goal is gone (item collected), the route ran out, or we are stuck — and
+    // whenever the tank crosses the refuel threshold, so heading for the exit on fumes is
+    // interrupted by a trip to a flask (and a full tank goes back to heading for the exit).
+    // The 0.15 of hysteresis stops the two rules alternating every frame at the boundary.
+    const tank = s.run.fuelMax > 0 ? s.run.fuel / s.run.fuelMax : 1;
+    const wantsFuel = ap.goal !== null && ap.goal.kind === 'oil';
     if (
       ap.goal === null ||
       ap.step >= ap.route.length ||
-      (ap.goal.kind === 'item' && itemTaken(s, ap.goal))
+      ((ap.goal.kind === 'item' || ap.goal.kind === 'oil') && itemTaken(s, ap.goal)) ||
+      (!wantsFuel && tank < ap.refuelAt) ||
+      (wantsFuel && tank > ap.refuelAt + 0.15)
     ) {
       plan(s);
     }
@@ -330,13 +410,64 @@ function installAutopilot() {
   // Phase trace, taken from the store rather than sampled per frame: a small level builds
   // synchronously, so `loading` can last less than one animation frame and a sampler would miss it.
   window.__trace = [{ phase: g.state().phase, level: g.state().level, t: 0 }];
+
+  // The torch economy, observed rather than assumed. `pickup`/oil events are the sim telling us a
+  // flask was burned; `gained` is the fuel it actually put back. A massive maze is only playable
+  // if this happens repeatedly, so the run records every one.
+  const fuel = { refuels: 0, gained: 0, gems: 0, byLevel: {}, lowFuelEvents: 0 };
+  window.__fuel = fuel;
+
   g.subscribe((s) => {
     for (const ev of s.events) {
       if (ev.type === 'phase') {
         window.__trace.push({ phase: ev.to, level: s.level, t: +performance.now().toFixed(0) });
+      } else if (ev.type === 'pickup' && ev.kind === 'oil') {
+        // Deliberately does NOT spend the autopilot's detour budget: refuelling is the low-tank
+        // rule's job and is unlimited, while `pickupsWanted` exists to make it take a couple of
+        // deliberate detours for *gems*, which is the pickup path a player chooses rather than needs.
+        fuel.refuels++;
+        fuel.gained += ev.value;
+        fuel.byLevel[s.level] = (fuel.byLevel[s.level] || 0) + 1;
+      } else if (ev.type === 'pickup' && ev.kind === 'gem') {
+        fuel.gems++;
+        if (window.__ap) window.__ap.notePickup();
+      } else if (ev.type === 'lowFuel') {
+        fuel.lowFuelEvents++;
       }
     }
   });
+
+  // Animation-frame gap sampler, used to prove that carving a 128×128-cell level never stalls the
+  // frame loop. Sampling rAF deltas is the only honest measure: it sees the worker hand-off, the
+  // structured-clone deserialisation and the `levelReady` reducer exactly as a player's eye does.
+  const gaps = { on: false, max: 0, count: 0, over16: 0, last: 0 };
+  const gapTick = () => {
+    if (gaps.on) {
+      const now = performance.now();
+      if (gaps.last > 0) {
+        const d = now - gaps.last;
+        gaps.count++;
+        if (d > gaps.max) gaps.max = d;
+        if (d > 16.7 * 2) gaps.over16++;
+      }
+      gaps.last = now;
+    }
+    requestAnimationFrame(gapTick);
+  };
+  requestAnimationFrame(gapTick);
+  window.__gaps = {
+    start() {
+      gaps.on = true;
+      gaps.max = 0;
+      gaps.count = 0;
+      gaps.over16 = 0;
+      gaps.last = 0;
+    },
+    stop() {
+      gaps.on = false;
+      return { maxMs: +gaps.max.toFixed(2), frames: gaps.count, longFrames: gaps.over16 };
+    },
+  };
 }
 
 /** Wait until the page's game state satisfies `fn`, or reject. Extra args are passed to `fn`. */
@@ -499,6 +630,45 @@ try {
     };
   });
 
+  // ── Options screen ──
+  // The Map row changed from a two-state toggle to a three-state `choice` (§4.6), so the browser
+  // gate has to actually open the menu and step it. Driven through the real input path — the same
+  // `InputFrame` a keyboard produces — so this exercises `menus.handleInput`, not a private hook.
+  const press = async (action, times = 1) => {
+    for (let i = 0; i < times; i++) {
+      await page.evaluate((a) => window.__game.input.inject({ pressed: [a] }), action);
+      await sleep(120);
+    }
+  };
+  await press('down'); // Descend → Options
+  await press('confirm');
+  await sleep(400);
+  report.options = await page.evaluate(() => ({
+    screen: window.__game.screen(),
+    mapMode: window.__game.state().settings.mapMode,
+    minimap: window.__game.state().settings.minimap,
+  }));
+  await shot(page, 'options');
+  // Step the Map row and confirm both settings keys move together. Left and right are walked
+  // (a `choice` row wraps at both ends, so this passes through all three states twice) and every
+  // stop is checked, because the failure this guards against is silent: `mapMode` advancing while
+  // the legacy `minimap` mirror does not, which desynchronises the preference on the next reload.
+  await press('down', 4); // Sound → Music → Look Speed → Scanlines → Map
+  const cycle = [];
+  const readSetting = () =>
+    page.evaluate(() => {
+      const s = window.__game.state().settings;
+      return { mapMode: s.mapMode, minimap: s.minimap };
+    });
+  for (const dir of /** @type {const} */ (['left', 'left', 'right', 'right'])) {
+    await press(dir);
+    cycle.push(await readSetting());
+  }
+  report.options.cycle = cycle;
+  await shot(page, 'options-map');
+  await press('back');
+  await sleep(300);
+
   // ── Audio unlock ──
   // A click anywhere is the gesture the audio engine waits for; nothing may be constructed before
   // it (Chrome prints an autoplay warning, and the console gate would catch that).
@@ -523,19 +693,34 @@ try {
       await clearView(page, 4000);
       await shot(page, 'play');
     }
-    if (!mapShot && s.gems > 0) {
-      // A gem in the bag means some corridors are explored: the best moment for a minimap shot.
+    if (!mapShot && ms > 12000) {
+      // Twelve seconds of walking means a real stretch of corridor is on the map. The old trigger
+      // was "a gem is in the bag", which no longer works: level 1 is now 16×16 cells with 6 gems
+      // in it, and a direct run can finish without passing one — the shots then landed on the
+      // level-complete screen. Time is the honest proxy for "how much has been explored".
+      // CORNER is the state the player runs with; FULL is the one they stop to read.
       mapShot = true;
-      await page.evaluate(() =>
-        window.__game.dispatch({ type: 'setSetting', key: 'minimap', value: true }),
-      );
+      await setMap(page, 'corner');
       await sleep(400);
       await clearView(page, 4000);
       await shot(page, 'minimap');
+      await setMap(page, 'full');
+      await sleep(600);
+      await shot(page, 'fullmap');
+      await setMap(page, 'corner');
     }
   });
   if (!midShot) await shot(page, 'play');
-  if (!mapShot) await shot(page, 'minimap');
+  // Fallback only if the level ended inside 12 s: the map is only drawn while playing, so shooting
+  // it on the level-complete screen would produce a picture of the tally, not of the map.
+  if (!mapShot && (await page.evaluate(() => window.__game.state().phase === 'playing'))) {
+    await setMap(page, 'corner');
+    await shot(page, 'minimap');
+    await setMap(page, 'full');
+    await sleep(500);
+    await shot(page, 'fullmap');
+    await setMap(page, 'corner');
+  }
   report.autopilot = await page.evaluate(() => window.__ap.info());
   await page.evaluate(() => window.__ap.stop());
 
@@ -554,6 +739,15 @@ try {
 
   // ── Level 2 ──
   await page.evaluate(() => window.__game.dispatch({ type: 'nextLevel' }));
+  // The loading screen is a real screen again (main.js holds a built level for MIN_LOAD_S so the
+  // iris can complete its wipe), and it is the only place the game tells the player how big the
+  // labyrinth they are about to enter is. Shoot it while it is up.
+  await sleep(380);
+  report.loading = await page.evaluate(() => {
+    const s = window.__game.state();
+    return { phase: s.phase, level: s.level };
+  });
+  if (report.loading.phase === 'loading') await shot(page, 'loading');
   await waitForState(
     page,
     () => window.__game.state().phase === 'playing' && window.__game.state().level === 2,
@@ -644,28 +838,36 @@ try {
   report.level2 = await playLevel(page, LEVEL2_BUDGET_S);
   await page.evaluate(() => window.__ap.stop());
 
-  // ── Deep descent ──
-  // Levels above ~9 cross the worker threshold (cols*rows > 400), so this is the only part of the
-  // run that exercises the module-worker path, the big-maze fog-of-war and five-figure scores.
+  // ── Deep descent, all the way to the size cap ──
+  // Every level from 2 on crosses the worker threshold (cols*rows > 400), so this exercises the
+  // module-worker path, the big-maze fog-of-war and five-figure scores. The last hop is measured
+  // with an animation-frame sampler: carving 16 384 cells and shipping ~900 items plus a 66 kB tile
+  // buffer across a structured clone must not stall the frame loop.
   if (report.level2.done) {
     const t0 = Date.now();
     let reached = 2;
-    for (let level = 3; level <= 10 && Date.now() - t0 < 30000; level++) {
+    for (let level = 3; level <= CAP_LEVEL && Date.now() - t0 < 120000; level++) {
+      // Sample animation-frame gaps across the build of the biggest level in the game.
+      if (level === CAP_LEVEL) await page.evaluate(() => window.__gaps.start());
       await page.evaluate(() => window.__game.dispatch({ type: 'nextLevel' }));
       await waitForState(
         page,
         (lv) => window.__game.state().phase === 'playing' && window.__game.state().level === lv,
-        20000,
+        25000,
         `phase playing (level ${level})`,
         level,
       ).catch(() => {});
+      if (level === CAP_LEVEL) {
+        await sleep(600); // let the first few frames of the new level land in the sampler
+        report.buildGap = await page.evaluate(() => window.__gaps.stop());
+      }
       const st = await page.evaluate(() => {
         const s = window.__game.state();
         return { phase: s.phase, level: s.level, cols: s.levelData ? s.levelData.maze.cols : 0 };
       });
       if (st.phase !== 'playing' || st.level !== level) break;
       reached = level;
-      if (level < 10) await page.evaluate(() => window.__game.dispatch({ type: 'debugWin' }));
+      if (level < CAP_LEVEL) await page.evaluate(() => window.__game.dispatch({ type: 'debugWin' }));
     }
     report.deepDescent = {
       reached,
@@ -676,19 +878,161 @@ try {
           phase: s.phase,
           score: s.run.score,
           cols: s.levelData ? s.levelData.maze.cols : 0,
+          tiles: s.levelData ? s.levelData.maze.width : 0,
           items: s.levelData ? s.levelData.items.length : 0,
           torches: s.levelData ? s.levelData.torches.length : 0,
+          explored: s.explored ? s.explored.length : 0,
           fuelMax: Math.round(s.run.fuelMax),
           pathLength: s.levelData ? s.levelData.validation.pathLength : 0,
         };
       })),
     };
-    await page.evaluate(() => window.__ap.start(1));
-    await sleep(2500);
-    await clearView(page, 5000);
-    await shot(page, 'deep');
-    await page.evaluate(() => window.__ap.stop());
+
+    // ── The maximum-size level, driven for real ──
+    // 128×128 cells, ~900 items and ~1300 torches live, with the autopilot walking it and refuelling
+    // from flasks. Everything that could scale with maze size — the sim step, the sprite pass, the
+    // map raster, the fog grid — is under load here and nowhere else.
+    if (reached === CAP_LEVEL) {
+      const capHeapBefore = await heapMB();
+      await page.evaluate(() => window.__ap.start(4));
+      await sleep(2500);
+      await clearView(page, 5000);
+      await shot(page, 'deep');
+
+      const capStart = await page.evaluate(() => ({
+        refuels: window.__fuel.refuels,
+        fuel: window.__game.state().run.fuel,
+        distance: window.__game.state().run.distance,
+      }));
+      const capSoak = await page.evaluate(
+        (seconds) =>
+          new Promise((resolve) => {
+            const g = window.__game;
+            const render = [];
+            const t0 = performance.now();
+            let frames = 0;
+            let fuelRises = 0;
+            let lastFuel = g.state().run.fuel;
+            const f = () => {
+              frames++;
+              render.push(g.renderStats().ms);
+              const now = g.state().run.fuel;
+              if (now > lastFuel + 0.5) fuelRises++;
+              lastFuel = now;
+              if (performance.now() - t0 < seconds * 1000) requestAnimationFrame(f);
+              else {
+                render.sort((a, b) => a - b);
+                const ls = g.stats();
+                const s = g.state();
+                resolve({
+                  seconds: +((performance.now() - t0) / 1000).toFixed(2),
+                  frames,
+                  fuelRises,
+                  rafFps: +((frames * 1000) / (performance.now() - t0)).toFixed(1),
+                  loopFps: +ls.fps.toFixed(1),
+                  stepMsAvg: +ls.stepMsAvg.toFixed(4),
+                  frameMsP99: +ls.frameMsP99.toFixed(2),
+                  renderMsAvg: +ls.renderMsAvg.toFixed(3),
+                  worldMsAvg: +(render.reduce((a, b) => a + b, 0) / render.length).toFixed(3),
+                  worldMsP99: +render[Math.min(render.length - 1, Math.ceil(render.length * 0.99) - 1)].toFixed(3),
+                  droppedFrames: ls.droppedFrames,
+                  phase: s.phase,
+                  level: s.level,
+                  items: s.levelData ? s.levelData.items.length : 0,
+                  itemsTaken: s.levelData ? s.levelData.items.filter((i) => i.taken).length : 0,
+                  fuel: +s.run.fuel.toFixed(1),
+                  fuelMax: Math.round(s.run.fuelMax),
+                  levelRefuels: s.run.refuels,
+                  // Same counter as `capStart.refuels` — the run-cumulative one — so the difference
+                  // below is a difference. `run.refuels` is per LEVEL (§3) and is reported beside it.
+                  refuels: window.__fuel.refuels,
+                  distance: Math.round(s.run.distance),
+                  mapped: s.explored ? s.explored.reduce((a, b) => a + b, 0) : 0,
+                });
+              }
+            };
+            requestAnimationFrame(f);
+          }),
+        CAP_SOAK_S,
+      );
+      const capHeapAfter = await heapMB();
+      report.capLevel = {
+        ...capSoak,
+        refuelsDuringSoak: capSoak.refuels - capStart.refuels,
+        walkedDuringSoak: capSoak.distance - Math.round(capStart.distance),
+        heap: {
+          beforeMB: capHeapBefore,
+          afterMB: capHeapAfter,
+          growthMB:
+            capHeapBefore !== null && capHeapAfter !== null
+              ? +(capHeapAfter - capHeapBefore).toFixed(2)
+              : null,
+        },
+      };
+      await clearView(page, 5000);
+      await shot(page, 'cap-play');
+
+      // (c) Both map states on the biggest maze in the game, shot AFTER the soak so there is
+      // something on them — a minute of walking is the "just arrived" state a player sees.
+      for (const mode of /** @type {const} */ (['corner', 'full'])) {
+        await setMap(page, mode);
+        await sleep(800);
+        await shot(page, `cap-map-${mode}`);
+      }
+
+      // The map state that actually has to be legible is a player HALF WAY through a 12-minute
+      // labyrinth, and no test run has twelve minutes. So the fog is filled in along the real
+      // solution path exactly as walking it would fill it: every tile within REVEAL_RADIUS of the
+      // first 60 % of `validation.path`. This runs after every measurement, so it cannot move a
+      // single gate — it exists only so the full map can be judged at the size it is drawn at.
+      report.capMapReveal = await page.evaluate(() => {
+        const s = window.__game.state();
+        const m = s.levelData.maze;
+        const path = s.levelData.validation.path;
+        const ex = s.explored;
+        if (!path || !ex) return null;
+        const R = 3;
+        const upto = Math.floor(path.length * 0.6);
+        for (let i = 0; i < upto; i++) {
+          const ti = path[i];
+          const px = ti % m.width;
+          const py = (ti / m.width) | 0;
+          for (let dy = -R; dy <= R; dy++) {
+            const y = py + dy;
+            if (y < 0 || y >= m.height) continue;
+            for (let dx = -R; dx <= R; dx++) {
+              const x = px + dx;
+              if (x < 0 || x >= m.width) continue;
+              if (dx * dx + dy * dy > R * R) continue;
+              ex[y * m.width + x] = 1;
+            }
+          }
+        }
+        let n = 0;
+        for (let i = 0; i < ex.length; i++) n += ex[i];
+        return { pathTiles: path.length, revealedUpTo: upto, explored: n, tiles: ex.length };
+      });
+      // The map reconciles anything revealed outside the player's box with a 4 096-index rolling
+      // sweep (§4.6), i.e. ~16 frames for a 66 049-tile grid. A second is an order of magnitude more.
+      await sleep(1200);
+      await shot(page, 'cap-map-full-explored');
+      await setMap(page, 'corner');
+      await sleep(400);
+      await shot(page, 'cap-map-corner-explored');
+      report.capMapStats = await page.evaluate(() => {
+        const st = window.__game.state();
+        return { mapped: st.explored ? st.explored.reduce((a, b) => a + b, 0) : 0 };
+      });
+      await setMap(page, 'corner');
+      await page.evaluate(() => window.__ap.stop());
+    }
   }
+
+  // Read the economy HERE, before the torch is burned out with `stepOnce` below. That drain is an
+  // artificial one — the sim stepped with no input — and folding its inevitable `lowFuel` event in
+  // would make these numbers describe the harness rather than the game. What is wanted is what
+  // happened while the autopilot was actually playing.
+  report.fuelEconomy = await page.evaluate(() => ({ ...window.__fuel }));
 
   // ── Game over: burn the torch out ──
   // `stepOnce` runs the real fixed step without waiting for wall clock, so a full tank can be
@@ -792,8 +1136,51 @@ if (!report.gameOver || report.gameOver.phase !== 'gameOver') {
 }
 // Levels past the worker threshold are the only ones that exercise the module worker.
 if (report.deepDescent) {
-  if (report.deepDescent.reached < 10) fail(`deep descent stalled at level ${report.deepDescent.reached}`);
-  if (report.deepDescent.cols < 22) fail(`level 10 maze is only ${report.deepDescent.cols} cells wide`);
+  if (report.deepDescent.reached < CAP_LEVEL) {
+    fail(`deep descent stalled at level ${report.deepDescent.reached} (wanted ${CAP_LEVEL})`);
+  }
+  // The size cap: 128×128 cells = 257×257 tiles. Anything less means the curve is not shipping.
+  if (report.deepDescent.cols < 128) {
+    fail(`level ${CAP_LEVEL} maze is only ${report.deepDescent.cols} cells wide, expected 128`);
+  }
+  if (report.deepDescent.items < 600) {
+    fail(`level ${CAP_LEVEL} carries only ${report.deepDescent.items} items, expected ~800`);
+  }
+}
+
+// Massive mazes: building the biggest level in the game must not stall the frame loop.
+if (report.buildGap && report.buildGap.maxMs > MAX_BUILD_RAF_GAP_MS) {
+  fail(`level ${CAP_LEVEL} build stalled a frame for ${report.buildGap.maxMs}ms > ${MAX_BUILD_RAF_GAP_MS}ms`);
+}
+
+// The maximum-size level, played for real with ~900 items live.
+if (report.capLevel) {
+  const c = report.capLevel;
+  if (c.phase !== 'playing') fail(`cap-level soak ended in phase ${c.phase}`);
+  if (c.loopFps < MIN_FPS) fail(`cap-level fps ${c.loopFps} < ${MIN_FPS}`);
+  if (c.renderMsAvg > MAX_RENDER_MS_AVG) {
+    fail(`cap-level render avg ${c.renderMsAvg}ms > ${MAX_RENDER_MS_AVG}ms`);
+  }
+  if (c.worldMsP99 > MAX_RENDER_MS_P99) {
+    fail(`cap-level world render p99 ${c.worldMsP99}ms > ${MAX_RENDER_MS_P99}ms`);
+  }
+  if (c.heap.growthMB !== null && c.heap.growthMB > MAX_HEAP_GROWTH_MB) {
+    fail(`cap-level heap grew ${c.heap.growthMB}MB over ${c.seconds}s > ${MAX_HEAP_GROWTH_MB}MB`);
+  }
+  if (c.walkedDuringSoak < 20) fail(`autopilot barely moved on the cap level (${c.walkedDuringSoak} tiles)`);
+} else if (report.level2 && report.level2.done) {
+  fail('the maximum-size level was never reached, so nothing proved the massive-maze load');
+}
+
+// The refuel economy, observed end-to-end: a torch that never refills is a countdown, not an economy.
+if (!report.fuelEconomy || report.fuelEconomy.refuels < MIN_REFUELS) {
+  fail(
+    `the torch refilled only ${report.fuelEconomy ? report.fuelEconomy.refuels : 0} time(s), ` +
+      `wanted ≥ ${MIN_REFUELS}`,
+  );
+}
+if (report.fuelEconomy && report.fuelEconomy.refuels >= MIN_REFUELS && report.fuelEconomy.gained <= 0) {
+  fail('oil flasks were collected but restored no fuel');
 }
 
 const seen = new Set((report.phases || []).map((p) => p.phase));
@@ -815,6 +1202,28 @@ if (report.render) {
 if (report.heap && report.heap.growthMB !== null && report.heap.growthMB > MAX_HEAP_GROWTH_MB) {
   fail(`heap grew ${report.heap.growthMB}MB over ${report.heap.soakSeconds}s > ${MAX_HEAP_GROWTH_MB}MB`);
 }
+// The options screen's Map row is a three-state choice now, and cycling it must move BOTH the
+// `mapMode` enum and the legacy `minimap` mirror, or the preference desynchronises on reload.
+if (report.options && report.options.screen !== 'options') {
+  fail(`the options screen did not open from the title (screen is '${report.options.screen}')`);
+}
+if (report.options && report.options.cycle) {
+  const modes = report.options.cycle.map((c) => c.mapMode);
+  if (new Set(modes).size < 3) {
+    fail(`the options Map row did not reach three states (saw ${JSON.stringify(modes)})`);
+  }
+  for (const c of report.options.cycle) {
+    if (c.minimap !== (c.mapMode !== 'off')) {
+      fail(`mapMode '${c.mapMode}' and the legacy minimap mirror (${c.minimap}) disagree`);
+    }
+  }
+}
+
+// The loading screen must actually exist to be read (main.js MIN_LOAD_S, §4.7). If a build now
+// lands in three frames again, the iris snaps and the labyrinth banner is never seen.
+if (!report.loading || report.loading.phase !== 'loading') {
+  fail(`the loading screen was already gone 380ms after nextLevel (${report.loading ? report.loading.phase : 'no data'})`);
+}
 if (report.mobile) {
   if (report.mobile.phase !== 'playing') fail('mobile run never reached playing');
   if (report.mobile.horizontalOverflow) fail('mobile layout overflows horizontally');
@@ -829,6 +1238,7 @@ fs.writeFileSync(outFile, JSON.stringify(report, null, 2));
 
 const l1 = report.level1 || {};
 const l2 = report.level2 || {};
+const cap = report.capLevel;
 console.log(
   `[verify] ${report.pass ? 'PASS' : 'FAIL'} ` +
     `L1 ${l1.done ? `cleared in ${l1.seconds?.toFixed(1)}s, ${l1.fuel}/${l1.fuelMax} fuel left` : l1.phase} · ` +
@@ -839,6 +1249,16 @@ console.log(
     `render ${report.render ? `${report.render.fullRenderMsAvg}ms avg, world p99 ${report.render.worldMsP99}ms` : '?'} · ` +
     `heap +${report.heap ? report.heap.growthMB : '?'}MB · ` +
     `errors ${report.errors.length + report.pageErrors.length + report.gameErrors.length}`,
+);
+console.log(
+  `[verify] massive: ` +
+    `cap L${report.deepDescent ? report.deepDescent.reached : '?'} ` +
+    `${report.deepDescent ? `${report.deepDescent.cols}×${report.deepDescent.cols} cells / ${report.deepDescent.tiles}² tiles, ${report.deepDescent.items} items, ${report.deepDescent.torches} torches` : '?'} · ` +
+    `build gap max ${report.buildGap ? `${report.buildGap.maxMs}ms` : '?'} · ` +
+    (cap
+      ? `soak ${cap.seconds}s @ ${cap.loopFps}fps, step ${cap.stepMsAvg}ms, render ${cap.renderMsAvg}ms avg / world p99 ${cap.worldMsP99}ms, heap +${cap.heap.growthMB}MB, walked ${cap.walkedDuringSoak} tiles, ${cap.refuelsDuringSoak} refuels · `
+      : 'no cap soak · ') +
+    `refuels ${report.fuelEconomy ? report.fuelEconomy.refuels : '?'} (+${report.fuelEconomy ? Math.round(report.fuelEconomy.gained) : '?'}s)`,
 );
 if (!report.pass) for (const r of report.failReasons) console.log(`[verify]   ✗ ${r}`);
 console.log(`[verify] ${report.screenshots.length} screenshots · wrote ${path.relative(ROOT, outFile)}`);
