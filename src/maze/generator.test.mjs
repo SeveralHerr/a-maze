@@ -224,3 +224,97 @@ test('a long thin maze (the deepest possible recursion) never overflows the stac
   const big = generateMaze({ cols: 700, rows: 700, seed: 1 });
   assert.deepEqual(validateMaze(big).errors, []);
 });
+
+// ─── Cross-section shortcuts ─────────────────────────────────────────────────────────────────
+
+/**
+ * BFS cell distances over open corridors.
+ * @param {import('../core/types.js').Maze} m
+ * @param {number} from cell index
+ * @returns {Int32Array}
+ */
+function cellDistances(m, from) {
+  const n = m.cols * m.rows;
+  const dist = new Int32Array(n).fill(-1);
+  const queue = [from];
+  dist[from] = 0;
+  for (let h = 0; h < queue.length; h++) {
+    const c = queue[h];
+    const cx = c % m.cols;
+    const cy = (c - cx) / m.cols;
+    for (const [dx, dy] of [[1, 0], [0, 1], [-1, 0], [0, -1]]) {
+      const nx = cx + dx;
+      const ny = cy + dy;
+      if (nx < 0 || ny < 0 || nx >= m.cols || ny >= m.rows) continue;
+      if (m.tiles[(cy * 2 + 1 + dy) * m.width + (cx * 2 + 1 + dx)] !== TILE.FLOOR) continue;
+      const nc = ny * m.cols + nx;
+      if (dist[nc] >= 0) continue;
+      dist[nc] = dist[c] + 1;
+      queue.push(nc);
+    }
+  }
+  return dist;
+}
+
+test('shortcuts only remove walls, add exactly one loop each, and never exceed the request', () => {
+  for (const [cols, rows, count] of [[16, 16, 5], [40, 40, 33], [64, 33, 40], [128, 128, 341]]) {
+    for (let seed = 1; seed <= 4; seed++) {
+      const base = generateMaze({ cols, rows, seed });
+      const m = generateMaze({ cols, rows, seed, shortcuts: count });
+      let opened = 0;
+      for (let i = 0; i < base.tiles.length; i++) {
+        if (base.tiles[i] === TILE.FLOOR) assert.equal(m.tiles[i], TILE.FLOOR, `tile ${i} filled back in`);
+        else if (m.tiles[i] === TILE.FLOOR) opened++;
+      }
+      const v = validateMaze(m);
+      assert.ok(v.solvable && v.fullyConnected && v.bordersSealed, `${cols}×${rows} seed ${seed}`);
+      assert.equal(v.loops, opened, 'each opened wall is one extra cycle');
+      assert.ok(opened > 0, `${cols}×${rows} seed ${seed}: at least one shortcut placed`);
+      assert.ok(opened <= count, `${cols}×${rows} seed ${seed}: ${opened} > ${count} requested`);
+    }
+  }
+});
+
+test('every shortcut joins cells that were far apart, and the route keeps its guaranteed length', () => {
+  const detour = 12;
+  const keep = 0.9;
+  for (let seed = 1; seed <= 6; seed++) {
+    const tree = generateMaze({ cols: 32, rows: 32, seed });
+    const m = generateMaze({ cols: 32, rows: 32, seed, shortcuts: 40, shortcutDetour: detour, shortcutRouteKeep: keep });
+    const treeRoute = validateMaze(tree).pathLength;
+    // pathLength counts tiles (2 per cell step + 1); the guarantee is stated in cell steps.
+    const route = validateMaze(m).pathLength;
+    assert.ok((route - 1) / 2 >= Math.ceil(((treeRoute - 1) / 2) * keep),
+      `seed ${seed}: route ${route} fell below ${keep} of ${treeRoute}`);
+    assert.ok(validateMaze(m).loops > 0, 'the shortcuts did something');
+
+    // Replay: each opened wall, checked against the tree plus the walls opened before it, is a
+    // stronger claim than the generator makes (it checks against the live maze in its own order),
+    // so check the weaker, order-free one: in the *tree*, the two cells were ≥ detour apart.
+    for (let i = 0; i < m.tiles.length; i++) {
+      if (tree.tiles[i] !== TILE.WALL || m.tiles[i] !== TILE.FLOOR) continue;
+      const tx = i % m.width;
+      const ty = (i - tx) / m.width;
+      const a = tx % 2 === 0 ? [(tx - 2) / 2, (ty - 1) / 2] : [(tx - 1) / 2, (ty - 2) / 2];
+      const b = tx % 2 === 0 ? [tx / 2, (ty - 1) / 2] : [(tx - 1) / 2, ty / 2];
+      const d = cellDistances(tree, a[1] * m.cols + a[0])[b[1] * m.cols + b[0]];
+      assert.ok(d >= detour, `seed ${seed}: shortcut at tile (${tx},${ty}) joins cells only ${d} apart`);
+    }
+  }
+});
+
+test('shortcuts draw from their own stream: the carve is untouched and results are deterministic', () => {
+  const a = generateMaze({ cols: 24, rows: 24, seed: 77, shortcuts: 12 });
+  const b = generateMaze({ cols: 24, rows: 24, seed: 77, shortcuts: 12 });
+  assert.deepEqual(a.tiles, b.tiles);
+  const none = generateMaze({ cols: 24, rows: 24, seed: 77, shortcuts: 0 });
+  assert.equal(validateMaze(none).loops, 0, 'shortcuts: 0 is still a perfect maze');
+  for (const bad of [-3, NaN, 'x', undefined, null]) {
+    assert.deepEqual(generateMaze({ cols: 24, rows: 24, seed: 77, shortcuts: /** @type {any} */ (bad) }).tiles, none.tiles);
+  }
+  // Degenerate grids have no qualifying wall and must not throw.
+  for (const [cols, rows] of [[1, 1], [1, 40], [2, 2], [3, 1]]) {
+    const m = generateMaze({ cols, rows, seed: 5, shortcuts: 10 });
+    assert.ok(validateMaze(m).fullyConnected, `${cols}×${rows}`);
+  }
+});

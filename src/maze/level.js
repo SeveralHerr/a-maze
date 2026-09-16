@@ -25,6 +25,9 @@ import { populateLevel } from './populate.js';
  * @property {number} cols           logical cell columns, 1..4096
  * @property {number} rows           logical cell rows, 1..4096
  * @property {number} [braid=0]      fraction of dead ends to open, 0..1
+ * @property {number} [shortcuts=0]  cross-section shortcuts to open (see `generateMaze`)
+ * @property {number} [shortcutDetour] minimum path distance, in cells, a shortcut must bridge
+ * @property {number} [shortcutRouteKeep] fraction of the start→exit route shortcuts must keep
  * @property {number} [gems=0]       gems to scatter
  * @property {number} [oil=0]        oil flasks to scatter
  * @property {number} [fuelSeconds=0] floor for the derived fuel budget (0 = derive entirely)
@@ -45,7 +48,15 @@ export function buildLevel(params, seed) {
   if (params === null || typeof params !== 'object') {
     throw new RangeError(`buildLevel: params must be an object, got ${String(params)}`);
   }
-  const maze = generateMaze({ cols: params.cols, rows: params.rows, seed, braid: params.braid });
+  const maze = generateMaze({
+    cols: params.cols,
+    rows: params.rows,
+    seed,
+    braid: params.braid,
+    shortcuts: params.shortcuts,
+    shortcutDetour: params.shortcutDetour,
+    shortcutRouteKeep: params.shortcutRouteKeep,
+  });
   const validation = validateMaze(maze);
   assertMazeValid(maze, validation, params.braid);
   const { items, torches, fuel, par } = populateLevel(maze, validation, params, seed);

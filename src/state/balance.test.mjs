@@ -54,11 +54,15 @@ test('constants: the invariants the collision solver and feel depend on', () => 
 
 // ─── levelParams ─────────────────────────────────────────────────────────────────────────────
 
-test('levelParams: level 1 is a 16×16 perfect maze with a small, fixed tank', () => {
+test('levelParams: level 1 is a 16×16 unbraided maze with a few shortcuts and a small, fixed tank', () => {
   const p = levelParams(1);
   assert.equal(p.cols, 16, 'massive mazes: level 1 is 16×16 cells = 33×33 tiles');
   assert.equal(p.rows, 16);
-  assert.equal(p.braid, 0, 'level 1 is a perfect maze');
+  assert.equal(p.braid, 0, 'level 1 is unbraided');
+  assert.equal(p.shortcuts, Math.round(p.cells / LEVEL.SHORTCUT_CELLS), 'shortcuts scale with area');
+  assert.ok(p.shortcuts >= 3 && p.shortcuts <= 8, `level 1 asks for a few shortcuts (${p.shortcuts})`);
+  assert.equal(p.shortcutDetour, LEVEL.SHORTCUT_DETOUR);
+  assert.equal(p.shortcutRouteKeep, LEVEL.SHORTCUT_ROUTE_KEEP);
   assert.equal(p.fuelSeconds, FUEL.TANK_START, 'the tank, not a size-based budget');
   assert.ok(p.fuelSeconds >= 100 && p.fuelSeconds <= 120, `a ~110 s tank (${p.fuelSeconds} s)`);
   assert.equal(p.drain, 1, 'no extra drain before the size cap');

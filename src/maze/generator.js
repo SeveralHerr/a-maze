@@ -1,7 +1,8 @@
 // @ts-check
 /**
  * @file Maze generation: iterative randomized depth-first search ("recursive backtracker"),
- * optional braiding, and farthest-cell exit selection (ARCHITECTURE.md §4.4).
+ * optional cross-section shortcuts, optional braiding, and farthest-cell exit selection
+ * (ARCHITECTURE.md §4.4).
  *
  * ## Why the backtracker
  * It produces long, winding, low-branching corridors — exactly the "lost in a dungeon" feel the
@@ -38,6 +39,8 @@
  * full connectivity survive by construction — braiding can only *increase* `loops` (each removed
  * wall adds one edge to a graph whose node count is unchanged) and *decrease* the number of dead
  * ends. No re-validation of connectivity is needed after braiding; it is a theorem, not a hope.
+ * The shortcut pass (`connectSections`) is the same kind of operation — WALL → FLOOR between two
+ * cells — so the same argument covers it.
  *
  * ## Units & conventions
  * Tile coordinates, row-major indexing, thick walls and direction numbering are all defined in
@@ -58,7 +61,27 @@ import { TILE, DIR_COUNT, DIR_DX, DIR_DY, MAX_CELLS_PER_SIDE } from './constants
  * @property {number} rows   logical cell rows, 1..4096
  * @property {number} seed   any finite number; NaN/±Infinity are treated as 0
  * @property {number} [braid=0] fraction of dead ends to open up, clamped to 0..1
+ * @property {number} [shortcuts=0] walls to knock through between cells that are far apart by
+ *   path (see {@link connectSections}); floored, clamped to ≥ 0
+ * @property {number} [shortcutDetour=SHORTCUT_DETOUR] minimum path distance, in cells, between the
+ *   two cells a shortcut joins; floored, clamped to ≥ 2
+ * @property {number} [shortcutRouteKeep=SHORTCUT_ROUTE_KEEP] fraction (0..1) of the start→exit
+ *   route length that shortcuts must leave intact
  */
+
+/**
+ * Default minimum detour a shortcut must save, in cells. Two neighbours this far apart by path sit
+ * in genuinely different sections of the maze, so the opening turns a long backtrack into a loop;
+ * a smaller value would mostly join sibling corridors and change nothing the player can feel.
+ */
+export const SHORTCUT_DETOUR = 24;
+
+/**
+ * Default fraction of the carved start→exit route that shortcuts must preserve. Shortcuts exist to
+ * spare the player long backtracks, not to trivialise the level: unguarded, four shortcuts halve
+ * a 16×16 route (measured 314 → 150 tiles).
+ */
+export const SHORTCUT_ROUTE_KEEP = 0.9;
 
 /**
  * Validate one grid dimension. Non-integers are floored (a caller computing `cols` from a curve
@@ -104,11 +127,26 @@ function normalizeBraid(value) {
 }
 
 /**
+ * Normalise a non-negative integer parameter: floor, clamp to `min`, and treat anything
+ * non-numeric as `fallback`.
+ * @param {unknown} value
+ * @param {number} min
+ * @param {number} fallback
+ * @returns {number}
+ */
+function normalizeCount(value, min, fallback) {
+  if (value === undefined || value === null) return fallback;
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.max(min, Math.floor(n)) : fallback;
+}
+
+/**
  * Generate a thick-wall maze.
  *
- * Deterministic: the same `(cols, rows, seed, braid)` always produces bit-identical `tiles`, in
- * Node and in every browser. The carve and braid passes draw from two *forked* streams
- * (`maze.carve`, `maze.braid`), so changing the braid fraction never reshuffles the base maze.
+ * Deterministic: the same `(cols, rows, seed, braid, shortcuts, shortcutDetour)` always produces
+ * bit-identical `tiles`, in Node and in every browser. The carve, shortcut and braid passes draw
+ * from three *forked* streams (`maze.carve`, `maze.connect`, `maze.braid`), so changing either
+ * knob never reshuffles the base maze.
  *
  * Cost: O(cols·rows) time; memory is the tile buffer ((2c+1)(2r+1) bytes) plus ~9 bytes per cell
  * of scratch, all released on return. 2000×2000 cells ≈ 16 MiB of tiles + ~52 MiB of scratch.
@@ -126,6 +164,11 @@ export function generateMaze(params) {
   const rows = requireSide(params.rows, 'rows');
   const seed = normalizeSeed(params.seed);
   const braid = normalizeBraid(params.braid);
+  const shortcuts = normalizeCount(params.shortcuts, 0, 0);
+  const shortcutDetour = normalizeCount(params.shortcutDetour, 2, SHORTCUT_DETOUR);
+  const routeKeep = Number.isFinite(Number(params.shortcutRouteKeep ?? NaN))
+    ? clamp(Number(params.shortcutRouteKeep), 0, 1)
+    : SHORTCUT_ROUTE_KEEP;
 
   const width = cols * 2 + 1;
   const height = rows * 2 + 1;
@@ -135,6 +178,9 @@ export function generateMaze(params) {
 
   const rng = createRng(seed);
   carve(tiles, width, cols, rows, rng.fork('maze.carve'));
+  if (shortcuts > 0) {
+    connectSections(tiles, width, cols, rows, shortcuts, shortcutDetour, routeKeep, rng.fork('maze.connect'));
+  }
   if (braid > 0) braidDeadEnds(tiles, width, cols, rows, braid, rng.fork('maze.braid'));
 
   const exitCell = farthestCell(tiles, width, cols, rows, 0);
@@ -239,6 +285,174 @@ function probeCell(tiles, width, cols, rows, cx, cy, walledOut) {
 }
 
 /**
+ * Shortcut pass: knock through up to `count` interior walls whose two cells are at least `detour`
+ * cells apart by path, joining separate sections of the maze.
+ *
+ * Braiding only opens dead ends, and its dead-end-to-dead-end preference mostly joins neighbouring
+ * twigs of the same branch — the player still walks out of a long cul-de-sac the way they came in.
+ * This pass instead picks walls at random and keeps one only when a **bounded BFS** from one side
+ * cannot reach the other in fewer than `detour` steps, i.e. the wall separates two places the
+ * current maze (earlier shortcuts included) keeps far apart. That gives dead-end sections an
+ * occasional back door and lets corridors that "should" meet actually meet — so the player's
+ * mental map stops being a tree, and getting lost becomes possible.
+ *
+ * Because each test runs on the live tiles, a new shortcut is never placed where an earlier one
+ * already brought the two sides close: shortcuts spread out without an explicit spacing rule.
+ *
+ * **Route guard.** The pass takes the farthest cell of the carved tree as a reference exit and
+ * rejects any wall that would bring it closer than `routeKeep` of its original distance. A shortest
+ * path crosses a new edge (a,b) at most once, so with `ds`/`de` the current distances from the
+ * start and from the reference exit, the route through it is `min(ds[a]+1+de[b], ds[b]+1+de[a])`;
+ * both distance fields are repaired incrementally after every accepted wall. The final exit is still chosen
+ * afterwards as the farthest cell, which is at least as far as the reference exit — so the shipped
+ * route is ≥ `routeKeep` of the carved one (before braiding, which shortens it as it always has).
+ *
+ * Cost: one shuffle of ≈ 2·cols·rows candidate walls; per candidate a BFS capped at `detour` steps
+ * (a maze is tree-like, so that is a few dozen cells); per accepted wall a repair of the two
+ * distance fields that touches only the cells the new edge brought closer.
+ * Stops at `count` successes or when the candidates run out — never more than `count`.
+ *
+ * @param {Uint8Array} tiles   mutated in place
+ * @param {number} width
+ * @param {number} cols
+ * @param {number} rows
+ * @param {number} count       maximum walls to open
+ * @param {number} detour      minimum path distance (cells) between the two joined cells, ≥ 2
+ * @param {number} routeKeep   0..1 fraction of the start→exit route to preserve
+ * @param {import('../core/rng.js').Rng} rng
+ * @returns {number} number of walls actually removed
+ */
+function connectSections(tiles, width, cols, rows, count, detour, routeKeep, rng) {
+  const nCells = cols * rows;
+  const nWalls = (cols - 1) * rows + cols * (rows - 1);
+  if (nWalls === 0) return 0;
+
+  // Candidate walls, encoded `cell * 2 + d` (d = DIR_E 0 or DIR_S 1). After the carve n−1 of them
+  // are open tree edges; those are skipped when reached rather than filtered up front.
+  const walls = new Int32Array(nWalls);
+  let w = 0;
+  for (let cy = 0; cy < rows; cy++) {
+    for (let cx = 0; cx < cols; cx++) {
+      const cell = cy * cols + cx;
+      if (cx + 1 < cols) walls[w++] = cell * 2;
+      if (cy + 1 < rows) walls[w++] = cell * 2 + 1;
+    }
+  }
+  rng.shuffle(walls);
+
+  // Bounded-BFS scratch; `stamp` avoids clearing `mark` between searches.
+  const mark = new Int32Array(nCells);
+  const dist = new Int32Array(nCells);
+  const queue = new Int32Array(nCells);
+  let stamp = 0;
+
+  const ds = new Int32Array(nCells);
+  const de = new Int32Array(nCells);
+  const exitCell = distancesFrom(tiles, width, cols, rows, 0, ds, queue);
+  distancesFrom(tiles, width, cols, rows, exitCell, de, queue);
+  const minRoute = Math.ceil(ds[exitCell] * routeKeep);
+
+  let removed = 0;
+  for (let i = 0; i < nWalls && removed < count; i++) {
+    const cell = walls[i] >> 1;
+    const d = walls[i] & 1;
+    const cx = cell % cols;
+    const cy = (cell - cx) / cols;
+    const gap = (cy * 2 + 1 + DIR_DY[d]) * width + (cx * 2 + 1 + DIR_DX[d]);
+    if (tiles[gap] === TILE.FLOOR) continue;
+    const target = (cy + DIR_DY[d]) * cols + (cx + DIR_DX[d]);
+    if (ds[cell] + 1 + de[target] < minRoute || ds[target] + 1 + de[cell] < minRoute) continue;
+
+    // Is `target` reachable from `cell` in fewer than `detour` steps?
+    stamp++;
+    let head = 0;
+    let tail = 0;
+    mark[cell] = stamp;
+    dist[cell] = 0;
+    queue[tail++] = cell;
+    let near = false;
+    search: while (head < tail) {
+      const c = queue[head++];
+      const nd = dist[c] + 1;
+      if (nd >= detour) break; // BFS order: every cell still queued is at least this far
+      const qx = c % cols;
+      const qy = (c - qx) / cols;
+      const tx = qx * 2 + 1;
+      const ty = qy * 2 + 1;
+      for (let k = 0; k < DIR_COUNT; k++) {
+        const nx = qx + DIR_DX[k];
+        const ny = qy + DIR_DY[k];
+        if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+        if (tiles[(ty + DIR_DY[k]) * width + (tx + DIR_DX[k])] !== TILE.FLOOR) continue;
+        const n = ny * cols + nx;
+        if (mark[n] === stamp) continue;
+        if (n === target) {
+          near = true;
+          break search;
+        }
+        mark[n] = stamp;
+        dist[n] = nd;
+        queue[tail++] = n;
+      }
+    }
+    if (near) continue;
+
+    tiles[gap] = TILE.FLOOR;
+    removed++;
+    relaxDistances(tiles, width, cols, rows, ds, cell, target, queue);
+    relaxDistances(tiles, width, cols, rows, de, cell, target, queue);
+  }
+  return removed;
+}
+
+/**
+ * Repair a BFS distance field after the edge (a,b) was opened. Opening an edge can only shorten
+ * distances, and only through that edge, so it is enough to seed the farther endpoint with its
+ * improved distance and propagate improvements outward — the work is proportional to the cells
+ * that actually got closer, not to the maze.
+ * @param {Uint8Array} tiles
+ * @param {number} width
+ * @param {number} cols
+ * @param {number} rows
+ * @param {Int32Array} dist  a complete distance field (no -1 entries: the maze is connected); mutated
+ * @param {number} a
+ * @param {number} b
+ * @param {Int32Array} queue cols*rows slots of scratch
+ * @returns {void}
+ */
+function relaxDistances(tiles, width, cols, rows, dist, a, b, queue) {
+  let head = 0;
+  let tail = 0;
+  if (dist[a] + 1 < dist[b]) {
+    dist[b] = dist[a] + 1;
+    queue[tail++] = b;
+  } else if (dist[b] + 1 < dist[a]) {
+    dist[a] = dist[b] + 1;
+    queue[tail++] = a;
+  }
+  // Every enqueue strictly lowers a distance and the queue is FIFO over a BFS frontier, so a cell
+  // is enqueued at most once per call and `tail` never exceeds the scratch capacity.
+  while (head < tail) {
+    const c = queue[head++];
+    const nd = dist[c] + 1;
+    const cx = c % cols;
+    const cy = (c - cx) / cols;
+    const tx = cx * 2 + 1;
+    const ty = cy * 2 + 1;
+    for (let k = 0; k < DIR_COUNT; k++) {
+      const nx = cx + DIR_DX[k];
+      const ny = cy + DIR_DY[k];
+      if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+      if (tiles[(ty + DIR_DY[k]) * width + (tx + DIR_DX[k])] !== TILE.FLOOR) continue;
+      const n = ny * cols + nx;
+      if (dist[n] <= nd) continue;
+      dist[n] = nd;
+      queue[tail++] = n;
+    }
+  }
+}
+
+/**
  * Braid pass: open a wall at `braid` (0..1) of the maze's dead ends, turning the perfect maze into
  * one with loops. Only removes walls, so connectivity is preserved by construction.
  *
@@ -336,8 +550,23 @@ function braidDeadEnds(tiles, width, cols, rows, braid, rng) {
  */
 function farthestCell(tiles, width, cols, rows, fromCell) {
   const nCells = cols * rows;
-  const dist = new Int32Array(nCells).fill(-1);
-  const queue = new Int32Array(nCells); // every cell is enqueued at most once ⇒ exact capacity
+  // every cell is enqueued at most once ⇒ exact capacity
+  return distancesFrom(tiles, width, cols, rows, fromCell, new Int32Array(nCells), new Int32Array(nCells));
+}
+
+/**
+ * Fill `dist` with the BFS distance (in cells) of every cell from `fromCell`, -1 for unreachable.
+ * @param {Uint8Array} tiles
+ * @param {number} width
+ * @param {number} cols
+ * @param {number} rows
+ * @param {number} fromCell
+ * @param {Int32Array} dist   cols*rows slots, overwritten
+ * @param {Int32Array} queue  cols*rows slots of scratch
+ * @returns {number} cell index of the first cell discovered at the maximum distance
+ */
+function distancesFrom(tiles, width, cols, rows, fromCell, dist, queue) {
+  dist.fill(-1);
   let head = 0;
   let tail = 0;
   dist[fromCell] = 0;

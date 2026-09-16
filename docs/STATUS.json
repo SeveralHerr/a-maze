@@ -1,5 +1,5 @@
 {
- "updated": "2026-09-17T00:30:00.000Z",
+ "updated": "2026-09-17T01:00:00.000Z",
  "iteration": 10,
  "passThreshold": 8.5,
  "wave": "gauntlet-stopped-r2",
@@ -858,6 +858,12 @@
     "stress": "pass"
    },
    "verifyPass": null
+  },
+  {
+   "iteration": 15,
+   "updated": "2026-09-17T01:00:00.000Z",
+   "wave": "maze-shortcuts",
+   "summary": "Cross-section shortcuts so a dead end is not always a long backtrack (and the maze stops being a tree you can map in your head). New generator pass connectSections (src/maze/generator.js, own rng stream maze.connect, runs after carve and before braid): knocks through up to LEVEL.SHORTCUT_CELLS=48 cells-per-shortcut walls whose two cells are >= SHORTCUT_DETOUR=24 cells apart by path (bounded BFS on the live tiles, so shortcuts self-space), rejecting any that would cut the start->exit route below SHORTCUT_ROUTE_KEEP=0.9 (distance fields from start and a reference exit, repaired incrementally per accepted wall). Applies from level 1 (~2 of 5 requested fit on 16x16). Measured over 20 seeds, largest start/exit-free cul-de-sac: L1 37->18 cells, L2 71->29, L8 164->62, cap 111->54; L1 route 314->296 tiles; 128x128 generation +~25 ms (worker). Detour 16 was tried first and flattened the feasibility tension curve (lowest tank L1-2 0.76->0.65 vs 0.57 deep) because long loop corridors send wanderers further between flasks; 24 keeps it at 0.70 vs 0.57. Gates: npm test 38/38 files, validate-mazes 117306 mazes 0 failures (campaign perfect-maze check now requires braid AND shortcuts to be 0), stress OK. verify.mjs (browser) not run."
   }
  ],
  "openIssues": [

@@ -451,6 +451,32 @@ export const LEVEL = Object.freeze({
   /** Braid fraction (dead ends opened) once the ramp completes. */
   BRAID_MAX: 0.6,
   /**
+   * One cross-section shortcut requested per this many cells, on every level (level 1 included).
+   * A shortcut is a wall knocked through between two cells that are at least `SHORTCUT_DETOUR`
+   * cells apart by path, so a long cul-de-sac sometimes has a back door and corridors that look
+   * like they should meet sometimes do — less forced backtracking, and a maze you can get lost in
+   * because it is no longer a tree. Braid cannot do this: it opens dead-end *tips*, mostly into a
+   * sibling twig. Measured over 20 seeds (`src/maze/generator.js` shortcut pass): the largest
+   * start-and-exit-free cul-de-sac falls 37 → 18 cells on level 1, 71 → 29 on level 2, 164 → 62 on
+   * level 8, 111 → 54 at the cap. Small grids accept fewer than requested (≈2 of 5 on level 1):
+   * the detour and route rules run out of candidates, which is the intended "a few" there.
+   */
+  SHORTCUT_CELLS: 48,
+  /**
+   * Minimum path distance, in cells, between the two cells a shortcut joins (so each one spares at
+   * least 48 tiles of backtracking). 24 rather than 16 for a measured reason: at 16 the extra loops
+   * send a wandering player on long excursions between flasks early on, and the lowest tank on
+   * levels 1–2 fell from 0.76 to 0.65 — flattening the "L1 generous, L10 tense" curve that
+   * `feasibility.test.mjs` guards. At 24 it is 0.70 against 0.57 deep (20 seeds per level).
+   */
+  SHORTCUT_DETOUR: 24,
+  /**
+   * Fraction of the carved start→exit route shortcuts must leave intact. They exist to spare
+   * backtracking, not to hand out a faster exit: unguarded, four of them halve a 16×16 route.
+   * At 0.9 the level-1 route drops ≈ 6 % (314 → 296 tiles).
+   */
+  SHORTCUT_ROUTE_KEEP: 0.9,
+  /**
    * Levels over which braid ramps from 0 to `BRAID_MAX`. Longer than the size ramp on purpose, so
    * braid **keeps rising past the size cap** (0.49 at `CAP_LEVEL`, 0.6 from level 18).
    *
@@ -634,7 +660,8 @@ export function estimatedPathTiles(level) {
  * non-decreasing, and per-cell fuel is non-increasing (the tank grows far more slowly than the area).
  *
  * @param {number} level 1-based level number; non-finite or < 1 is treated as 1
- * @returns {{cols:number, rows:number, braid:number, gems:number, oil:number, fuelSeconds:number,
+ * @returns {{cols:number, rows:number, braid:number, shortcuts:number, shortcutDetour:number,
+ *   shortcutRouteKeep:number, gems:number, oil:number, fuelSeconds:number,
  *   par:number, fuelBase:number, fuelPerCell:number, fuelPerPathTile:number, cells:number,
  *   drain:number, oilTargetGap:number, oilDensity:number, gemDensity:number,
  *   oilRefuelSeconds:number, pathTiles:number}}
@@ -647,6 +674,7 @@ export function levelParams(level) {
 
   const braid =
     Math.pow(clamp01((lv - 1) / LEVEL.BRAID_RAMP_LEVELS), LEVEL.BRAID_RAMP_SHAPE) * LEVEL.BRAID_MAX;
+  const shortcuts = Math.round(cells / LEVEL.SHORTCUT_CELLS);
 
   // Density ramp: t = 0 on level 1, 1 once the maze has stopped growing.
   const t = clamp01((lv - 1) / LEVEL.DENSITY_RAMP_LEVELS);
@@ -673,6 +701,9 @@ export function levelParams(level) {
     cols: side,
     rows: side,
     braid,
+    shortcuts,
+    shortcutDetour: LEVEL.SHORTCUT_DETOUR,
+    shortcutRouteKeep: LEVEL.SHORTCUT_ROUTE_KEEP,
     gems,
     oil,
     fuelSeconds,

@@ -41,7 +41,9 @@ tree is served locally (`npm run serve`) and uploaded to itch.io by CI.
   side per level** to a cap of **128×128 cells = 257×257 tiles = 16 384 cells ≈ 33 000 floor tiles**,
   reached at level 15. `LEVEL.MAX_CELLS` in `balance.js` is the **single documented size knob** and
   the cap level is *derived* from it (`CAP_LEVEL`), never typed twice. Past the cap, levels get
-  **harder, not bigger**: braid keeps rising (0→0.6 over 17 levels, square-root shaped, 0.6 from
+  **harder, not bigger**: every level (level 1 included) also gets one cross-section **shortcut**
+  per `LEVEL.SHORTCUT_CELLS` (48) cells, so long cul-de-sacs sometimes have a back door;
+  braid keeps rising (0→0.6 over 17 levels, square-root shaped, 0.6 from
   level 18), the torch drains 3 % faster per level (`FUEL.DRAIN_PER_LEVEL`) from
   `LEVEL.DRAIN_RAMP_START` (level 5, so the ramp is felt inside the size curve) to a 1.35× ceiling
   (`FUEL.DRAIN_MAX`, 1.30× at the cap, 1.35× from level 17), and oil thins from one flask per 20
@@ -345,7 +347,7 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   gridCursor`), `exploredPool` and `drain` — still nothing outside `src/state` may read it.
 - `balance.js` — every tuning number: speeds, the torch economy, maze size per level, score
   formulas, the settings spec, and
-  `levelParams(level) → {cols, rows, braid, gems, oil, fuelSeconds, par, fuelBase, fuelPerCell,
+  `levelParams(level) → {cols, rows, braid, shortcuts, shortcutDetour, shortcutRouteKeep, gems, oil, fuelSeconds, par, fuelBase, fuelPerCell,
   fuelPerPathTile, cells, drain, oilTargetGap, oilDensity, gemDensity, oilRefuelSeconds, pathTiles}`.
   - **`fuelSeconds` IS the tank** (110→150 s, independent of area), not `base + cells × perCell`.
   - **`par` is a FLOOR only** — `src/maze/populate.js` knows the real shortest path and derives the
@@ -462,10 +464,15 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
 
 ### 4.4 `src/maze` (Wave 2)
 - `constants.js` — `TILE = { FLOOR:0, WALL:1 }`, `DIRS`.
-- `generator.js` — `generateMaze({cols, rows, seed, braid=0}) → Maze`. **Iterative randomized
+- `generator.js` — `generateMaze({cols, rows, seed, braid=0, shortcuts=0, shortcutDetour=24,
+  shortcutRouteKeep=0.9}) → Maze`. **Iterative randomized
   recursive backtracker** with an explicit `Int32Array` stack (no recursion → no stack overflow at
-  any size), followed by optional **braiding** (remove `braid` fraction of dead ends by knocking a
-  wall into a neighbouring corridor — keeps solvability, adds loops). Start = cell (0,0); exit =
+  any size), followed by optional **shortcuts** (knock through up to `shortcuts` walls whose two
+  cells are ≥ `shortcutDetour` cells apart by path — a bounded BFS on the live tiles — while keeping
+  the start→exit route ≥ `shortcutRouteKeep` of the carved one; connects separate sections so a
+  cul-de-sac can have a back door) and optional **braiding** (remove `braid` fraction of dead ends by knocking a
+  wall into a neighbouring corridor). Both only remove walls — keeps solvability, adds loops.
+  Streams: `maze.carve`, `maze.connect`, `maze.braid`. Start = cell (0,0); exit =
   the cell **farthest from start** by BFS distance (guarantees a long route). Must handle
   1×1 up to 2000×2000 cells in bounded memory/time (O(n)).
 - `validator.js` — `validateMaze(maze) → Validation` via iterative BFS over tiles (typed-array
@@ -515,7 +522,7 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
     tank (tutorial, demo, fixture) but never raise it — a stale worker build or a future path-derived
     budget (~650 s on a 128×128 level) can never inflate the economy. Retune from `FUEL.*` and
     `LEVEL.*` in `balance.js`.
-- `level.js` — `buildLevel(params:{cols,rows,braid,gems,oil,fuelSeconds,par}, seed) → LevelData`
+- `level.js` — `buildLevel(params:{cols,rows,braid,shortcuts?,shortcutDetour?,shortcutRouteKeep?,gems,oil,fuelSeconds,par}, seed) → LevelData`
   (generate → validate → **throw if invalid** → populate). Deterministic for a given seed.
   Also `assertMazeValid(maze, validation, braid?)` (the guard, exported so its message is testable)
   and `levelTransferList(data) → ArrayBuffer[]` (the buffers to hand to `postMessage`).

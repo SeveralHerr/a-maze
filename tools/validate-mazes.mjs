@@ -466,7 +466,8 @@ function runLevels() {
       }
       ms += performance.now() - t0;
       built++;
-      checkMaze(data.maze, params.braid ?? 0, where);
+      // Shortcuts add loops just as braid does, so only a level with neither must be a tree.
+      checkMaze(data.maze, (params.braid ?? 0) + (params.shortcuts ?? 0), where);
       const r = checkLevel(data, params, where);
 
       pathSum += data.validation.pathLength;
