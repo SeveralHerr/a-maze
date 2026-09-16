@@ -78,7 +78,7 @@ jobs:
       run: node tools/stress.mjs
 
     # No build step: the game is plain ES modules loaded straight from index.html.
-    # The upload is index.html at the root plus src/ beside it, which is exactly the
+    # The upload is index.html at the root plus src/ and images/ beside it, which is exactly the
     # layout `node tools/serve.mjs` serves locally. Tests, tooling and node_modules
     # are left out - they are never fetched by the page and only inflate the upload.
     - name: Assemble build
@@ -86,6 +86,7 @@ jobs:
         rm -rf "${BUILD_DIR}"
         mkdir -p "${BUILD_DIR}"
         cp index.html styles.css "${BUILD_DIR}/"
+        cp -r images "${BUILD_DIR}/"
         rsync -a --exclude='*.test.mjs' --exclude='*.test-util.mjs' \
                  --exclude='preview.html' --exclude='preview.js' \
                  --exclude='README.md' src "${BUILD_DIR}/"
@@ -94,7 +95,7 @@ jobs:
     # successfully and leave a blank page on itch.io.
     - name: Verify build output
       run: |
-        if [ ! -s "${BUILD_DIR}/index.html" ] || [ ! -s "${BUILD_DIR}/src/main.js" ]; then
+        if [ ! -s "${BUILD_DIR}/index.html" ] || [ ! -s "${BUILD_DIR}/src/main.js" ] || [ ! -s "${BUILD_DIR}/images/jamcraft_logo.png" ]; then
           echo "::error::Build produced no ${BUILD_DIR}/index.html or no ${BUILD_DIR}/src/main.js - aborting deploy."
           ls -laR "${BUILD_DIR}" || true
           exit 1

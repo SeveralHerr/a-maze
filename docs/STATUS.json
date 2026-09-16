@@ -1,6 +1,6 @@
 {
- "updated": "2026-09-16T20:03:56.096Z",
- "iteration": 9,
+ "updated": "2026-09-16T22:35:00.000Z",
+ "iteration": 10,
  "passThreshold": 8.5,
  "wave": "gauntlet-stopped-r2",
  "waves": {
@@ -811,6 +811,12 @@
     "browserSmoke": "headless Chrome: ?headless=1 never fullscreens, 0 errors; iframe allowfullscreen at 640x400 enters fullscreen (1280x720) on Descend, 0 errors"
    },
    "verifyPass": null
+  },
+  {
+   "iteration": 10,
+   "updated": "2026-09-16T22:35:00.000Z",
+   "wave": "jamcraft-splash",
+   "summary": "Jamcraft studio logo intro ported from the Godot jamcraft-splash skill: static #splash markup in index.html (first paint is the black card), animated by src/splash.js with the Web Animations API (0.1 s delay, 0.45 s pop with back-ease + additive flash, 0.7 s hold push-in, 0.3 s fade, 0.35 s reveal, ~1.9 s total; reduced-motion drops scale/flash). Loaded as its own module so a main.js failure cannot strand it. Any key/click/touch/gamepad button skips; the skipping press is swallowed by window capture listeners (verified: Enter during the splash leaves phase 'title'). #splash stays pointer-events: none. ?headless=1 and ?splash=0 remove it at once, so verify.mjs is unaffected. images/jamcraft_logo.png added (navy 4 px frame blackened so non-16:9 screens show no seam) and copied by the itch.io deploy workflow, which now also fails if it is missing. ARCHITECTURE.md §2 documents the layer. npm test 38/38 files pass; headless Chrome screenshots at 960x540 and 390x844 checked."
   }
  ],
  "openIssues": [

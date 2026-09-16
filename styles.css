@@ -6,6 +6,7 @@
  *   #post     CSS effect layers: scanlines, vignette, low-fuel pulse, flash, iris
  *   #overlay  HUD + menus, drawn at device resolution so lettering stays crisp
  *   #touch    on-screen controls, created by src/input only on a touch device
+ *   #splash   the Jamcraft logo intro (src/splash.js), removed ~2 s after load
  *
  * #view and #post are sized in JS (src/main.js `layout()`) to the largest box that preserves the
  * framebuffer's aspect — snapped to a whole pixel multiple when that costs almost nothing — and
@@ -140,6 +141,40 @@ body.portrait #view {
 body.locked,
 body.locked #overlay {
   cursor: none;
+}
+
+/* ── Jamcraft logo intro ────────────────────────────────────────────────────────────────────── */
+
+/* Above everything, but `pointer-events: none` like every layer above #overlay: src/splash.js
+   swallows the skipping press with window capture listeners, so nothing here can strand input if
+   the script never runs. Full-bleed (not safe-area inset): it is a black card, not UI. */
+#splash {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  overflow: hidden;
+  background: #000;
+  pointer-events: none;
+}
+
+/* The logo PNG is 16:9 with the mark centred on black, so `contain` on a black card shows it whole
+   at any aspect. Oversized by 3 % per edge so the back-ease overshoot below 1.0 never shows a seam. */
+#splash .splash-logo {
+  position: absolute;
+  top: -3%;
+  left: -3%;
+  width: 106%;
+  height: 106%;
+  object-fit: contain;
+  opacity: 0;
+}
+
+#splash .splash-flash {
+  position: absolute;
+  inset: 0;
+  background: #fff;
+  opacity: 0;
+  mix-blend-mode: plus-lighter;
 }
 
 /* ── Focus ─────────────────────────────────────────────────────────────────────────────────── */

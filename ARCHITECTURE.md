@@ -136,6 +136,13 @@ by `main.js`):
 | `#overlay` | `src/ui/hud.js` + `menus.js`| one shared `Surface`; also the input target (pointer lock, touch) |
 | `#touch`   | `src/input/touch-overlay.js`| virtual stick + MAP/PAUSE, only on a touch device; `pointer-events: none` |
 
+Above all four, `#splash` (`src/splash.js`, integrator) is the Jamcraft studio logo intro: static
+markup in `index.html`, loaded as its own module script so a `main.js` failure cannot strand it,
+removed about 2 s after load (any key/click/touch/gamepad button skips; `?headless=1` and
+`?splash=0` remove it at once). `images/jamcraft_logo.png` is the one image file the game ships — a
+studio mark, not game art, so §1's "no image assets" for the world still holds. The skipping press
+is swallowed by window capture listeners so it never reaches the title menu.
+
 `#touch` (and every layer above the overlay) **must stay `pointer-events: none`** or no click ever
 reaches `#overlay` and both pointer lock and the virtual stick die silently.
 

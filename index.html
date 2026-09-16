@@ -23,6 +23,7 @@
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' shape-rendering='crispEdges'><rect width='16' height='16' fill='%23070910'/><rect x='7' y='9' width='2' height='6' fill='%237a4a1a'/><rect x='6' y='14' width='4' height='1' fill='%235a3413'/><rect x='6' y='8' width='4' height='2' fill='%23d9a441'/><rect x='6' y='5' width='4' height='3' fill='%23c2410c'/><rect x='7' y='3' width='2' height='3' fill='%23f59e0b'/><rect x='7' y='1' width='1' height='3' fill='%23fde68a'/><rect x='5' y='7' width='1' height='2' fill='%23c2410c'/><rect x='10' y='7' width='1' height='2' fill='%23c2410c'/></svg>" />
 
   <link rel="stylesheet" href="styles.css" />
+  <link rel="preload" as="image" href="images/jamcraft_logo.png" />
 
   <!-- The page is native ES modules with no bundler, so the browser only discovers the deep
        imports one round trip at a time. Preloading the heavy leaves of the graph lets them be
@@ -48,12 +49,20 @@
     <canvas id="overlay" aria-label="A-MAZE: torchlit dungeon maze. Keyboard: WASD or arrows to move, mouse to look, Shift to sprint, M to cycle the map between off, corner and full screen, Esc to pause."></canvas>
     <div id="touch" aria-hidden="true"></div>
   </main>
+  <!-- Jamcraft logo intro. Static markup so the first paint is already the black card; animated and
+       removed by src/splash.js, which loads independently of main.js. -->
+  <div id="splash" aria-hidden="true">
+    <img class="splash-logo" src="images/jamcraft_logo.png" alt="" decoding="async" />
+    <div class="splash-flash"></div>
+  </div>
   <noscript>
+    <style>#splash { display: none; }</style>
     <div id="noscript">
       <h1>A-MAZE</h1>
       <p>This game is built from plain ES modules and needs JavaScript enabled to run.</p>
     </div>
   </noscript>
+  <script type="module" src="src/splash.js"></script>
   <script type="module" src="src/main.js"></script>
 </body>
 </html>
