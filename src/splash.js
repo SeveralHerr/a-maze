@@ -74,6 +74,9 @@ function runSplash() {
   const swallow = (/** @type {Event} */ ev) => {
     if (done) return;
     ev.stopImmediatePropagation();
+    // The press that skips the logo is often the player's first gesture, and main.js wants it for
+    // fullscreen. Swallowing hides it, so hand it over explicitly (still inside the activation).
+    globalThis.dispatchEvent(new CustomEvent('splash:gesture', { detail: ev }));
     if (ev.cancelable && ev.type !== 'keyup') ev.preventDefault();
     if (SKIP_EVENTS.includes(ev.type) && !(/** @type {KeyboardEvent} */ (ev).repeat)) outro();
   };

@@ -865,7 +865,11 @@ lays out around the world band without measuring the DOM itself.
 cursor is hidden only while the pointer is locked (`body.locked`).
 
 **Fullscreen** _(itch.io embed)_: browsers only honour `requestFullscreen` inside a user gesture, so
-main.js asks on the gestures that start or resume play: first thing in the menus' `onNewGame`,
+main.js asks on the player's **first gesture of any kind** (window capture `keydown` other than
+Escape, mouse `pointerdown`, touch/pen `pointerup`, plus `splash:gesture` — a `CustomEvent` whose
+`detail` is the input event, dispatched by `src/splash.js` for every input it swallows), until
+fullscreen has been entered once; then those listeners are removed. It also asks on the gestures
+that start or resume play: first thing in the menus' `onNewGame`,
 `onResume` and `onNextLevel` callbacks (a pointer confirm is inside the event; a keyboard confirm is
 polled on the next step, which is still inside the browser's transient-activation window), and on
 `pointerdown` over `#overlay` while `playing` — registered before the click that takes pointer

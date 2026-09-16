@@ -351,6 +351,35 @@ function boot() {
    */
   let fullscreenRequestMs = -1e9;
 
+  /**
+   * Go fullscreen on the player's FIRST gesture of any kind — a key or click on the splash or the
+   * title — rather than waiting for Descend. It cannot happen earlier: without a gesture the browser
+   * refuses. Once fullscreen has been entered this stops; after an Esc the player stays windowed
+   * until they start, resume or click back into play (the gestures below and in the menus).
+   * The splash swallows its input in window capture listeners, so it forwards it as `splash:gesture`.
+   * @param {Event} ev
+   * @returns {void}
+   */
+  const onFirstGesture = (ev) => {
+    const e = /** @type {any} */ (ev.type === 'splash:gesture' ? /** @type {CustomEvent} */ (ev).detail : ev);
+    if (!e) return;
+    // Activation lands on keydown (never Esc), on pointerdown for a mouse, on pointerup for touch/pen.
+    const mouse = e.pointerType === 'mouse' || !e.pointerType;
+    const grants =
+      (e.type === 'keydown' && e.key !== 'Escape') ||
+      (e.type === 'pointerdown' && mouse) ||
+      (e.type === 'pointerup' && !mouse) ||
+      e.type === 'touchend';
+    if (grants) autoFullscreen();
+  };
+  const firstGestureTypes = ['splash:gesture', 'keydown', 'pointerdown', 'pointerup'];
+  for (const type of firstGestureTypes) listen(globalThis, type, onFirstGesture, true);
+  const stopFirstGesture = fullscreen.onChange((active) => {
+    if (!active) return;
+    for (const type of firstGestureTypes) globalThis.removeEventListener(type, onFirstGesture, true);
+    stopFirstGesture();
+  });
+
   // ── Maze generation ─────────────────────────────────────────────────────────────────────────
   const mazeClient = createMazeClient();
 
