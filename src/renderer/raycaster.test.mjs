@@ -709,19 +709,25 @@ test('a wall torch is still hidden by geometry genuinely in front of it', () => 
   assert.ok(ownSide.filter(Boolean).length > 10, 'the twin-corridor torch must be visible from its side');
 });
 
-test("the player's torch lights a pool that falls off into shadow without turning the stone warm", () => {
-  // Measured on a straight corridor with no sconces, so only the player's torch and the fog light it.
-  // Two failures this guards against, both shipped once: a colormap that kept every surface the
-  // same cool blue however close the torch was (no pool at all), and its overcorrection, which
-  // warmed materials by brightness until the cobbles ahead read r−b +48…+83 (tan sand) and the stone
-  // beside the player went neutral grey. The reference keeps blue-grey stone at full light; orange
-  // belongs to the wall sconces (next test).
+/**
+ * A straight 38-tile corridor with no sconces, so only the player's torch and the fog light it.
+ * @returns {import('../core/types.js').Maze}
+ */
+function bareCorridor() {
   const width = 40;
   const height = 3;
   const tiles = new Uint8Array(width * height).fill(1);
   for (let x = 1; x < width - 1; x++) tiles[width + x] = 0;
-  /** @type {import('../core/types.js').Maze} */
-  const maze = { width, height, cols: 19, rows: 1, tiles, start: { x: 1, y: 1 }, exit: { x: 1, y: 1 }, seed: 1 };
+  return { width, height, cols: 19, rows: 1, tiles, start: { x: 1, y: 1 }, exit: { x: 1, y: 1 }, seed: 1 };
+}
+
+test("the player's torch throws a warm pool around the player that fades to cool shadow", () => {
+  // Playtest feedback: "the player doesn't appear to be emitting any light". The torch in hand used
+  // to be deliberately untinted, so the corridor beside the player was the same blue-grey as the
+  // shadow — it read as ambient light, not as a flame being carried. Guards against both that and
+  // the older overcorrection that warmed every material by brightness until the cobbles ahead read
+  // r−b +48…+83 (tan sand) and the whole corridor went orange.
+  const maze = bareCorridor();
   const frame = renderScene(maze, { player: { x: 1.5, y: 1.5, angle: 0 }, exit: { x: 38, y: 1 }, light: 0.9 });
   const floorNear = regionStats(frame, (x, y) => isFloorPx(frame, x, y) && rowDistOf(frame, y) >= 1 && rowDistOf(frame, y) < 2.5);
   const floorDark = regionStats(frame, (x, y) => isFloorPx(frame, x, y) && rowDistOf(frame, y) >= 4.5 && rowDistOf(frame, y) < 7);
@@ -730,24 +736,95 @@ test("the player's torch lights a pool that falls off into shadow without turnin
   const wallFar = regionStats(frame, (x, y) => frame.z[x] > 6 && frame.z[x] < 12 && isWallPx(frame, x, y));
   // A pool: bright near, falling off with distance.
   assert.ok(floorNear.lum > floorDark.lum * 1.4, `the floor pool must fall off (${floorNear.lum.toFixed(1)} → ${floorDark.lum.toFixed(1)})`);
-  assert.ok(wallNear.lum > wallMid.lum * 1.15, `near stone must be lit harder than stone 3 tiles on (${wallNear.lum.toFixed(1)} vs ${wallMid.lum.toFixed(1)})`);
-  // …of blue-grey stone and grey cobbles, like the reference (walls r−b −20…−27, floor ≈ +9).
-  for (const [name, r] of /** @type {const} */ ([['near', wallNear], ['mid', wallMid], ['far', wallFar]])) {
-    assert.ok(r.rb <= -12, `${name} walls must stay blue-grey under the player's torch (r-b ${r.rb.toFixed(1)})`);
+  assert.ok(wallNear.lum > wallMid.lum * 1.25, `near stone must be lit harder than stone 3 tiles on (${wallNear.lum.toFixed(1)} vs ${wallMid.lum.toFixed(1)})`);
+  // …that is visibly firelight beside the player (measured: near walls r−b ≈ +8, floor ≈ +14)…
+  assert.ok(wallNear.rb >= 0, `stone beside the player must be warmed by the torch in hand (r-b ${wallNear.rb.toFixed(1)})`);
+  assert.ok(wallNear.rb >= wallFar.rb + 15, `the warmth must come from the player, not the whole corridor (near ${wallNear.rb.toFixed(1)} vs far ${wallFar.rb.toFixed(1)})`);
+  assert.ok(floorNear.rb > 0 && floorNear.rb < 30, `the lit floor is warm cobble, not tan sand (r-b ${floorNear.rb.toFixed(1)})`);
+  // …and fades back to the blue-grey shadow outside the pool.
+  for (const [name, r] of /** @type {const} */ ([['mid', wallMid], ['far', wallFar]])) {
+    assert.ok(r.rb <= -8, `${name} walls outside the pool must stay blue-grey (r-b ${r.rb.toFixed(1)})`);
   }
-  assert.ok(floorNear.rb > -12 && floorNear.rb < 25, `the lit floor is grey with a trace of warmth (r-b ${floorNear.rb.toFixed(1)})`);
+});
+
+test("the player's pool dims, shrinks and cools as the oil runs out", () => {
+  // The oil is the light: the world itself must show how much is left, not only the HUD gauge.
+  // Before this, the stone beside the player measured the same r−b (−26) at every fuel level and
+  // lost only ~20 % of its luminance between a full and an empty tank.
+  const maze = bareCorridor();
+  /** @param {number} light */
+  const near = (light) => {
+    const f = renderScene(maze, { player: { x: 1.5, y: 1.5, angle: 0 }, exit: { x: 38, y: 1 }, light });
+    return {
+      wall: regionStats(f, (x, y) => f.z[x] < 1.6 && isWallPx(f, x, y)),
+      mid: regionStats(f, (x, y) => f.z[x] >= 2.5 && f.z[x] < 4 && isWallPx(f, x, y)),
+      far: regionStats(f, (x, y) => f.z[x] > 8 && f.z[x] < 14 && isWallPx(f, x, y)),
+    };
+  };
+  const full = near(1);
+  const half = near(0.5);
+  const low = near(0.1);
+  // Stone far past the pool shows only the ambient light every frame shares; subtracting it compares
+  // the torch's own contribution.
+  const own = (/** @type {number} */ l) => l - low.far.lum;
+  assert.ok(own(low.wall.lum) < own(full.wall.lum) * 0.55, `an empty tank must visibly dim the stone beside the player (${full.wall.lum.toFixed(1)} → ${low.wall.lum.toFixed(1)})`);
+  assert.ok(full.wall.lum > half.wall.lum && half.wall.lum > low.wall.lum, 'brightness must fall steadily with the oil');
+  assert.ok(full.wall.rb >= low.wall.rb + 15, `the pool must cool as the flame weakens (r-b ${full.wall.rb.toFixed(1)} → ${low.wall.rb.toFixed(1)})`);
+  assert.ok(full.mid.lum > low.mid.lum * 1.4, `the pool must shrink: stone 3 tiles out goes dark (${full.mid.lum.toFixed(1)} → ${low.mid.lum.toFixed(1)})`);
+});
+
+test('a nearly empty torch gutters, a full one only flickers', () => {
+  const maze = bareCorridor();
+  // One renderer for the whole time series, the way the game drives it. (A fresh renderer per frame
+  // is dozens of closures over the same code, which costs V8 its per-instance specialisation and
+  // made the allocation test later in this file measure the JIT rather than the renderer.)
+  const { canvas, read } = fakeCanvas();
+  const rc = createRaycaster(canvas, { textures });
+  rc.resize(960, 540, 1);
+  /**
+   * Spread of the near-wall luminance over six seconds of flame.
+   * @param {number} light
+   * @param {boolean} [reducedMotion]
+   * @returns {{min:number, max:number}}
+   */
+  const spread = (light, reducedMotion = false) => {
+    let min = Infinity;
+    let max = -Infinity;
+    // Off the integers on purpose: a view whose `time` is a small integer is stored as a Smi, and
+    // mixing that representation into the renderer's type feedback made the allocation test later
+    // in this file measure V8's field generalisation instead of the renderer.
+    for (let t = 0.13; t < 6; t += 0.25) {
+      rc.render(makeView(maze, { player: { x: 1.5, y: 1.5, angle: 0 }, exit: { x: 38, y: 1 }, light, time: t, reducedMotion }));
+      /** @type {Frame} */
+      const f = { buf: read(), w: rc.internalSize.w, h: rc.internalSize.h, z: rc.depth() };
+      const l = regionStats(f, (x, y) => f.z[x] < 1.6 && isWallPx(f, x, y)).lum;
+      if (l < min) min = l;
+      if (l > max) max = l;
+    }
+    return { min, max };
+  };
+  const full = spread(1);
+  const low = spread(0.1);
+  const lowCalm = spread(0.1, true);
+  assert.ok(full.max - full.min <= 5, `a full tank must burn steadily (lum ${full.min.toFixed(1)}…${full.max.toFixed(1)})`);
+  assert.ok(low.max - low.min >= 6 && low.max - low.min > 1.5 * (full.max - full.min), `a nearly empty torch must sputter (lum ${low.min.toFixed(1)}…${low.max.toFixed(1)})`);
+  assert.ok(lowCalm.max - lowCalm.min < low.max - low.min, 'reduced motion must soften the guttering');
 });
 
 test('the colour temperature of the preview corridor matches the reference', () => {
   // `preview.html?pose=0` at a full tank: a long corridor with a sconce a tile behind the eye. The
-  // reference measures walls r−b −20…−27 with median luminance ~56 and floor r−b ≈ +9. Before this
-  // was fixed the same frame measured walls −5…+3 and floor +48…+83.
+  // reference measures shadowed walls r−b −20…−27 with median luminance ~56 and floor r−b ≈ +9.
+  // Before the tint axis existed the same frame measured floor +48…+83 (tan sand). The stone beside
+  // the player is now warmed by the torch in hand and the sconce behind (measured +31, floor +45) —
+  // firelit stone, but still stone: the corridor ahead falls back to the reference's blue (−16).
   const scene = previewScene(0);
   const frame = renderScene(scene.maze, scene.view);
   const wallNear = regionStats(frame, (x, y) => frame.z[x] < 2 && isWallPx(frame, x, y));
+  const wallFar = regionStats(frame, (x, y) => frame.z[x] > 4 && isWallPx(frame, x, y));
   const floorNear = regionStats(frame, (x, y) => isFloorPx(frame, x, y) && rowDistOf(frame, y) < 2.5);
-  assert.ok(wallNear.rb <= -10, `near stone must read blue-grey (r-b ${wallNear.rb.toFixed(1)})`);
-  assert.ok(floorNear.rb <= 30, `the near floor must not read as tan sand (r-b ${floorNear.rb.toFixed(1)})`);
+  assert.ok(wallNear.rb > 0 && wallNear.rb <= 45, `near stone must read firelit, not peach (r-b ${wallNear.rb.toFixed(1)})`);
+  assert.ok(wallFar.rb <= -8, `stone past the pool must fall back to blue-grey (r-b ${wallFar.rb.toFixed(1)})`);
+  assert.ok(floorNear.rb <= 50, `the near floor must not read as tan sand (r-b ${floorNear.rb.toFixed(1)})`);
   assert.ok(
     wallNear.lumP50 >= 35 && wallNear.lumP50 <= 75,
     `near stone keeps the reference's mid-grey brightness (median luminance ${wallNear.lumP50.toFixed(0)})`,
@@ -774,15 +851,19 @@ test('a wall sconce throws an amber pool that stands out even beside a full tank
   ];
   for (const { name, a, b, whole } of regions) {
     // Measured when this was written: wall −25 → +28, floor −11 → +30. Before the tint axis existed
-    // the same pool went −12 → −3 (brighter, but still neutral).
-    assert.ok(a.rb >= b.rb + 30 && a.rb > 10, `the ${name} under a sconce must turn amber (r-b ${b.rb.toFixed(1)} → ${a.rb.toFixed(1)})`);
+    // the same pool went −12 → −3 (brighter, but still neutral). Since the torch in hand warms the
+    // near field too, the bare pool starts warmer (wall ≈ +4) and the sconce must still add a
+    // clearly hotter amber on top of it (measured: pool wall +4 → +31, walls in view +11 → +22).
+    assert.ok(a.rb >= b.rb + 20 && a.rb > 25, `the ${name} under a sconce must turn amber (r-b ${b.rb.toFixed(1)} → ${a.rb.toFixed(1)})`);
     assert.ok(a.lum >= b.lum * 1.15, `the sconce must still brighten the ${name} at a full tank (${b.lum.toFixed(1)} → ${a.lum.toFixed(1)})`);
     // …and the warmth shows in the frame as a whole, not only in a few pixels next to the flame.
-    assert.ok(whole[0].rb >= whole[1].rb + 12, `the ${name}s in view barely warm (r-b ${whole[1].rb.toFixed(1)} → ${whole[0].rb.toFixed(1)})`);
+    assert.ok(whole[0].rb >= whole[1].rb + 8, `the ${name}s in view barely warm (r-b ${whole[1].rb.toFixed(1)} → ${whole[0].rb.toFixed(1)})`);
   }
-  // …and the pool is the warm thing in the frame: well away from the sconce the stone stays cool.
+  // …and the pool is the warm thing in the frame: well away from the sconce, past the player's own
+  // small warm pool, the stone stays cool.
   const far = renderScene(maze, { ...view, player: { x: 6.5, y: 3.5, angle: Math.PI } }, noTorchArt);
-  assert.ok(regionStats(far, (x, y) => isWallPx(far, x, y)).rb <= -12, 'stone 12 tiles from the sconce must stay blue-grey');
+  const farRb = regionStats(far, (x, y) => far.z[x] > 3 && isWallPx(far, x, y)).rb;
+  assert.ok(farRb <= -12, `stone 12 tiles from the sconce must stay blue-grey (r-b ${farRb.toFixed(1)})`);
 });
 
 test('a sconce far down a dark corridor is still a visible orange flame', () => {
@@ -1007,6 +1088,8 @@ test('rendering does not allocate per frame', () => {
     player: { x: 2.5, y: 2.5, angle: 0 },
     torches: [{ x: 4, y: 2, face: 2 }],
     items: [{ id: 1, kind: 'gem', x: 3.2, y: 2.5, taken: false }],
+    // A nearly empty tank, so the guttering branch of the player's torch is on the measured path.
+    light: 0.15,
   });
   for (let i = 0; i < 200; i++) {
     view.time = i * 0.016;
@@ -1026,10 +1109,15 @@ test('rendering does not allocate per frame', () => {
     }
     return process.memoryUsage().heapUsed - before;
   }
-  // Two blocks, and only the smaller counts. A single sample is at the mercy of where the collector
-  // happened to be, which made this assertion flaky; a real per-frame allocation leaks in *every*
-  // block, so taking the minimum keeps the signal and drops the GC noise.
-  const grown = Math.min(block(3.2), block(40.7));
+  // Up to six blocks, and the smallest counts. A single sample is at the mercy of where the collector
+  // happened to be, and of how far V8 has tiered the frame up: while hot helpers still run in a
+  // middle tier their doubles are boxed as short-lived garbage, and under CPU load (the runner
+  // starts every test file at once) that lasted past two blocks with no scavenge in between —
+  // 7–17 MB of `heapUsed` on a renderer that allocates nothing once optimised. A real per-frame
+  // allocation leaks in *every* block, so the minimum keeps the signal and drops that noise; the
+  // loop stops at the first clean block, so a passing run still measures only one or two.
+  let grown = Infinity;
+  for (let b = 0; b < 6 && grown >= 3_000_000; b++) grown = Math.min(grown, block(3.2 + b * 37.5));
   assert.ok(grown < 3_000_000, `heap grew ${(grown / 1e6).toFixed(2)} MB over 2000 frames`);
 });
 

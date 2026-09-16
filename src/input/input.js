@@ -106,6 +106,20 @@ const MAX_MOUSE_EVENT_PX = 2000;
 const FREE_MOVE_REARM_MS = 100;
 
 /**
+ * Mouse events arriving within this many ms of a real touch event are treated as the browser's
+ * compatibility events for that touch (Chrome, Safari and Firefox all emit them right after
+ * `touchend`), not as a mouse. Engines that expose `sourceCapabilities.firesTouchEvents` are
+ * identified exactly; this window covers the rest.
+ */
+const TOUCH_GHOST_MOUSE_MS = 1000;
+
+/**
+ * A pointer-lock request from a press is still considered in flight for this long (ms), so the
+ * `click` that follows the same press does not fire a second, competing request.
+ */
+const PRESS_LOCK_DEDUPE_MS = 500;
+
+/**
  * Hard ceiling on the yaw accumulated between two polls, in radians. Half a turn per sim step is
  * already beyond any deliberate flick; anything larger is a bug or a hostile input source.
  */
@@ -339,7 +353,23 @@ export function createInput(canvasEl, opts) {
   let stickSprint = false;
   let lookId = -1;
   let lookLastX = 0;
+  /**
+   * "This device can touch": latched by a real touch or the coarse-pointer hint. Drives the on-screen
+   * controls and `isTouch` only. It must NOT disable the mouse on its own: Windows Chrome on a
+   * touchscreen laptop reports `(pointer: coarse)` and no fine pointer while the player is using a
+   * real mouse, and gating mouse look on this latch left those players with a visible cursor and a
+   * dead camera. {@link touchInControl} is the gate for mouse look and pointer lock.
+   */
   let touchDetected = false;
+  /** Timestamp of the last real touch event; see {@link TOUCH_GHOST_MOUSE_MS}. */
+  let lastTouchMs = -1e9;
+  /**
+   * True once a genuine mouse event has been seen more recently than a real touch. Starts false so
+   * a touch-primary device (coarse hint, no mouse yet) never asks for the pointer.
+   */
+  let mouseInUse = false;
+  /** When a press last issued a pointer-lock request; see {@link PRESS_LOCK_DEDUPE_MS}. */
+  let pressLockMs = -1e9;
 
   // Gamepad state.
   /** Previous pressed bits, for edge detection. 32 covers every standard-mapping pad. */
@@ -557,17 +587,46 @@ export function createInput(canvasEl, opts) {
     lookAccum += radians * sensitivity * invertSign;
   }
 
+  /**
+   * True while touch, not the mouse, is driving: the device can touch and no genuine mouse event has
+   * been seen since the last real touch. Gates mouse look and every pointer-lock request.
+   */
+  function touchInControl() {
+    return touchDetected && !mouseInUse;
+  }
+
+  /**
+   * Is this mouse event the browser's compatibility echo of a touch rather than a real mouse?
+   * @param {any} e
+   */
+  function mouseFromTouch(e) {
+    const caps = e && e.sourceCapabilities;
+    if (caps && caps.firesTouchEvents === true) return true;
+    return now() - lastTouchMs < TOUCH_GHOST_MOUSE_MS;
+  }
+
+  /** A real touch just happened: touch owns look until a genuine mouse event says otherwise. */
+  function noteTouch() {
+    lastTouchMs = now();
+    mouseInUse = false;
+  }
+
   /** @param {any} e */
   function onMouseMove(e) {
     if (!e) return;
     const locked = isLocked();
-    // Mouse look is live whenever the player is playing — captured or not. Pointer lock is the
-    // better mode (no screen edge, hidden cursor) and is still requested, but a player who never
-    // clicks must not find the mouse dead. Touch devices synthesise mouse events after a tap, which
-    // would double-apply on top of the drag-look.
-    if (!locked && (touchDetected || !shouldLockPointer())) return;
     const dx = e.movementX;
     if (typeof dx !== 'number' || !Number.isFinite(dx)) return;
+    if (!locked) {
+      // Touch devices synthesise mouse events after a tap, which would double-apply on top of the
+      // drag-look. A real mouse moving proves the mouse is in use (a touchscreen laptop).
+      if (mouseFromTouch(e)) return;
+      if (dx !== 0 || e.movementY) mouseInUse = true;
+    }
+    // Mouse look is live whenever the player is playing — captured or not. Pointer lock is the
+    // better mode (no screen edge, hidden cursor) and is still requested, but a player who never
+    // clicks must not find the mouse dead.
+    if (!locked && (touchInControl() || !shouldLockPointer())) return;
     // Engagement spike guard (see LOCK_SETTLE_MS): only right after the lock lands.
     if (lockFirstMove) {
       lockFirstMove = false;
@@ -587,22 +646,57 @@ export function createInput(canvasEl, opts) {
   }
 
   /**
-   * A mouse press on the play surface is a user gesture that can authorise the automatic lock (see
-   * onKeyDown), which is what captures the mouse after a menu click starts a level.
+   * A primary mouse press on the play surface. It is a user gesture, so it:
+   * - authorises the automatic lock (see onKeyDown) — what captures the mouse after a menu click
+   *   starts a level;
+   * - asks for the lock right now while playing. Asking on the *press* rather than only on `click`
+   *   matters: main.js asks for fullscreen on the same `pointerdown`, and a fullscreen request
+   *   consumes the gesture, so a lock requested later on `click` is refused. This listener is
+   *   registered before main.js's, so it runs first.
+   * Both `pointerdown` and `mousedown` arrive here: main.js calls `preventDefault` on a
+   * `pointerdown` a menu consumed, which suppresses the compatibility `mousedown` entirely.
    * @param {any} e
    */
+  function onMousePress(e) {
+    if (!e || e.button !== 0) return;
+    lastGestureMs = now();
+    mouseInUse = true;
+    // A deliberate press is also the player telling us to try again after we gave up.
+    autoLockFails = 0;
+    if (isLocked() || !shouldLockPointer()) return;
+    if (now() - pressLockMs < PRESS_LOCK_DEDUPE_MS) return;
+    pressLockMs = now();
+    requestPointerLock();
+  }
+
+  /** @param {any} e */
+  function onPointerDown(e) {
+    if (!e) return;
+    const type = e.pointerType;
+    if (type === 'touch' || type === 'pen') {
+      noteTouch();
+      return;
+    }
+    if (type !== 'mouse') return; // `mousedown` covers engines without pointer events
+    onMousePress(e);
+  }
+
+  /** @param {any} e */
   function onMouseDown(e) {
-    if (e && e.button === 0) lastGestureMs = now();
+    if (!e || mouseFromTouch(e)) return;
+    onMousePress(e);
   }
 
   /**
    * Pointer lock may only be requested from a user gesture. A click is the most direct one, and it
-   * asks only while the predicate says the player is playing.
+   * asks only while the predicate says the player is playing. Usually the press already asked.
+   * @param {any} e
    */
-  const onClick = () => {
-    // A deliberate click is also the player telling us to try again after we gave up.
+  const onClick = (e) => {
+    if (e && mouseFromTouch(e)) return;
     autoLockFails = 0;
-    if (touchDetected || isLocked() || !shouldLockPointer()) return;
+    if (touchInControl() || isLocked() || !shouldLockPointer()) return;
+    if (now() - pressLockMs < PRESS_LOCK_DEDUPE_MS) return;
     requestPointerLock();
   };
 
@@ -649,7 +743,7 @@ export function createInput(canvasEl, opts) {
    * and never again after {@link AUTO_LOCK_MAX_FAILS} refusals until a lock actually lands.
    */
   function maybeAutoLock() {
-    if (destroyed || touchDetected || autoLockFails >= AUTO_LOCK_MAX_FAILS) return;
+    if (destroyed || touchInControl() || autoLockFails >= AUTO_LOCK_MAX_FAILS) return;
     if (!target || typeof target.requestPointerLock !== 'function') return;
     if (isLocked() || !shouldLockPointer()) return;
     const t = now();
@@ -727,6 +821,7 @@ export function createInput(canvasEl, opts) {
   /** @param {any} e */
   function onTouchStart(e) {
     markTouch();
+    noteTouch();
     if (!e || !e.changedTouches) return;
     // The game element owns its gestures: no scrolling, no pinch-zoom, no double-tap-zoom, and no
     // long-press selection. Scoped to this element, so the rest of the page is untouched.
@@ -762,6 +857,7 @@ export function createInput(canvasEl, opts) {
   /** @param {any} e */
   function onTouchMove(e) {
     if (!e || !e.changedTouches) return;
+    lastTouchMs = now();
     if (e.cancelable !== false && typeof e.preventDefault === 'function') e.preventDefault();
     const list = e.changedTouches;
     for (let i = 0; i < list.length; i++) {
@@ -780,6 +876,7 @@ export function createInput(canvasEl, opts) {
   /** @param {any} e */
   function onTouchEnd(e) {
     if (!e || !e.changedTouches) return;
+    lastTouchMs = now();
     const list = e.changedTouches;
     for (let i = 0; i < list.length; i++) {
       const t = list[i];
@@ -1283,6 +1380,7 @@ export function createInput(canvasEl, opts) {
   listen(doc, 'mousemove', onMouseMove);
   listen(doc, 'pointerlockchange', onPointerLockChange);
   listen(doc, 'pointerlockerror', onPointerLockError);
+  listen(target, 'pointerdown', onPointerDown);
   listen(target, 'mousedown', onMouseDown);
   listen(target, 'click', onClick);
 
@@ -1313,7 +1411,7 @@ export function createInput(canvasEl, opts) {
       return isLocked();
     },
     get wantsPointer() {
-      if (destroyed || touchDetected || !target || typeof target.requestPointerLock !== 'function') return false;
+      if (destroyed || touchInControl() || !target || typeof target.requestPointerLock !== 'function') return false;
       return !isLocked() && shouldLockPointer() === true;
     },
   };

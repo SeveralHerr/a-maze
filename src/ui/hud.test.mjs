@@ -667,3 +667,130 @@ test('notice(text) shows a centred one-line banner for about 1.6 s, reduced moti
   assert.doesNotThrow(() => hud.notice(''));
   assert.doesNotThrow(() => hud.notice(/** @type {any} */ (null)));
 });
+
+// ─── The oil: labels and hints ────────────────────────────────────────────────────────────────
+
+test('the fuel readout is labelled OIL, never TANK, and never crowds the clock', () => {
+  // Playtest: "'TANK' is a bit confusing". The label names what the flasks refill. The flask tally
+  // ("OIL ×3") is drawn only where there is room for it *and* a clear gap before the clock: at 1280
+  // wide "OIL ×4 1:16" read as one run of numbers.
+  const allowed = ['OIL', 'OIL ×3', 'LOW', 'LOW OIL'];
+  for (const [w, h, dpr] of [[1920, 1080, 1], [1280, 720, 1], [390, 844, 3]]) {
+    const hud = createHud(drawableCanvas(w, h), { map: 'off' });
+    hud.resize(w, h, dpr);
+    const state = playingState({ fuel: 80 });
+    /**
+     * The gauge's label and clock boxes this frame.
+     * @returns {{label:any, clock:any, all:string[]}}
+     */
+    const shoot = () => {
+      state.time += 1 / 60;
+      const boxes = collectLayout(() => hud.render(state, null, 0)).filter((b) => b.kind === 'text');
+      const clock = boxes.find((b) => /^\d+:\d\d$/.test(b.label));
+      const label = boxes.find((b) => allowed.includes(b.label));
+      return { label, clock, all: boxes.map((b) => b.label) };
+    };
+    /** @param {ReturnType<typeof shoot>} f @param {string} what */
+    const check = (f, what) => {
+      assert.ok(!f.all.some((t) => /TANK/.test(t)), `${w}x${h} ${what}: no TANK anywhere (${f.all.join(' | ')})`);
+      assert.ok(f.clock, `${w}x${h} ${what}: the clock is drawn (${f.all.join(" | ")})`);
+      if (f.label === undefined) return; // a bar with no room for any word drops it
+      const m = hud.surface.metrics;
+      const glyph = f.label.w / f.label.label.length;
+      assert.ok(f.clock.x - (f.label.x + f.label.w) >= Math.min(2 * glyph, 3 * m.u) - 1, `${w}x${h} ${what}: "${f.label.label}" crowds the clock`);
+    };
+    const plain = shoot();
+    check(plain, 'full');
+    if (w >= 1280) assert.equal(plain.label && plain.label.label, 'OIL', `${w}x${h}: the gauge says OIL`);
+    state.run.refuels = 3;
+    const tally = shoot();
+    check(tally, 'after flasks');
+    if (w >= 1280) assert.ok(tally.label && ['OIL', 'OIL ×3'].includes(tally.label.label), `${w}x${h}: tally or plain OIL`);
+    state.run.fuel = 10;
+    // The gauge reads the smoothed bar, which takes a moment to fall.
+    for (let i = 0; i < 60; i++) shoot();
+    const low = shoot();
+    check(low, 'low');
+    if (w >= 1280) assert.ok(low.label && ['LOW', 'LOW OIL'].includes(low.label.label), `${w}x${h}: the alarm replaces the tally (${low.all.join(' | ')})`);
+  }
+});
+
+test('the first level of a session explains the oil once, on screen at both layouts', () => {
+  for (const [w, h, dpr, hint] of /** @type {const} */ ([
+    [1280, 720, 1, 'Your torch burns oil - grab flasks to refill'],
+    [390, 844, 3, 'Torch burns oil - find flasks'],
+  ])) {
+    const hud = createHud(drawableCanvas(w, h), { map: 'off' });
+    hud.resize(w, h, dpr);
+    const state = playingState({ fuel: 110 });
+    state.level = 1;
+    const m = hud.surface.metrics;
+    let frames = 0;
+    for (let i = 0; i < 60 * 8; i++) {
+      state.time += 1 / 60;
+      const boxes = collectLayout(() => hud.render(state, null, 0)).filter((b) => b.kind === 'text' && b.label === hint);
+      if (boxes.length === 0) continue;
+      frames++;
+      const b = boxes[0];
+      assert.ok(b.x >= 0 && b.x + b.w <= m.w, `${w}x${h}: the hint fits on screen (${b.x}..${b.x + b.w} of ${m.w})`);
+    }
+    assert.ok(frames > 60 * 3 && frames < 60 * 5, `${w}x${h}: the hint stays up long enough to read (${frames} frames)`);
+    // A second run in the same session does not repeat it.
+    hud.reset();
+    state.level = 2;
+    step(hud, state);
+    state.level = 1;
+    let again = 0;
+    for (let i = 0; i < 60 * 3; i++) again += step(hud, state).includes(hint) ? 1 : 0;
+    assert.equal(again, 0, 'explained once per session');
+  }
+  // Deeper levels never raise it.
+  const hud = createHud(drawableCanvas(1280, 720), { map: 'off' });
+  hud.resize(1280, 720, 1);
+  const state = playingState();
+  let shown = 0;
+  for (let i = 0; i < 60 * 3; i++) shown += step(hud, state).some((t) => /burns oil/.test(t)) ? 1 : 0;
+  assert.equal(shown, 0);
+});
+
+test('running low on oil raises a notice once per level, on the crossing only', () => {
+  const warn = 'Torch Low - Find Oil';
+  const hud = createHud(drawableCanvas(1280, 720), { map: 'off' });
+  hud.resize(1280, 720, 1);
+  const count = (/** @type {string[]} */ t) => t.filter((s) => s === warn).length;
+  const state = playingState({ fuel: 40, fuelMax: 110 });
+  for (let i = 0; i < 10; i++) assert.equal(count(step(hud, state)), 0, 'plenty of oil: quiet');
+  state.run.fuel = 27; // under a quarter
+  assert.equal(count(step(hud, state)), 1, 'the crossing raises it');
+  let shown = 1;
+  for (let i = 0; i < 60 * 4; i++) shown += count(step(hud, state));
+  assert.ok(shown > 60 && shown < 60 * 3, `it stays up about two seconds (${shown} frames)`);
+  // Refill and drain again on the same level: not again.
+  state.run.fuel = 90;
+  step(hud, state);
+  state.run.fuel = 20;
+  for (let i = 0; i < 30; i++) assert.equal(count(step(hud, state)), 0, 'once per level');
+  // A new level that starts low is not news…
+  state.level++;
+  for (let i = 0; i < 30; i++) assert.equal(count(step(hud, state)), 0, 'a level starting low is quiet');
+  // …but crossing on it is.
+  state.run.fuel = 90;
+  step(hud, state);
+  state.run.fuel = 20;
+  assert.equal(count(step(hud, state)), 1, 'a new level can warn again');
+  // It never replaces "Map Found".
+  state.level++;
+  state.run.fuel = 90;
+  state.run.mapFound = false;
+  step(hud, state);
+  state.run.mapFound = true;
+  assert.equal(step(hud, state).filter((s) => s === MAP_FOUND_TEXT).length, 1);
+  state.run.fuel = 20;
+  const t = step(hud, state);
+  assert.equal(count(t), 0, 'the reward banner is not clobbered');
+  assert.equal(t.filter((s) => s === MAP_FOUND_TEXT).length, 1);
+  // …but the warning is only deferred, not lost: it shows once the reward banner has gone.
+  let late = 0;
+  for (let i = 0; i < 60 * 5; i++) late += count(step(hud, state)) > 0 ? 1 : 0;
+  assert.ok(late > 0, 'a crossing under "Map Found" still warns after the banner clears');
+});

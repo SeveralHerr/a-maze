@@ -65,6 +65,44 @@ test('items sit on the centre of a floor tile and never share a tile', () => {
   }
 });
 
+test('oil flasks are never clustered: no two within 2 tiles of each other on a real-sized level', () => {
+  // Bug report: "two oils were right next to each other and the other was unable to be picked up".
+  // The sim leaves a flask on the floor until the tank has room for half of it (src/state/sim.js
+  // takeItem), so the flask beside one just drunk is refused — correct economy, but on the very next
+  // tile it reads as a broken pickup. A second flask that close is also worth nothing to the route,
+  // so the scatter never plants one there. Chebyshev distance ≥ 3 between every pair of flasks.
+  const levels = [
+    [{ cols: 16, rows: 16, braid: 0, gemDensity: 50, oilDensity: 20, fuelSeconds: 110 }, 12],
+    [{ cols: 40, rows: 40, braid: 0.15, gemDensity: 55, oilDensity: 25, fuelSeconds: 121, oilTargetGap: 40 }, 6],
+    [{ cols: 128, rows: 128, braid: 0.35, gemDensity: 60, oilDensity: 30, fuelSeconds: 150 }, 2],
+  ];
+  let checked = 0;
+  for (const [p, seeds] of levels) {
+    for (let seed = 0; seed < /** @type {number} */ (seeds); seed++) {
+      const { maze, pop } = build(/** @type {never} */ (p), seed * 97 + 5);
+      const oils = pop.items.filter((i) => i.kind === 'oil');
+      const at = new Map(oils.map((o) => [(o.y - 0.5) * maze.width + (o.x - 0.5), o]));
+      for (const o of oils) {
+        const tx = o.x - 0.5;
+        const ty = o.y - 0.5;
+        for (let dy = -2; dy <= 2; dy++) {
+          for (let dx = -2; dx <= 2; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const other = at.get((ty + dy) * maze.width + tx + dx);
+            assert.equal(
+              other,
+              undefined,
+              `${maze.width}² seed ${seed}: flask ${o.id} at (${tx},${ty}) has flask ${other?.id} at (${tx + dx},${ty + dy})`,
+            );
+          }
+        }
+        checked++;
+      }
+    }
+  }
+  assert.ok(checked > 1000, `only ${checked} flasks checked — the test is not testing`);
+});
+
 test('counts come from density when it is given, in either unit', () => {
   // 0.05 items per cell and 20 cells per item are the same request; both must be honoured, because
   // src/state ships the field in whichever unit it settles on.
@@ -418,11 +456,12 @@ test('MAP: the choice is seeded — same seed same tile, different seeds spread 
 
 test('MAP: adding the scroll changed no oil flask and no gem for a given seed (golden layouts)', () => {
   // Fingerprints of the oil+gem item list recorded from populate.js immediately BEFORE the map
-  // scroll was added. A change here means the new stream leaked into the old ones.
+  // scroll was added. A change here means the new stream leaked into the old ones. Re-recorded once,
+  // deliberately, when flasks gained OIL_SPACING (no two flasks within 2 tiles; item counts unchanged).
   const golden = [
-    [{ cols: 16, rows: 16, braid: 0, gemDensity: 50, oilDensity: 20, fuelSeconds: 110 }, 1, 820075842, 18],
-    [{ cols: 40, rows: 40, braid: 0.15, gemDensity: 55, oilDensity: 25, fuelSeconds: 121, oilTargetGap: 40 }, 77, 2154034811, 93],
-    [{ cols: 128, rows: 128, braid: 0.35, gemDensity: 60, oilDensity: 30, fuelSeconds: 150 }, 4242, 3860516084, 819],
+    [{ cols: 16, rows: 16, braid: 0, gemDensity: 50, oilDensity: 20, fuelSeconds: 110 }, 1, 3616682625, 18],
+    [{ cols: 40, rows: 40, braid: 0.15, gemDensity: 55, oilDensity: 25, fuelSeconds: 121, oilTargetGap: 40 }, 77, 2321115807, 93],
+    [{ cols: 128, rows: 128, braid: 0.35, gemDensity: 60, oilDensity: 30, fuelSeconds: 150 }, 4242, 3047600986, 819],
   ];
   for (const [p, seed, hash, count] of golden) {
     const { pop } = build(/** @type {never} */ (p), /** @type {number} */ (seed));

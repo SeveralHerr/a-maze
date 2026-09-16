@@ -202,6 +202,19 @@ const GEM_CELLS_PER_GEM_HI = 60;
 const OIL_BRANCH_RADIUS = 3;
 
 /**
+ * Exclusion radius around a flask (Chebyshev tiles): no flask is planted within this many tiles of
+ * another, so flasks are ≥ 3 tiles apart.
+ *
+ * `src/state/sim.js` leaves a flask on the floor until the tank has room for half of it. Two flasks
+ * on neighbouring tiles therefore play as "the second one cannot be picked up" (the first just filled
+ * the tank), which players report as a bug — and the second is worth nothing to the route anyway.
+ * It is a preference, never a hard constraint: the refuel chain (the hard guarantee) and the
+ * last-resort mop-up in {@link fillByStride} fall back to a crowded tile when no spaced one exists,
+ * which only happens on degenerate mazes (0 clustered pairs across levels 1–40 × 5 seeds).
+ */
+const OIL_SPACING = 2;
+
+/**
  * Hard cap on items of one kind. The gameplay maximum needs ~550 flasks and ~300 gems; 4096 leaves
  * three levels of headroom for a tool building something far past the shipped curve while keeping
  * the worst case bounded (4096 items ≈ 260 KB of `Item` objects in V8 — see `tools/stress.mjs`).
@@ -422,6 +435,7 @@ function resolveCount(density, explicit, cells, perLo, perHi) {
  * @property {number} height
  * @property {number} total          `width · height`
  * @property {Uint8Array} occupied   1 = reserved or already carrying an item
+ * @property {Uint8Array} oilNear    1 = within {@link OIL_SPACING} tiles of a placed flask
  * @property {Int32Array} pathDist   tiles to the nearest solution-path tile; −1 = wall/unreachable
  * @property {Int32Array} pathIndexOf index into `validation.path`, −1 when the tile is not on it
  * @property {Int32Array} stamp      visited marker for the bounded probes (one id per probe)
@@ -489,6 +503,7 @@ export function populateLevel(maze, validation, params, seed) {
     height,
     total,
     occupied: new Uint8Array(total),
+    oilNear: new Uint8Array(total),
     pathDist: new Int32Array(total),
     pathIndexOf: new Int32Array(total),
     stamp: new Int32Array(total),
@@ -826,9 +841,10 @@ function collectBranchCandidates(ctx, from) {
  * @param {number} lastQ  path index of the previous chain flask (0 = the start, full tank)
  * @param {number} gap    maximum allowed advance (`q − lastQ`)
  * @param {import('../core/rng.js').Rng} rng
+ * @param {boolean} spaced reject tiles within {@link OIL_SPACING} of a flask already placed
  * @returns {boolean} true when `ctx.out2` holds `[tileIndex, q]`
  */
-function chainSpotNear(ctx, path, p, lastQ, gap, rng) {
+function chainSpotNear(ctx, path, p, lastQ, gap, rng, spaced) {
   const n = collectBranchCandidates(ctx, path[p]);
   if (n === 0) return false;
 
@@ -838,6 +854,7 @@ function chainSpotNear(ctx, path, p, lastQ, gap, rng) {
   let ties = 0;
   for (let i = 0; i < n; i++) {
     const tile = ctx.cand[i];
+    if (spaced && ctx.oilNear[tile] !== 0) continue;
     const packed = nearestPathFrom(ctx, tile, OIL_BRANCH_RADIUS);
     if (packed < 0) continue;
     const q = (packed / 4) | 0;
@@ -900,14 +917,21 @@ function placeRefuelChain(out, ctx, path, gap, rng) {
     if (++guard > path.length) break;
     const aim = Math.min(last - 1, lastQ + gap);
     let found = false;
-    for (let p = aim; p > lastQ; p--) {
-      if (chainSpotNear(ctx, path, p, lastQ, gap, rng)) {
-        found = true;
-        break;
+    // Spaced first: where the route doubles back, the best spot for this flask can sit on the tile
+    // beside the previous one (path indices a whole gap apart, tiles two apart), and the sim would
+    // then refuse it right after the first had filled the tank (see OIL_SPACING). Any legal spot keeps
+    // the guarantee, so a crowded one is only the fallback.
+    for (let pass = 0; pass < 2 && !found; pass++) {
+      for (let p = aim; p > lastQ; p--) {
+        if (chainSpotNear(ctx, path, p, lastQ, gap, rng, pass === 0)) {
+          found = true;
+          break;
+        }
       }
     }
     if (!found) break;
     pushItem(out, ctx.occupied, 'oil', ctx.out2[0], ctx.width);
+    markOilNear(ctx, ctx.out2[0]);
     lastQ = ctx.out2[1];
     placed++;
   }
@@ -1049,7 +1073,7 @@ function floorNeighbours(tiles, width, idx) {
  */
 function scatterByBuckets(out, kind, quota, ctx, deadEndOnly, rng) {
   if (quota <= 0) return 0;
-  const { tiles, width, height, occupied, pathDist } = ctx;
+  const { tiles, width, height, occupied, pathDist, oilNear } = ctx;
   // `floor` (not `ceil`): it errs toward *more* buckets than the quota, so the usual case is a
   // choice of spots rather than a shortfall the stride fallback has to mop up.
   const side = Math.max(1, Math.floor(Math.sqrt((width * height) / quota)));
@@ -1060,6 +1084,7 @@ function scatterByBuckets(out, kind, quota, ctx, deadEndOnly, rng) {
   const bestScore = new Int32Array(buckets);
   const tieSeed = rng.u32() | 0;
   const isGem = kind === 'gem';
+  const isOil = kind === 'oil';
 
   for (let y = 1; y < height - 1; y++) {
     const row = y * width;
@@ -1067,6 +1092,7 @@ function scatterByBuckets(out, kind, quota, ctx, deadEndOnly, rng) {
     for (let x = 1; x < width - 1; x++) {
       const idx = row + x;
       if (tiles[idx] !== TILE.FLOOR || occupied[idx] !== 0) continue;
+      if (isOil && oilNear[idx] !== 0) continue;
       if (deadEndOnly && floorNeighbours(tiles, width, idx) !== 1) continue;
       const pd = pathDist[idx] < 0 ? 0 : pathDist[idx];
       const rank = isGem ? Math.min(pd, 255) : 255 - Math.min(Math.abs(pd - 2), 255);
@@ -1088,8 +1114,10 @@ function scatterByBuckets(out, kind, quota, ctx, deadEndOnly, rng) {
   let placed = 0;
   for (let i = 0; i < buckets && placed < quota; i++) {
     const idx = best[order[i]];
-    if (idx < 0 || occupied[idx] !== 0) continue;
+    // Re-checked at take time: two neighbouring buckets can both have picked tiles along their seam.
+    if (idx < 0 || occupied[idx] !== 0 || (isOil && oilNear[idx] !== 0)) continue;
     pushItem(out, occupied, kind, idx, width);
+    if (isOil) markOilNear(ctx, idx);
     placed++;
   }
   return placed;
@@ -1111,7 +1139,8 @@ function scatterByBuckets(out, kind, quota, ctx, deadEndOnly, rng) {
  */
 function fillByStride(out, kind, quota, ctx, rng) {
   if (quota <= 0) return 0;
-  const { tiles, width, total, occupied } = ctx;
+  const { tiles, width, total, occupied, oilNear } = ctx;
+  const isOil = kind === 'oil';
   let free = 0;
   for (let i = 0; i < total; i++) if (tiles[i] === TILE.FLOOR && occupied[i] === 0) free++;
   if (free === 0) return 0;
@@ -1122,18 +1151,45 @@ function fillByStride(out, kind, quota, ctx, rng) {
   let placed = 0;
   for (let i = 0; i < total && placed < quota; i++) {
     if (tiles[i] !== TILE.FLOOR || occupied[i] !== 0) continue;
-    if (seen++ % stride === offset) {
+    if (seen++ % stride === offset && !(isOil && oilNear[i] !== 0)) {
       pushItem(out, occupied, kind, i, width);
+      if (isOil) markOilNear(ctx, i);
       placed++;
     }
   }
-  // Integer division can leave the quota a few short; mop up whatever is left, in order.
-  for (let i = 0; i < total && placed < quota; i++) {
-    if (tiles[i] !== TILE.FLOOR || occupied[i] !== 0) continue;
-    pushItem(out, occupied, kind, i, width);
-    placed++;
+  // Integer division (or the flask spacing) can leave the quota a few short; mop up what is left,
+  // in order — still spaced where the maze has room, and only then anywhere free.
+  for (let pass = isOil ? 0 : 1; pass < 2; pass++) {
+    for (let i = 0; i < total && placed < quota; i++) {
+      if (tiles[i] !== TILE.FLOOR || occupied[i] !== 0) continue;
+      if (pass === 0 && oilNear[i] !== 0) continue;
+      pushItem(out, occupied, kind, i, width);
+      if (isOil) markOilNear(ctx, i);
+      placed++;
+    }
   }
   return placed;
+}
+
+/**
+ * Mark every tile within {@link OIL_SPACING} (Chebyshev) of a flask at `idx` as too close for
+ * another scattered flask. O(1): a fixed 5×5 stamp, clipped to the grid.
+ * @param {Ctx} ctx
+ * @param {number} idx tile index of the flask just placed
+ * @returns {void}
+ */
+function markOilNear(ctx, idx) {
+  const { width, height, oilNear } = ctx;
+  const x = idx % width;
+  const y = (idx - x) / width;
+  const x0 = Math.max(0, x - OIL_SPACING);
+  const x1 = Math.min(width - 1, x + OIL_SPACING);
+  const y0 = Math.max(0, y - OIL_SPACING);
+  const y1 = Math.min(height - 1, y + OIL_SPACING);
+  for (let ty = y0; ty <= y1; ty++) {
+    const row = ty * width;
+    for (let tx = x0; tx <= x1; tx++) oilNear[row + tx] = 1;
+  }
 }
 
 /**

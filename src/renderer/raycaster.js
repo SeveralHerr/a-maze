@@ -21,13 +21,15 @@
  * `8 sconce tints × 64 levels × 256 palette entries` of already-packed RGBA. Along the level axis,
  * level 0 is the cool blue-black fog colour and level 63 is `ILLUM_MAX` (over-bright headroom only
  * wall sconces reach), with per-channel gammas so shadow drifts blue. Along the tint axis, 0 is
- * light from the player's own torch (stone stays blue-grey) and 7 is pure sconce light (amber).
+ * untinted (cool blue-grey stone) and 7 is pure sconce light (amber); the player's own torch warms
+ * the heart of its pool part of the way up that axis (`PLAYER_WARM`).
  * Shading a pixel is therefore `colormap[(tint << 14) | (level << 8) | paletteIndex]` — one lookup.
  *
  * Level and tint are computed once per wall column and once per 12-pixel segment along each
  * floor/ceiling row, and interpolated in between — light is smooth, so that is indistinguishable
  * from evaluating it per pixel and an order of magnitude cheaper. The level sums a small ambient,
- * the player's torch (radius `lerp(2.5, 7, view.light)` with two octaves of flicker) and the
+ * the player's torch (radius `lerp(2.5, 7, view.light)`, brightness and warmth that fall with it,
+ * two octaves of flicker, and guttering below `GUTTER_START`) and the
  * nearest eight wall torches as point lights; the tint is the sconces' share of that sum. A torch
  * lights only the tiles its flame can see — a per-torch visibility window, baked the first time the
  * torch becomes a light and kept for the level — which is what stops light leaking through masonry
@@ -368,6 +370,51 @@ const ATT_EXPONENT = 2.0;
  */
 const PLAYER_TORCH_CORE = 0.1;
 
+/**
+ * How far the player's plateau leans from the eye to the radius (`buildPlayerAttLut`): the light at
+ * the edge of the pool is `1 − lean` of the flat plateau before the shoulder. A pure plateau lit the
+ * first few tiles evenly, which read as ambient light rather than as a flame the player carries.
+ */
+const PLAYER_TORCH_LEAN = 0.3;
+
+/**
+ * Firelight tint of the player's own torch at the heart of its pool, as a fraction of the full
+ * sconce tint (`WARM_STEPS - 1`), at a full tank.
+ *
+ * WHY the torch in hand is warm at all: it used to be deliberately untinted (blue-grey stone at full
+ * light, orange only under wall sconces), and playtesters read that as "the player isn't emitting
+ * any light" — a uniformly lit cool corridor looks like ambient light, not like a flame you carry.
+ * A warm core that fades to the cool stone at the pool's edge makes the light visibly *come from
+ * the player*, and because it scales with `view.light` the oil left is readable in the world.
+ *
+ * The tint follows the torch's own attenuation (the leaning plateau, times `playerWarmFx`), so it
+ * is strongest beside the player and gone at the pool's edge, where the stone keeps its blue. The
+ * surfaces the player actually sees are a tile or more away, so it lands well short of a sconce's
+ * amber — measured on a bare corridor at a full tank: near walls r−b ≈ +12, stone 3 tiles out −8,
+ * against ≈ +31 on a wall under a sconce. Measure before retuning (`raycaster.test.mjs`).
+ */
+const PLAYER_WARM = 1;
+
+/**
+ * Brightness of the player's torch at an empty tank, as a fraction of a full one. The radius shrinks
+ * too (`TORCH_MIN_R`); dimming as well is what makes the drain visible *beside* the player, where the
+ * radius change alone never showed.
+ */
+const PLAYER_POWER_EMPTY = 0.55;
+
+/**
+ * `view.light` below which the torch starts to gutter: deep, irregular dips in brightness and a
+ * shrinking warm core, deepening toward an empty tank. `main.js` maps fuel through `frac^0.65`, so
+ * 0.4 is ≈ 24 % of the tank — the HUD's low-oil threshold.
+ */
+const GUTTER_START = 0.4;
+
+/** Largest fraction of the torch's brightness a single gutter dip removes, at an empty tank. */
+const GUTTER_DEPTH = 0.65;
+
+/** Fraction of the pool's radius a full-depth gutter dip pulls in along with the brightness. */
+const GUTTER_SHRINK = 0.35;
+
 /** Height of a sconce's flame above the floor, tiles — for the incidence term on flat surfaces. */
 const FLAME_Z = 0.62;
 
@@ -627,7 +674,9 @@ function buildPlayerAttLut(out) {
   for (let i = 0; i <= ATT_LUT_N; i++) {
     let u = (i / ATT_LUT_N - PLAYER_TORCH_CORE) / (1 - PLAYER_TORCH_CORE);
     u = u < 0 ? 0 : u > 1 ? 1 : u;
-    out[i] = 1 - u * u * (3 - 2 * u);
+    // A gentle linear lean across the plateau (`PLAYER_TORCH_LEAN`), so the stone beside the player
+    // is visibly the brightest in the pool and the light reads as coming *from* the player.
+    out[i] = (1 - u * u * (3 - 2 * u)) * (1 - PLAYER_TORCH_LEAN * (i / ATT_LUT_N));
   }
 }
 
@@ -889,6 +938,11 @@ export function createRaycaster(canvas, options) {
   let horizon = 0;
   let torchInvR = 1 / TORCH_MAX_R;
   let torchPower = 1;
+  /**
+   * The player torch's firelight tint at the centre of its pool this frame, 16.16 tint steps. An
+   * integer on purpose, so storing it every frame never boxes a heap number.
+   */
+  let playerWarmFx = 0;
   let lastTime = 0;
 
   /** @type {RenderStats} reused */
@@ -1293,7 +1347,8 @@ export function createRaycaster(canvas, options) {
     const d = Math.sqrt(dx * dx + dy * dy);
     let t = d * torchInvR;
     if (t > 1) t = 1;
-    const own = AMBIENT + playerAttLut[(t * ATT_LUT_N) | 0] * torchPower;
+    const pa = playerAttLut[(t * ATT_LUT_N) | 0];
+    const own = AMBIENT + pa * torchPower;
     let sconce = 0;
     // Tile of the point, for the visibility windows. `| 0` truncates rather than floors, which only
     // differs west or north of the map, where every window already reads "not visible".
@@ -1316,16 +1371,18 @@ export function createRaycaster(canvas, options) {
       const dl = Math.sqrt(d2);
       sconce += attFlatLut[(dl * INV_TORCH_RADIUS * ATT_LUT_N) | 0] * lightPow[i];
     }
-    return mixLight(own, sconce);
+    return mixLight(own, sconce, (pa * playerWarmFx) | 0);
   }
 
   /**
-   * Sum the player's and the sconces' light, record the sconce tint in `illumWarmFx`, and clamp.
+   * Sum the player's and the sconces' light, record the firelight tint in `illumWarmFx`, and clamp.
    * @param {number} own ambient + player torch
    * @param {number} sconce sum of wall-torch contributions
+   * @param {number} pw the player torch's firelight tint at this point, 16.16 tint steps — an integer,
+   *   so passing it never boxes a heap number
    * @returns {number} 0..ILLUM_MAX
    */
-  function mixLight(own, sconce) {
+  function mixLight(own, sconce, pw) {
     const total = own + sconce;
     if (sconce > 0 && total > 0) {
       let share = (sconce / total) * SCONCE_WARM_GAIN;
@@ -1337,6 +1394,9 @@ export function createRaycaster(canvas, options) {
     } else {
       illumWarmFx = 0;
     }
+    // The torch in hand warms the heart of its own pool (`PLAYER_WARM`). Whichever flame tints the
+    // point harder wins, so a sconce's amber is never diluted by standing next to it.
+    if (pw > illumWarmFx) illumWarmFx = pw;
     // A NaN (a corrupt light) must not reach the level maths: the comparison fails and it becomes 0.
     return total < ILLUM_MAX ? (total > 0 ? total : 0) : ILLUM_MAX;
   }
@@ -1392,7 +1452,8 @@ export function createRaycaster(canvas, options) {
     if (lam < 0) lam = 0;
     let t = d * torchInvR;
     if (t > 1) t = 1;
-    const own = AMBIENT + playerAttLut[(t * ATT_LUT_N) | 0] * torchPower * lam;
+    const pa = playerAttLut[(t * ATT_LUT_N) | 0];
+    const own = AMBIENT + pa * torchPower * lam;
     let sconce = 0;
     const tx = wx | 0;
     const ty = wy | 0;
@@ -1414,7 +1475,7 @@ export function createRaycaster(canvas, options) {
       if (face > 1) face = 1;
       sconce += attLut[(dl * INV_TORCH_RADIUS * ATT_LUT_N) | 0] * lightPow[i] * face;
     }
-    return mixLight(own, sconce);
+    return mixLight(own, sconce, (pa * playerWarmFx) | 0);
   }
 
   /**
@@ -2346,13 +2407,25 @@ export function createRaycaster(canvas, options) {
     else if (horizon > height - 1) horizon = height - 1;
 
     const light = Number.isFinite(view.light) ? Math.max(0, Math.min(1, view.light)) : 1;
-    torchInvR = 1 / (TORCH_MIN_R + (TORCH_MAX_R - TORCH_MIN_R) * light);
     // Flicker: two octaves, halved for players who asked for reduced motion.
     const flickAmp = reduced ? 0.5 : 1;
+    const flicker =
+      1 - flickAmp * (0.09 * (1 - tnoise(time * 6.7, 0x3c2f)) + 0.05 * (1 - tnoise(time * 15.3, 0x77b1)));
+    // Guttering: below `GUTTER_START` the flame starts to choke — irregular deep dips that pull the
+    // pool in and cool it, deepening toward an empty tank. Only the peaks of a slow noise dip, so
+    // the flame steadies between them and each dip reads as an event rather than as noise.
+    const gutter = light < GUTTER_START ? 1 - light / GUTTER_START : 0;
+    let dip = 0;
+    if (gutter > 0) {
+      const n = tnoise(time * 3.1, 0x5e11) * 0.6 + tnoise(time * 11.7, 0x2b8d) * 0.4;
+      dip = n > 0.45 ? (n > 0.75 ? 1 : (n - 0.45) / 0.3) : 0;
+      dip = dip * gutter * GUTTER_DEPTH * (reduced ? 0.5 : 1);
+    }
+    torchInvR = 1 / ((TORCH_MIN_R + (TORCH_MAX_R - TORCH_MIN_R) * light) * (1 - GUTTER_SHRINK * dip));
     torchPower =
-      PLAYER_TORCH_CEILING *
-      (0.86 + 0.14 * light) *
-      (1 - flickAmp * (0.09 * (1 - tnoise(time * 6.7, 0x3c2f)) + 0.05 * (1 - tnoise(time * 15.3, 0x77b1))));
+      PLAYER_TORCH_CEILING * (PLAYER_POWER_EMPTY + (1 - PLAYER_POWER_EMPTY) * light) * flicker * (1 - dip);
+    // The warm core breathes with the flame and shrinks with the oil left.
+    playerWarmFx = (WARM_FX_MAX * PLAYER_WARM * (0.7 + 0.3 * light) * flicker * (1 - dip)) | 0;
 
     buf.fill(fogPacked);
     // Cheap identity check; a real rebuild happens only on a level change (§4.5).

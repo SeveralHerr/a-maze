@@ -514,6 +514,40 @@ const MAP_FOUND_LIFE = 2.4;
 /** Seconds a `notice(text)` stays up (§4.8: ~1.6 s). */
 const NOTICE_LIFE = 1.6;
 
+/**
+ * The words under the fuel bar. Playtesters found the old `TANK` confusing: nothing on screen said
+ * *what* was in the tank or that the torch burns it. `OIL` names the thing the flasks refill, and
+ * sits beside the torch icon and the time left, so the panel reads "torch · oil · 1:16".
+ */
+const OIL_LABEL = 'OIL';
+
+/** The label once flasks have been drunk this level: `OIL ×3`. Falls back to {@link OIL_LABEL}. */
+const OIL_TALLY_PREFIX = 'OIL ×';
+
+/** The label while the oil is low. Falls back to {@link LOW_SHORT_LABEL} where the bar is narrow. */
+const LOW_OIL_LABEL = 'LOW OIL';
+
+/** The low label on a bar too narrow for {@link LOW_OIL_LABEL}. */
+const LOW_SHORT_LABEL = 'LOW';
+
+/**
+ * The one-time explanation of the fuel mechanic, raised shortly after the first level of a session
+ * starts. Title case like the other notices (`'No Map - Find the Scroll'` in `src/main.js`).
+ */
+const OIL_HINT_TEXT = 'Your torch burns oil - grab flasks to refill';
+
+/** {@link OIL_HINT_TEXT} for a view too narrow to hold it (a portrait phone). */
+const OIL_HINT_SHORT = 'Torch burns oil - find flasks';
+
+/** Seconds the oil hint stays up: it is a sentence to read, not a two-word notice. */
+const OIL_HINT_LIFE = 4.5;
+
+/** Raised the first time on each level the oil drops to the low mark. */
+const LOW_OIL_TEXT = 'Torch Low - Find Oil';
+
+/** Seconds the low-oil notice stays up. */
+const LOW_OIL_LIFE = 2.2;
+
 /** A banner's fade (and, with motion on, drop) in, in 64ths of a second (≈ 0.19 s). */
 const BANNER_IN_64 = 12;
 
@@ -656,6 +690,14 @@ export function createHud(overlayCanvas, options) {
   /** Refuels taken this level (a fallback for when `state.run` does not carry the count). */
   let refuelCount = 0;
 
+  // ── Oil hints ──
+  /** Whether this HUD has explained the oil yet. Once per session: a reminder every run is nagging. */
+  let oilHintShown = false;
+  /** Whether the oil was at or under the low mark last frame (true fraction, not the smoothed bar). */
+  let lastLowOil = false;
+  /** Whether the low-oil notice has been raised on this level. */
+  let lowOilNoticed = false;
+
   // ── Map scroll (§4.8) ──
   /** `run.mapFound` as last seen; the banner fires on its false → true edge only. */
   let lastMapFound = true;
@@ -701,7 +743,7 @@ export function createHud(overlayCanvas, options) {
 
   // ── Readout text, rebuilt only when the number behind it changes (see the file header) ──
   const fuelText = createTextMemo((sec) => formatTime(sec));
-  const refuelText = createTextMemo((n) => '×' + n);
+  const refuelText = createTextMemo((n) => OIL_TALLY_PREFIX + n);
   const scoreText = createTextMemo((v) => formatInt(v));
   const gemsText = createTextMemo((g, t) => formatCount(g, t));
   const depthText = createTextMemo((lv) => formatDepth(lv));
@@ -761,6 +803,8 @@ export function createHud(overlayCanvas, options) {
     anim.refillFlare = 0;
     anim.refillFrom = 0;
     refuelCount = 0;
+    lastLowOil = false;
+    lowOilNoticed = false;
     for (let i = 0; i < MAX_POPS; i++) pops[i].t = -1;
     // A new run starts locked on a fresh level: that is not a discovery, so the next frame adopts
     // `mapFound` rather than comparing it against the old run's value.
@@ -787,10 +831,56 @@ export function createHud(overlayCanvas, options) {
    */
   function notice(text) {
     if (typeof text !== 'string' || text === '') return;
+    showNotice(text, NOTICE_LIFE);
+  }
+
+  /**
+   * @param {string} text a constant string (the HUD keeps the reference)
+   * @param {number} life seconds
+   * @returns {void}
+   */
+  function showNotice(text, life) {
     banner.kind = BANNER_NOTICE;
     banner.text = text;
-    banner.life = NOTICE_LIFE;
+    banner.life = life;
     banner.t = 0;
+  }
+
+  /**
+   * Explain the oil once, and warn when it runs low.
+   *
+   * The hint waits until the HUD has faded in on the first level of the session and the banner slot
+   * is free, so it never replaces a notice the player asked for. The low warning fires on the
+   * crossing into the low mark — once per level, and never on a level's first frame (a level that
+   * *starts* low is not news) — and never over "Map Found", which is a reward worth reading.
+   * @param {GameState} state
+   * @param {boolean} levelChanged
+   * @returns {void}
+   */
+  function trackOil(state, levelChanged) {
+    const run = state.run;
+    const low = run.fuelMax > 0 && run.fuel <= run.fuelMax * LOW_FUEL_FRACTION;
+    if (levelChanged || state.phase !== 'playing') {
+      if (levelChanged) lowOilNoticed = false;
+      lastLowOil = low;
+      return;
+    }
+    if (!oilHintShown && state.level === 1 && anim.intro >= 1 && banner.kind === BANNER_NONE) {
+      oilHintShown = true;
+      // The banner steps its text down to scale 1 and no further, so a sentence wider than the view
+      // at scale 1 (its frame and margins included) would run off a phone: use the short form there.
+      const m = surface.metrics;
+      const fits = measureAt(OIL_HINT_TEXT, 'hud', 1) + 24 * m.u <= m.viewW;
+      showNotice(fits ? OIL_HINT_TEXT : OIL_HINT_SHORT, OIL_HINT_LIFE);
+    }
+    if (low && !lastLowOil && !lowOilNoticed) {
+      // A crossing under "Map Found" is held, not spent: leaving `lastLowOil` false re-offers it
+      // every frame until the banner clears.
+      if (banner.kind === BANNER_MAP_FOUND) return;
+      lowOilNoticed = true;
+      showNotice(LOW_OIL_TEXT, LOW_OIL_LIFE);
+    }
+    lastLowOil = low;
   }
 
   /**
@@ -849,7 +939,8 @@ export function createHud(overlayCanvas, options) {
     const run = state.run;
 
     // A new level (or a new run) resets the readouts rather than rolling them across the cut.
-    if (state.level !== lastLevel) {
+    const levelChanged = state.level !== lastLevel;
+    if (levelChanged) {
       lastLevel = state.level;
       lastGems = run.gems;
       lastFuel = run.fuel;
@@ -915,6 +1006,7 @@ export function createHud(overlayCanvas, options) {
       }
     }
     // After the aging, so a banner raised this frame starts at t = 0.
+    trackOil(state, levelChanged);
     trackMapFound(state);
   }
 
@@ -1163,8 +1255,8 @@ export function createHud(overlayCanvas, options) {
   }
 
   /**
-   * Top-left: the torch **tank** — torch icon, segmented bar with quarter-tank ticks, refuel
-   * count, remaining time.
+   * Top-left: the torch **tank** — torch icon, segmented bar with quarter-tank ticks, the `OIL`
+   * label (`OIL ×N` flasks drunk where there is room, `LOW OIL` when low), remaining time.
    *
    * WHY it is drawn as a tank and not as a timer: `fuelMax` no longer scales with the maze, so the
    * bar is a small vessel the player refills every 60–90 s rather than a countdown to the exit.
@@ -1286,12 +1378,20 @@ export function createHud(overlayCanvas, options) {
     const timeText = fuelText(Math.floor(run.fuel));
     drawAt(ctx, timeText, barX + barW, textY, 'hud', size, low ? 'hudAlarm' : flare > 0 ? 'hudBright' : 'hudDim', 'right');
     const refuels = refuelsOf(state);
-    // "TANK" until the first flask, then a tally of them. The word is dropped rather than allowed
-    // to collide with the clock when the bar is narrow (a phone has no room for both).
-    const tankLabel = low ? 'LOW' : refuels > 0 ? refuelText(refuels) : 'TANK';
-    const timeW = measureAt(timeText, 'hud', size);
-    const labelW = measureAt(tankLabel, 'hud', size);
-    if (labelW + timeW + 3 * u <= barW) {
+    // "OIL" until the first flask, then "OIL ×N" — the flasks drunk this level — and "LOW OIL" when
+    // it is time to find one. Where the bar is too narrow for the long form the short one is used,
+    // and the word is dropped rather than allowed to collide with the clock (a phone may have room
+    // for neither).
+    // At least two blank glyphs between the label and the clock: "OIL ×4 1:16" read as one number.
+    const labelGap = Math.max(3 * u, 2 * HUD_ADVANCE * size);
+    const timeW = measureAt(timeText, 'hud', size) + labelGap;
+    let tankLabel = low ? LOW_OIL_LABEL : refuels > 0 ? refuelText(refuels) : OIL_LABEL;
+    let labelW = measureAt(tankLabel, 'hud', size);
+    if (labelW + timeW > barW) {
+      tankLabel = low ? LOW_SHORT_LABEL : OIL_LABEL;
+      labelW = measureAt(tankLabel, 'hud', size);
+    }
+    if (labelW + timeW <= barW) {
       drawAt(ctx, tankLabel, barX, textY, 'hud', size, low ? 'hudAlarm' : 'hudDim');
     }
   }

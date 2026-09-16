@@ -503,9 +503,122 @@ test('arrow-key turning and free mouse look apply in the same frame', () => {
 
 test('touch devices never take look from synthesised mouse moves', () => {
   const t = setup({ coarsePointer: true, playing: true });
+  delete t.env.canvas.requestPointerLock;
+  // The compatibility mouse events a browser emits right after a tap.
+  t.env.canvas.dispatchEvent(touchEvent('touchstart', [{ id: 1, x: 600, y: 300 }]));
+  t.env.canvas.dispatchEvent(touchEvent('touchend', [{ id: 1, x: 600, y: 300 }]));
   mouseMove(t, 100);
   mouseMove(t, 100);
+  t.env.canvas.dispatchEvent({ type: 'mousedown', button: 0 });
+  t.env.canvas.dispatchEvent({ type: 'click' });
+  assert.equal(t.input.poll().lookDX, 0, 'echoes inside the ghost window are ignored');
+
+  // Engines with InputDeviceCapabilities say so outright, however late the echo arrives.
+  t.env.advance(5000);
+  const echo = { sourceCapabilities: { firesTouchEvents: true } };
+  for (let i = 0; i < 3; i++) t.env.document.dispatchEvent({ type: 'mousemove', movementX: 50, ...echo });
   assert.equal(t.input.poll().lookDX, 0);
+  assert.equal(t.input.wantsPointer, false, 'touch is still in control');
+  t.input.destroy();
+});
+
+test('regression: a touchscreen laptop reporting (pointer: coarse) still gets mouse look and pointer lock', () => {
+  // Windows Chrome on a touchscreen laptop: `(pointer: coarse)` true, `(any-pointer: fine)` false,
+  // maxTouchPoints 10 — while the player uses a real mouse. The hint used to latch "touch device",
+  // which disabled click-to-lock, the automatic lock and free mouse look: a visible cursor and a
+  // dead camera.
+  const t = setup({ coarsePointer: true, playing: true });
+  assert.equal(t.input.isTouch, true, 'the on-screen controls may still show');
+  mouseMove(t, 20);
+  mouseMove(t, 40);
+  assert.ok(Math.abs(t.input.poll().lookDX - 40 * 0.0024) < 1e-12, 'free mouse look turns the camera');
+  assert.equal(t.input.wantsPointer, true, 'and the game wants the pointer');
+
+  t.env.canvas.dispatchEvent({ type: 'pointerdown', pointerType: 'mouse', button: 0 });
+  assert.equal(t.env.document.pointerLockElement, t.env.canvas, 'a click captures the mouse');
+  t.input.destroy();
+
+  // Keyboard resume on the same device, after the mouse has been used, re-locks automatically.
+  const k = setup({ coarsePointer: true, playing: false });
+  mouseMove(k, 5);
+  k.keyDown('Enter');
+  k.setPlaying(true);
+  k.input.poll();
+  assert.equal(k.env.document.pointerLockElement, k.env.canvas);
+  k.input.destroy();
+});
+
+test('hybrid device: a real touch hands look to touch, a later real mouse takes it back', () => {
+  const t = setup({ playing: true });
+  delete t.env.canvas.requestPointerLock;
+  mouseMove(t, 10);
+  mouseMove(t, 10);
+  assert.ok(t.input.poll().lookDX > 0);
+
+  t.env.canvas.dispatchEvent(touchEvent('touchstart', [{ id: 1, x: 600, y: 300 }]));
+  t.env.canvas.dispatchEvent(touchEvent('touchend', [{ id: 1, x: 600, y: 300 }]));
+  t.input.poll();
+  mouseMove(t, 10);
+  mouseMove(t, 10);
+  assert.equal(t.input.poll().lookDX, 0, 'the echo of the tap does not turn the camera');
+  assert.equal(t.input.wantsPointer, false);
+
+  t.env.advance(1500);
+  mouseMove(t, 10); // real mouse, but the first free move after a gap is the re-entry guard
+  mouseMove(t, 10);
+  assert.ok(Math.abs(t.input.poll().lookDX - 10 * 0.0024) < 1e-12, 'the mouse is back in control');
+  t.input.destroy();
+});
+
+test('pointer lock is requested on the mouse press, before a fullscreen request can consume the gesture', () => {
+  const t = setup({ playing: true });
+  let requests = 0;
+  t.env.canvas.requestPointerLock = () => {
+    requests++; // pending: a real browser answers a task later
+  };
+  // A second listener registered after input.js (main.js's fullscreen request) must see the lock
+  // already asked for.
+  let requestsSeenByLaterListener = -1;
+  t.env.canvas.addEventListener('pointerdown', () => {
+    requestsSeenByLaterListener = requests;
+  });
+  t.env.canvas.dispatchEvent({ type: 'pointerdown', pointerType: 'mouse', button: 0 });
+  assert.equal(requestsSeenByLaterListener, 1);
+  t.env.canvas.dispatchEvent({ type: 'mousedown', button: 0 });
+  t.env.canvas.dispatchEvent({ type: 'click' });
+  assert.equal(requests, 1, 'the compatibility mousedown and the click do not ask again');
+
+  // A refusal is retried by the next press, even after the automatic path gave up.
+  t.env.advance(600);
+  t.env.canvas.dispatchEvent({ type: 'pointerdown', pointerType: 'mouse', button: 0 });
+  assert.equal(requests, 2);
+
+  // Right-clicks, touch and pen presses never ask.
+  t.env.advance(600);
+  t.env.canvas.dispatchEvent({ type: 'pointerdown', pointerType: 'mouse', button: 2 });
+  t.env.canvas.dispatchEvent({ type: 'pointerdown', pointerType: 'touch', button: 0 });
+  t.env.canvas.dispatchEvent({ type: 'pointerdown', pointerType: 'pen', button: 0 });
+  assert.equal(requests, 2);
+
+  // Menus never ask.
+  t.setPlaying(false);
+  t.env.advance(600);
+  t.env.canvas.dispatchEvent({ type: 'pointerdown', pointerType: 'mouse', button: 0 });
+  assert.equal(requests, 2);
+  t.input.destroy();
+});
+
+test('a menu click whose mousedown was suppressed (pointerdown preventDefault) still authorises the lock', () => {
+  // main.js calls preventDefault on a pointerdown the menus consumed; browsers then never deliver
+  // the compatibility mousedown. Only pointerdown and click arrive.
+  const t = setup({ playing: false });
+  t.env.canvas.dispatchEvent({ type: 'pointerdown', pointerType: 'mouse', button: 0 });
+  t.env.canvas.dispatchEvent({ type: 'click' });
+  assert.equal(t.env.document.pointerLockElement, null, 'menus keep the cursor');
+  t.env.advance(900); // loading
+  t.setPlaying(true);
+  t.input.poll();
+  assert.equal(t.env.document.pointerLockElement, t.env.canvas, 'captured once play begins');
   t.input.destroy();
 });
 

@@ -622,6 +622,72 @@ test('pickups: a sprint step at the dt clamp sweeps its whole path, not just its
   assert.ok(s.events.some((e) => e.type === 'pickup'));
 });
 
+/**
+ * Walk the player east along row y = 1.5 from x0 to x1 at walking speed, 60 Hz.
+ * @param {import('../core/types.js').GameState} s
+ * @param {number} x1
+ * @returns {void}
+ */
+function walkEastTo(s, x1) {
+  const p = s.player;
+  p.angle = 0;
+  for (let i = 0; i < 600 && p.x < x1; i++) step(s, 1 / 60, input({ moveY: 1 }));
+}
+
+test('pickups: two flasks on adjacent tiles are both collected when the tank has room for both', () => {
+  // Bug report: "two oils were right next to each other and the other was unable to be picked up".
+  const maze = mazeFrom(['############', '#S........E#', '############']);
+  const a = itemAt(1, 'oil', 3.5, 1.5);
+  const b = itemAt(2, 'oil', 4.5, 1.5);
+  const s = playing(maze, [a, b], 100);
+  s.run.fuel = 5;
+  walkEastTo(s, 6.5);
+  assert.equal(a.taken, true, 'first flask');
+  assert.equal(b.taken, true, 'second flask');
+  assert.equal(s.run.refuels, 2);
+});
+
+test('pickups: every pair of item kinds on adjacent tiles is collected, across bucket seams too', () => {
+  const kinds = /** @type {const} */ (['gem', 'oil', 'map']);
+  // x = 3.5 | 4.5 straddles the ITEM_GRID_TILES = 4 bucket seam; 1.5 | 2.5 does not.
+  for (const [ax, bx] of [[1.5, 2.5], [3.5, 4.5], [7.5, 8.5]]) {
+    for (const ka of kinds) {
+      for (const kb of kinds) {
+        const maze = mazeFrom(['##############', '#S..........E#', '##############']);
+        const a = itemAt(1, ka, ax, 1.5);
+        const b = itemAt(2, kb, bx, 1.5);
+        const s = playing(maze, [a, b], 100);
+        s.run.fuel = s.run.fuelMax * 0.1;
+        s.player.x = 1.5;
+        s.player.y = 1.5;
+        walkEastTo(s, 10.2);
+        assert.equal(a.taken, true, `${ka}@${ax} then ${kb}@${bx}: first`);
+        assert.equal(b.taken, true, `${ka}@${ax} then ${kb}@${bx}: second`);
+      }
+    }
+  }
+});
+
+test('pickups: a second adjacent flask refused on a topped-up tank is taken once the torch burns down', () => {
+  // The half-a-flask rule (sim.js takeItem): the first flask tops the tank up, so the second is left
+  // on the floor on purpose. It must really still be collectible — standing on it, without having to
+  // walk off and back — as soon as the tank has room for it.
+  const maze = mazeFrom(['############', '#S........E#', '############']);
+  const a = itemAt(1, 'oil', 3.5, 1.5);
+  const b = itemAt(2, 'oil', 4.5, 1.5);
+  const s = playing(maze, [a, b], 100);
+  s.run.fuel = s.run.fuelMax * 0.6;
+  walkEastTo(s, 4.5);
+  assert.equal(a.taken, true, 'first flask');
+  assert.equal(b.taken, false, 'second flask left for later (tank nearly full)');
+  let t = 0;
+  while (!b.taken && t < 120 && s.phase === 'playing') {
+    step(s, 1 / 60, NONE);
+    t += 1 / 60;
+  }
+  assert.equal(b.taken, true, `second flask taken after ${t.toFixed(1)} s standing on it`);
+});
+
 // ─── Derived ─────────────────────────────────────────────────────────────────────────────────
 
 test('updateDerived: exitDist, nearExit ramp and lowFuel', () => {

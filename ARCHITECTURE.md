@@ -401,8 +401,16 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   would decrement a different slot on keyup; `wantsPointer` is true while the game wants mouse look
   but does not own the pointer (playing, not touch, lock supported, not locked) — the hook for a
   "click to look" prompt.
-  _Mouse look without a click:_ while `shouldLockPointer()` is true and the device has not proven
-  touch, `mousemove.movementX` turns the camera whether or not the pointer is locked. Pointer lock is
+  _Mouse look without a click:_ while `shouldLockPointer()` is true and the mouse is in control,
+  `mousemove.movementX` turns the camera whether or not the pointer is locked.
+  _Touch vs mouse (hybrid devices):_ `isTouch` (overlay shown) is latched by a real touch **or** the
+  `(pointer: coarse)` hint, but the hint never disables the mouse — Windows Chrome on a touchscreen
+  laptop reports `pointer: coarse` with no fine pointer while a real mouse is in use. The mouse is
+  in control unless a real touch happened more recently than a real mouse event; mouse events
+  synthesised from a touch (`sourceCapabilities.firesTouchEvents`, or within
+  `TOUCH_GHOST_MOUSE_MS` of a touch) are ignored. Pointer lock is requested on a primary mouse
+  `pointerdown`/`mousedown` while playing (before main.js's fullscreen request in the same event,
+  which consumes the gesture) and again on `click`. Pointer lock is
   still requested (canvas click, or automatically after a recent keyboard **or mouse** gesture —
   starting a level from a menu row counts) because it removes the screen edge and hides the cursor.
   Unlocked, the first move after a gap of `FREE_MOVE_REARM_MS` is dropped (the cursor re-entering
@@ -563,7 +571,9 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   DDA wall casting with textured walls, one perspective row-walk serving floor **and** ceiling,
   per-column z-buffer, sorted billboard sprites (items, portal, torch flames) with z-test,
   **dynamic lighting**: player torch radius = `lerp(2.5, 7, view.light)` with two octaves of
-  flicker + the eight nearest wall torches as point lights (each occluded by the plane of the wall
+  flicker; its brightness and a warm firelight core around the player also fall with
+  `view.light`, and below 0.4 it gutters (so the oil left reads in the world, not only on the
+  HUD) + the eight nearest wall torches as point lights (each occluded by the plane of the wall
   it is bolted to) + distance fog to a cool blue-black. Head bob offsets the horizon, quantised to
   whole pixels so the wall base and the floor rows cannot disagree by a pixel and shimmer.
   Shading is a Doom-style **colormap** (64 levels × 256 entries of pre-packed RGBA) plus a 4×4
@@ -707,8 +717,10 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   **The gauge reads as a tank, not a countdown** (this is the massive-maze change in the HUD):
   quarter-tank graduations every 4 segments, a refill surge (the bar sweeps up from where the eye
   last saw it with a white-hot leading edge, the panel edge flares, the torch icon relights for the
-  flare even at 3 % fuel), a recurring low-tank alarm (pulsing red outline, cooled flame, `LOW` chip)
-  and a `TANK ×N` refuel tally. The depth panel is one line, `DEPTH n · C×R` (two lines on a
+  flare even at 3 % fuel), a recurring low-tank alarm (pulsing red outline, cooled flame, `LOW OIL`
+  / `LOW` label), and an `OIL` label that becomes an `OIL ×N` refuel tally where the bar has room.
+  The HUD itself raises two notices: a once-per-session oil explanation on level 1 and a
+  once-per-level `Torch Low - Find Oil` on the crossing into low fuel (never over "Map Found"). The depth panel is one line, `DEPTH n · C×R` (two lines on a
   phone); the level clock and `MAPPED %` live on the full-map header and the pause screen.
   It prefers `run.refuels` (§3) and falls back to its own tally of rendered fuel rises.
   Also exports the shared overlay `createSurface(canvas)` — whose `Surface` gained
