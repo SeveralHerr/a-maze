@@ -325,21 +325,54 @@ test('sensitivity scales look, invertLook flips it, both live-updatable', () => 
   t.input.destroy();
 });
 
-test('mouse spikes and garbage deltas cannot teleport the aim', () => {
+test('mouse: a real high-DPI flick passes through intact; glitches are dropped, not clamped', () => {
   const t = setup();
   t.env.document.pointerLockElement = t.env.canvas;
-  mouseMove(t, 100000); // the classic pointer-lock acquisition spike
-  const dx = t.input.poll().lookDX;
-  assert.ok(Math.abs(dx - 180 * 0.0024) < 1e-12, `clamped to 180px, got ${dx}`);
+  // One animation frame of a 3200 DPI flick: Chrome coalesces this into a single event.
+  mouseMove(t, 600);
+  let dx = t.input.poll().lookDX;
+  assert.ok(Math.abs(dx - 600 * 0.0024) < 1e-12, `600 counts must not be clamped, got ${dx}`);
+  mouseMove(t, -900);
+  dx = t.input.poll().lookDX;
+  assert.ok(Math.abs(dx + 900 * 0.0024) < 1e-12, `and not in the other direction either, got ${dx}`);
+
+  // A driver/wake glitch is thrown away entirely rather than becoming a maximum-size turn.
+  mouseMove(t, 100000);
+  mouseMove(t, -50000);
+  assert.equal(t.input.poll().lookDX, 0);
 
   mouseMove(t, NaN);
   mouseMove(t, Infinity);
   t.env.document.dispatchEvent({ type: 'mousemove' }); // no movementX at all
   assert.equal(t.input.poll().lookDX, 0);
 
-  // Even a flood of legitimate max-size deltas is capped at half a turn per step.
-  for (let i = 0; i < 5000; i++) mouseMove(t, 180);
+  // Even a flood of plausible deltas is capped at half a turn per step.
+  for (let i = 0; i < 5000; i++) mouseMove(t, 1500);
   assert.ok(Math.abs(t.input.poll().lookDX - Math.PI) < 1e-12);
+  t.input.destroy();
+});
+
+test('mouse: the jumbo delta at pointer-lock engagement is dropped, then look resumes', () => {
+  const t = setup();
+  t.env.document.pointerLockElement = t.env.canvas;
+  t.env.document.dispatchEvent({ type: 'pointerlockchange' });
+  mouseMove(t, 1400); // Chrome's cursor-to-origin jump, delivered with the lock
+  assert.equal(t.input.poll().lookDX, 0, 'first move after engagement is ignored');
+  mouseMove(t, 40);
+  assert.equal(t.input.poll().lookDX, 0, 'and anything inside the settle window');
+  t.env.advance(60);
+  mouseMove(t, 40);
+  assert.ok(Math.abs(t.input.poll().lookDX - 40 * 0.0024) < 1e-12, 'normal look ~one frame later');
+
+  // Moves arriving long after engagement: only the very first is sacrificed.
+  const u = setup();
+  u.env.document.pointerLockElement = u.env.canvas;
+  u.env.document.dispatchEvent({ type: 'pointerlockchange' });
+  u.env.advance(500);
+  mouseMove(u, 30);
+  mouseMove(u, 30);
+  assert.ok(Math.abs(u.input.poll().lookDX - 30 * 0.0024) < 1e-12);
+  u.input.destroy();
   t.input.destroy();
 });
 
@@ -356,8 +389,10 @@ test('any pointer-lock transition drops the partial gesture and the drag', () =>
   mouseMove(t, 90);
   t.env.document.dispatchEvent({ type: 'pointerlockchange' });
   assert.equal(t.input.poll().lookDX, 0);
+  t.env.advance(100);
+  mouseMove(t, 90); // the engagement spike slot
   mouseMove(t, 90);
-  assert.ok(t.input.poll().lookDX > 0, 'and normal look resumes immediately after');
+  assert.ok(t.input.poll().lookDX > 0, 'and normal look resumes right after');
   t.input.destroy();
 });
 
@@ -458,19 +493,26 @@ test('automatic pointer lock is gated by gesture, phase, cooldown and refusals',
   t.input.poll();
   assert.equal(requests, 1, 'and the cooldown stops a request storm');
 
+  // After a refusal the retry comes soon (Chrome refuses for ~1 s after an Escape release) ...
+  t.env.advance(100);
+  t.input.poll();
+  assert.equal(requests, 1, 'but not every poll');
+  t.env.advance(160);
+  t.input.poll();
+  assert.equal(requests, 2, 'a refused request is retried after ~250 ms, not 1.2 s');
+  // ... and stops after a bounded number of refusals (~2 s of trying).
+  for (let i = 0; i < 20; i++) {
+    t.env.advance(260);
+    t.input.poll();
+  }
+  assert.equal(requests, 8, 'eight refusals and the module stops asking');
   t.env.advance(1300);
   t.input.poll();
-  assert.equal(requests, 2);
-  t.env.advance(1300);
-  t.input.poll();
-  assert.equal(requests, 3);
-  t.env.advance(1300);
-  t.input.poll();
-  assert.equal(requests, 3, 'three refusals and the module stops asking');
+  assert.equal(requests, 8);
 
   // A deliberate click is the player saying "try again".
   t.env.canvas.dispatchEvent({ type: 'click' });
-  assert.equal(requests, 4);
+  assert.equal(requests, 9);
 
   // Touch devices never want the pointer at all.
   const m = setup({ coarsePointer: true, playing: true });
@@ -483,6 +525,108 @@ test('automatic pointer lock is gated by gesture, phase, cooldown and refusals',
   m.input.poll();
   assert.equal(touchRequests, 0);
   m.input.destroy();
+  t.input.destroy();
+});
+
+test('a refused lock right after Escape lands within ~a second of a keyboard resume', () => {
+  const t = setup({ playing: true });
+  const refuseUntil = t.env.performance.now() + 1000; // Chrome's post-Escape window
+  t.env.canvas.requestPointerLock = () => {
+    if (t.env.performance.now() < refuseUntil) {
+      t.env.document.dispatchEvent({ type: 'pointerlockerror' });
+      return;
+    }
+    t.env.document.pointerLockElement = t.env.canvas;
+    t.env.document.dispatchEvent({ type: 'pointerlockchange' });
+  };
+  assert.equal(t.input.wantsPointer, true, 'playing without the pointer: the HUD may prompt');
+  t.keyDown('Enter');
+  let lockedAt = -1;
+  for (let ms = 0; ms <= 3000; ms += 16) {
+    t.input.poll();
+    if (t.input.pointerLocked) {
+      lockedAt = ms;
+      break;
+    }
+    t.env.advance(16);
+  }
+  assert.ok(lockedAt >= 1000 && lockedAt <= 1300, `locked at ${lockedAt} ms`);
+  assert.equal(t.input.wantsPointer, false, 'prompt clears once the pointer is ours');
+  t.setPlaying(false);
+  t.env.document.pointerLockElement = null;
+  assert.equal(t.input.wantsPointer, false, 'menus never want the pointer');
+  t.input.destroy();
+
+  const m = setup({ coarsePointer: true, playing: true });
+  assert.equal(m.input.wantsPointer, false, 'touch devices never prompt for a mouse');
+  m.input.destroy();
+});
+
+test('setBindings: a remap drives the game, releases held keys, and null restores defaults', async () => {
+  const { createBindings } = await import('./bindings.js');
+  const t = setup();
+  t.keyDown('KeyW');
+  assert.equal(t.input.poll().moveY, 1);
+
+  // ESDF layout; W unbound.
+  t.input.setBindings(
+    createBindings({
+      KeyE: ['forward', 'up'],
+      KeyD: ['backward', 'down'],
+      KeyS: ['strafeLeft', 'left'],
+      KeyF: ['strafeRight', 'right'],
+      KeyW: [],
+      KeyA: [],
+      KeyQ: [],
+    }),
+  );
+  assert.equal(t.input.poll().moveY, 0, 'the key held across the swap is released');
+  t.keyUp('KeyW');
+  t.keyDown('KeyW');
+  assert.equal(t.input.poll().moveY, 0, 'W is unbound now');
+  t.keyUp('KeyW');
+  t.keyDown('KeyE');
+  let f = t.input.poll();
+  assert.equal(f.moveY, 1);
+  assert.ok(f.pressed.has('up'), 'menu nav follows the remap');
+  t.keyUp('KeyE');
+  t.keyDown('KeyS');
+  assert.equal(t.input.poll().moveX, -1);
+  t.keyUp('KeyS');
+  // Escape can never be remapped away.
+  t.keyDown('Escape');
+  f = t.input.poll();
+  assert.ok(f.pressed.has('pause') && f.pressed.has('back'));
+  t.keyUp('Escape');
+
+  t.input.setBindings(null);
+  t.keyDown('KeyW');
+  assert.equal(t.input.poll().moveY, 1, 'defaults are back');
+  t.input.setBindings(/** @type {any} */ ({ keyHold: 3 }));
+  t.keyDown('KeyA');
+  assert.equal(t.input.poll().moveX, -1, 'garbage tables fall back to the defaults');
+  t.input.destroy();
+
+  // Also accepted at construction.
+  const env = createFakeEnv();
+  const input = createInput(env.canvas, {
+    bindings: createBindings({ KeyI: ['forward'] }),
+    env: { window: env.window, document: env.document, navigator: env.navigator, performance: env.performance },
+  });
+  env.window.dispatchEvent({ type: 'keydown', code: 'KeyI', cancelable: true });
+  assert.equal(input.poll().moveY, 1);
+  input.destroy();
+});
+
+test('setBindings keeps poll() allocation-free (tables are swapped, not copied)', async () => {
+  const { createBindings } = await import('./bindings.js');
+  const t = setup();
+  t.input.setBindings(createBindings({ KeyI: ['forward'] }));
+  const a = t.input.poll();
+  t.keyDown('KeyI');
+  const b = t.input.poll();
+  assert.equal(a, b);
+  assert.equal(a.pressed, b.pressed);
   t.input.destroy();
 });
 
@@ -522,6 +666,19 @@ test('gamepad: right stick drives turn through the deadzone and the response cur
   t.env.setGamepads([fakePad({ axes: [0, 0, 0.59, 0] })]);
   const half = t.input.poll().turn;
   assert.ok(half > 0 && half < 0.3, `expected a soft centre, got ${half}`);
+
+  // Radial like the left stick: a small vertical wobble does not re-open the X deadzone, and a
+  // thumb resting diagonally inside the radial zone does not turn at all.
+  t.env.setGamepads([fakePad({ axes: [0, 0, 0.12, 0.1] })]);
+  assert.equal(t.input.poll().turn, 0, 'inside the radial deadzone');
+  t.env.setGamepads([fakePad({ axes: [0, 0, 0.7071, 0.7071] })]);
+  const diag = t.input.poll().turn;
+  t.env.setGamepads([fakePad({ axes: [0, 0, 0.7071, 0] })]);
+  const flat = t.input.poll().turn;
+  assert.ok(diag > flat, `same X, more total deflection → past the deadzone sooner (${diag} vs ${flat})`);
+  // A 3-axis pad still turns.
+  t.env.setGamepads([fakePad({ axes: [0, 0, 1] })]);
+  assert.equal(t.input.poll().turn, 1);
   t.input.destroy();
 });
 
@@ -550,6 +707,8 @@ test('gamepad: buttons are edge-triggered and d-pad moves', () => {
   assert.ok(tap([1]).has('back'), 'B goes back');
   assert.ok(tap([9]).has('pause'), 'Start pauses');
   assert.ok(tap([8]).has('map'), 'Back/View toggles the map');
+  assert.ok(tap([3]).has('mute'), 'Y mutes');
+  assert.equal(tap([5]).size, 0, 'RB is not a mute a sprinting thumb can graze');
 
   // D-pad: up/down move, left/right turn, and they also navigate menus.
   t.env.setGamepads([fakePad({ pressed: [12] })]);

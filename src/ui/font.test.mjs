@@ -200,6 +200,72 @@ test('drawText degrades gracefully with no canvas and no context', () => {
   assert.doesNotThrow(() => clearFontCache());
 });
 
+test('the middle dot is a dot, not a dash', () => {
+  // The HUD separator used to be a 3×2 block, as wide as the hyphen, so "DEPTH 2 · 24×24" read as
+  // "DEPTH 2 - 24×24" everywhere it appeared.
+  for (const font of /** @type {const} */ (['hud', 'display'])) {
+    const dot = /** @type {{w:number, h:number, mask:Uint8Array}} */ (glyphMask(font, '·'));
+    let minX = Infinity;
+    let maxX = -1;
+    let minY = Infinity;
+    let maxY = -1;
+    for (let y = 0; y < dot.h; y++) {
+      for (let x = 0; x < dot.w; x++) {
+        if (dot.mask[y * dot.w + x] === 0) continue;
+        minX = Math.min(minX, x);
+        maxX = Math.max(maxX, x);
+        minY = Math.min(minY, y);
+        maxY = Math.max(maxY, y);
+      }
+    }
+    assert.ok(maxX >= 0, `${font}: the dot has ink`);
+    assert.ok(maxX - minX + 1 <= 2, `${font}: ink is ${maxX - minX + 1} columns wide`);
+    assert.ok(maxY - minY + 1 <= 2, `${font}: ink is ${maxY - minY + 1} rows tall`);
+    const face = faceInfo(font);
+    assert.ok(minY > 0 && maxY < face.ascent - 1, `${font}: the dot floats at mid height (rows ${minY}–${maxY})`);
+    // Narrower than the hyphen it used to be mistaken for.
+    const dash = /** @type {{w:number, h:number, mask:Uint8Array}} */ (glyphMask(font, '-'));
+    let dashInk = 0;
+    for (let x = 0; x < dash.w; x++) for (let y = 0; y < dash.h; y++) dashInk = Math.max(dashInk, dash.mask[y * dash.w + x] ? x + 1 : 0);
+    assert.ok(maxX - minX + 1 < dashInk, `${font}: dot narrower than the hyphen`);
+  }
+});
+
+test('the atlas cache stays bounded however many raw colours are drawn', async () => {
+  // Build real atlases: give Node a document that can make canvases.
+  const g = /** @type {any} */ (globalThis);
+  const noop = () => {};
+  g.document = {
+    createElement: () => ({
+      width: 0,
+      height: 0,
+      getContext: () => ({
+        createImageData: (/** @type {number} */ w, /** @type {number} */ h) => ({ data: new Uint8ClampedArray(w * h * 4) }),
+        putImageData: noop,
+      }),
+    }),
+  };
+  try {
+    const { fontCacheSize } = await import('./font.js');
+    clearFontCache();
+    const ctx = /** @type {any} */ ({ globalAlpha: 1, drawImage: noop });
+    for (let i = 0; i < 40; i++) {
+      const hex = `#${(i * 37).toString(16).padStart(2, '0')}40${(255 - i).toString(16).padStart(2, '0')}`;
+      drawText(ctx, 'A', 0, 0, { font: i % 2 === 0 ? 'hud' : 'display', color: hex });
+      assert.ok(fontCacheSize() <= 16, `after ${i + 1} colours the cache holds ${fontCacheSize()} atlases`);
+    }
+    // Named styles in steady use survive the churn of one-off colours.
+    drawText(ctx, 'A', 0, 0, { font: 'hud', color: 'hud' });
+    const before = fontCacheSize();
+    for (let i = 0; i < 20; i++) drawText(ctx, 'A', 0, 0, { font: 'hud', color: `#0000${(i + 16).toString(16)}` });
+    assert.ok(fontCacheSize() <= 16);
+    assert.ok(before <= 16);
+  } finally {
+    delete g.document;
+    clearFontCache();
+  }
+});
+
 test('styles and colours are complete and well-formed', () => {
   for (const name of Object.keys(FONT_STYLES)) {
     const style = FONT_STYLES[name];

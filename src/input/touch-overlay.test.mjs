@@ -158,27 +158,65 @@ test('update() binds visibility to the phase and hides the stick with it', () =>
   m.overlay.destroy();
 });
 
-test('the button bar steps out of the full map’s header', () => {
+test('the MAP button never moves when the map mode changes (a second tap must land)', () => {
   const m = mount();
   const bar = m.layer.childNodes[2];
-  assert.equal(bar.style.transform, undefined, 'nothing is written before the first update');
+  const mapBtn = m.layer.findByText('MAP');
+  const snapshot = () => [bar.style.cssText, bar.style.transform, bar.style.top, bar.style.marginTop, bar.style.padding, mapBtn.style.transform, mapBtn.style.margin].join('|');
 
   m.overlay.update({ phase: 'playing', settings: { mapMode: 'corner' } });
-  assert.equal(bar.style.transform, undefined, 'the common case writes nothing at all');
-
+  const before = snapshot();
+  // The player presses MAP; main.js opens the full map; the next frame's update() runs while the
+  // thumb is still on the glass.
+  mapBtn.dispatchEvent({ type: 'touchstart', cancelable: true });
+  assert.deepEqual(m.fired, ['map']);
+  const held = mapBtn.style.transform; // the press visual, not a layout move
   m.overlay.update({ phase: 'playing', settings: { mapMode: 'full' } });
-  assert.equal(bar.attributes['data-map'], 'full', 'the hook styles.css can key off');
-  assert.match(bar.style.transform, /translateY\(\d+px\)/, 'and a shift that works without it');
+  assert.equal(bar.style.transform, undefined, 'the bar is not shifted');
+  assert.equal(mapBtn.style.transform, held);
+  mapBtn.dispatchEvent({ type: 'touchend' });
+  assert.equal(snapshot(), before, 'geometry identical with the full map open');
+  assert.equal(bar.attributes['data-map'], 'full', 'the styling hook still reports the mode');
 
-  m.overlay.update({ phase: 'playing', settings: { mapMode: 'off' } });
-  assert.equal(bar.attributes['data-map'], 'default');
-  assert.equal(bar.style.transform, '', 'the page stylesheet keeps its say in every other mode');
-
-  // A state without settings (or without a map mode at all) must not move anything.
+  // Tap the same spot again: it fires, and closing the map moves nothing either.
+  mapBtn.dispatchEvent({ type: 'touchstart', cancelable: true });
+  mapBtn.dispatchEvent({ type: 'touchend' });
+  assert.deepEqual(m.fired, ['map', 'map']);
+  for (const mapMode of ['off', 'corner', 'full', /** @type {any} */ (7)]) {
+    m.overlay.update({ phase: 'playing', settings: { mapMode } });
+    assert.equal(snapshot(), before, String(mapMode));
+  }
   m.overlay.update({ phase: 'playing' });
-  assert.equal(bar.style.transform, '');
-  m.overlay.update({ phase: 'playing', settings: { mapMode: /** @type {any} */ (7) } });
-  assert.equal(bar.style.transform, '');
+  assert.equal(snapshot(), before);
+  assert.equal(bar.attributes['data-map'], 'default');
+  m.overlay.destroy();
+});
+
+test('the bar rests below the full map header line in every mode', () => {
+  const m = mount();
+  const bar = m.layer.childNodes[2];
+  const pad = /padding:calc\(env\(safe-area-inset-top,0px\) \+ (\d+)px\)/.exec(bar.style.cssText);
+  assert.ok(pad, bar.style.cssText);
+  assert.ok(Number(pad[1]) >= 64, `drop is built into the resting position, got ${pad && pad[1]}`);
+  m.overlay.destroy();
+});
+
+test('the knob lights up while the flick-to-sprint latch is on, writing only on change', () => {
+  const m = mount();
+  const knob = m.layer.childNodes[1];
+  m.overlay.setStick(true, 100, 500, 130, 470, false);
+  const idleBorder = knob.style.borderColor;
+  m.overlay.setStick(true, 100, 500, 100, 440, true);
+  assert.notEqual(knob.style.borderColor, idleBorder, 'sprint is visible');
+  assert.match(knob.style.boxShadow, /rgba\(255,160,40/);
+  knob.style.boxShadow = 'SENTINEL';
+  m.overlay.setStick(true, 100, 500, 100, 439, true);
+  assert.equal(knob.style.boxShadow, 'SENTINEL', 'no rewrite while the latch holds');
+  m.overlay.setStick(true, 100, 500, 110, 480, false);
+  assert.doesNotMatch(knob.style.boxShadow, /255,160,40/);
+  m.overlay.setStick(true, 100, 500, 100, 440, true);
+  m.overlay.setStick(false, 0, 0, 0, 0, false);
+  assert.doesNotMatch(knob.style.boxShadow, /255,160,40/, 'releasing the stick resets the look');
   m.overlay.destroy();
 });
 

@@ -689,6 +689,13 @@ function boot() {
     const rect = overlay.getBoundingClientRect();
     const overlayW = Math.max(1, Math.round(rect.width) || cssW);
     const overlayH = Math.max(1, Math.round(rect.height) || cssH);
+    // Tell the shared surface where the world band sits (§4.6 `Surface.setViewRect`) rather than
+    // leaving it to re-measure `#view` itself: this function is the one that decided the band, and
+    // on a portrait phone the menus lay rows out around it. Relative to the overlay, in CSS px.
+    if (view && typeof hud.surface?.setViewRect === 'function') {
+      const vr = view.getBoundingClientRect();
+      hud.surface.setViewRect(vr.left - rect.left, vr.top - rect.top, vr.width, vr.height);
+    }
     hud.resize(overlayW, overlayH, dpr);
     menus.resize(overlayW, overlayH, dpr);
   }

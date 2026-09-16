@@ -27,7 +27,15 @@
  * text costs 300 blits and zero garbage.
  *
  * Atlases are cached per face **and per style string**, so a caller that passes a raw CSS colour
- * ("#ff0000") gets a cache entry too; the cache is capped and evicts in insertion order.
+ * ("#ff0000") gets a cache entry too; the cache is capped at `MAX_ATLASES` and evicts one-off
+ * colours before the named styles in steady use.
+ *
+ * ## The per-frame path
+ * `drawText`/`measureLine` take an options object, which is right for anything built once. Code that
+ * lays a screen out every frame uses the scalar twins `drawAt`, `measureAt` and `heightAt` instead:
+ * an options literal handed to a call V8 does not inline is a heap object, and the overlay used to
+ * make a couple of kilobytes of them a frame. `setLayoutProbe` reports every line's box to a test
+ * (see `geometry.test.mjs`); with no probe installed it costs one null check a line.
  *
  * ## Crispness invariant
  * Every glyph is blitted at an **integer** scale to **integer** coordinates with image smoothing
@@ -383,10 +391,12 @@ const EXTRA_GLYPHS = /** @type {const} */ ([
     '...../...../...../...../...../#.#.#/#.#.#',
     '........./........./........./........./........./........./........./........./##.##.##./##.##.##.',
   ],
-  // · — separator between footer fields.
+  // · — separator between fields ("DEPTH 2 · 24×24"). ONE centred pixel at mid cap height: the
+  // old 3×2 block was as wide as the hyphen and every separator in the game read as a minus sign
+  // ("DEPTH 2 - 24×24"). A dot is recognised by being small, not by being bold.
   [
     0xb7,
-    '...../...../...../.###./.###./...../.....',
+    '...../...../...../..#../...../...../.....',
     '..../..../..../..../.##./.##./..../..../..../....',
   ],
 ]);
@@ -1066,22 +1076,45 @@ function atlasFor(face, styleKey, style) {
   const atlas = buildAtlas(face, style);
   if (atlas === null) return null;
 
-  if (atlasCount >= MAX_ATLASES) {
-    // Evict the oldest entry of the largest bucket; atlases are interchangeable, so any eviction
-    // policy is correct — this one is O(1) and keeps the cache from growing without bound.
-    const firstFace = atlasCache.keys().next();
-    if (!firstFace.done) {
-      const bucket = /** @type {Map<string, Atlas>} */ (atlasCache.get(firstFace.value));
-      const firstKey = bucket.keys().next();
-      if (!firstKey.done) {
-        bucket.delete(firstKey.value);
-        atlasCount--;
-      }
-    }
-  }
+  if (atlasCount >= MAX_ATLASES) evictAtlas();
   byStyle.set(styleKey, atlas);
   atlasCount++;
   return atlas;
+}
+
+/**
+ * Drop one cached atlas to make room for another.
+ *
+ * The oldest **ad-hoc** entry (a raw CSS colour) goes first, from whichever face holds one: those
+ * are the one-off colours, while a named style such as `hud` is drawn every frame and evicting it
+ * would only make the next frame rebuild it. If every cached atlas is a named style, the oldest of
+ * those goes instead. Every bucket is searched — the old policy only ever looked at the *first*
+ * face's bucket, so once that bucket was empty nothing was deleted, `atlasCount` still grew, and the
+ * `MAX_ATLASES` bound quietly stopped holding. Runs at atlas-build time only, never per frame.
+ * @returns {void}
+ */
+function evictAtlas() {
+  for (let pass = 0; pass < 2; pass++) {
+    for (const bucket of atlasCache.values()) {
+      for (const key of bucket.keys()) {
+        if (pass === 0 && FONT_STYLES[key] !== undefined) continue;
+        bucket.delete(key);
+        atlasCount--;
+        return;
+      }
+    }
+  }
+}
+
+/**
+ * Number of glyph atlases currently cached, across both faces. For tests and diagnostics: the
+ * cache is bounded by `MAX_ATLASES`, and this is how that bound is asserted.
+ * @returns {number}
+ */
+export function fontCacheSize() {
+  let n = 0;
+  for (const bucket of atlasCache.values()) n += bucket.size;
+  return n;
 }
 
 /**
@@ -1092,6 +1125,50 @@ export function clearFontCache() {
   atlasCache.clear();
   adHocStyles.clear();
   atlasCount = 0;
+}
+
+// ─── Layout probe ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Receives the box of every line of text and every panel the overlay draws.
+ *
+ * `kind` is `'text'` or `'panel'`; `x, y, w, h` are UI pixels; `unit` is the text scale for text and
+ * the border thickness for a panel; `label` is the string drawn (or the panel's frame material).
+ * @typedef {(kind:string, x:number, y:number, w:number, h:number, unit:number, label:string) => void} LayoutProbe
+ */
+
+/** @type {LayoutProbe|null} */
+let layoutProbe = null;
+
+/**
+ * Install (or with `null`, remove) a layout probe.
+ *
+ * WHY it exists: every layout defect the overlay has shipped — a stat label overprinting its
+ * neighbour on a phone, a readout sitting on its panel's frame — is invisible to a unit test that
+ * only counts fills, because in Node no glyph is ever blitted. The probe reports the *box* of every
+ * line of text as it is laid out (before, and regardless of, the atlas), so a test can render a screen
+ * at a real viewport and assert that no two lines intersect and every line stays inside its panel.
+ * With no probe installed the cost is one null check per line.
+ * @param {LayoutProbe|null} fn
+ * @returns {void}
+ */
+export function setLayoutProbe(fn) {
+  layoutProbe = typeof fn === 'function' ? fn : null;
+}
+
+/**
+ * Report one box to the installed probe, if any (`pixels.js` reports its panels through this).
+ * @param {string} kind
+ * @param {number} x
+ * @param {number} y
+ * @param {number} w
+ * @param {number} h
+ * @param {number} unit
+ * @param {string} label
+ * @returns {void}
+ */
+export function probeLayout(kind, x, y, w, h, unit, label) {
+  if (layoutProbe !== null) layoutProbe(kind, x, y, w, h, unit, label);
 }
 
 // ─── Measuring ───────────────────────────────────────────────────────────────────────────────
@@ -1117,10 +1194,81 @@ export function clearFontCache() {
  * @returns {number}
  */
 function scaleOf(opts) {
-  const raw = opts === undefined ? 1 : opts.size !== undefined ? opts.size : opts.scale;
+  return clampScale(opts === undefined ? 1 : opts.size !== undefined ? opts.size : opts.scale);
+}
+
+/**
+ * A raw scale value as a whole number ≥ 1.
+ * @param {unknown} raw
+ * @returns {number}
+ */
+function clampScale(raw) {
   if (typeof raw !== 'number' || !Number.isFinite(raw)) return 1;
   const s = Math.round(raw);
   return s < 1 ? 1 : s;
+}
+
+// ─── Scalar API (the per-frame path) ─────────────────────────────────────────────────────────
+
+/**
+ * Width of one line at an integer scale, in surface pixels — {@link measureLine} without the
+ * options object.
+ *
+ * WHY the scalar twins exist: the overlay lays every screen out from scratch every frame, and a
+ * `{font, size, color, align}` literal handed to a function V8 does not inline is a heap object —
+ * measured at 1.4–2.2 kB of garbage per frame across the HUD and the menus. These take the same
+ * inputs as plain arguments and allocate nothing; the options forms remain for everything that is
+ * not per frame.
+ * @param {string} text
+ * @param {FontName} font
+ * @param {number} size integer pixel scale
+ * @returns {number}
+ */
+export function measureAt(text, font, size) {
+  return measureLineRaw(faceOf(font), typeof text === 'string' ? text : String(text), 0) * clampScale(size);
+}
+
+/**
+ * Height of one line of `font` at `size` ({@link textHeight} without the options object).
+ * @param {FontName} font
+ * @param {number} size
+ * @returns {number}
+ */
+export function heightAt(font, size) {
+  return faceOf(font).height * clampScale(size);
+}
+
+/**
+ * Draw one line of text ({@link drawText} without the options object — see {@link measureAt} for
+ * why). Tracking is 0 and a raw CSS colour gets no drop shadow; callers that need either use
+ * `drawText`.
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {string} text
+ * @param {number} x anchor x (see `align`)
+ * @param {number} y anchor y (see `baseline`)
+ * @param {FontName} font
+ * @param {number} size integer pixel scale
+ * @param {string} color a `FONT_STYLES` name or a CSS colour
+ * @param {'left'|'center'|'right'} [align] default `'left'`
+ * @param {'top'|'middle'|'baseline'|'bottom'} [baseline] default `'top'`
+ * @param {number} [alpha] 0..1, default 1
+ * @returns {number} the width drawn (0 when no atlas could be built)
+ */
+export function drawAt(ctx, text, x, y, font, size, color, align, baseline, alpha) {
+  return drawLineImpl(
+    ctx,
+    typeof text === 'string' ? text : String(text),
+    x,
+    y,
+    faceOf(font),
+    clampScale(size),
+    0,
+    color,
+    false,
+    align,
+    baseline,
+    alpha === undefined ? 1 : alpha,
+  );
 }
 
 /**
@@ -1134,10 +1282,9 @@ function scaleOf(opts) {
  * @returns {number} width in surface pixels (0 for an empty string)
  */
 export function measureLine(text, opts) {
-  const face = faceOf(opts === undefined ? undefined : opts.font);
-  const scale = scaleOf(opts);
-  const tracking = opts !== undefined && typeof opts.tracking === 'number' ? opts.tracking : 0;
-  return measureLineRaw(face, String(text), tracking) * scale;
+  if (opts === undefined) return measureLineRaw(HUD_FACE, String(text), 0);
+  const tracking = typeof opts.tracking === 'number' ? opts.tracking : 0;
+  return measureLineRaw(faceOf(opts.font), String(text), tracking) * scaleOf(opts);
 }
 
 /**
@@ -1335,32 +1482,60 @@ export function wrapText(text, maxWidth, opts) {
  * @returns {number} the advance width actually drawn, in surface pixels
  */
 export function drawText(ctx, text, x, y, opts) {
-  const str = String(text);
+  if (opts === undefined) {
+    return drawLineImpl(ctx, String(text), x, y, HUD_FACE, 1, 0, undefined, false, undefined, undefined, 1);
+  }
+  return drawLineImpl(
+    ctx,
+    String(text),
+    x,
+    y,
+    faceOf(opts.font),
+    scaleOf(opts),
+    typeof opts.tracking === 'number' ? opts.tracking : 0,
+    opts.color,
+    opts.shadow === true,
+    opts.align,
+    opts.baseline,
+    typeof opts.alpha === 'number' ? opts.alpha : 1,
+  );
+}
+
+/**
+ * The one line-drawing routine behind {@link drawText} and {@link drawAt}.
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {string} str
+ * @param {number} x
+ * @param {number} y
+ * @param {Face} face
+ * @param {number} scale integer ≥ 1
+ * @param {number} tracking
+ * @param {string|undefined} color
+ * @param {boolean} shadow
+ * @param {string|undefined} align
+ * @param {string|undefined} baseline
+ * @param {number} alpha
+ * @returns {number}
+ */
+function drawLineImpl(ctx, str, x, y, face, scale, tracking, color, shadow, align, baseline, alpha) {
   if (ctx === null || ctx === undefined || str.length === 0) return 0;
 
-  const face = faceOf(opts === undefined ? undefined : opts.font);
-  const scale = scaleOf(opts);
-  const tracking = opts !== undefined && typeof opts.tracking === 'number' ? opts.tracking : 0;
-  const color = opts === undefined ? undefined : opts.color;
-  const style = styleOf(color, opts !== undefined && opts.shadow === true);
-  const styleKey = color === undefined ? 'hud' : opts !== undefined && opts.shadow === true ? color + '|1' : color;
-  const atlas = atlasFor(face, styleKey, style);
-  if (atlas === null) return 0;
-
-  const widthRaw = measureLineRaw(face, str, tracking);
-  const width = widthRaw * scale;
-
-  const align = opts === undefined ? undefined : opts.align;
+  const width = measureLineRaw(face, str, tracking) * scale;
   let penX = align === 'center' ? x - Math.round(width / 2) : align === 'right' ? x - width : x;
-  const baseline = opts === undefined ? undefined : opts.baseline;
   let top = y;
   if (baseline === 'middle') top = y - Math.round((face.height * scale) / 2);
   else if (baseline === 'baseline') top = y - face.ascent * scale;
   else if (baseline === 'bottom') top = y - face.height * scale;
   penX = Math.round(penX);
   top = Math.round(top);
+  // Reported before the atlas is needed, so the layout can be tested where no canvas exists.
+  if (layoutProbe !== null && alpha > 0) layoutProbe('text', penX, top, width, face.height * scale, scale, str);
 
-  const alpha = opts !== undefined && typeof opts.alpha === 'number' ? opts.alpha : 1;
+  const style = styleOf(color, shadow);
+  const styleKey = color === undefined ? 'hud' : shadow && FONT_STYLES[color] === undefined ? color + '|1' : color;
+  const atlas = atlasFor(face, styleKey, style);
+  if (atlas === null) return 0;
+
   const prevAlpha = ctx.globalAlpha;
   if (alpha < 1) {
     if (alpha <= 0) return width;

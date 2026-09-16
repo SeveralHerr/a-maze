@@ -25,7 +25,7 @@
 
 import { clamp, clamp01 } from '../core/math.js';
 import { createLogger } from '../core/log.js';
-import { COLOR, measureLine } from './font.js';
+import { COLOR, measureAt, probeLayout } from './font.js';
 
 /** @typedef {import('./font.js').TextOptions} TextOptions */
 
@@ -33,32 +33,78 @@ const log = createLogger('ui/pixels');
 
 // ─── Colour helpers ──────────────────────────────────────────────────────────────────────────
 
+/** Alpha steps per colour: alpha is quantised to 1/64, so 0/64 … 64/64. */
+const ALPHA_STEPS = 65;
+
+/** Most distinct base colours the `withAlpha` cache interns (the UI uses a few dozen). */
+const MAX_ALPHA_COLORS = 256;
+
 /**
- * Memoised `rgba()` strings. Building one per fill per frame would allocate thousands of short
- * strings a second; the UI uses a few dozen distinct (colour, alpha) pairs in total.
- * @type {Map<string, string>}
+ * Base colour → small integer id. Looking a string key up in a `Map` allocates nothing, which is
+ * the whole point: the first version keyed its memo on `hex + a`, a string **concatenation on every
+ * call**, so the cache that existed to avoid garbage made some on every fill of every frame.
+ * @type {Map<string, number>}
  */
-const alphaColors = new Map();
+const alphaIds = new Map();
+
+/**
+ * Cached `rgba()` strings, indexed `id * ALPHA_STEPS + step`.
+ * @type {Array<string|undefined>}
+ */
+const alphaSlots = new Array(MAX_ALPHA_COLORS * ALPHA_STEPS);
 
 /**
  * `#rrggbb` + alpha → `rgba(r,g,b,a)`, memoised. Alpha is quantised to 1/64 so a fading element
- * cannot fill the cache with 60 new strings a second.
+ * cannot fill the cache with 60 new strings a second. A cached lookup allocates nothing.
  * @param {string} hex `#rrggbb`
  * @param {number} alpha 0..1
  * @returns {string} a CSS colour
  */
 export function withAlpha(hex, alpha) {
-  const a = alpha <= 0 ? 0 : alpha >= 1 ? 1 : Math.round(alpha * 64) / 64;
-  if (a >= 1) return hex;
-  const key = hex + a;
-  const hit = alphaColors.get(key);
-  if (hit !== undefined) return hit;
+  return withAlphaStep(hex, alpha <= 0 ? 0 : alpha >= 1 ? 64 : Math.round(alpha * 64));
+}
+
+/**
+ * {@link withAlpha} with the alpha already quantised to a whole number of 64ths (0 … 64).
+ *
+ * For animated alphas on the per-frame path: a fractional argument to a call V8 does not inline
+ * is boxed on every call, a small integer is not. `withAlphaStep(c, (pulse * 64) | 0)` allocates
+ * nothing where `withAlpha(c, pulse)` allocated a number a frame.
+ * @param {string} hex `#rrggbb`
+ * @param {number} step 0..64 (clamped)
+ * @returns {string} a CSS colour
+ */
+export function withAlphaStep(hex, step) {
+  if (step >= 64) return hex;
+  if (!(step > 0)) step = 0;
+  let id = alphaIds.get(hex);
+  if (id === undefined) {
+    // Past the cap the colour is still correct, just not cached: a caller inventing colours per
+    // frame degrades to garbage, never to a leak.
+    if (alphaIds.size >= MAX_ALPHA_COLORS) return rgbaOf(hex, step);
+    id = alphaIds.size;
+    alphaIds.set(hex, id);
+  }
+  const slot = id * ALPHA_STEPS + step;
+  let css = alphaSlots[slot];
+  if (css === undefined) {
+    css = rgbaOf(hex, step);
+    alphaSlots[slot] = css;
+  }
+  return css;
+}
+
+/**
+ * Build the `rgba()` string for a colour at a quantised alpha step (cache misses only).
+ * @param {string} hex
+ * @param {number} step 0..63
+ * @returns {string}
+ */
+function rgbaOf(hex, step) {
   const r = parseInt(hex.slice(1, 3), 16) || 0;
   const g = parseInt(hex.slice(3, 5), 16) || 0;
   const b = parseInt(hex.slice(5, 7), 16) || 0;
-  const css = `rgba(${r},${g},${b},${a})`;
-  if (alphaColors.size < 512) alphaColors.set(key, css);
-  return css;
+  return `rgba(${r},${g},${b},${step / 64})`;
 }
 
 /**
@@ -146,6 +192,84 @@ export function drawArt(ctx, art, x, y, scale, palette) {
 }
 
 /**
+ * Indexed art pre-rendered once into an offscreen image, then blitted.
+ * @typedef {Object} ArtSprite
+ * @property {number} w art width in art pixels
+ * @property {number} h art height in art pixels
+ * @property {(ctx:CanvasRenderingContext2D, x:number, y:number, scale:number) => void} draw  one
+ *   `drawImage` at an integer scale (falls back to `drawArt` where no offscreen canvas exists)
+ */
+
+/**
+ * Wrap a large piece of art — the title wordmark — so drawing it costs one `drawImage` instead of
+ * a `fillRect` per colour run. `drawArt` is the right tool for a 7×7 icon; a 140-pixel-wide
+ * wordmark is ~1 600 runs, which is per-frame work the title screen does not need to do.
+ *
+ * The image is built lazily on the first draw, at scale 1; the overlay's transform has image
+ * smoothing off and an integer scale, so the blit stays pixel-exact. The draw is reported to the
+ * layout probe as an `'art'` box.
+ * @param {Art} art
+ * @param {ReadonlyArray<string|null>} palette `#rrggbb` per index; `null` is transparent
+ * @returns {ArtSprite}
+ */
+export function createArtSprite(art, palette) {
+  /** @type {CanvasImageSource|null} */
+  let image = null;
+  let built = false;
+
+  /** @returns {void} */
+  function build() {
+    built = true;
+    try {
+      let canvas = null;
+      /** @type {CanvasRenderingContext2D|null} */
+      let c2d = null;
+      if (typeof OffscreenCanvas === 'function') {
+        canvas = new OffscreenCanvas(art.w, art.h);
+        c2d = /** @type {CanvasRenderingContext2D|null} */ (/** @type {unknown} */ (canvas.getContext('2d')));
+      } else if (typeof document !== 'undefined' && typeof document.createElement === 'function') {
+        const el = document.createElement('canvas');
+        el.width = art.w;
+        el.height = art.h;
+        canvas = el;
+        c2d = el.getContext('2d');
+      }
+      if (canvas === null || c2d === null) return;
+      const img = c2d.createImageData(art.w, art.h);
+      const rgb = [0, 0, 0];
+      for (let i = 0; i < art.data.length; i++) {
+        const color = palette[art.data[i]];
+        if (art.data[i] === 0 || color === null || color === undefined) continue;
+        hexToRgb(color, rgb);
+        img.data[i * 4] = rgb[0];
+        img.data[i * 4 + 1] = rgb[1];
+        img.data[i * 4 + 2] = rgb[2];
+        img.data[i * 4 + 3] = 255;
+      }
+      c2d.putImageData(img, 0, 0);
+      image = /** @type {CanvasImageSource} */ (canvas);
+    } catch (err) {
+      log.error('art sprite: offscreen canvas unavailable', err);
+      image = null;
+    }
+  }
+
+  return {
+    w: art.w,
+    h: art.h,
+    draw(ctx, x, y, scale) {
+      if (!built) build();
+      const s = scale < 1 ? 1 : Math.round(scale);
+      const ox = Math.round(x);
+      const oy = Math.round(y);
+      probeLayout('art', ox, oy, art.w * s, art.h * s, s, '');
+      if (image !== null) ctx.drawImage(image, 0, 0, art.w, art.h, ox, oy, art.w * s, art.h * s);
+      else drawArt(ctx, art, ox, oy, s, palette);
+    },
+  };
+}
+
+/**
  * Rotate indexed art 90° clockwise.
  * @param {Art} art
  * @returns {Art}
@@ -205,9 +329,12 @@ export function drawPanel(ctx, x, y, w, h, u, opts) {
   const kind = opts !== undefined && opts.frame !== undefined ? opts.frame : 'stone';
   const tones = FRAME_TONES[kind] !== undefined ? FRAME_TONES[kind] : FRAME_TONES.stone;
   const alpha = opts !== undefined && opts.alpha !== undefined ? clamp01(opts.alpha) : 0.72;
+  // Alphas as whole 64ths: fractional arguments to `withAlpha` were boxed on every panel, every frame.
+  const a64 = Math.round(alpha * 64);
+  probeLayout('panel', px, py, pw, ph, b, kind);
 
   // Outer edge, then the frame body, then the interior ground.
-  ctx.fillStyle = withAlpha(COLOR.void, Math.min(1, alpha + 0.2));
+  ctx.fillStyle = withAlphaStep(COLOR.void, a64 + 13);
   ctx.fillRect(px, py, pw, ph);
   ctx.fillStyle = tones[1];
   ctx.fillRect(px + b, py + b, pw - b * 2, ph - b * 2);
@@ -224,12 +351,12 @@ export function drawPanel(ctx, x, y, w, h, u, opts) {
   const iw = pw - inset * 2;
   const ih = ph - inset * 2;
   if (iw > 0 && ih > 0) {
-    ctx.fillStyle = withAlpha(COLOR.fog, alpha);
+    ctx.fillStyle = withAlphaStep(COLOR.fog, a64);
     ctx.fillRect(px + inset, py + inset, iw, ih);
     if (opts === undefined || opts.texture !== false) {
       const course = 7 * b;
       const joint = Math.max(1, b >> 1);
-      ctx.fillStyle = withAlpha(COLOR.stoneDeep, alpha * 0.5);
+      ctx.fillStyle = withAlphaStep(COLOR.stoneDeep, a64 >> 1);
       let row = 0;
       for (let yy = py + inset + course; yy < py + inset + ih - 1; yy += course, row++) {
         ctx.fillRect(px + inset, yy, iw, joint);
@@ -575,10 +702,38 @@ export function fillRing(ctx, cx, cy, r, step) {
  * @returns {number} an integer scale in [minScale, maxScale]
  */
 export function fitScale(text, maxWidth, opts, maxScale, minScale = 1) {
+  const font = opts.font === 'display' ? 'display' : 'hud';
+  // Tracking adds one column per gap between glyphs; measured without an options object so a
+  // per-frame fit allocates nothing.
+  const gaps = text.length > 1 ? text.length - 1 : 0;
+  const unit = measureAt(text, font, 1) + (typeof opts.tracking === 'number' ? opts.tracking * gaps : 0);
+  return fitScaleUnit(unit, maxWidth, maxScale, minScale);
+}
+
+/**
+ * {@link fitScale} for a width already measured at scale 1 — and for callers that must not build an
+ * options object per frame.
+ * @param {string} text
+ * @param {number} maxWidth UI pixels
+ * @param {'hud'|'display'} font
+ * @param {number} maxScale
+ * @param {number} [minScale]
+ * @returns {number}
+ */
+export function fitScaleAt(text, maxWidth, font, maxScale, minScale = 1) {
+  return fitScaleUnit(measureAt(text, font, 1), maxWidth, maxScale, minScale);
+}
+
+/**
+ * @param {number} unit width at scale 1
+ * @param {number} maxWidth
+ * @param {number} maxScale
+ * @param {number} minScale
+ * @returns {number}
+ */
+function fitScaleUnit(unit, maxWidth, maxScale, minScale) {
   const lo = Math.max(1, Math.round(minScale));
   const hi = Math.max(lo, Math.round(maxScale));
-  const unit = measureLine(text, { font: opts.font, size: 1, tracking: opts.tracking });
   if (unit <= 0) return hi;
-  const fits = Math.floor(maxWidth / unit);
-  return clamp(fits, lo, hi);
+  return clamp(Math.floor(maxWidth / unit), lo, hi);
 }

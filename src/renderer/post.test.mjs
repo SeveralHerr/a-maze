@@ -170,6 +170,44 @@ test('the scanline pitch is an integer number of CSS pixels and switches off whe
   assert.equal(scan.style.opacity, '0');
 });
 
+test('a fractional row pitch is drawn at its true period instead of beating against the rows', () => {
+  // 1920×1080 letterboxes to a 1917×1080 box over 240 rows: 4.5 CSS px per row. Rounding that to 5
+  // walked the dark line through the rows in a 9-row beat — moiré on the most common desktop size.
+  const { root } = makeDom();
+  const post = createPost(root);
+  const scan = root.children[0];
+  post.set({ scanlines: true });
+
+  post.resize(1917, 1080, 240);
+  const g = scan.style.backgroundImage;
+  const stops = [...g.matchAll(/([\d.]+)px/g)].map((m) => Number(m[1]));
+  assert.equal(stops[stops.length - 1], 4.5, `the period must be exactly one row (4.5px), got ${g}`);
+  assert.equal(stops[1], 1, 'one CSS pixel of line per row, as at a whole pitch');
+  // The mean darkening matches what the nearest whole pitch would have drawn, within a hair.
+  const alpha = Number(/rgba\(0,0,0,([\d.]+)\)/.exec(g)?.[1]);
+  const mean = (alpha * stops[1]) / 4.5;
+  assert.ok(Math.abs(mean - 0.34 / 5) < 0.004, `mean darkening ${mean.toFixed(4)} drifted from the 5 px pitch's`);
+
+  // 1280×720 is exactly 3 px per row: whole-pixel stops, as before.
+  post.resize(1280, 720, 240);
+  assert.match(scan.style.backgroundImage, / 3px\)/);
+  assert.doesNotMatch(scan.style.backgroundImage, /\d\.\d+px/);
+
+  // A box a pixel off a whole multiple (961 px over 240 rows) is close enough to snap.
+  post.resize(1708, 961, 240);
+  assert.match(scan.style.backgroundImage, / 4px\)/);
+});
+
+test('the scanline gap is transparent — a white lift under multiply would do nothing', () => {
+  const { root } = makeDom();
+  const post = createPost(root);
+  post.set({ scanlines: true });
+  for (const [w, h] of [[1280, 720], [1917, 1080], [1920, 1440]]) {
+    post.resize(w, h, 240);
+    assert.doesNotMatch(root.children[0].style.backgroundImage, /255,255,255/, `lift stop at ${w}×${h}`);
+  }
+});
+
 test('a tight scanline pitch draws a gentler line than a wide one', () => {
   // At 3 CSS px per row one row in three is darkened; at the old fixed 0.42 that cost ~14 % of the
   // mean luminance and banded every wall face. The line's strength must fall with the pitch.

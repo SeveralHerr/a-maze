@@ -208,11 +208,39 @@ test('pause: back resumes, and the rows do what they say', () => {
   menus.handleInput(press('down'), state);
   menus.handleInput(press('down'), state); // Quit to Title
   menus.handleInput(press('confirm'), state);
-  assert.ok(log.includes('quit'));
+  menus.render(state);
+  assert.equal(log.includes('quit'), false, 'Quit to Title asks first');
+  assert.equal(menus.screen(), 'confirm');
+  // The dialog opens on its safe answer: a second Enter keeps the run.
+  menus.handleInput(press('confirm'), state);
+  menus.render(state);
+  assert.equal(menus.screen(), 'pause');
+  assert.equal(log.includes('quit'), false);
+  // Back on Quit to Title (the row is remembered), then Abandon.
+  menus.handleInput(press('confirm'), state);
+  menus.handleInput(press('down'), state);
+  menus.handleInput(press('confirm'), state);
+  assert.deepEqual(log.filter((e) => e === 'quit'), ['quit'], 'Abandon quits exactly once');
 
   log.length = 0;
+  menus.render(state);
   assert.equal(menus.handleInput(press('back'), state), true);
   assert.ok(log.includes('resume'), 'Esc on the pause screen resumes');
+});
+
+test('the abandon dialog: back and the first row both keep the run', () => {
+  const { menus, log } = harness();
+  const state = makeState('paused');
+  menus.render(state);
+  for (let i = 0; i < 3; i++) menus.handleInput(press('down'), state);
+  menus.handleInput(press('confirm'), state);
+  menus.render(state);
+  assert.equal(menus.screen(), 'confirm');
+  // Escape arrives as back + pause in one frame (§4.3): one close, no resume, no quit.
+  menus.handleInput({ pressed: new Set(['back', 'pause']) }, state);
+  menus.render(state);
+  assert.equal(menus.screen(), 'pause', 'Escape cancels the dialog');
+  assert.equal(log.includes('quit') || log.includes('resume'), false);
 });
 
 test('options: arrows adjust settings without mutating state', () => {
@@ -284,7 +312,75 @@ test('level complete: confirm skips the tally, then descends', () => {
   log.length = 0;
   menus.handleInput(press('down'), state);
   menus.handleInput(press('confirm'), state);
+  menus.render(state);
+  assert.equal(menus.screen(), 'confirm', 'Quit to Title from a cleared depth asks first');
+  assert.equal(log.includes('quit'), false);
+  menus.handleInput(press('down'), state);
+  menus.handleInput(press('confirm'), state);
   assert.ok(log.includes('quit'));
+});
+
+test('Escape on level complete never abandons the run', () => {
+  const { menus, log } = harness();
+  const state = makeState('levelComplete');
+  menus.render(state);
+  state.time = 0.3;
+  menus.render(state);
+
+  // Escape, Backspace and pad B all arrive as `back`; Escape also carries `pause`.
+  for (const frame of [{ pressed: new Set(['back', 'pause']) }, press('back'), press('pause')]) {
+    menus.handleInput(frame, state);
+    menus.render(state);
+    assert.equal(log.includes('quit'), false, 'no single keypress quits from the tally');
+    assert.equal(menus.screen(), 'complete');
+  }
+  // The first Escape finished the tally and moved the cursor onto Quit to Title: confirm now opens
+  // the dialog rather than descending.
+  menus.handleInput(press('confirm'), state);
+  menus.render(state);
+  assert.equal(menus.screen(), 'confirm');
+  assert.equal(log.includes('nextLevel'), false);
+
+  // Cancelling returns to the finished tally — it must not roll again.
+  menus.handleInput(press('back'), state);
+  state.time = 0.35;
+  menus.render(state);
+  assert.equal(menus.screen(), 'complete');
+  menus.handleInput(press('up'), state);
+  log.length = 0;
+  menus.handleInput(press('confirm'), state);
+  assert.deepEqual(log.filter((e) => e === 'nextLevel'), ['nextLevel'], 'the tally stayed finished');
+});
+
+test('game over: back is still a direct exit (that run is already over)', () => {
+  const { menus, log } = harness();
+  const state = makeState('gameOver');
+  menus.render(state);
+  menus.handleInput(press('back'), state);
+  assert.deepEqual(log.filter((e) => e === 'quit'), ['quit']);
+  // …and so is its Title row: no dialog.
+  log.length = 0;
+  menus.handleInput(press('down'), state);
+  menus.handleInput(press('confirm'), state);
+  assert.deepEqual(log.filter((e) => e === 'quit'), ['quit']);
+});
+
+test('the next level-complete screen opens on Descend, whatever was selected last time', () => {
+  const { menus, log } = harness();
+  const state = makeState('levelComplete');
+  menus.render(state);
+  menus.handleInput(press('back'), state); // finish the tally, cursor to Quit to Title
+  menus.render(state);
+  state.phase = 'loading';
+  state.time = 2;
+  menus.render(state);
+  state.phase = 'levelComplete';
+  state.time = 4;
+  menus.render(state);
+  menus.handleInput(press('confirm'), state); // skip
+  log.length = 0;
+  menus.handleInput(press('confirm'), state);
+  assert.deepEqual(log.filter((e) => e === 'nextLevel'), ['nextLevel']);
 });
 
 test('game over: retry and title', () => {
@@ -799,6 +895,69 @@ test('the loading screen size mirror matches the shipped curve', () => {
   assert.equal(cellsForLevel(30), 128, 'past the cap a level gets harder, not bigger');
   assert.equal(cellsForLevel(0), 16);
   assert.equal(cellsForLevel(NaN), 16);
+});
+
+test('NEW BEST is measured against the record the run started with, strictly', async () => {
+  const { setLayoutProbe } = await import('./font.js');
+  /**
+   * Play a run through the menus' eyes and report the record line game over shows.
+   * @param {number} startBest the stored best on the title screen
+   * @param {Array<[string, number, number, number]>} steps [phase, level, score, best] per frame
+   * @returns {string}
+   */
+  const recordLine = (startBest, steps) => {
+    const menus = createMenus(liveCanvas(1280, 720), {});
+    menus.resize(1280, 720, 1);
+    const state = makeState('title');
+    state.best.score = startBest;
+    state.run.score = 0;
+    menus.render(state);
+    for (const [phase, level, score, best] of steps) {
+      state.phase = phase;
+      state.level = level;
+      state.run.score = score;
+      state.best.score = best;
+      state.time += 1;
+      menus.render(state);
+    }
+    /** @type {string[]} */
+    const labels = [];
+    setLayoutProbe((kind, _x, _y, _w, _h, _u, label) => {
+      if (kind === 'text') labels.push(label);
+    });
+    try {
+      state.time += 1;
+      menus.render(state);
+    } finally {
+      setLayoutProbe(null);
+    }
+    return labels.includes('NEW BEST!') ? 'NEW BEST!' : labels.includes('BEST') ? 'BEST' : '?';
+  };
+
+  // Tying the record is not a new record (`recordBest` has already folded the run into `best`).
+  assert.equal(recordLine(5000, [['loading', 1, 0, 5000], ['gameOver', 3, 5000, 5000]]), 'BEST');
+  // Beating it is.
+  assert.equal(recordLine(5000, [['loading', 1, 0, 5000], ['gameOver', 3, 5100, 5100]]), 'NEW BEST!');
+  // A record set at an earlier level complete still counts at game over, even though the stored
+  // best already equals the final score by then.
+  assert.equal(
+    recordLine(5000, [
+      ['loading', 1, 0, 5000],
+      ['levelComplete', 1, 6000, 6000],
+      ['loading', 2, 6000, 6000],
+      ['gameOver', 2, 6000, 6000],
+    ]),
+    'NEW BEST!',
+  );
+  // "Try Again" starts a new run from game over: the reference moves to the new record.
+  assert.equal(
+    recordLine(5000, [
+      ['gameOver', 3, 6000, 6000],
+      ['loading', 1, 0, 6000],
+      ['gameOver', 1, 6000, 6000],
+    ]),
+    'BEST',
+  );
 });
 
 test('the end screens survive a run with no optional stat fields', () => {

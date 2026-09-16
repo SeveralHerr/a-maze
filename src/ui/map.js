@@ -54,8 +54,15 @@
 
 import { clamp, clamp01 } from '../core/math.js';
 import { createLogger } from '../core/log.js';
-import { COLOR, drawText, measureLine, textHeight } from './font.js';
-import { createTextMemo, formatCount, formatDistance, formatPercent, formatLabyrinth } from './format.js';
+import { COLOR, drawAt, heightAt, measureAt } from './font.js';
+import {
+  createTextMemo,
+  formatClock,
+  formatCount,
+  formatDistance,
+  formatPercent,
+  formatLabyrinth,
+} from './format.js';
 import {
   ARROWS,
   ARROW_PALETTE,
@@ -67,6 +74,7 @@ import {
   hexToRgb,
   ICON_SIZE,
   withAlpha,
+  withAlphaStep,
 } from './pixels.js';
 
 /** @typedef {import('../core/types.js').GameState} GameState */
@@ -76,6 +84,12 @@ import {
 /** @typedef {import('./pixels.js').Art} Art */
 
 const log = createLogger('ui/map');
+
+/** 45°, the player arrow's heading step. */
+const QUARTER_TURN = Math.PI / 4;
+
+/** The player arrow's blink tone: the outline and body swapped (see `drawPlayerArrow`). */
+const ARROW_PALETTE_INVERTED = Object.freeze([null, COLOR.fireCore, COLOR.void]);
 
 // ─── Mode ────────────────────────────────────────────────────────────────────────────────────
 
@@ -495,8 +509,8 @@ export function cornerWindow(px, py, span, mw, mh, out) {
 /**
  * Per-frame cost accounting, surfaced by `?debug=1` and by the verification tools.
  * @typedef {Object} MapStats
- * @property {number} updateMs   last raster maintenance cost
- * @property {number} drawMs     last draw cost
+ * @property {number} updateMs   raster maintenance cost, sampled one frame in 32
+ * @property {number} drawMs     draw cost, sampled one frame in 32
  * @property {number} painted    pixels painted by the last update
  * @property {number} scanned    tile indices read by the last update
  * @property {number} flushes    dirty-rect uploads in the last update (0 or 1)
@@ -590,6 +604,11 @@ export function createMapView(options) {
   /** Scratch for {@link cornerWindow}. */
   const win = new Int32Array(2);
 
+  /** Frame counter for the sampled cost timings; see `update`. */
+  let timingTick = 0;
+  /** Whether this frame's update and draw are timed. */
+  let timing = true;
+
   /** @type {MapStats} */
   const stats = {
     updateMs: 0,
@@ -639,6 +658,8 @@ export function createMapView(options) {
    * @returns {boolean} false when no raster could be created (no DOM)
    */
   function adoptLevel(level, maze) {
+    // Ask the device question again per level: a hybrid device may have gained or lost a mouse.
+    closeHintText = '';
     const w = maze.width;
     const h = maze.height;
     if (!(w > 0) || !(h > 0)) return false;
@@ -770,7 +791,11 @@ export function createMapView(options) {
    * @returns {void}
    */
   function update(state, clock) {
-    const t0 = now();
+    // One frame in 32 is timed: the timings are diagnostics, and calling the clock twice per pass
+    // boxed a fresh number per call on every frame the map was open.
+    timingTick = (timingTick + 1) & 31;
+    timing = timingTick === 1;
+    const t0 = timing ? now() : 0;
     stats.painted = 0;
     stats.scanned = 0;
     stats.flushes = 0;
@@ -778,21 +803,21 @@ export function createMapView(options) {
     const level = state === null || state === undefined ? null : state.levelData;
     const grid = state === null || state === undefined ? null : state.explored;
     if (level === null || level === undefined || grid === null || grid === undefined) {
-      stats.updateMs = now() - t0;
+      if (timing) stats.updateMs = now() - t0;
       return;
     }
     const maze = level.maze;
     if (maze === null || maze === undefined) {
-      stats.updateMs = now() - t0;
+      if (timing) stats.updateMs = now() - t0;
       return;
     }
     if (level !== levelRef && !adoptLevel(level, maze)) {
-      stats.updateMs = now() - t0;
+      if (timing) stats.updateMs = now() - t0;
       return;
     }
     if (tile32 === null || grid.length < mw * mh) {
       // A mismatched explored buffer would be read out of bounds; refuse rather than guess.
-      stats.updateMs = now() - t0;
+      if (timing) stats.updateMs = now() - t0;
       return;
     }
 
@@ -870,7 +895,7 @@ export function createMapView(options) {
       // Any raster change invalidates the cell downsample.
       cellStamp = -1;
     }
-    stats.updateMs = now() - t0;
+    if (timing) stats.updateMs = now() - t0;
   }
 
   /**
@@ -935,7 +960,7 @@ export function createMapView(options) {
    */
   function drawCorner(ctx, m, state, clock, reduced) {
     if (tileCanvas === null || levelRef === null || levelRef !== state.levelData) return 0;
-    const t0 = now();
+    const t0 = timing ? now() : 0;
     const u = m.u;
     const pad = 3 * u;
     const span = m.narrow ? MAP.CORNER_TILES_NARROW : MAP.CORNER_TILES;
@@ -950,19 +975,17 @@ export function createMapView(options) {
     // Stone, not iron: on a phone the corner map sits on the black control deck below the world,
     // where an iron frame (#2f343d) is invisible. The stone bevel's highlight reads on both the
     // lit corridor of a desktop layout and that black deck.
-    drawPanel(ctx, bx, by, size + frame * 2, size + frame * 2, u, {
-      frame: 'stone',
-      alpha: 0.9,
-      border: frame,
-      rivets: false,
-      // No masonry behind a map: the courses read as corridors.
-      texture: false,
-    });
+    // No masonry behind a map (the courses read as corridors), no rivets. Reused options object:
+    // a literal here was a heap allocation every frame the corner map was open.
+    cornerPanel.border = frame;
+    drawPanel(ctx, bx, by, size + frame * 2, size + frame * 2, u, cornerPanel);
 
     const ox = bx + frame;
     const oy = by + frame;
     const p = state.player;
-    cornerWindow(p.x, p.y, span, mw, mh, win);
+    // Whole tiles in: `span` is odd, so the window's `round(px - half)` equals `round(px) - half`,
+    // and an integer argument is not boxed on the way into the call the way a position is.
+    cornerWindow(Math.round(p.x), Math.round(p.y), span, mw, mh, win);
     blitWindow(ctx, ox, oy, size, win[0], win[1], span, zoom);
 
     // Exit, once its tile has been seen — it is the one thing worth over-drawing.
@@ -972,16 +995,21 @@ export function createMapView(options) {
       const ey = maze.exit.y - win[1];
       if (ex >= 0 && ey >= 0 && ex < span && ey < span) {
         const pulse = reduced ? 1 : 0.6 + 0.4 * Math.sin(clock * 4);
-        ctx.fillStyle = withAlpha(COLOR.arcCyan, pulse);
+        ctx.fillStyle = withAlphaStep(COLOR.arcCyan, (pulse * 64) | 0);
         const s = Math.max(2, zoom);
         ctx.fillRect(ox + ex * zoom, oy + ey * zoom, s, s);
       }
     }
 
     drawPlayerArrow(
-      ctx, ox + (p.x - win[0]) * zoom, oy + (p.y - win[1]) * zoom, p.angle, zoom * 3, clock, reduced,
+      ctx,
+      Math.round((ox + (p.x - win[0]) * zoom) * 2),
+      Math.round((oy + (p.y - win[1]) * zoom) * 2),
+      (Math.round(p.angle / QUARTER_TURN) & 7) >>> 0,
+      zoom * 3,
+      !reduced && clock % 1.1 >= 0.82,
     );
-    stats.drawMs = now() - t0;
+    if (timing) stats.drawMs = now() - t0;
     return size + frame * 2;
   }
 
@@ -1032,6 +1060,24 @@ export function createMapView(options) {
   const gemsMemo = createTextMemo((g, t) => formatCount(g, t));
   const exitMemo = createTextMemo((d) => 'EXIT ' + formatDistance(d));
   const distMemo = createTextMemo((d) => formatDistance(d));
+  const clockMemo = createTextMemo((sec) => formatClock(sec));
+
+  /** `drawPanel` options for the two map frames, mutated per call instead of built per frame. */
+  /** @type {{frame:'stone', alpha:number, border:number, rivets:boolean, texture:boolean}} */
+  const cornerPanel = { frame: 'stone', alpha: 0.9, border: 1, rivets: false, texture: false };
+  /** @type {{frame:'stone', alpha:number, border:number, rivets:boolean, texture:boolean}} */
+  const fullPanel = { frame: 'stone', alpha: 0.92, border: 1, rivets: true, texture: false };
+
+  /**
+   * Whole seconds on the level clock — the resolution `formatClock` prints, so the memo key only
+   * changes when the text does.
+   * @param {GameState} state
+   * @returns {number}
+   */
+  function clockSeconds(state) {
+    const t = state.run !== undefined ? state.run.levelTime : 0;
+    return Number.isFinite(t) && t > 0 ? Math.floor(t) : 0;
+  }
 
   /**
    * The full-screen labyrinth map: the fitted map, what it is (depth, size, how much is mapped) and
@@ -1060,7 +1106,7 @@ export function createMapView(options) {
   function drawFull(ctx, m, state, clock, reduced, gaugeRight, gaugeBottom) {
     const level = /** @type {any} */ (state.levelData);
     if (tileCanvas === null || level === null || level !== levelRef) return;
-    const t0 = now();
+    const t0 = timing ? now() : 0;
     const maze = level.maze;
     const u = m.u;
 
@@ -1087,9 +1133,9 @@ export function createMapView(options) {
     const hx = under ? margin : Math.max(margin, gR + 3 * u);
     const headY = under ? Math.max(margin, gB + 2 * u) : margin;
     const headSize = headerScale(head, mapped, m.w - hx - margin, u);
-    const headH = textHeight({ font: 'hud', size: headSize });
+    const headH = heightAt('hud', headSize);
     const legendSize = legendScale(m, state, u);
-    const legendH = textHeight({ font: 'hud', size: legendSize });
+    const legendH = heightAt('hud', legendSize);
     const legendY = m.h - margin - legendH;
     const boxTop = headY + headH + 3 * u;
     const boxH = legendY - 3 * u - boxTop - frame * 2;
@@ -1116,7 +1162,7 @@ export function createMapView(options) {
 
     // ── Candidate 2: rails (a wide screen only) ──
     const railSize = Math.max(1, u);
-    const railLineH = textHeight({ font: 'hud', size: railSize });
+    const railLineH = heightAt('hud', railSize);
     let rail = false;
     let railLeft = 0;
     let railRight = 0;
@@ -1124,18 +1170,19 @@ export function createMapView(options) {
       // The left rail is already as wide as the gauge above it, so the close hint lives at its foot
       // rather than widening the legend rail on the other side of the map.
       const textW = Math.max(
-        measureLine(depthMemo(state.level), { font: 'hud', size: railSize }),
-        measureLine(sizeMemo(maze.cols, maze.rows), { font: 'hud', size: railSize }),
-        measureLine(mapped, { font: 'hud', size: railSize }),
-        measureLine(closeHint(), { font: 'hud', size: railSize }),
+        measureAt(depthMemo(state.level), 'hud', railSize),
+        measureAt(sizeMemo(maze.cols, maze.rows), 'hud', railSize),
+        measureAt(mapped, 'hud', railSize),
+        measureAt(clockMemo(clockSeconds(state)), 'hud', railSize),
+        measureAt(closeHint(), 'hud', railSize),
       );
       railLeft = Math.max(gR, margin + textW) + 4 * u;
       railRight = legendColumnWidth(state, railSize, u) + margin + 4 * u;
       const railWDev = (m.w - railLeft - railRight - frame * 2) * dev;
       const railHDev = (m.h - margin * 2 - frame * 2) * dev;
-      // Both rails must actually hold their text: three lines under the gauge plus the close hint
+      // Both rails must actually hold their text: four lines under the gauge plus the close hint
       // at the foot on the left, three legend rows plus the distance line on the right.
-      const leftFits = gB + 4 * u + 3 * (railLineH + 2 * u) + 2 * u + railLineH <= m.h - margin;
+      const leftFits = gB + 4 * u + 4 * (railLineH + 2 * u) + 2 * u + railLineH <= m.h - margin;
       const rightFits = margin + u + 3 * legendRowPitch(railSize, u) + railLineH <= m.h - margin;
       if (railWDev >= 16 * dev && railHDev >= 16 * dev && leftFits && rightFits) {
         chooseFullScale(maze.cols, maze.rows, railWDev, railHDev, railFit);
@@ -1143,7 +1190,7 @@ export function createMapView(options) {
       }
     }
     if (!rail && !stripsOk) {
-      stats.drawMs = now() - t0;
+      if (timing) stats.drawMs = now() - t0;
       return;
     }
 
@@ -1165,23 +1212,13 @@ export function createMapView(options) {
     } else {
       px = Math.round((m.w - panelW) / 2);
       py = Math.round(boxTop + (boxH + frame * 2 - panelH) / 2);
-      drawText(ctx, head, hx, headY, { font: 'hud', size: headSize, color: 'hudGold' });
-      drawText(ctx, mapped, m.w - margin, headY, {
-        font: 'hud',
-        size: headSize,
-        color: 'hudDim',
-        align: 'right',
-      });
+      drawAt(ctx, head, hx, headY, 'hud', headSize, 'hudGold');
+      drawAt(ctx, mapped, m.w - margin, headY, 'hud', headSize, 'hudDim', 'right');
     }
 
     // ── The map ──
-    drawPanel(ctx, px, py, panelW, panelH, u, {
-      frame: 'stone',
-      alpha: 0.92,
-      border: frame,
-      rivets: true,
-      texture: false,
-    });
+    fullPanel.border = frame;
+    drawPanel(ctx, px, py, panelW, panelH, u, fullPanel);
     ctx.fillStyle = withAlpha(COLOR.stoneShadow, 0.92);
     ctx.fillRect(px + frame, py + frame, panelW - frame * 2, panelH - frame * 2);
 
@@ -1213,7 +1250,7 @@ export function createMapView(options) {
       perTileY = fit.scale / 2;
     } else {
       ctx.restore();
-      stats.drawMs = now() - t0;
+      if (timing) stats.drawMs = now() - t0;
       return;
     }
 
@@ -1234,7 +1271,7 @@ export function createMapView(options) {
       ctx.fillStyle = withAlpha(COLOR.void, 0.85);
       ctx.fillRect(Math.round(exx - arm), Math.round(exy - thick), arm * 2, thick * 2);
       ctx.fillRect(Math.round(exx - thick), Math.round(exy - arm), thick * 2, arm * 2);
-      ctx.fillStyle = withAlpha(COLOR.arcCyan, 0.35 + 0.65 * pulse);
+      ctx.fillStyle = withAlphaStep(COLOR.arcCyan, ((0.35 + 0.65 * pulse) * 64) | 0);
       ctx.fillRect(Math.round(exx - arm), Math.round(exy - thick / 2), arm * 2, thick);
       ctx.fillRect(Math.round(exx - thick / 2), Math.round(exy - arm), thick, arm * 2);
       const glyph = Math.max(1, Math.round(perTileX * 4));
@@ -1247,7 +1284,7 @@ export function createMapView(options) {
           s,
         );
       } else {
-        ctx.fillStyle = withAlpha(COLOR.arcPale, pulse);
+        ctx.fillStyle = withAlphaStep(COLOR.arcPale, (pulse * 64) | 0);
         const s = Math.max(2 * dev, Math.round(perTileX * 2));
         ctx.fillRect(Math.round(exx - s / 2), Math.round(exy - s / 2), s, s);
       }
@@ -1259,7 +1296,14 @@ export function createMapView(options) {
     const ay = oy + (p.y - (fit.res === 'cell' ? 1 : 0)) * perTileY;
     // The marker is sized in absolute pixels, not in tiles: at 12 device pixels per tile a
     // "five tiles wide" arrow would be a 60-pixel cream blot over the corner of the map.
-    drawPlayerArrow(ctx, ax, ay, p.angle, clamp(Math.round(perTileX * 4), 6 * dev, 14 * dev), clock, reduced);
+    drawPlayerArrow(
+      ctx,
+      Math.round(ax * 2),
+      Math.round(ay * 2),
+      (Math.round(p.angle / QUARTER_TURN) & 7) >>> 0,
+      clamp(Math.round(perTileX * 4), 6 * dev, 14 * dev),
+      !reduced && clock % 1.1 >= 0.82,
+    );
 
     // Back to the UI grid (and out of the clip) before anything else draws.
     ctx.restore();
@@ -1267,7 +1311,7 @@ export function createMapView(options) {
     // ── Legend ──
     if (rail) drawLegendColumn(ctx, m, state, m.w - railRight + 4 * u, margin, railSize);
     else drawLegend(ctx, m, state, margin, legendY, legendSize);
-    stats.drawMs = now() - t0;
+    if (timing) stats.drawMs = now() - t0;
   }
 
   /**
@@ -1282,16 +1326,17 @@ export function createMapView(options) {
   function headerScale(head, mapped, room, u) {
     let size = Math.max(1, u);
     for (;;) {
-      const hw = measureLine(head, { font: 'hud', size });
-      const mwid = measureLine(mapped, { font: 'hud', size });
+      const hw = measureAt(head, 'hud', size);
+      const mwid = measureAt(mapped, 'hud', size);
       if (hw + mwid + 4 * u <= room || size <= 1) return size;
       size--;
     }
   }
 
   /**
-   * The left rail of the wide full map: depth, labyrinth size, mapped share — one fact a line,
-   * under the fuel gauge — and how to close the map, at its foot.
+   * The left rail of the wide full map: depth, labyrinth size, mapped share and the level clock —
+   * one fact a line, under the fuel gauge — and how to close the map, at its foot. (The clock moved
+   * here from the play HUD's depth plaque, which now carries only depth and size.)
    * @param {CanvasRenderingContext2D} ctx
    * @param {any} m
    * @param {GameState} state
@@ -1304,10 +1349,11 @@ export function createMapView(options) {
    * @returns {void}
    */
   function drawRailHeader(ctx, m, state, maze, x, y, size, pitch, mapped) {
-    drawText(ctx, depthMemo(state.level), x, y, { font: 'hud', size, color: 'hudGold' });
-    drawText(ctx, sizeMemo(maze.cols, maze.rows), x, y + pitch, { font: 'hud', size, color: 'hudBright' });
-    drawText(ctx, mapped, x, y + pitch * 2, { font: 'hud', size, color: 'hudDim' });
-    drawText(ctx, closeHint(), x, m.h - x, { font: 'hud', size, color: 'hudDim', baseline: 'bottom' });
+    drawAt(ctx, depthMemo(state.level), x, y, 'hud', size, 'hudGold');
+    drawAt(ctx, sizeMemo(maze.cols, maze.rows), x, y + pitch, 'hud', size, 'hudBright');
+    drawAt(ctx, mapped, x, y + pitch * 2, 'hud', size, 'hudDim');
+    drawAt(ctx, clockMemo(clockSeconds(state)), x, y + pitch * 3, 'hud', size, 'hudDim');
+    drawAt(ctx, closeHint(), x, m.h - x, 'hud', size, 'hudDim', 'left', 'bottom');
   }
 
   /**
@@ -1320,7 +1366,7 @@ export function createMapView(options) {
     return state.explored !== null && exitIdx >= 0 && state.explored[exitIdx] !== 0;
   }
 
-  /** Cached close hint; the device question is asked once. */
+  /** Cached close hint; the device question is asked once per level (see `adoptLevel`). */
   let closeHintText = '';
 
   /**
@@ -1382,12 +1428,12 @@ export function createMapView(options) {
   function legendWidth(state, size, u) {
     const run = state.run;
     const seen = exitSeen(state);
-    let w = ICON_SIZE.gem * size + 2 * u + measureLine(gemsMemo(run.gems, run.gemsTotal), { font: 'hud', size }) + 5 * u;
-    w += ICON_SIZE.oilW * size + 2 * u + measureLine('OIL', { font: 'hud', size }) + 5 * u;
+    let w = ICON_SIZE.gem * size + 2 * u + measureAt(gemsMemo(run.gems, run.gemsTotal), 'hud', size) + 5 * u;
+    w += ICON_SIZE.oilW * size + 2 * u + measureAt('OIL', 'hud', size) + 5 * u;
     if (!seen) {
-      w += ICON_SIZE.portal * size + 2 * u + measureLine('EXIT', { font: 'hud', size }) + 5 * u;
+      w += ICON_SIZE.portal * size + 2 * u + measureAt('EXIT', 'hud', size) + 5 * u;
     }
-    w += measureLine(seen ? exitText(state) : closeHint(), { font: 'hud', size });
+    w += measureAt(seen ? exitText(state) : closeHint(), 'hud', size);
     return w;
   }
 
@@ -1412,30 +1458,40 @@ export function createMapView(options) {
     const run = state.run;
     const seen = exitSeen(state);
 
+    const gemText = gemsMemo(run.gems, run.gemsTotal);
+    const rightText = seen ? exitText(state) : closeHint();
+    const rightX = m.w - x - measureAt(rightText, 'hud', size);
+    // Even at size 1 the whole strip can be wider than a phone ("12/273" plus a "MAP TO CLOSE" hint
+    // on a 195-pixel surface overprinted EXIT with the hint). Something then gives way rather than
+    // overlapping: the close hint while the exit is unseen (the MAP button says the same thing),
+    // the OIL swatch once the distance readout — the reason to open the map — needs the room.
+    const gemW = ICON_SIZE.gem * iconScale + 2 * u + measureAt(gemText, 'hud', size);
+    const oilW = ICON_SIZE.oilW * iconScale + 2 * u + measureAt('OIL', 'hud', size);
+    const exitW = seen ? 0 : 5 * u + ICON_SIZE.portal * iconScale + 2 * u + measureAt('EXIT', 'hud', size);
+    const crowded = x + gemW + 5 * u + oilW + exitW + 3 * u > rightX;
+    const showOil = !(crowded && seen);
+    const showRight = !(crowded && !seen);
+
     // Gems, then flasks, then the exit — the order they matter in.
     drawGemIcon(ctx, cx, y, iconScale);
     cx += ICON_SIZE.gem * iconScale + 2 * u;
-    const gemText = gemsMemo(run.gems, run.gemsTotal);
-    drawText(ctx, gemText, cx, y, { font: 'hud', size, color: 'hudGem' });
-    cx += measureLine(gemText, { font: 'hud', size }) + 5 * u;
+    drawAt(ctx, gemText, cx, y, 'hud', size, 'hudGem');
+    cx += measureAt(gemText, 'hud', size) + 5 * u;
 
-    drawOilIcon(ctx, cx, y - u, iconScale);
-    cx += ICON_SIZE.oilW * iconScale + 2 * u;
-    drawText(ctx, 'OIL', cx, y, { font: 'hud', size, color: 'hudGold' });
-    cx += measureLine('OIL', { font: 'hud', size }) + 5 * u;
+    if (showOil) {
+      drawOilIcon(ctx, cx, y - u, iconScale);
+      cx += ICON_SIZE.oilW * iconScale + 2 * u;
+      drawAt(ctx, 'OIL', cx, y, 'hud', size, 'hudGold');
+      cx += measureAt('OIL', 'hud', size) + 5 * u;
+    }
 
     if (!seen) {
       drawPortalIcon(ctx, cx, y, iconScale);
       cx += ICON_SIZE.portal * iconScale + 2 * u;
-      drawText(ctx, 'EXIT', cx, y, { font: 'hud', size, color: 'hudBright' });
+      drawAt(ctx, 'EXIT', cx, y, 'hud', size, 'hudBright');
     }
 
-    drawText(ctx, seen ? exitText(state) : closeHint(), m.w - x, y, {
-      font: 'hud',
-      size,
-      color: seen ? 'hudBright' : 'hudDim',
-      align: 'right',
-    });
+    if (showRight) drawAt(ctx, rightText, m.w - x, y, 'hud', size, seen ? 'hudBright' : 'hudDim', 'right');
   }
 
   /**
@@ -1460,9 +1516,9 @@ export function createMapView(options) {
     const icon = Math.max(ICON_SIZE.gem, ICON_SIZE.oilW, ICON_SIZE.portal) * Math.max(1, size) + 2 * u;
     // Every label sits right of the icon column, the distance included, so the rail is exactly as
     // wide as its longest label: "12/273" or "1,240m" — never "EXIT 1,240m" on one line.
-    let w = measureLine(gemsMemo(run.gems, run.gemsTotal), { font: 'hud', size });
-    w = Math.max(w, measureLine('EXIT', { font: 'hud', size }));
-    if (exitSeen(state)) w = Math.max(w, measureLine(distText(state), { font: 'hud', size }));
+    let w = measureAt(gemsMemo(run.gems, run.gemsTotal), 'hud', size);
+    w = Math.max(w, measureAt('EXIT', 'hud', size));
+    if (exitSeen(state)) w = Math.max(w, measureAt(distText(state), 'hud', size));
     return icon + w;
   }
 
@@ -1498,49 +1554,47 @@ export function createMapView(options) {
     let ry = y + u;
 
     drawGemIcon(ctx, x, ry, iconScale);
-    drawText(ctx, gemsMemo(run.gems, run.gemsTotal), textX, ry, { font: 'hud', size, color: 'hudGem' });
+    drawAt(ctx, gemsMemo(run.gems, run.gemsTotal), textX, ry, 'hud', size, 'hudGem');
     ry += pitch;
 
     drawOilIcon(ctx, x, ry - u, iconScale);
-    drawText(ctx, 'OIL', textX, ry, { font: 'hud', size, color: 'hudGold' });
+    drawAt(ctx, 'OIL', textX, ry, 'hud', size, 'hudGold');
     ry += pitch;
 
     drawPortalIcon(ctx, x, ry, iconScale);
-    drawText(ctx, 'EXIT', textX, ry, { font: 'hud', size, color: seen ? 'hudDim' : 'hudBright' });
+    drawAt(ctx, 'EXIT', textX, ry, 'hud', size, seen ? 'hudDim' : 'hudBright');
     if (seen) {
       // Found: the number that matters, under its swatch and in the brightest style in the rail.
-      drawText(ctx, distText(state), textX, ry + textHeight({ font: 'hud', size }) + 2 * u, {
-        font: 'hud',
-        size,
-        color: 'hudBright',
-      });
+      drawAt(ctx, distText(state), textX, ry + heightAt('hud', size) + 2 * u, 'hud', size, 'hudBright');
     }
   }
 
   /**
-   * The player marker: the 8-heading arrow, blinking so the eye finds it on a busy map.
+   * The player marker: the 8-heading arrow, **always drawn**. It blinks by swapping its two tones —
+   * a cream arrow in a dark outline, then a dark arrow in a cream outline — so the eye still catches
+   * the movement on a busy map, but the "you are here" marker is never missing. (It used to vanish
+   * for 0.28 s of every 1.1 s, and two separate screenshots of the full map caught it gone.)
+   *
+   * Every argument is an integer, computed by the caller: this runs every frame the map is open, and
+   * a fractional position, angle or clock handed to a call that is not inlined is a boxed number.
    * @param {CanvasRenderingContext2D} ctx
-   * @param {number} cx centre x in UI pixels
-   * @param {number} cy centre y
-   * @param {number} angle radians (0 = east)
+   * @param {number} cx2 centre x in half pixels (twice the coordinate, rounded)
+   * @param {number} cy2 centre y in half pixels
+   * @param {number} octant heading, `round(angle / 45°) & 7` with 0 = east
    * @param {number} sizePx how wide the marker should be, in the units the caller is drawing in
-   * @param {number} clock
-   * @param {boolean} reduced
+   * @param {boolean} inverted draw the blink tone
    * @returns {void}
    */
-  function drawPlayerArrow(ctx, cx, cy, angle, sizePx, clock, reduced) {
-    // Mostly on, briefly off: a marker that is missing half the time is one you have to hunt for.
-    if (!reduced && clock % 1.1 >= 0.82) return;
-    const octant = (Math.round(angle / (Math.PI / 4)) & 7) >>> 0;
-    const arrow = ARROWS[octant];
+  function drawPlayerArrow(ctx, cx2, cy2, octant, sizePx, inverted) {
+    const arrow = ARROWS[octant & 7];
     const scale = Math.max(1, Math.round(sizePx / arrow.w));
     drawArt(
       ctx,
       arrow,
-      Math.round(cx - (arrow.w * scale) / 2),
-      Math.round(cy - (arrow.h * scale) / 2),
+      Math.round((cx2 - arrow.w * scale) / 2),
+      Math.round((cy2 - arrow.h * scale) / 2),
       scale,
-      ARROW_PALETTE,
+      inverted ? ARROW_PALETTE_INVERTED : ARROW_PALETTE,
     );
   }
 

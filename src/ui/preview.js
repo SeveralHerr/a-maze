@@ -38,6 +38,20 @@ const mapParam = params.get('map');
 const cellsParam = Number(params.get('cells') || '24');
 const reducedMotion = params.get('reduced') === '1';
 const showHint = params.get('hint') === '1';
+/**
+ * `?band=1`: tell the surface the world is the 4:3 band a portrait phone letterboxes into (centred at
+ * 42 % of the height, as `src/main.js` lays it out), and darken the decks above and below it — the
+ * layout the title and the HUD have to respect on a real phone.
+ */
+const bandParam = params.get('band') === '1';
+/** `?pad=1`: pretend a gamepad is connected, so the Controls panel shows its PAD column. */
+if (params.get('pad') === '1') {
+  try {
+    Object.defineProperty(navigator, 'getGamepads', { value: () => [{ connected: true }], configurable: true });
+  } catch (err) {
+    // A browser that refuses the override simply shows the keyboard table.
+  }
+}
 
 // ─── A hand-built level ──────────────────────────────────────────────────────────────────────
 
@@ -317,6 +331,13 @@ function setScreen(name) {
     case 'pause':
       state.phase = 'paused';
       break;
+    case 'confirm':
+      // Pause → Quit to Title opens the abandon dialog. Pause rows: Resume, Options, Controls, Quit.
+      state.phase = 'paused';
+      menus.render(state);
+      menus.handleInput(frameWith('up'), state);
+      menus.handleInput(frameWith('confirm'), state);
+      break;
     case 'complete':
       state.phase = 'levelComplete';
       state.run.levelScore = 500 * state.level + Math.floor(state.run.fuel) * 10 * state.level;
@@ -463,6 +484,14 @@ function drawBackdrop(t) {
   vig.addColorStop(1, 'rgba(3,4,8,0.85)');
   ctx.fillStyle = vig;
   ctx.fillRect(0, 0, w, h);
+
+  if (bandParam && band.h > 0) {
+    // The decks of a portrait phone: everything outside the world band is the page's black.
+    const scale = h / window.innerHeight;
+    ctx.fillStyle = '#05070c';
+    ctx.fillRect(0, 0, w, Math.round(band.y * scale));
+    ctx.fillRect(0, Math.round((band.y + band.h) * scale), w, h);
+  }
 }
 
 // ─── Font proof sheet ────────────────────────────────────────────────────────────────────────
@@ -647,7 +676,16 @@ function onResize() {
   backCanvas.height = Math.max(1, Math.round(h * dpr));
   hud.resize(w, h, dpr);
   menus.resize(w, h, dpr);
+  if (bandParam) {
+    const bandH = Math.round((w * 3) / 4);
+    band.y = Math.round(h * 0.42 - bandH / 2);
+    band.h = bandH;
+    hud.surface.setViewRect(0, band.y, w, bandH);
+  }
 }
+
+/** The `?band=1` world band, in CSS pixels. */
+const band = { y: 0, h: 0 };
 window.addEventListener('resize', onResize, { passive: true });
 onResize();
 

@@ -708,6 +708,84 @@ test('attract: a dead end is handled by turning around, not by getting stuck', (
   assert.ok(maxX - minX > 1.2, `camera patrolled the stub (${minX.toFixed(2)}..${maxX.toFixed(2)})`);
 });
 
+/**
+ * Drive the attract camera and measure how smooth the shot is.
+ * @param {import('../core/types.js').Maze} maze
+ * @param {number} hz step rate
+ * @param {number} seconds
+ * @param {(s: import('../core/types.js').GameState) => boolean} [counts] which steps to include in
+ *   the yaw-rate statistics (all by default)
+ * @returns {{maxAngAccel:number, maxLinAccel:number, maxAbsRate:number, travelled:number, counted:number}}
+ */
+function attractSmoothness(maze, hz, seconds, counts) {
+  const s = createInitialState();
+  reducer(s, { type: 'levelReady', data: levelDataFor(maze) });
+  const dt = 1 / hz;
+  let prevRate = 0;
+  let prevSpeed = 0;
+  let maxAngAccel = 0;
+  let maxLinAccel = 0;
+  let maxAbsRate = 0;
+  let travelled = 0;
+  let counted = 0;
+  const steps = Math.round(seconds * hz);
+  for (let i = 0; i < steps; i++) {
+    const a0 = s.player.angle;
+    const x0 = s.player.x;
+    const y0 = s.player.y;
+    stepAttract(s, dt);
+    let d = s.player.angle - a0;
+    while (d > Math.PI) d -= TAU;
+    while (d < -Math.PI) d += TAU;
+    const rate = d / dt;
+    const speed = Math.hypot(s.player.x - x0, s.player.y - y0) / dt;
+    travelled += speed * dt;
+    if (i > 0) {
+      maxAngAccel = Math.max(maxAngAccel, Math.abs(rate - prevRate) / dt);
+      maxLinAccel = Math.max(maxLinAccel, Math.abs(speed - prevSpeed) / dt);
+    }
+    if (counts === undefined || counts(s)) {
+      counted++;
+      maxAbsRate = Math.max(maxAbsRate, Math.abs(rate));
+    }
+    prevRate = rate;
+    prevSpeed = speed;
+  }
+  return { maxAngAccel, maxLinAccel, maxAbsRate, travelled, counted };
+}
+
+test('attract: turn rate and speed ease — no single-frame snap at corners or tiles', () => {
+  // Regression: the steering assigned the proportional command straight to the turn rate and the
+  // cos-falloff straight to the speed, so both stepped at every corner and every tile — measured
+  // 152 rad/s² and 102 tiles/s² peaks over a 3-minute walk. Three minutes of TWISTY is ~70 corners.
+  for (const hz of [30, 60, 144]) {
+    const r = attractSmoothness(mazeFrom(TWISTY), hz, 180);
+    assert.ok(r.maxAngAccel < 20, `${hz} Hz: peak angular acceleration ${r.maxAngAccel.toFixed(1)} rad/s²`);
+    assert.ok(r.maxLinAccel < 12, `${hz} Hz: peak forward acceleration ${r.maxLinAccel.toFixed(1)} tiles/s²`);
+    assert.ok(r.travelled > 100, `${hz} Hz: the camera still explores (${r.travelled.toFixed(0)} tiles in 3 min)`);
+  }
+});
+
+test('attract: walking a straight corridor does not re-aim at every tile', () => {
+  // Regression: aiming at the bare centre of the next tile moved the target on each arrival, so the
+  // yaw rate flipped −0.14 → +0.09 rad/s every tile down a straight corridor. With the look-ahead aim
+  // point on the centre line, a settled straight walk only carries the idle sway (≈ 0.04 rad/s).
+  const row = '#S' + '.'.repeat(36) + '#';
+  const maze = mazeFrom(['#'.repeat(row.length), row, '#'.repeat(row.length)]);
+  maze.exit = { x: row.length - 2, y: 1 };
+  const swayRate = ATTRACT.SWAY_AMP * TAU * ATTRACT.SWAY_HZ;
+  // Only the eastbound leg well clear of both dead ends, after the start-up turn has settled.
+  const r = attractSmoothness(
+    maze,
+    60,
+    12,
+    (s) => s.player.x > 6 && s.player.x < row.length - 6 && Math.cos(s.player.angle) > 0.99,
+  );
+  assert.ok(r.counted > 300, `the eastbound straight was measured (${r.counted} steps)`);
+  assert.ok(r.maxAbsRate < swayRate * 1.5 + 0.02, `yaw rate on the straight reached ${r.maxAbsRate.toFixed(3)} rad/s`);
+  assert.ok(r.travelled > 15, 'and it did walk the corridor');
+});
+
 test('attract: a state with no level data is a no-op, not a crash', () => {
   const s = createInitialState();
   stepAttract(s, 1 / 60);

@@ -101,10 +101,11 @@ class FakeBuffer {
     this.length = length;
     this.sampleRate = sampleRate;
     this.duration = length / sampleRate;
-    this._data = new Float32Array(length);
+    this._data = [];
+    for (let c = 0; c < channels; c++) this._data.push(new Float32Array(length));
   }
-  getChannelData() {
-    return this._data;
+  getChannelData(c = 0) {
+    return this._data[c];
   }
 }
 
@@ -165,6 +166,12 @@ class FakeCtx {
   createStereoPanner() {
     const n = new FakeNode(this, 'panner');
     n._param('pan', 0);
+    return n;
+  }
+  createConvolver() {
+    const n = new FakeNode(this, 'convolver');
+    n.normalize = true;
+    n.buffer = null;
     return n;
   }
   createWaveShaper() {
@@ -461,7 +468,8 @@ test('unlock is idempotent: one context, one graph, one noise buffer', () => {
   audio.unlock();
   audio.unlock();
   assert.equal(ctx.nodes.length, nodesAfterFirst, 'no second graph');
-  assert.equal(ctx.buffers, 1, 'the noise buffer is created exactly once');
+  // One shared noise buffer plus one impulse response per reverb bus, all built once.
+  assert.equal(ctx.buffers, 3, 'the noise buffer and the two IRs are created exactly once');
 });
 
 test('the noise buffer is shared by every noise voice', () => {
@@ -473,7 +481,7 @@ test('the noise buffer is shared by every noise voice', () => {
     ctx.advance(0.5);
     audio.update(state);
   }
-  assert.equal(ctx.buffers, 1, 'noise buffers are created once, never per voice');
+  assert.equal(ctx.buffers, 3, 'buffers are created once at unlock, never per voice');
   const sources = ctx.of('bufferSource');
   assert.ok(sources.length >= 6);
   const first = sources[0].buffer;
@@ -525,13 +533,19 @@ test('stolen voices are disconnected, so nodes never leak', () => {
   audio.unlock();
   const state = makeState();
   for (let i = 0; i < 60; i++) audio.handle([{ type: 'bump', strength: 1 }], state);
-  // Every node created for a voice that is no longer live must have been disconnected.
+  // Every source created for a voice that is no longer live must have been disconnected, except
+  // the ones still sounding: the live voices and the stolen tails still fading in the retire ring
+  // (at most one pool's worth). No shipped cue voice owns more than two sources. The always-on
+  // generators never get a stop time, which is how they are told apart here.
   const live = audio.stats().voices;
-  const voiceNodes = ctx.nodes.filter((n) => n.kind === 'osc' || n.kind === 'bufferSource');
-  const disconnected = voiceNodes.filter((n) => n.disconnects > 0).length;
+  const voiceNodes = ctx.nodes.filter(
+    (n) => (n.kind === 'osc' || n.kind === 'bufferSource') && n.stopped < Infinity,
+  );
+  const connected = voiceNodes.filter((n) => n.disconnects === 0).length;
+  assert.ok(voiceNodes.length > 60, 'the storm actually created voices');
   assert.ok(
-    disconnected >= voiceNodes.length - live * 4,
-    `only ${disconnected}/${voiceNodes.length} voice nodes were disconnected`,
+    connected <= (live + 6) * 2,
+    `${connected}/${voiceNodes.length} voice sources are still connected`,
   );
 });
 
@@ -580,11 +594,15 @@ test('dispose stops and disconnects everything and is idempotent', () => {
 // Cue behaviour
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/** Peak amplitude ramped onto any gain node in the given op slice. */
+/**
+ * Peak envelope amplitude in the given op slice: the attack ramps (`lin`) every voice's head gain
+ * climbs to. Static `set`s are deliberately ignored — those are send levels and relative partial
+ * gains, not loudness.
+ */
 function peakGain(ops) {
   let peak = 0;
   for (const op of ops) {
-    if (op.param === 'gain' && (op.method === 'lin' || op.method === 'set')) {
+    if (op.param === 'gain' && op.method === 'lin') {
       if (op.value > peak) peak = op.value;
     }
   }
@@ -1478,4 +1496,435 @@ test('the widest cues fit a voice: no node is ever dropped past MAX_NODES', asyn
   const overflow = errors.filter((e) => JSON.stringify(e).includes('overflow'));
   assert.equal(overflow.length, 0, 'a cue asked for more nodes than MAX_NODES');
   assert.equal(audio.stats().failures, 0);
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// Round 3: key discipline, small speakers, the room, the phrase engine, lifecycle hardening
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/** Level key offsets in semitones, mirrored from audio.js MUSIC_KEYS (A, G, C, E). */
+const KEY_SEMIS = [0, -2, 3, -5];
+/** Minor pentatonic pitch classes over the tonic. */
+const SCALE_PCS = new Set([0, 3, 5, 7, 10]);
+
+/**
+ * Pitch class of `f` relative to the level's tonic, or NaN when `f` is not on an equal-tempered
+ * semitone of that key at all.
+ * @param {number} f Hz
+ * @param {number} level 1-based
+ * @returns {number}
+ */
+function pitchClass(f, level) {
+  const tonic = AUDIO.MUSIC.root * Math.pow(2, KEY_SEMIS[(level - 1) % 4] / 12);
+  const semis = 12 * Math.log2(f / tonic);
+  const r = Math.round(semis);
+  if (Math.abs(semis - r) > 0.02) return NaN;
+  return ((r % 12) + 12) % 12;
+}
+
+/** Oscillator frequencies set in an op slice. */
+function oscFreqs(ctx, from) {
+  return ctx
+    .opsSince(from)
+    .filter((o) => o.param === 'frequency' && o.node.kind === 'osc' && o.method === 'set')
+    .map((o) => o.value);
+}
+
+test('the gem chime and its whole combo ladder stay inside the level key', () => {
+  for (const level of [1, 2, 3, 4]) {
+    const { ctx, audio } = makeAudio();
+    audio.unlock();
+    const state = makeState({ level, phase: 'title' });
+    audio.update(state); // keys the engine to the level
+    const mark = ctx.ops.length;
+    // A nine-gem sweep: climbs the ladder to COMBO_MAX and holds there. Handled back to back (no
+    // update() in between) so no music pluck lands in the measured slice.
+    for (let i = 0; i < 9; i++) {
+      audio.handle([{ type: 'pickup', kind: 'gem', x: 2.5, y: 1.5, value: 100 }], state);
+      ctx.advance(0.15);
+    }
+    const freqs = oscFreqs(ctx, mark);
+    assert.ok(freqs.length >= 27, `level ${level}: the sweep produced ${freqs.length} tones`);
+    for (const f of freqs) {
+      const pc = pitchClass(f, level);
+      assert.ok(
+        SCALE_PCS.has(pc),
+        `level ${level}: gem tone ${f.toFixed(2)} Hz (pc ${pc}) is out of key`,
+      );
+    }
+  }
+});
+
+test('the gem ladder climbs one scale step per combo, never a whole-tone ladder', () => {
+  const { ctx, audio } = makeAudio();
+  audio.unlock();
+  const state = makeState({ level: 2, phase: 'title' });
+  audio.update(state);
+  const roots = [];
+  for (let i = 0; i <= AUDIO.COMBO_MAX; i++) {
+    const mark = ctx.ops.length;
+    audio.handle([{ type: 'pickup', kind: 'gem', x: 2.5, y: 1.5, value: 100 }], state);
+    roots.push(oscFreqs(ctx, mark)[0]);
+    ctx.advance(0.2);
+  }
+  for (let i = 1; i < roots.length; i++) {
+    const step = 12 * Math.log2(roots[i] / roots[i - 1]);
+    assert.ok(step > 1.9 && step < 3.1, `rung ${i} moved ${step.toFixed(2)} semitones`);
+  }
+});
+
+test('the record chord is transposed into the key the run ended in', () => {
+  const { ctx, audio } = makeAudio();
+  audio.unlock();
+  const state = makeState({ level: 4, phase: 'gameOver' });
+  audio.update(state);
+  const mark = ctx.ops.length;
+  audio.handle([{ type: 'gameOver', score: 5000, newBest: true }], state);
+  const key = Math.pow(2, KEY_SEMIS[3] / 12);
+  const freqs = oscFreqs(ctx, mark);
+  for (const hz of [523.25, 659.25, 783.99]) {
+    assert.ok(
+      freqs.some((f) => Math.abs(f - hz * key) < 1e-6),
+      `record triad note ${hz} is not transposed to the level-4 key`,
+    );
+  }
+  assert.ok(!freqs.some((f) => Math.abs(f - 523.25) < 1e-6), 'the untransposed C major is gone');
+});
+
+/**
+ * What a small speaker can reproduce: tones at or above `floorHz`, and band/high-passed noise
+ * centred at or above it.
+ * @returns {{tones:number[], bands:number[]}}
+ */
+function audibleOnSmallSpeakers(ctx, from, floorHz) {
+  const ops = ctx.opsSince(from);
+  const tones = ops
+    .filter(
+      (o) =>
+        o.param === 'frequency' && o.node.kind === 'osc' && o.method === 'set' && o.value >= floorHz,
+    )
+    .map((o) => o.value);
+  const bands = ops
+    .filter(
+      (o) =>
+        o.param === 'frequency' &&
+        o.node.kind === 'filter' &&
+        o.method === 'set' &&
+        o.value >= floorHz &&
+        (o.node.type === 'bandpass' || o.node.type === 'highpass'),
+    )
+    .map((o) => o.value);
+  return { tones, bands };
+}
+
+test('the heartbeat, bump and footstep all carry content a phone speaker can play', () => {
+  const { ctx, audio } = makeAudio();
+  audio.unlock();
+
+  // Heartbeat, measured on the first update that arms it (no music/crackle in the way: we only
+  // look at filters and tones the beat itself creates, but keep the phase honest).
+  const state = makeState();
+  state.derived.lowFuel = true;
+  state.run.fuel = 20;
+  audio.update(makeState({ phase: 'title', level: 1 }));
+  ctx.advance(0.05);
+  let mark = ctx.ops.length;
+  audio.update(state);
+  const beat = audibleOnSmallSpeakers(ctx, mark, 150);
+  assert.ok(
+    beat.tones.filter((f) => f >= 180 && f <= 210).length >= 2,
+    `the lub and the dub each need a harmonic above 150 Hz (${beat.tones})`,
+  );
+  assert.ok(
+    beat.bands.some((f) => f >= 600 && f <= 1300),
+    'the lub needs a band-passed transient in the 0.6–1.3 kHz range',
+  );
+
+  ctx.advance(2);
+  mark = ctx.ops.length;
+  audio.handle([{ type: 'bump', strength: 0.6 }], makeState());
+  const bump = audibleOnSmallSpeakers(ctx, mark, 150);
+  assert.ok(bump.tones.length >= 1, 'the bump thud has an upper partial');
+  assert.ok(bump.bands.some((f) => f >= 500), 'the bump has a stone slap above 500 Hz');
+
+  ctx.advance(2);
+  mark = ctx.ops.length;
+  audio.handle([{ type: 'footstep', foot: 0 }], makeState());
+  const step = audibleOnSmallSpeakers(ctx, mark, 150);
+  assert.ok(step.tones.length >= 1 && step.bands.length >= 1, 'the step keeps grit and a harmonic');
+});
+
+test('each bus reverb is a convolver on a synthetic, decaying, decorrelated stereo IR', () => {
+  const { ctx, audio } = makeAudio();
+  audio.unlock();
+  const convs = ctx.of('convolver');
+  assert.equal(convs.length, 2, 'one room per bus');
+  assert.equal(ctx.of('delay').length, 0, 'the single-echo delay line is gone');
+  const { sfxBus, musicBus } = graphOf(ctx);
+  assert.ok(
+    ctx.connections.some(([a, b]) => a === convs[0] && b === sfxBus),
+    'the sfx room returns into the sfx bus',
+  );
+  assert.ok(
+    ctx.connections.some(([a, b]) => a === convs[1] && b === musicBus),
+    'the music room returns into the music bus',
+  );
+
+  for (const [i, conv] of convs.entries()) {
+    const spec = i === 0 ? AUDIO.REVERB.sfx : AUDIO.REVERB.music;
+    assert.equal(conv.normalize, false, 'the IR carries its own calibrated level');
+    const buf = conv.buffer;
+    assert.ok(buf && buf.numberOfChannels === 2, 'stereo IR');
+    assert.ok(Math.abs(buf.duration - spec.seconds) < 0.01, 'a real tail, not a single echo');
+    assert.ok(buf.duration >= 1);
+    const L = buf.getChannelData(0);
+    const R = buf.getChannelData(1);
+    const q = Math.floor(L.length / 4);
+    let head = 0;
+    let tail = 0;
+    let energy = 0;
+    let cross = 0;
+    let nonFinite = 0;
+    for (let n = 0; n < L.length; n++) {
+      if (!Number.isFinite(L[n]) || !Number.isFinite(R[n])) nonFinite++;
+      if (n < q) head += L[n] * L[n];
+      if (n >= 3 * q) tail += L[n] * L[n];
+      energy += L[n] * L[n];
+      cross += L[n] * R[n];
+    }
+    assert.equal(nonFinite, 0);
+    assert.ok(tail < head * 0.01, `the tail decays (${tail} vs ${head})`);
+    assert.ok(
+      Math.abs(energy - spec.energy) < 1e-3,
+      `IR energy is calibrated to ${spec.energy} (${energy})`,
+    );
+    assert.ok(Math.abs(cross) < energy * 0.3, 'left and right are decorrelated, so the room is wide');
+    const preSamples = Math.floor(buf.sampleRate * spec.pre);
+    for (let n = 0; n < preSamples; n++) assert.equal(L[n], 0, 'silence before the pre-delay');
+  }
+});
+
+test('the reverb IR is deterministic per seed', () => {
+  const irOf = (seed) => {
+    const { ctx, audio } = makeAudio({ seed });
+    audio.unlock();
+    return Array.from(ctx.of('convolver')[0].buffer.getChannelData(0).slice(0, 4000));
+  };
+  assert.deepEqual(irOf(42), irOf(42));
+  assert.notDeepEqual(irOf(42), irOf(43));
+});
+
+test('a context without createConvolver still gets a (delay) tail and makes sound', () => {
+  const ctx = new FakeCtx();
+  // @ts-ignore — deliberately removing an optional factory method
+  ctx.createConvolver = undefined;
+  const audio = createAudio({ contextFactory: () => ctx, doc: null, seed: 5 });
+  assert.equal(audio.unlock(), true);
+  assert.equal(ctx.of('delay').length, 2, 'a fallback tail per bus');
+  audio.handle([{ type: 'levelStart', level: 1 }], makeState());
+  assert.ok(audio.stats().voices > 0);
+});
+
+/**
+ * Play the title-screen ambience for `seconds` and return the *melody* in order: triangle plucks,
+ * skipping cadence dyads (which start 90 ms after their note).
+ * @returns {{t:number, f:number}[]}
+ */
+function melody(seconds, level = 1, seed = 1234) {
+  const { ctx, audio } = makeAudio({ seed });
+  audio.unlock();
+  const state = makeState({ phase: 'title', level });
+  const mark = ctx.nodes.length;
+  const frames = Math.round(seconds / 0.05);
+  for (let i = 0; i < frames; i++) {
+    audio.update(state);
+    ctx.advance(0.05);
+  }
+  const notes = ctx.nodes
+    .slice(mark)
+    .filter((n) => n.kind === 'osc' && n.type === 'triangle' && n.started >= 0)
+    .map((n) => ({ t: n.started, f: n.frequency.value }))
+    .sort((a, b) => a.t - b.t);
+  /** @type {{t:number, f:number}[]} */
+  const out = [];
+  for (const n of notes) {
+    if (out.length && n.t - out[out.length - 1].t < 0.3) continue; // the dyad under a cadence
+    out.push(n);
+  }
+  return out;
+}
+
+/** Split a melody into phrases at the long rests. @returns {{t:number, f:number}[][]} */
+function phrasesOf(notes) {
+  const restGap = AUDIO.PHRASE.pulse * AUDIO.PHRASE.restMin;
+  const out = [];
+  let cur = [];
+  for (let i = 0; i < notes.length; i++) {
+    cur.push(notes[i]);
+    if (i + 1 === notes.length || notes[i + 1].t - notes[i].t >= restGap - 1e-6) {
+      out.push(cur);
+      cur = [];
+    }
+  }
+  return out;
+}
+
+test('the generative line moves mostly by step, on a pulse grid, in key', () => {
+  const notes = melody(600);
+  assert.ok(notes.length > 80, `ten minutes should hold plenty of notes (${notes.length})`);
+  let steps = 0;
+  for (let i = 1; i < notes.length; i++) {
+    const semis = Math.abs(12 * Math.log2(notes[i].f / notes[i - 1].f));
+    if (semis <= 5.01) steps++;
+  }
+  const moves = notes.length - 1;
+  // A uniform draw from the old two-octave bag landed within a fourth well under half the time.
+  assert.ok(steps / moves >= 0.7, `only ${steps}/${moves} intervals are steps`);
+  for (const n of notes) assert.ok(SCALE_PCS.has(pitchClass(n.f, 1)), `${n.f} Hz is out of key`);
+  const t0 = notes[0].t;
+  for (const n of notes) {
+    const beats = (n.t - t0) / AUDIO.PHRASE.pulse;
+    assert.ok(Math.abs(beats - Math.round(beats)) < 1e-6, `onset ${n.t} is off the pulse grid`);
+  }
+});
+
+test('phrases breathe and resolve: every phrase ends on the root or the fifth', () => {
+  const phrases = phrasesOf(melody(600));
+  assert.ok(phrases.length >= 10, `ten minutes should contain many phrases (${phrases.length})`);
+  // The last phrase may be cut off by the end of the window.
+  for (const p of phrases.slice(0, -1)) {
+    const pc = pitchClass(p[p.length - 1].f, 1);
+    assert.ok(pc === 0 || pc === 7, `a phrase ended on pitch class ${pc}, not the root or fifth`);
+    assert.ok(p.length >= 2, 'a phrase is a motif, not a lone pluck');
+  }
+});
+
+test('the motif recurs, varied, rather than every phrase being new or identical', () => {
+  const phrases = phrasesOf(melody(600)).slice(0, -1);
+  const keys = phrases.map((p) => p.map((n) => Math.round(12 * Math.log2(n.f / 110))).join(','));
+  const distinct = new Set(keys).size;
+  assert.ok(distinct < keys.length, `no phrase ever came back (${distinct}/${keys.length})`);
+  assert.ok(distinct > 2, 'but the line is not one loop either');
+});
+
+test('an OS interruption re-arms the gesture listeners and a tap brings sound back', () => {
+  const doc = fakeDoc();
+  const ctx = new FakeCtx();
+  const audio = createAudio({ contextFactory: () => ctx, doc, seed: 7 });
+  doc.fire('pointerdown');
+  assert.equal(audio.unlocked, true);
+  assert.equal(doc.count('pointerdown'), 0);
+
+  // iOS Safari after a phone call: 'interrupted', page still visible, and resume() refused.
+  ctx.resume = () => {
+    ctx.resumes++;
+    return Promise.reject(new Error('not allowed without a gesture'));
+  };
+  const before = ctx.resumes;
+  ctx.state = 'interrupted';
+  assert.equal(typeof ctx.onstatechange, 'function', 'the engine listens for state changes');
+  ctx.onstatechange();
+  assert.equal(audio.unlocked, false);
+  assert.ok(ctx.resumes > before, 'a resume was attempted straight away');
+  assert.ok(doc.count('pointerdown') > 0, 'the next tap is listened for again');
+
+  // The tap: now the platform allows it.
+  ctx.resume = FakeCtx.prototype.resume;
+  doc.fire('touchend');
+  assert.equal(ctx.state, 'running');
+  assert.equal(audio.unlocked, true);
+  assert.equal(doc.count('touchend'), 0, 'and the listeners detach again once running');
+
+  audio.dispose();
+  assert.equal(ctx.onstatechange, null, 'teardown clears the state hook');
+});
+
+test('an explicit suspend() is not undone by the interruption recovery', () => {
+  const doc = fakeDoc();
+  const ctx = new FakeCtx();
+  const audio = createAudio({ contextFactory: () => ctx, doc, seed: 7 });
+  doc.fire('pointerdown');
+  audio.suspend();
+  ctx.onstatechange();
+  assert.equal(ctx.state, 'suspended');
+  assert.equal(doc.count('pointerdown'), 0, 'no listener re-armed for a deliberate suspend');
+  audio.resume();
+  assert.equal(ctx.state, 'running');
+  audio.dispose();
+});
+
+test('isolated failures decay; only a burst switches audio off', () => {
+  const { ctx, audio } = makeAudio();
+  audio.unlock();
+  const realGain = ctx.createGain;
+  const state = makeState({ phase: 'title' });
+  const failOnce = () => {
+    ctx.createGain = () => {
+      throw new Error('transient');
+    };
+    audio.handle([{ type: 'bump', strength: 1 }], state);
+    ctx.createGain = realGain;
+  };
+  // Forty rare failures, one every three seconds: a long run with a flaky edge case.
+  for (let i = 0; i < 40; i++) {
+    failOnce();
+    ctx.advance(3);
+    audio.update(state);
+  }
+  assert.equal(audio.available, true, 'sporadic failures must not add up to silence');
+  assert.equal(audio.stats().failures, 40, 'but every one is still counted');
+
+  // A genuine burst still trips the breaker.
+  for (let i = 0; i < AUDIO.FAIL.burst; i++) failOnce();
+  assert.equal(audio.available, false, 'a failure storm switches audio off');
+  assert.equal(audio.stats().state, 'failed');
+});
+
+test('rejected suspend/resume/close promises are always handled', async () => {
+  const rejections = [];
+  const onRejection = (r) => rejections.push(r);
+  process.on('unhandledRejection', onRejection);
+  try {
+    const doc = fakeDoc();
+    const ctx = new FakeCtx();
+    const audio = createAudio({ contextFactory: () => ctx, doc, seed: 3 });
+    doc.fire('pointerdown');
+    ctx.suspend = () => Promise.reject(new Error('closed'));
+    ctx.close = () => Promise.reject(new Error('closed'));
+    ctx.resume = () => Promise.reject(new Error('no gesture'));
+    audio.suspend();
+    doc.hidden = true;
+    doc.fire('visibilitychange');
+    doc.hidden = false;
+    ctx.state = 'suspended';
+    doc.fire('visibilitychange');
+    audio.resume();
+    audio.dispose();
+    await new Promise((r) => setTimeout(r, 20));
+  } finally {
+    process.off('unhandledRejection', onRejection);
+  }
+  assert.equal(rejections.length, 0, `unhandled rejections: ${rejections.join('; ')}`);
+});
+
+test('a steal storm keeps the retire ring bounded and reaps it completely', () => {
+  const { ctx, audio } = makeAudio({ maxVoices: 4 });
+  audio.unlock();
+  const state = makeState({ phase: 'title', settings: { ...makeState().settings, music: 0 } });
+  const stillConnected = () =>
+    ctx.nodes.filter(
+      (n) =>
+        n instanceof FakeSource && n.started >= 0 && n.stopped < Infinity && n.disconnects === 0,
+    ).length;
+  for (let round = 0; round < 5; round++) {
+    for (let i = 0; i < 50; i++) audio.handle([{ type: 'levelStart', level: 1 }], state);
+    // Live voices plus one pool's worth of fading tails, two sources each at most.
+    const connected = stillConnected();
+    assert.ok(connected <= (4 + 4) * 2, `round ${round}: ${connected} sources still connected`);
+    ctx.currentTime += 5;
+    for (const n of ctx.nodes) n.onended = null;
+    audio.update(state);
+  }
+  assert.equal(stillConnected(), 0);
+  assert.ok(audio.stats().stolen > 100, 'the storm really did steal');
 });

@@ -391,7 +391,52 @@ test('phase machine: newGame resets the run and re-arms the record check', () =>
   assert.equal(s.run.score, 0);
   assert.equal(s.run.gems, 0);
   assert.equal(s.run.totalTime, 0);
-  assert.equal(s.best.score, 1000, 'the record itself survives a restart');
+  assert.equal(s.best.score, 4321, 'the abandoned run was folded into the record before the reset');
+  assert.equal(s.sim.runBestScore, 4321, 'and the new run measures newBest against that record');
+});
+
+test('best: quitting to the title from pause keeps the run\'s score in the record', () => {
+  // Regression: toTitle used to leave `paused` without recordBest, so the points of a level the
+  // player quit were never counted — and a run that had already beaten the record lost it.
+  const s = createInitialState(undefined, { score: 150, level: 1 });
+  reducer(s, { type: 'newGame', seed: 1 });
+  reducer(s, { type: 'levelReady', data: level([item(1, 'gem', 1.5, 1.5), item(2, 'gem', 2.5, 1.5)], 100) });
+  ticks(s, 1); // +100 on the start tile
+  for (let i = 0; i < 40 && s.run.gems < 2; i++) ticks(s, 1, { moveY: 1 });
+  assert.equal(s.run.gems, 2, 'both gems collected');
+  assert.equal(s.run.score, 200);
+  reducer(s, { type: 'pause' });
+  reducer(s, { type: 'toTitle' });
+  assert.equal(s.phase, 'title');
+  assert.equal(s.best.score, s.run.score, 'best.score === run.score after the quit');
+  assert.equal(s.best.level, 1);
+});
+
+test('best: quitting a worse run from pause leaves the record alone', () => {
+  const s = createInitialState(undefined, { score: 99999, level: 7 });
+  reducer(s, { type: 'newGame', seed: 1 });
+  reducer(s, { type: 'levelReady', data: level([item(1, 'gem', 1.5, 1.5)], 100) });
+  ticks(s, 1);
+  reducer(s, { type: 'pause' });
+  reducer(s, { type: 'toTitle' });
+  assert.equal(s.best.score, 99999);
+  assert.equal(s.best.level, 7);
+});
+
+test('best: best.level is the deepest level REACHED — dying on 2 after clearing 1 records 2', () => {
+  // Pinned on purpose (sim.recordBest): a death folds in the level the run was on, the same number
+  // a clear of that level records. The menus label it as depth reached.
+  const s = createInitialState();
+  reducer(s, { type: 'newGame', seed: 1 });
+  reducer(s, { type: 'levelReady', data: level([], 100) });
+  reducer(s, { type: 'debugWin' });
+  assert.equal(s.best.level, 1, 'clearing level 1 records 1');
+  reducer(s, { type: 'nextLevel' });
+  reducer(s, { type: 'levelReady', data: level([], 100) });
+  s.run.fuel = 1 / 120;
+  collect(s, 5, {}, (st) => st.phase !== 'playing');
+  assert.equal(s.phase, 'gameOver');
+  assert.equal(s.best.level, 2, 'dying on level 2 records 2');
 });
 
 test('phase machine: a non-finite seed keeps the previous one rather than poisoning the run', () => {
@@ -685,7 +730,7 @@ test('fuel: running out ends the run and records the best score once', () => {
   assert.equal(s.phase, 'gameOver');
 });
 
-test('fuel: sprinting drains 1.5× as fast, but only while actually moving', () => {
+test('fuel: sprinting drains FUEL.SPRINT_MULT× as fast, but only while actually moving', () => {
   const LONG = ['#########', '#S.....E#', '#########'];
   const walk = started(level([], 100, LONG));
   const sprint = started(level([], 100, LONG));
@@ -697,7 +742,10 @@ test('fuel: sprinting drains 1.5× as fast, but only while actually moving', () 
   const usedSprint = 100 - sprint.run.fuel;
   const usedStill = 100 - still.run.fuel;
   assert.ok(Math.abs(usedWalk - 1) < 0.02, `walking burned ${usedWalk} s`);
-  assert.ok(usedSprint > usedWalk * 1.4, `sprinting burned ${usedSprint} s`);
+  assert.ok(
+    Math.abs(usedSprint - usedWalk * FUEL.SPRINT_MULT) < 0.05,
+    `sprinting burned ${usedSprint} s against ${usedWalk} s walking`,
+  );
   assert.ok(Math.abs(usedStill - 1) < 0.02, 'holding sprint while standing still costs nothing extra');
 });
 

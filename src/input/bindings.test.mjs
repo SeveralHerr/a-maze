@@ -24,6 +24,12 @@ import {
   axisDeadzone,
   codeFromKey,
   CONTROL_HINTS,
+  HOLD_NAMES,
+  DEFAULT_KEY_BINDINGS,
+  DEFAULT_BINDINGS,
+  createBindings,
+  describeControls,
+  keyLabel,
 } from './bindings.js';
 
 test('ACTIONS covers the contract vocabulary exactly once', () => {
@@ -121,6 +127,8 @@ test('gamepad standard mapping: A/B/Start/Back and the d-pad', () => {
   // Unbound buttons must read as undefined, never as 0 (= slot FORWARD).
   assert.equal(GAMEPAD_BUTTON_HOLD[3], undefined);
   assert.equal(GAMEPAD_BUTTON_ACTION[5], undefined);
+  // Mute is reachable from a pad (Y / Triangle), and never from a shoulder a thumb grazes.
+  assert.equal(GAMEPAD_BUTTON_ACTION[3], ACTION_BIT.mute);
 });
 
 test('radialDeadzone: inside the zone is exactly zero', () => {
@@ -217,4 +225,74 @@ test('CONTROL_HINTS is frozen, non-empty and complete enough to render', () => {
     assert.equal(typeof h.keys, 'string');
     assert.equal(typeof h.pad, 'string');
   }
+});
+
+test('createBindings(null) reproduces the default tables exactly', () => {
+  const b = createBindings(null);
+  assert.deepEqual({ ...b.keyHold }, { ...KEY_HOLD });
+  assert.deepEqual({ ...b.keyActionMask }, { ...KEY_ACTION_MASK });
+  assert.equal(Object.getPrototypeOf(b.keyHold), null);
+  assert.equal(Object.getPrototypeOf(b.keyActionMask), null);
+  assert.ok(Object.isFrozen(DEFAULT_BINDINGS.keyHold), 'the shared defaults cannot be mutated');
+  assert.equal(HOLD_NAMES.length, HOLD_COUNT);
+  for (const names of Object.values(DEFAULT_KEY_BINDINGS)) assert.ok(Array.isArray(names));
+});
+
+test('createBindings applies overrides wholesale per key and is total on garbage', () => {
+  const b = createBindings({ KeyI: ['forward', 'up'], KeyW: [], KeyQ: ['sprint', 'forward', 'mute'] });
+  assert.equal(b.keyHold.KeyI, HOLD.FORWARD);
+  assert.equal(b.keyActionMask.KeyI, ACTION_BIT.up);
+  assert.equal(b.keyHold.KeyW, undefined, 'an empty list unbinds');
+  assert.equal(b.keyActionMask.KeyW, undefined);
+  assert.equal(b.keyHold.KeyQ, HOLD.SPRINT, 'first hold name wins');
+  assert.equal(b.keyActionMask.KeyQ, ACTION_BIT.mute);
+  assert.equal(b.keyHold.ArrowUp, HOLD.FORWARD, 'untouched keys keep their defaults');
+  // 'back' is the action, 'backward' the slot: no ambiguity.
+  const c = createBindings({ KeyK: ['backward'], KeyL: ['back'] });
+  assert.equal(c.keyHold.KeyK, HOLD.BACK);
+  assert.equal(c.keyActionMask.KeyK, undefined);
+  assert.equal(c.keyHold.KeyL, undefined);
+  assert.equal(c.keyActionMask.KeyL, ACTION_BIT.back);
+  // Escape is locked: a stored remap can never strand the player outside the pause menu.
+  const d = createBindings({ Escape: [] });
+  assert.equal(d.keyActionMask.Escape, ACTION_BIT.back | ACTION_BIT.pause);
+  // Garbage from localStorage.
+  for (const junk of [7, 'x', [], { KeyW: 'forward' }, { KeyW: [1, null, 'constructor', '__proto__'] }]) {
+    const j = createBindings(/** @type {any} */ (junk));
+    assert.equal(typeof j.keyHold, 'object');
+  }
+  const e = createBindings(/** @type {any} */ ({ KeyW: [1, null, 'constructor', 'toString'] }));
+  assert.equal(e.keyHold.KeyW, undefined);
+  assert.equal(e.keyActionMask.KeyW, undefined);
+});
+
+test('describeControls generates the hints from the tables, so they follow a remap', () => {
+  const rows = Object.fromEntries(CONTROL_HINTS.map((h) => [h.label, h]));
+  assert.equal(rows.Move.keys, 'W S / ↑ ↓');
+  assert.equal(rows.Strafe.keys, 'A D');
+  assert.equal(rows.Turn.keys, 'Q E / ← →');
+  assert.equal(rows.Sprint.keys, 'Shift', 'left/right shift collapse to one keycap');
+  assert.equal(rows.Map.keys, 'M / Tab');
+  assert.equal(rows.Pause.keys, 'Esc / P');
+  assert.equal(rows.Mute.keys, 'N');
+  assert.equal(rows.Mute.pad, 'Y');
+  assert.equal(rows.Confirm.keys, 'Enter / Space');
+  assert.equal(rows.Back.keys, 'Esc / Backspace');
+
+  const remapped = describeControls(createBindings({ KeyI: ['forward', 'up'], KeyW: [], KeyN: [] }));
+  const r = Object.fromEntries(remapped.map((h) => [h.label, h]));
+  assert.equal(r.Move.keys, 'I S / ↑ ↓', 'letters pair with letters, arrows with arrows');
+  assert.equal(r.Mute.keys, '—', 'an unbound control says so');
+  assert.ok(Object.isFrozen(remapped));
+  assert.deepEqual(describeControls(/** @type {any} */ (null)), CONTROL_HINTS);
+});
+
+test('keyLabel prints what the keycap says', () => {
+  assert.equal(keyLabel('KeyW'), 'W');
+  assert.equal(keyLabel('Digit7'), '7');
+  assert.equal(keyLabel('Numpad8'), 'Num8');
+  assert.equal(keyLabel('ArrowLeft'), '←');
+  assert.equal(keyLabel('Escape'), 'Esc');
+  assert.equal(keyLabel('Semicolon'), ';');
+  assert.equal(keyLabel('F5'), 'F5');
 });

@@ -9,7 +9,7 @@
  * JS. That only works if every texel is a palette *index*, so all art in `textures.js` is painted
  * with the `C.*` indices exported here, and nothing anywhere invents an off-palette colour.
  *
- * Colours were sampled from `docs/art-reference.png`: cool blue-grey stone, warm grey-brown
+ * Colours were sampled from `docs/art-reference.png`: cool blue-grey stone, grey
  * cobbles, dark brown ceiling timber, creeping green moss, and a warm fire ramp that is the only
  * saturated warm light in the scene. Each material is a *ramp* (a short ordered run of related
  * shades) so textures can dither between neighbouring steps instead of banding.
@@ -80,15 +80,18 @@ const ENTRIES = /** @type {const} */ ([
   ['mossLight', 0x5e8a37],
   ['mossTip', 0x86a852],
 
-  // ── Cobbles: warm grey-brown floor stones with near-black gaps. ──────────────────────────────
-  ['cobGap', 0x111010],
-  ['cobShadow', 0x211e1b],
-  ['cobDark', 0x34312c],
-  ['cobMid', 0x474440],
-  ['cobBase', 0x5b5751],
-  ['cobLight', 0x736e67],
-  ['cobBright', 0x8c867d],
-  ['cobHilite', 0xa69f95], // worn/wet top of a stone
+  // ── Cobbles: stone-grey floor with near-black gaps. ──────────────────────────────────────────
+  // A barely warm grey, not brown: the reference's cobbles read warm only where torchlight falls on
+  // them (r−b ≈ +9 overall), and the sconce tint in the colormap supplies that. The old brown ramp
+  // under a warm-by-brightness colormap read as tan sand (r−b +48…+83 on the lit floor).
+  ['cobGap', 0x100f0f],
+  ['cobShadow', 0x1f1d1c],
+  ['cobDark', 0x32302e],
+  ['cobMid', 0x464442],
+  ['cobBase', 0x5a5855],
+  ['cobLight', 0x72706c],
+  ['cobBright', 0x8a8883],
+  ['cobHilite', 0xa4a19c], // worn/wet top of a stone
 
   // ── Timber: ceiling planks and beams. ────────────────────────────────────────────────────────
   ['woodShadow', 0x140c06],

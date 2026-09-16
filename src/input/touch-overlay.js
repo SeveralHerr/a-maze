@@ -23,12 +23,13 @@
  * The handle returned by {@link createTouchOverlay}.
  * @typedef {Object} TouchOverlay
  * @property {(state: {phase?: string, settings?: {mapMode?: string}}|null|undefined) => void} update
- *   Bind visibility to the game phase, and the button bar's position to the map mode. Controls
- *   show only while `phase === 'playing'` (a pause or title menu draws its own buttons). Safe to
- *   call every frame: it costs two compares.
- * @property {(active: boolean, originX: number, originY: number, knobX: number, knobY: number) => void} setStick
+ *   Bind visibility to the game phase. Controls show only while `phase === 'playing'` (a pause or
+ *   title menu draws its own buttons). The map mode only sets the bar's `data-map` styling hook;
+ *   it never moves a button. Safe to call every frame: it costs two compares.
+ * @property {(active: boolean, originX: number, originY: number, knobX: number, knobY: number, sprint?: boolean) => void} setStick
  *   Move/show/hide the virtual stick. Coordinates are **CSS pixels in viewport space** (i.e. raw
- *   `Touch.clientX/clientY`), matching what `input.js` already tracks.
+ *   `Touch.clientX/clientY`), matching what `input.js` already tracks. `sprint` lights the knob up
+ *   while the flick-to-sprint latch is on, so a touch player can see they are burning fuel faster.
  * @property {() => void} destroy   Remove every node and listener this overlay created.
  * @property {HTMLElement|null} element  The overlay's root node (null if the DOM was unusable).
  */
@@ -48,16 +49,26 @@ const KNOB_RADIUS = 26;
 const CLICK_SUPPRESS_MS = 700;
 
 /**
- * How far down the button bar slides while the **full** map is open, in CSS px.
+ * Extra drop of the button bar below where the page stylesheet puts it, in CSS px — applied
+ * **always**, never as a function of game state.
  *
- * `styles.css` already pushes the bar clear of the HUD's top-right panel, but the full-screen map
- * draws its own header (`DEPTH n · 128×128` on the left, `MAPPED %` on the right) at that same
- * vertical inset on a phone, so PAUSE landed on top of the percentage. One button height plus the
- * gap moves the bar off the header line and onto the map's top-right margin, where it covers a
- * corner of a picture instead of a number. A `transform` (rather than a margin or a `top`) so the
- * shift composes with wherever the page stylesheet has put the bar, without knowing that value.
+ * `styles.css` pushes the bar clear of the HUD's top-right panel, but the full-screen map draws its
+ * own header (`DEPTH n · 128×128` on the left, `MAPPED %` on the right) at that same vertical inset
+ * on a phone, so PAUSE landed on top of the percentage. The previous fix slid the bar down only
+ * while the full map was open — which moved MAP out from under the thumb that had just pressed it,
+ * so tapping the same spot again to close the map missed. A control must never move because it
+ * was used: the bar now sits at the lowered position in every mode, one button height plus the gap
+ * below the header line, so MAP opens and closes the map from exactly the same spot.
  */
-const FULL_MAP_DROP_PX = 64;
+const BAR_DROP_PX = 64;
+
+/** Knob look while the flick-to-sprint latch is on: brighter rim and a hot glow (fuel burns 1.5×). */
+const KNOB_SPRINT_BORDER = '#ffd37a';
+const KNOB_SPRINT_BG = 'rgba(255,176,64,0.55)';
+const KNOB_SPRINT_SHADOW = 'inset 0 0 0 2px rgba(0,0,0,0.5),0 0 18px 4px rgba(255,160,40,0.6)';
+const KNOB_IDLE_BORDER = GOLD;
+const KNOB_IDLE_BG = 'rgba(217,164,65,0.30)';
+const KNOB_IDLE_SHADOW = 'inset 0 0 0 2px rgba(0,0,0,0.5),0 0 10px rgba(217,164,65,0.25)';
 
 /**
  * Create the on-screen touch controls inside `root`.
@@ -144,8 +155,8 @@ export function createTouchOverlay(root, opts) {
   const knob = el(
     'div',
     `position:absolute;left:0;top:0;width:${KNOB_RADIUS * 2}px;height:${KNOB_RADIUS * 2}px;` +
-      `margin:${-KNOB_RADIUS}px 0 0 ${-KNOB_RADIUS}px;border:2px solid ${GOLD};border-radius:50%;` +
-      'background:rgba(217,164,65,0.30);box-shadow:inset 0 0 0 2px rgba(0,0,0,0.5),0 0 10px rgba(217,164,65,0.25);' +
+      `margin:${-KNOB_RADIUS}px 0 0 ${-KNOB_RADIUS}px;border:2px solid ${KNOB_IDLE_BORDER};border-radius:50%;` +
+      `background:${KNOB_IDLE_BG};box-shadow:${KNOB_IDLE_SHADOW};` +
       'opacity:0;transition:opacity 120ms linear;will-change:transform;transform:translate3d(-999px,-999px,0);'
   );
 
@@ -156,7 +167,7 @@ export function createTouchOverlay(root, opts) {
   const bar = el(
     'div',
     'position:absolute;top:0;right:0;display:flex;gap:10px;pointer-events:none;' +
-      'padding:calc(env(safe-area-inset-top,0px) + 10px) calc(env(safe-area-inset-right,0px) + 10px) 0 0;'
+      `padding:calc(env(safe-area-inset-top,0px) + ${10 + BAR_DROP_PX}px) calc(env(safe-area-inset-right,0px) + 10px) 0 0;`
   );
   // SEAM (integrator): the HUD's score/gem panel also lives in the top-right corner, so on a
   // portrait phone these buttons landed on top of the score. The class is the only hook the page
@@ -256,7 +267,8 @@ export function createTouchOverlay(root, opts) {
 
   // ── Mutable view state (cached so we only touch the DOM on a real change) ─────────────────
   let visible = true; // visible until the first update() binds us to a phase
-  let barLowered = false; // true while the full-screen map is open
+  let mapAttr = ''; // last `data-map` written
+  let knobSprint = false;
   let stickShown = false;
   let ringX = NaN;
   let ringY = NaN;
@@ -279,15 +291,14 @@ export function createTouchOverlay(root, opts) {
     update(state) {
       if (destroyed) return;
 
-      // The full map covers the screen with its own header; the bar steps out of its way. The
-      // `data-map` attribute is the hook `styles.css` (integrator territory) can use to place the
-      // bar itself — the inline transform below is what makes the fix stand up without it.
+      // `data-map` is a styling hook only (`styles.css` may key off it). Position deliberately does
+      // NOT depend on the map mode — see BAR_DROP_PX: a button that moves when pressed misses the
+      // second tap.
       const settings = state ? /** @type {any} */ (state).settings : null;
-      const lower = !!settings && settings.mapMode === 'full';
-      if (lower !== barLowered) {
-        barLowered = lower;
-        bar.setAttribute('data-map', lower ? 'full' : 'default');
-        bar.style.transform = lower ? `translateY(${FULL_MAP_DROP_PX}px)` : '';
+      const attr = !!settings && settings.mapMode === 'full' ? 'full' : 'default';
+      if (attr !== mapAttr) {
+        mapAttr = attr;
+        bar.setAttribute('data-map', attr);
       }
 
       // Anything that is not the playing phase is a menu, and menus own the screen: hiding the
@@ -299,8 +310,16 @@ export function createTouchOverlay(root, opts) {
       if (!show) setStickShown(false);
     },
 
-    setStick(active, originX, originY, kx, ky) {
+    setStick(active, originX, originY, kx, ky, sprint) {
       if (destroyed) return;
+      const hot = active === true && sprint === true && visible;
+      if (hot !== knobSprint) {
+        // Written only on a change of the latch, so a touchmove adds no style writes.
+        knobSprint = hot;
+        knob.style.borderColor = hot ? KNOB_SPRINT_BORDER : KNOB_IDLE_BORDER;
+        knob.style.background = hot ? KNOB_SPRINT_BG : KNOB_IDLE_BG;
+        knob.style.boxShadow = hot ? KNOB_SPRINT_SHADOW : KNOB_IDLE_SHADOW;
+      }
       if (!active || !visible) {
         setStickShown(false);
         return;

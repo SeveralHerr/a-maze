@@ -12,9 +12,11 @@
  * 1/128, the iris to 0.5 %) so an animating effect writes a style perhaps twenty times a second
  * instead of sixty. `set()` is therefore safe to call unconditionally from the render loop.
  *
- * The scanline pitch is derived from the renderer's internal resolution: one dark line per
- * internal pixel row, snapped to a whole number of CSS pixels, which is what keeps the pattern
- * crisp instead of shimmering with moiré as the window resizes.
+ * The scanline pitch is derived from the renderer's internal resolution: exactly one dark line per
+ * internal pixel row, so the pattern is locked to the rows it darkens. A pitch that is a whole
+ * number of CSS pixels is drawn with whole-pixel stops (crisp); any other pitch — 1080 CSS px over
+ * 240 rows is 4.5 — is drawn at its true fractional period rather than rounded, because a rounded
+ * period drifts against the rows and beats into moiré across the screen.
  *
  * Owns its own stylesheet because `styles.css` is integrator territory; the sheet is injected once
  * per document and is namespaced under `.amaze-post-*`.
@@ -138,31 +140,42 @@ export function createPost(rootEl) {
   /**
    * Rebuild the scanline gradient for the current display size.
    *
-   * `pitch` is how many CSS pixels one internal framebuffer row occupies, rounded to an integer:
-   * a fractional pitch is what produces the crawling moiré you see in bad CRT filters. Below 2 CSS
-   * pixels per row there is no room for a line, so the overlay switches itself off.
-   * @param {number} pitch integer CSS pixels per internal row
+   * `pitch` is how many CSS pixels one internal framebuffer row occupies. It used to be rounded to
+   * a whole number, which is exact at 720p (3 px) but at 1080p put a 5 px period over 4.5 px rows,
+   * and the dark line then walked through the rows in a 9-row beat — the moiré the rounding was
+   * meant to prevent. Now a fractional pitch is drawn at its true period. Chrome snaps each hard
+   * one-pixel stop to a device row, so the lines land 4 and 5 px apart in turn — exactly the rows
+   * the pixelated upscale gives the framebuffer — and stay locked to them top to bottom (measured
+   * at 1917×1080: 240 lines for 240 rows, every line within half a pixel of its row, 234 of 240 a
+   * single row of identical weight). A whole pitch keeps whole-pixel stops. Below 2 CSS pixels per
+   * row there is no room for a line, so the overlay switches itself off.
+   * @param {number} pitch CSS pixels per internal row (whole, or rounded to 1/1000)
    * @returns {void}
    */
   function applyScanPitch(pitch) {
     scanPitch = pitch;
-    if (pitch < 2) {
+    if (!(pitch >= 2)) {
       scanEl.style.backgroundImage = 'none';
       return;
     }
-    // One dark line per internal row, a third of the pitch thick: visible texture, still legible.
-    const thick = pitch >= 6 ? 2 : 1;
+    const whole = pitch === Math.round(pitch);
+    const band = Math.round(pitch);
+    // One dark line per internal row: a single CSS pixel up to a 6 px pitch, two beyond.
+    const thick = band >= 6 ? 2 : 1;
     // Strength scales with the pitch. At a wide pitch the dark line is one row in six and reads as
     // CRT character; at the shipped 3 px pitch (1280×720 over a 240-row buffer) it is one row in
     // THREE, and at 0.42 that cost ~14 % of the mean luminance plus hard banding straight across
-    // every wall face — measurably more wall detail than the effect was buying. The gap's lift is
-    // scaled the same way so the two stay in proportion.
-    const dark = pitch >= 6 ? 0.42 : pitch >= 5 ? 0.34 : pitch >= 4 ? 0.28 : 0.22;
-    const lift = pitch >= 6 ? 0.04 : pitch >= 5 ? 0.034 : pitch >= 4 ? 0.028 : 0.022;
+    // every wall face — measurably more wall detail than the effect was buying.
+    const lineDark = band >= 6 ? 0.42 : band >= 5 ? 0.34 : band >= 4 ? 0.28 : 0.22;
+    // A fractional pitch keeps the mean darkening (`alpha × thick / pitch`) of its nearest whole
+    // pitch, so 4.5 px rows read neither lighter nor darker than 4 or 5 px ones.
+    const dark = whole ? lineDark : Math.round(((lineDark * pitch) / band) * 1000) / 1000;
+    // The gap is fully transparent. It used to carry a faint white "lift", but this layer blends
+    // with `multiply`, and multiplying by white leaves the picture exactly as it was.
     scanEl.style.backgroundImage =
       `repeating-linear-gradient(to bottom,` +
       `rgba(0,0,0,${dark}) 0px, rgba(0,0,0,${dark}) ${thick}px,` +
-      `rgba(255,255,255,${lift}) ${thick}px, rgba(255,255,255,${lift}) ${pitch}px)`;
+      `rgba(0,0,0,0) ${thick}px, rgba(0,0,0,0) ${pitch}px)`;
   }
 
   /**
@@ -174,7 +187,11 @@ export function createPost(rootEl) {
    */
   function resize(cssW, cssH, internalH) {
     const rows = internalH > 0 ? internalH : 240;
-    const pitch = Math.max(1, Math.round((cssH > 0 ? cssH : rows) / rows));
+    const rowPx = (cssH > 0 ? cssH : rows) / rows;
+    const nearest = Math.round(rowPx);
+    // Snap only when the rounding error, accumulated over every row, stays under about one CSS
+    // pixel top to bottom — too little to form a beat — since whole-pixel stops are crisper.
+    const pitch = Math.abs(rowPx - nearest) * rows <= 1 ? nearest : Math.round(rowPx * 1000) / 1000;
     if (pitch !== scanPitch) applyScanPitch(pitch);
   }
 

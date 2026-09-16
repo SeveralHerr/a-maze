@@ -28,10 +28,11 @@
 
 import { clamp, clamp01 } from '../core/math.js';
 import { createLogger } from '../core/log.js';
-import { COLOR, drawText, lineHeight, measureLine, textHeight } from './font.js';
+import { COLOR, drawAt, heightAt, measureAt, wrapText } from './font.js';
 import {
   createCounter,
   createTextMemo,
+  formatClock,
   formatCount,
   formatDistance,
   formatInt,
@@ -48,14 +49,16 @@ import {
   setMapMode,
 } from './map.js';
 import {
+  createArtSprite,
   createSurface,
   drawArt,
   compileArt,
   drawFlame,
   drawPanel,
   drawWell,
-  fitScale,
+  fitScaleAt,
   withAlpha,
+  withAlphaStep,
   ICON_SIZE,
 } from './hud.js';
 
@@ -233,6 +236,37 @@ const GAMEOVER_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
   { id: 'quit', label: 'Title', kind: 'action' },
 ]);
 
+/**
+ * "Abandon the descent?" — the confirmation behind every *Quit to Title* that would throw a live run
+ * away (pause and level complete; a game-over run is already over, so its Title row goes straight
+ * there). The safe answer is the first row and the one selected on entry, and `back` means it too:
+ * a reflexive Escape, Enter, Escape can never cost a thirty-minute descent.
+ */
+const CONFIRM_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
+  { id: 'stay', label: 'Keep Going', kind: 'back' },
+  { id: 'abandon', label: 'Abandon', kind: 'action' },
+]);
+
+/** The abandon dialog's heading, whole and as the two lines a phone draws it on. */
+const CONFIRM_HEADING = 'Abandon the descent?';
+const CONFIRM_TOP = 'Abandon';
+const CONFIRM_BOTTOM = 'the descent?';
+
+/** End-screen headings, whole and split (see `fitHeading`). */
+const HEADING_CLEARED = 'Cleared';
+const HEADING_OUT = 'Your torch has gone out';
+const HEADING_OUT_TOP = 'Your torch';
+const HEADING_OUT_BOTTOM = 'has gone out';
+/** Its note, from pause. */
+const CONFIRM_NOTE_RUN = 'YOUR RUN ENDS HERE';
+/** Its note, from a cleared depth (the tally screen). */
+const CONFIRM_NOTE_CLEARED = 'NO FURTHER DESCENT';
+
+/** Title screen copy. */
+const TITLE_SUBTITLE = 'The Torchlit Descent';
+const TITLE_VERSION = 'v0.1';
+const TITLE_COPYRIGHT = '© 2026 SeveralHerr';
+
 /** The game-over record line. */
 const NEW_BEST_TEXT = 'NEW BEST!';
 
@@ -246,11 +280,131 @@ const SCREENS = Object.freeze({
   options: Object.freeze({ id: 'options', items: OPTION_ITEMS }),
   credits: Object.freeze({ id: 'credits', items: CREDITS_ITEMS }),
   controls: Object.freeze({ id: 'controls', items: CONTROLS_ITEMS }),
+  confirm: Object.freeze({ id: 'confirm', items: CONFIRM_ITEMS }),
   complete: Object.freeze({ id: 'complete', items: COMPLETE_ITEMS }),
   gameover: Object.freeze({ id: 'gameover', items: GAMEOVER_ITEMS }),
   loading: Object.freeze({ id: 'loading', items: NO_ITEMS }),
   none: Object.freeze({ id: 'none', items: NO_ITEMS }),
 });
+
+/** `drawPanel` options per screen, built once instead of as a literal per frame. */
+const PANEL_PAUSE = Object.freeze({ frame: /** @type {const} */ ('stone'), alpha: 0.86 });
+const PANEL_OPTIONS = Object.freeze({ frame: /** @type {const} */ ('stone'), alpha: 0.9 });
+const PANEL_WOOD = Object.freeze({ frame: /** @type {const} */ ('wood'), alpha: 0.9 });
+const PANEL_END = Object.freeze({ frame: /** @type {const} */ ('stone'), alpha: 0.92 });
+
+// ─── Title wordmark ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * The A-MAZE wordmark, drawn by hand: 24 rows of silhouette, `#` = ink.
+ *
+ * WHY it is art and not text: the title used to be the 12-row display face blown up ten times, which
+ * read as a blocky arcade logo — and its pixels were ~7× the size of the world's. This is lettered
+ * at the size it is shown, in the manner of the gold title of `docs/art-reference.png`: heavy stems
+ * against hairline diagonals and shoulders (the thin/thick contrast of a broad nib), stems cut on a
+ * slant at the top, diamond feet, a flagged apex on each A. It is drawn at 1–4× so a wordmark pixel
+ * stays within about 1.5× of a world texel. The tones — outline, drop shadow, the parchment rim along
+ * the top of every stroke, a lit left flank and a shaded underside — are derived from the silhouette
+ * by {@link compileWordmark}, so the letterforms can be edited here as plain rows.
+ * @type {ReadonlyArray<string>}
+ */
+const WORDMARK_ROWS = Object.freeze([
+  '..........####...................................................................####....................................................',
+  '.........#####..............................#...................................#####............################.........##############.',
+  '.......#######............................####...............#####............#######............################........###############.',
+  '......#..#####..........................########...........#######...........#..#####............################.......####..........##.',
+  '........##.####.........................####..####........########.............##.####...........################.......####...........#.',
+  '........##.####........................#####....####.##.####..####.............##.####...........##..........####.......####.............',
+  '........##.####.........................####.....#########....####.............##.####...........#..........#####.......####.............',
+  '.......##...####........................####.......#####......####............##...####..........#.........#####........####.............',
+  '.......##...####........................####.......####.......####............##...####..........#........#####.........####.............',
+  '.......##...####........................####.......####.......####............##...####...................####..........####.............',
+  '......##....####...........######.......####.......####.......####...........##....####..................####...........####.......##....',
+  '......##.....####.........#########.....####.......####.......####...........##.....####.............##########.........##############...',
+  '......#......####........###########....####.......####.......####...........#......####.............##########.........##############...',
+  '.....############.........#########.....####.......####.......####..........############..............#####.............####.......##....',
+  '.....#############......................####.......####.......####..........#############.............####..............####.............',
+  '....##........####......................####.......####.......####.........##........####............#####........#.....####.............',
+  '....##........####......................####.......####.......####.........##........####...........#####.........#.....####.............',
+  '....##........####......................####.......####.......####.........##........####..........#####..........#.....####...........#.',
+  '...##.........#####.....................####.......####.......####........##.........#####.........####...........#.....####...........#.',
+  '...##..........####.....................####.......####.......####........##..........####........#################.....####...........#.',
+  '...##..........####.....................####.......####.......####........##..........####........#################.....####..........##.',
+  '.####.........#######...................#####......#####......#####.....####.........#######......#################.....#################',
+  '######........#######..................#######....#######....#######...######........#######......################......#################',
+  '..##............###......................###........###........###.......##............###...............................................',
+]);
+
+/**
+ * Wordmark palette indices: 1 drop shadow, 2 outline, 3 shaded underside, 4 gold, 5 light gold
+ * (upper strokes and lit left flanks), 6 parchment rim.
+ */
+const WORDMARK_PALETTE = Object.freeze([
+  null,
+  COLOR.void,
+  COLOR.goldDark,
+  COLOR.goldMid,
+  COLOR.goldBase,
+  COLOR.gold,
+  COLOR.parchment,
+]);
+
+/**
+ * Turn the wordmark silhouette into toned indexed art: one pixel of outline all round, a one-pixel
+ * drop shadow down and right, and inside the ink a parchment rim on every top edge, light gold on
+ * the upper strokes and left flanks, and a shaded underside. Runs once, at import.
+ * @param {ReadonlyArray<string>} rows
+ * @returns {import('./pixels.js').Art}
+ */
+export function compileWordmark(rows) {
+  const ih = rows.length;
+  let iw = 0;
+  for (let i = 0; i < ih; i++) if (rows[i].length > iw) iw = rows[i].length;
+  // One pixel of outline on every side, plus one more right and down for the shadow.
+  const w = iw + 3;
+  const h = ih + 3;
+  const ink = new Uint8Array(w * h);
+  for (let y = 0; y < ih; y++) {
+    for (let x = 0; x < rows[y].length; x++) {
+      if (rows[y].charCodeAt(x) === 35) ink[(y + 1) * w + x + 1] = 1;
+    }
+  }
+  /** @param {number} x @param {number} y @returns {boolean} */
+  const at = (x, y) => x >= 0 && y >= 0 && x < w && y < h && ink[y * w + x] === 1;
+  const data = new Uint8Array(w * h);
+  const upper = 1 + Math.round(ih * 0.42);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (at(x, y)) {
+        let t = y < upper ? 5 : 4;
+        if (!at(x, y + 1) || (!at(x + 1, y) && y >= upper)) t = 3;
+        if (!at(x - 1, y) && at(x, y + 1)) t = 5;
+        if (!at(x, y - 1)) t = 6;
+        data[y * w + x] = t;
+        continue;
+      }
+      if (at(x - 1, y - 1) || at(x, y - 1) || at(x + 1, y - 1) || at(x - 1, y) || at(x + 1, y) ||
+          at(x - 1, y + 1) || at(x, y + 1) || at(x + 1, y + 1)) {
+        data[y * w + x] = 2;
+      }
+    }
+  }
+  // Drop shadow: the outlined shape, one pixel down and right, wherever that is still empty.
+  for (let y = h - 1; y >= 1; y--) {
+    for (let x = w - 1; x >= 1; x--) {
+      if (data[y * w + x] === 0 && data[(y - 1) * w + x - 1] !== 0 && data[(y - 1) * w + x - 1] !== 1) {
+        data[y * w + x] = 1;
+      }
+    }
+  }
+  return { w, h, data };
+}
+
+/** Cap height of the wordmark lettering, in art pixels (the silhouette's rows). */
+const WORDMARK_CAP_ROWS = WORDMARK_ROWS.length;
+
+/** The wordmark, compiled once and blitted from an offscreen image. */
+const WORDMARK = createArtSprite(compileWordmark(WORDMARK_ROWS), WORDMARK_PALETTE);
 
 /** Credits copy. Lines are wrapped to the panel width at draw time. */
 const CREDITS_LINES = Object.freeze([
@@ -304,7 +458,7 @@ const DEFAULT_CONTROL_HINTS = Object.freeze([
 ]);
 
 /** The line under the keyboard table, for a player who will pick the game up on a phone later. */
-const TOUCH_HINT = 'Touch: left stick moves, drag the right half to look.';
+const TOUCH_HINT = 'Touch: stick moves, drag looks';
 
 /**
  * What a phone is played with (`src/input/touch-overlay.js` + the touch path of `input.js`).
@@ -326,7 +480,7 @@ const TOUCH_CONTROL_HINTS = Object.freeze([
 ]);
 
 /** The footer under the touch table. */
-const KEYBOARD_HINT = 'A keyboard or gamepad works too.';
+const KEYBOARD_HINT = 'Keyboard and pad work too';
 
 /** Characters the bitmap faces cannot draw, and what to say instead. */
 const GLYPH_FALLBACK = Object.freeze({
@@ -356,7 +510,10 @@ function sanitizeHints(hints) {
     const label = typeof h.label === 'string' ? h.label : '';
     const keys = typeof h.keys === 'string' ? h.keys : '';
     if (label === '' || keys === '') continue;
-    out.push({ label: translateGlyphs(label), keys: translateGlyphs(keys) });
+    // The gamepad binding is kept: the Controls panel shows it as a third column whenever a pad is
+    // connected (the game supports one, and dropping the column here hid that from its players).
+    const pad = typeof h.pad === 'string' ? translateGlyphs(h.pad) : '';
+    out.push({ label: translateGlyphs(label), keys: translateGlyphs(keys), pad });
   }
   return out.length === 0 ? DEFAULT_CONTROL_HINTS : out;
 }
@@ -546,16 +703,24 @@ export function createMenus(overlayCanvas, callbacks) {
   let lastPhase = '';
   /** Screen id seen on the previous render. */
   let lastScreen = '';
-  /** Seconds since the current screen appeared. */
-  let enterT = 0;
-  /** Animation clock, advanced from `state.time`. */
-  let clock = 0;
-  let lastTime = -1;
+  /**
+   * The menus' fractional per-frame numbers, as fields of one object: a closure `let` holding a
+   * non-integer boxes a new number on every store, which was garbage on every frame (see the same
+   * note in `hud.js`). Object fields are updated in place.
+   */
+  const anim = {
+    /** Seconds since the current screen appeared. */
+    enterT: 0,
+    /** Animation clock, advanced from `state.time`. */
+    clock: 0,
+    /** Last `state.time` seen; −1 before the first frame. */
+    lastTime: -1,
+    /** Seconds since the tally started; −1 while no tally is running. */
+    tallyT: -1,
+  };
 
   // ── Tally state (level complete) ──
   const tallyCounters = [createCounter(0), createCounter(0), createCounter(0), createCounter(0)];
-  /** Seconds since the tally started; −1 while no tally is running. */
-  let tallyT = -1;
   /** True once the player has skipped/finished the tally animation. */
   let tallyDone = false;
 
@@ -586,6 +751,9 @@ export function createMenus(overlayCanvas, callbacks) {
   // the (already integer) inputs, so a screen that is standing still allocates no strings at all.
   const bestMemo = createTextMemo((score, level) => 'BEST ' + formatInt(score) + '  ·  DEPTH ' + level);
   const statusMemo = createTextMemo((level, score) => 'DEPTH ' + level + '  ·  ' + formatInt(score));
+  const pauseDetailMemo = createTextMemo((sec, pct) =>
+    pct >= 0 ? 'TIME ' + formatClock(sec) + '  ·  MAPPED ' + pct + '%' : 'TIME ' + formatClock(sec),
+  );
   const bannerMemo = createTextMemo((level, side) => formatLevelBanner(level, side, side));
   const cellsMemo = createTextMemo((cells) => formatInt(cells) + ' CELLS');
   const gemsRowMemo = createTextMemo(
@@ -593,6 +761,7 @@ export function createMenus(overlayCanvas, callbacks) {
   );
   const torchRowMemo = createTextMemo((sec) => 'TORCH LEFT ' + formatTime(sec));
   const clearedMemo = createTextMemo((level) => 'Depth ' + level + ' Cleared');
+  const clearedTopMemo = createTextMemo((level) => 'Depth ' + level);
   const levelMemo = createTextMemo((level) => String(level));
   /** One integer memo per tally row (final value) and per rolling counter (shown value). */
   const tallyFinalMemos = [0, 1, 2, 3].map(() => createTextMemo((v) => formatInt(v)));
@@ -617,6 +786,19 @@ export function createMenus(overlayCanvas, callbacks) {
   let pressedRow = -1;
   /** Row whose slider is being dragged, or −1. */
   let dragRow = -1;
+  /**
+   * The best score as it stood when the current run started, or −1 when no frame has shown it.
+   * "NEW BEST!" is measured against this, strictly, exactly as `recordBest` in src/state does —
+   * by the time the game-over screen shows, `state.best` already includes this run, so comparing
+   * against it celebrated every run that merely *tied* the record.
+   */
+  let runStartBest = -1;
+  /** Incremented on every screen change, so a screen can do once-per-visit work. */
+  let screenSerial = 0;
+  /** Clock time the gamepad question was last asked on the Controls screen (−1: ask now). */
+  let padSeenAt = -1;
+  /** Whether a gamepad was connected when last asked. */
+  let padShown = false;
 
   /**
    * The sub-screen open over the title or pause screen, or null.
@@ -626,6 +808,7 @@ export function createMenus(overlayCanvas, callbacks) {
     if (sub === 'options') return SCREENS.options;
     if (sub === 'credits') return SCREENS.credits;
     if (sub === 'controls') return SCREENS.controls;
+    if (sub === 'confirm') return SCREENS.confirm;
     return null;
   }
 
@@ -643,7 +826,8 @@ export function createMenus(overlayCanvas, callbacks) {
       case 'loading':
         return SCREENS.loading;
       case 'levelComplete':
-        return SCREENS.complete;
+        // Only the abandon confirmation opens over the tally.
+        return sub === 'confirm' ? SCREENS.confirm : SCREENS.complete;
       case 'gameOver':
         return SCREENS.gameover;
       default:
@@ -718,6 +902,8 @@ export function createMenus(overlayCanvas, callbacks) {
   function openSub(id) {
     savedIndex[currentScreenId] = index;
     sub = id;
+    // The confirmation always opens on its safe answer; every other sub-screen remembers its row.
+    if (id === 'confirm') savedIndex[id] = 0;
     index = savedIndex[id] !== undefined ? savedIndex[id] : 0;
   }
 
@@ -734,8 +920,22 @@ export function createMenus(overlayCanvas, callbacks) {
 
   /** Id of the screen drawn last frame (used by openSub/closeSub for the index memory). */
   let currentScreenId = 'title';
-  /** Id of the base screen (title or pause) under any open sub-screen. */
+  /** Id of the base screen (title, pause or level complete) under any open sub-screen. */
   let currentBaseId = 'title';
+
+  /**
+   * Record which screen is up and which base screen a sub-screen would return to. Called from both
+   * `render` and `handleInput`, so a keypress that arrives before the first frame still opens and
+   * closes sub-screens against the right base.
+   * @param {GameState} state
+   * @param {Screen} screen
+   * @returns {void}
+   */
+  function noteScreen(state, screen) {
+    currentScreenId = screen.id;
+    currentBaseId =
+      state.phase === 'paused' ? 'pause' : state.phase === 'levelComplete' ? 'complete' : 'title';
+  }
 
   /**
    * Run a row's action.
@@ -799,6 +999,17 @@ export function createMenus(overlayCanvas, callbacks) {
         return true;
       case 'quit':
         sound('uiConfirm');
+        if (screen.id === 'gameover') {
+          // That run is already over; there is nothing left to lose.
+          invoke(cb.onQuit, 'onQuit');
+        } else {
+          openSub('confirm');
+        }
+        return true;
+      case 'abandon':
+        sound('uiConfirm');
+        // Close first, so a host whose `onQuit` does not change the phase is not left on the dialog.
+        closeSub();
         invoke(cb.onQuit, 'onQuit');
         return true;
       case 'next':
@@ -956,7 +1167,9 @@ export function createMenus(overlayCanvas, callbacks) {
    */
   function handleInput(frame, state) {
     if (state === null || typeof state !== 'object') return false;
+    syncPhase(state);
     const screen = screenFor(state);
+    noteScreen(state, screen);
     if (screen.id === 'none') return false;
     // Nothing is selectable while a level is being carved; the frame belongs to whoever else wants
     // it (the composition root still gets its pause/mute hotkeys).
@@ -999,14 +1212,38 @@ export function createMenus(overlayCanvas, callbacks) {
       } else if (screen.id === 'pause') {
         sound('uiBack');
         invoke(cb.onResume, 'onResume');
-      } else if (screen.id === 'gameover' || screen.id === 'complete') {
-        // `back` on an end screen is "leave", not "resume" — the run is already over.
+      } else if (screen.id === 'complete') {
+        // Escape is the pause key, and players hit it by reflex. On the screen that celebrates a
+        // cleared depth it must never abandon the run: it finishes the tally if one is rolling and
+        // puts the cursor on "Quit to Title" — leaving still takes a deliberate confirm, and then
+        // the abandon dialog.
+        if (!tallyDone) finishTally(state);
+        const quitRow = rowOf(screen, 'quit');
+        if (quitRow >= 0 && index !== quitRow) {
+          index = quitRow;
+          sound('uiMove');
+        } else {
+          sound('uiDeny');
+        }
+      } else if (screen.id === 'gameover') {
+        // `back` on game over is "leave": that run is already over, so there is nothing to confirm.
         sound('uiBack');
         invoke(cb.onQuit, 'onQuit');
       }
       consumed = true;
     }
     return consumed;
+  }
+
+  /**
+   * Row index of the item with this id on a screen, or −1.
+   * @param {Screen} screen
+   * @param {string} id
+   * @returns {number}
+   */
+  function rowOf(screen, id) {
+    for (let i = 0; i < screen.items.length; i++) if (screen.items[i].id === id) return i;
+    return -1;
   }
 
   /**
@@ -1151,7 +1388,7 @@ export function createMenus(overlayCanvas, callbacks) {
     tallyCounters[1].snap(fuelBonusOf(state));
     tallyCounters[2].snap(SCORE_RULES.CLEAR_BASE * level);
     tallyCounters[3].snap(run.score);
-    tallyT = TALLY_DELAY + TALLY_STAGGER * TALLY_ROWS + 1;
+    anim.tallyT = TALLY_DELAY + TALLY_STAGGER * TALLY_ROWS + 1;
     tallyDone = true;
   }
 
@@ -1177,52 +1414,32 @@ export function createMenus(overlayCanvas, callbacks) {
    * Advance the animation clock and per-screen timers.
    * @param {GameState} state
    * @param {Screen} screen
-   * @returns {number} the frame delta in seconds
+   * @returns {void}
    */
   function advance(state, screen) {
     const now = state.time;
-    let dt = lastTime < 0 ? 0 : now - lastTime;
+    let dt = anim.lastTime < 0 ? 0 : now - anim.lastTime;
     if (!(dt >= 0) || dt > MAX_FRAME_DT) dt = dt > MAX_FRAME_DT ? MAX_FRAME_DT : 0;
-    lastTime = now;
-    clock += dt;
+    anim.lastTime = now;
+    anim.clock += dt;
 
-    if (state.phase !== lastPhase) {
-      // Every phase change closes any sub-screen: arriving at "game over" with the options panel
-      // still open would be a dead end. The very first frame is not a transition — a harness (or
-      // a deep link) may legitimately have opened a sub-screen before anything was rendered.
-      if (lastPhase !== '') {
-        sub = null;
-        pressedRow = -1;
-        dragRow = -1;
-      }
-      lastPhase = state.phase;
-    }
     if (screen.id !== lastScreen) {
       lastScreen = screen.id;
-      enterT = 0;
+      anim.enterT = 0;
       index = savedIndex[screen.id] !== undefined ? savedIndex[screen.id] : 0;
       const count = syncEnabled(screen, state);
       if (count > 0 && !rowEnabled[index]) index = menuStep(rowEnabled, -1, 1, count);
-      if (screen.id === 'complete') {
-        tallyT = 0;
-        tallyDone = false;
-        for (let i = 0; i < tallyCounters.length; i++) tallyCounters[i].snap(0);
-        // Reduced motion means reduced motion: rows arriving one at a time over ~1.8 s with four
-        // counters rolling is exactly the effect the setting asks to turn off, and suppressing
-        // only the 160 ms row punch left the animation that matters running.
-        if (state.settings !== undefined && state.settings.reducedMotion === true) {
-          finishTally(state);
-        }
-      } else {
-        tallyT = -1;
-      }
+      // Ask the device question again on every screen: a hybrid tablet that has just gained a
+      // mouse should stop being told to tap. One media query per screen entry, never per frame.
+      coarsePointer = -1;
+      if (screen.id === 'controls') padSeenAt = -1;
+      screenSerial++;
     }
-    enterT += dt;
-    if (tallyT >= 0) {
-      tallyT += dt;
+    anim.enterT += dt;
+    if (anim.tallyT >= 0) {
+      anim.tallyT += dt;
       for (let i = 0; i < tallyCounters.length; i++) tallyCounters[i].update(dt);
     }
-    return dt;
   }
 
   /**
@@ -1230,12 +1447,62 @@ export function createMenus(overlayCanvas, callbacks) {
    * @param {GameState} state
    * @returns {void}
    */
+  /**
+   * React to a phase change, before the screen for this frame is chosen (closing a sub-screen here
+   * means the frame draws the right screen rather than one frame of the stale one).
+   * @param {GameState} state
+   * @returns {void}
+   */
+  function syncPhase(state) {
+    // The record a run is measured against is the best *before it started* (the same rule as
+    // `recordBest` in src/state): on the title, and while a fresh run's first level is loading at
+    // zero points, the stored best has not been touched by this run yet.
+    if (
+      state.best !== undefined &&
+      (state.phase === 'title' || (state.phase === 'loading' && state.level <= 1 && state.run.score === 0))
+    ) {
+      runStartBest = state.best.score;
+    }
+    if (state.phase === lastPhase) return;
+    // Every phase change closes any sub-screen: arriving at "game over" with the options panel
+    // still open would be a dead end. The very first frame is not a transition — a harness (or a
+    // deep link) may legitimately have opened a sub-screen before anything was rendered.
+    if (lastPhase !== '') {
+      sub = null;
+      pressedRow = -1;
+      dragRow = -1;
+    }
+    lastPhase = state.phase;
+    if (state.phase === 'levelComplete' || state.phase === 'gameOver') {
+      // An end screen opens on its first row ("Descend", "Try Again") every time, whatever was
+      // selected when the last one closed.
+      savedIndex.complete = 0;
+      savedIndex.gameover = 0;
+    }
+    if (state.phase === 'levelComplete') {
+      // The tally belongs to the phase, not to the screen: opening the abandon dialog over it and
+      // cancelling must not roll it again.
+      anim.tallyT = 0;
+      tallyDone = false;
+      for (let i = 0; i < tallyCounters.length; i++) tallyCounters[i].snap(0);
+      // Reduced motion means reduced motion: rows arriving one at a time over ~1.8 s with four
+      // counters rolling is exactly the effect the setting asks to turn off.
+      if (state.settings !== undefined && state.settings.reducedMotion === true) finishTally(state);
+    } else {
+      anim.tallyT = -1;
+    }
+  }
+
+  /**
+   * @param {GameState} state
+   * @returns {void}
+   */
   function render(state) {
     if (state === null || typeof state !== 'object') return;
     lastState = state;
+    syncPhase(state);
     const screen = screenFor(state);
-    currentScreenId = screen.id;
-    currentBaseId = state.phase === 'paused' ? 'pause' : 'title';
+    noteScreen(state, screen);
     advance(state, screen);
 
     const ctx = surface.beginFrameIfClosed();
@@ -1251,7 +1518,7 @@ export function createMenus(overlayCanvas, callbacks) {
     }
 
     const reduced = state.settings !== undefined && state.settings.reducedMotion === true;
-    const enter = reduced ? 1 : clamp01(enterT / ENTER_TIME);
+    const enter = reduced ? 1 : clamp01(anim.enterT / ENTER_TIME);
     const prevAlpha = ctx.globalAlpha;
     ctx.globalAlpha = prevAlpha * (0.15 + 0.85 * enter);
 
@@ -1271,6 +1538,9 @@ export function createMenus(overlayCanvas, callbacks) {
         break;
       case 'controls':
         drawControls(ctx, m, state, screen, enter, reduced);
+        break;
+      case 'confirm':
+        drawConfirm(ctx, m, state, screen, enter, reduced);
         break;
       case 'loading':
         drawLoading(ctx, m, state, reduced);
@@ -1299,7 +1569,7 @@ export function createMenus(overlayCanvas, callbacks) {
    * @returns {void}
    */
   function drawScrim(ctx, m, strength) {
-    ctx.fillStyle = withAlpha(COLOR.void, clamp01(strength));
+    ctx.fillStyle = withAlphaStep(COLOR.void, (clamp01(strength) * 64) | 0);
     ctx.fillRect(0, 0, m.w, m.h);
   }
 
@@ -1407,21 +1677,16 @@ export function createMenus(overlayCanvas, callbacks) {
       const enabled = rowEnabled[i];
       const label = item.label;
       const style = !enabled ? 'gothicOff' : selected ? 'gothicHot' : 'gothic';
-      const w = measureLine(label, { font: 'display', size: scale });
+      const w = measureAt(label, 'display', scale);
       // A selected row breathes very slightly — one pixel of lift, no more; a jumping menu is a
       // toy, a menu that leans toward you is a game.
-      const lift = selected && !reduced ? Math.round(Math.sin(clock * 3.4) * u * 0.5) : 0;
-      drawText(ctx, label, cx, y + lift, {
-        font: 'display',
-        size: scale,
-        color: style,
-        align: 'center',
-      });
+      const lift = selected && !reduced ? Math.round(Math.sin(anim.clock * 3.4) * u * 0.5) : 0;
+      drawAt(ctx, label, cx, y + lift, 'display', scale, style, 'center');
 
       if (selected) {
         const fs = Math.max(1, Math.round(scale * 0.8));
         const fw = ICON_SIZE.flameW * fs;
-        const frame = reduced ? 0 : ((clock * 11) | 0) % 3;
+        const frame = reduced ? 0 : ((anim.clock * 11) | 0) % 3;
         drawFlame(ctx, cx - Math.round(w / 2) - fw - 2 * u, y + lift - fs, fs, frame);
         drawFlame(ctx, cx + Math.round(w / 2) + 2 * u, y + lift - fs, fs, frame + 1);
       }
@@ -1486,18 +1751,17 @@ export function createMenus(overlayCanvas, callbacks) {
    * @param {SurfaceMetrics} m
    * @param {string} text
    * @param {number} y
+   * @param {number} size text scale — the caller's, so a prompt is never louder than what it names
    * @param {boolean} reduced
    * @returns {void}
    */
-  function drawPrompt(ctx, m, text, y, reduced) {
-    const alpha = reduced ? 1 : 0.45 + 0.55 * (0.5 + 0.5 * Math.sin(clock * 3.6));
-    drawText(ctx, text, Math.round(m.w / 2), Math.round(y), {
-      font: 'hud',
-      size: fitScale(text, m.w - 8 * m.u, { font: 'hud' }, m.u),
-      color: 'hudDim',
-      align: 'center',
-      alpha,
-    });
+  function drawPrompt(ctx, m, text, y, size, reduced) {
+    const alpha = reduced ? 1 : 0.45 + 0.55 * (0.5 + 0.5 * Math.sin(anim.clock * 3.6));
+    // The blink goes through the context, not through a fractional argument (see `withAlphaStep`).
+    const before = ctx.globalAlpha;
+    ctx.globalAlpha = before * alpha;
+    drawAt(ctx, text, Math.round(m.w / 2), Math.round(y), 'hud', size, 'hudDim', 'center');
+    ctx.globalAlpha = before;
   }
 
   /**
@@ -1515,8 +1779,8 @@ export function createMenus(overlayCanvas, callbacks) {
    * @returns {void}
    */
   function drawRow(ctx, label, value, left, right, y, size, labelColor, valueColor, alpha) {
-    drawText(ctx, label, left, y, { font: 'hud', size, color: labelColor, alpha });
-    drawText(ctx, value, right, y, { font: 'hud', size, color: valueColor, align: 'right', alpha });
+    drawAt(ctx, label, left, y, 'hud', size, labelColor, 'left', 'top', alpha);
+    drawAt(ctx, value, right, y, 'hud', size, valueColor, 'right', 'top', alpha);
   }
 
   /**
@@ -1531,8 +1795,8 @@ export function createMenus(overlayCanvas, callbacks) {
     let scale = maxScale;
     for (let i = 0; i < labels.length; i++) {
       const unit =
-        measureLine(labels[i], { font: 'hud', size: 1 }) +
-        measureLine(values[i], { font: 'hud', size: 1 }) +
+        measureAt(labels[i], 'hud', 1) +
+        measureAt(values[i], 'hud', 1) +
         6;
       if (unit <= 0) continue;
       const fits = Math.floor(width / unit);
@@ -1544,6 +1808,16 @@ export function createMenus(overlayCanvas, callbacks) {
   // ── Title ──
 
   /**
+   * The title: the hand-lettered wordmark, the subtitle, a rule, the menu, the best score and the
+   * footer.
+   *
+   * Two arrangements. On a wide surface the lettering sits in a soft column of shade over the
+   * attract-mode dungeon, as in `docs/art-reference.png`. On a **portrait phone** the world is a 4:3
+   * band across the middle of the screen (§4.7 "Layout"), and fractions of the full height put the
+   * logo in the black deck above it and cut a menu row in half across its bottom edge — so the
+   * title is laid out by bands instead: wordmark and subtitle centred in the upper deck, the rule on
+   * the band's top edge, the attract camera unobstructed in the band, and the menu, best score and
+   * footer in the lower deck.
    * @param {CanvasRenderingContext2D} ctx
    * @param {SurfaceMetrics} m
    * @param {GameState} state
@@ -1555,98 +1829,110 @@ export function createMenus(overlayCanvas, callbacks) {
   function drawTitle(ctx, m, state, screen, enter, reduced) {
     const u = m.u;
     const cx = Math.round(m.w / 2);
-
-    // A soft column of shade behind the lettering, so the attract-mode dungeon stays visible at
-    // the edges but never fights the type.
-    const colW = Math.min(m.w, Math.max(m.w * 0.62, 120 * u));
-    drawScrim(ctx, m, 0.3);
-    drawColumnShade(ctx, m, Math.round(colW / 2));
-
-    // The logo is a fixed fraction of the width at every resolution — the one element that should
-    // look identical on a phone and on a 1440p monitor.
-    const logoScale = fitScale('A-MAZE', m.w * 0.62, { font: 'display' }, 10, 2);
-    const subScale = fitScale(
-      'The Torchlit Descent',
-      m.w * 0.88,
-      { font: 'display' },
-      Math.max(1, Math.round(logoScale / 3)),
-    );
     const slide = reduced ? 0 : Math.round((1 - enter) * 6 * u);
-
-    const logoY = Math.round(m.h * 0.11) - slide;
-    drawText(ctx, 'A-MAZE', cx, logoY, {
-      font: 'display',
-      size: logoScale,
-      color: 'gothic',
-      align: 'center',
-      tracking: 1,
-    });
-    const logoH = textHeight({ font: 'display', size: logoScale });
-    drawText(ctx, 'The Torchlit Descent', cx, logoY + logoH + u, {
-      font: 'display',
-      size: subScale,
-      color: 'gothicDim',
-      align: 'center',
-    });
-    const subH = textHeight({ font: 'display', size: subScale });
-    const ruleY = logoY + logoH + subH + 4 * u;
-    drawRule(ctx, cx, ruleY, Math.round(colW * 0.34), u);
-
-    // The list sits at a comfortable 46 % of the height, but never crowds the rule above it or
-    // the best-score and footer lines below: on a very short window it is the list that gives way.
-    const listTop = Math.max(Math.round(m.h * 0.46), ruleY + 9 * u);
     const rows = screen.items.length;
-    const availH = m.h - listTop - 26 * u;
-    const heightCap = Math.max(1, Math.floor((availH / Math.max(1, rows) - 6 * u) / 12));
-    // The menu never outranks the wordmark. On a phone the logo is width-bound (62 % of 234 UI
-    // pixels) while the height cap still allowed scale 4 rows, so the four menu words came out
-    // bigger than "A-MAZE" itself — the title screen's hierarchy upside down.
-    const itemScale = fitScale(
-      'Descend',
+
+    // Footer: version left, copyright right, at whatever size lets both sit on one line with a gap —
+    // one step under the layout unit. It is the quietest line on the screen; at a full unit the
+    // version string was as tall as the best-score line and louder than the menu it sits under.
+    const footScale = fitOneRowScale(TITLE_VERSION, TITLE_COPYRIGHT, m.w - 8 * u, Math.max(1, u - 1));
+    const footH = heightAt('hud', footScale);
+    const footY = m.h - 3 * u;
+    const best = state.best;
+    const bestText = best !== undefined && best.score > 0 ? bestMemo(best.score, best.level) : '';
+    // The record is a line of information, never a rival to the menu: a phone's ×2 menu words have a
+    // 20-row cap height and a full-unit HUD line there is 21 rows, so the narrow layout drops a step.
+    const bestScale =
+      bestText === '' ? 1 : fitScaleAt(bestText, m.w - 8 * u, 'hud', m.narrow ? Math.max(1, u - 1) : u);
+    const bestBottom = footY - footH - 3 * u;
+    // Everything above this is free for the menu.
+    const lowFloor =
+      bestText === '' ? footY - footH - 4 * u : bestBottom - heightAt('hud', bestScale) - 4 * u;
+
+    const viewBottom = m.viewY + m.viewH;
+    const band =
+      m.narrow && m.viewH > 0 && m.viewY >= m.h * 0.15 && lowFloor - viewBottom >= m.h * 0.2;
+
+    const colW = Math.round(Math.min(m.w, Math.max(m.w * 0.62, 120 * u)));
+    drawScrim(ctx, m, 0.3);
+    // Over the black deck of a phone a column of shade is invisible work.
+    if (!band) drawColumnShade(ctx, m, Math.round(colW / 2));
+
+    // The wordmark is lettered at 1:1 and shown at 1–4×, never blown up past that, so a wordmark
+    // pixel stays close to a world texel. Bound by width *and* height, so a short window keeps its
+    // menu.
+    const logoRoom = band ? m.viewY - 8 * u : m.h * 0.17;
+    const logoScale = clamp(
+      Math.min(
+        Math.floor((m.w * (m.narrow ? 0.9 : 0.62)) / WORDMARK.w),
+        Math.floor(logoRoom / WORDMARK.h),
+      ),
+      1,
+      4,
+    );
+    const logoW = WORDMARK.w * logoScale;
+    const logoH = WORDMARK.h * logoScale;
+    const subScale = fitScaleAt(TITLE_SUBTITLE, m.w * 0.88, 'display', logoScale, 1);
+    const subH = heightAt('display', subScale);
+    const groupH = logoH + 2 * u + subH;
+
+    let logoY = 0;
+    let ruleY = 0;
+    let listTop = 0;
+    if (band) {
+      logoY = Math.max(2 * u, Math.round((m.viewY - 4 * u - groupH) / 2)) - slide;
+      ruleY = m.viewY - 2 * u;
+      listTop = viewBottom + 4 * u;
+    } else {
+      logoY = Math.round(m.h * 0.1) - slide;
+      ruleY = logoY + groupH + 4 * u;
+      // The list owns everything between the rule and the record line. It used to start at a fixed
+      // 46 % of the height, which at 1280×720 left it 142 UI pixels for four rows — two short of ×2 —
+      // so the menu came out at ×1, smaller than the best score and the footer beneath it.
+      listTop = ruleY + 9 * u;
+    }
+    WORDMARK.draw(ctx, cx - (logoW >> 1), logoY, logoScale);
+    drawAt(ctx, TITLE_SUBTITLE, cx, logoY + logoH + 2 * u, 'display', subScale, 'gothicDim', 'center');
+    drawRule(ctx, cx, ruleY, Math.round(Math.min(colW, m.w - 8 * u) * 0.36), u);
+
+    // The menu never outranks the lettering: at most one step above the subtitle, and never taller
+    // than its share of the room it has been given.
+    const pitchPad = band ? 5 * u : 6 * u;
+    // …and never as tall as the wordmark: a menu word's cap height (10 display rows a step) stays
+    // under ~¾ of the wordmark's (24 rows a step). On a phone the wordmark is width-bound at ×1, and
+    // ×2 menu words in the display face's heavy strokes outweighed it.
+    const wordmarkRank = Math.max(1, Math.floor((WORDMARK_CAP_ROWS * logoScale * 0.75) / 10));
+    const heightCap = Math.max(1, Math.floor(((lowFloor - listTop) / Math.max(1, rows) - pitchPad) / 12));
+    // Wide: the menu words match the subtitle, as in the reference ("New Game" beside "The Wizard's
+    // Cat"). One step above it they are heavier than the hairline wordmark itself — and the step used
+    // to depend on whether a best score had been saved (a fresh profile has no record line, so the
+    // height cap let the menu jump from ×2 to ×3). A phone keeps its one step up: there the wordmark
+    // is width-bound at ×1, and ×1 menu rows are too small to aim a thumb at.
+    const rankCap = m.narrow ? subScale + 1 : subScale;
+    const itemScale = fitScaleAt(
+      'Controls',
       colW * 0.7,
-      { font: 'display' },
-      Math.max(1, Math.min(scaleCap(m, 110), heightCap, logoScale - 1)),
+      'display',
+      Math.max(1, Math.min(scaleCap(m, 110), heightCap, rankCap, wordmarkRank)),
       1,
     );
-    const rowH = textHeight({ font: 'display', size: itemScale }) + 6 * u;
-    drawItemList(ctx, m, state, screen, listTop, itemScale, rowH, reduced);
+    const rowH = heightAt('display', itemScale) + pitchPad;
+    // Centred in the room it was given: the lower deck on a phone, between the rule and the record
+    // line on a wide screen.
+    const top = listTop + Math.max(0, Math.round((lowFloor - listTop - rowH * rows) / 2));
+    drawItemList(ctx, m, state, screen, top, itemScale, rowH, reduced);
 
-    // Footer: version left, copyright right — at whatever size lets both sit on one line with a
-    // gap, which on a phone is one font pixel per UI pixel.
-    const version = 'v0.1';
-    const copyright = '© 2026 SeveralHerr';
-    const footScale = fitRowScale([version], [copyright], m.w - 8 * u, u);
-    const footH = textHeight({ font: 'hud', size: footScale });
-    const footY = m.h - 3 * u;
-    drawText(ctx, version, 3 * u, footY, {
-      font: 'hud',
-      size: footScale,
-      color: 'hudDim',
-      baseline: 'bottom',
-    });
-    drawText(ctx, copyright, m.w - 3 * u, footY, {
-      font: 'hud',
-      size: footScale,
-      color: 'hudDim',
-      align: 'right',
-      baseline: 'bottom',
-    });
-
+    drawAt(ctx, TITLE_VERSION, 3 * u, footY, 'hud', footScale, 'hudDim', 'left', 'bottom');
+    drawAt(ctx, TITLE_COPYRIGHT, m.w - 3 * u, footY, 'hud', footScale, 'hudDim', 'right', 'bottom');
     // Best score sits on its own line above the footer, never across it.
-    const best = state.best;
-    if (best !== undefined && best.score > 0) {
-      const bestText = bestMemo(best.score, best.level);
-      drawText(ctx, bestText, cx, footY - footH - 3 * u, {
-        font: 'hud',
-        size: fitScale(bestText, m.w - 8 * u, { font: 'hud' }, u),
-        color: 'hudGold',
-        align: 'center',
-        baseline: 'bottom',
-      });
-    }
+    if (bestText !== '') drawAt(ctx, bestText, cx, bestBottom, 'hud', bestScale, 'hudGold', 'center', 'bottom');
   }
 
   // ── Pause ──
+
+  /** Screen-entry serial the pause screen's mapped share was counted on (see `drawPause`). */
+  let pauseCountedOn = -1;
+  let pauseMappedPct = -1;
 
   /**
    * @param {CanvasRenderingContext2D} ctx
@@ -1662,33 +1948,94 @@ export function createMenus(overlayCanvas, callbacks) {
     const cx = Math.round(m.w / 2);
     drawScrim(ctx, m, 0.66);
 
-    const panelW = Math.min(m.w - 8 * u, Math.max(90 * u, m.w * 0.56));
-    const headScale = fitScale('Paused', panelW * 0.7, { font: 'display' }, Math.max(2, u * 2), 1);
-    const itemScale = fitScale('Quit to Title', panelW * 0.8, { font: 'display' }, scaleCap(m, 150), 1);
-    const rowH = textHeight({ font: 'display', size: itemScale }) + 5 * u;
-    const headH = textHeight({ font: 'display', size: headScale });
-    const statusH = textHeight({ font: 'hud', size: u });
-    const panelH = headH + 13 * u + rowH * screen.items.length + statusH + 6 * u;
-    const px = Math.round(cx - panelW / 2);
-    const py = Math.round((m.h - panelH) / 2) + panelSlide(enter, u, reduced);
+    // The level clock and the mapped share live here rather than on the play HUD: the pause screen
+    // is where a player stops to take stock. The mapped share is an O(tiles) count, so it is taken
+    // once per visit to this screen — never per frame.
+    if (pauseCountedOn !== screenSerial) {
+      pauseCountedOn = screenSerial;
+      const level = state.levelData;
+      const total =
+        level !== null && level !== undefined && level.maze !== undefined ? level.maze.width * level.maze.height : 0;
+      pauseMappedPct =
+        total > 0 && state.explored !== null && state.explored !== undefined
+          ? Math.round(clamp01(countExplored(state.explored, total) / total) * 100)
+          : -1;
+    }
 
-    drawPanel(ctx, px, py, panelW, panelH, u, { frame: 'stone', alpha: 0.86 });
-    drawText(ctx, 'Paused', cx, py + 5 * u, {
-      font: 'display',
-      size: headScale,
-      color: 'gothic',
-      align: 'center',
-    });
-    drawRule(ctx, cx, py + 5 * u + headH + 3 * u, Math.round(panelW * 0.32), u);
-    drawItemList(ctx, m, state, screen, py + headH + 13 * u, itemScale, rowH, reduced);
+    const panelW = Math.round(Math.min(m.w - 8 * u, Math.max(90 * u, m.w * 0.56)));
+    const headScale = fitScaleAt('Paused', panelW * 0.7, 'display', Math.max(2, u + 1), 1);
+    const itemScale = fitScaleAt('Quit to Title', panelW * 0.8, 'display', Math.min(scaleCap(m, 150), headScale), 1);
+    const rowH = heightAt('display', itemScale) + 5 * u;
+    const headH = heightAt('display', headScale);
     const status = statusMemo(state.level, Math.floor(state.run.score));
-    drawText(ctx, status, cx, py + panelH - 3 * u, {
-      font: 'hud',
-      size: fitScale(status, panelW - 8 * u, { font: 'hud' }, u),
-      color: 'hudDim',
-      align: 'center',
-      baseline: 'bottom',
-    });
+    const detail = pauseDetailMemo(Math.floor(Math.max(0, state.run.levelTime)), pauseMappedPct);
+    const statusScale = Math.min(
+      fitScaleAt(status, panelW - 12 * u, 'hud', u),
+      fitScaleAt(detail, panelW - 12 * u, 'hud', u),
+    );
+    const statusH = heightAt('hud', statusScale);
+    // Rows, a hairline, the two status lines, and the same 7u of stone under them that the heading
+    // has over it: the status block used to start 1u under the last row and end on the frame.
+    const panelH = headH + 13 * u + rowH * screen.items.length + 4 * u + 2 * statusH + 2 * u + 7 * u;
+    const px = Math.round(cx - panelW / 2);
+    const py = Math.max(2 * u, Math.round((m.h - panelH) / 2)) + panelSlide(enter, u, reduced);
+
+    drawPanel(ctx, px, py, panelW, panelH, u, PANEL_PAUSE);
+    drawAt(ctx, 'Paused', cx, py + 5 * u, 'display', headScale, 'gothic', 'center');
+    drawRule(ctx, cx, py + 5 * u + headH + 3 * u, Math.round(panelW * 0.32), u);
+    const listEnd = drawItemList(ctx, m, state, screen, py + headH + 13 * u, itemScale, rowH, reduced);
+    ctx.fillStyle = withAlphaStep(COLOR.stoneDark, 40);
+    ctx.fillRect(px + 8 * u, listEnd + u, panelW - 16 * u, Math.max(1, u >> 1));
+    const statusY = listEnd + 4 * u;
+    drawAt(ctx, status, cx, statusY, 'hud', statusScale, 'hudDim', 'center');
+    drawAt(ctx, detail, cx, statusY + statusH + 2 * u, 'hud', statusScale, 'hudDim', 'center');
+  }
+
+  // ── Abandon confirmation ──
+
+  /**
+   * "Abandon the descent?" — see `CONFIRM_ITEMS`. Drawn over whichever screen opened it, with the
+   * run that would be lost spelled out, because "are you sure?" means more next to the number.
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {SurfaceMetrics} m
+   * @param {GameState} state
+   * @param {Screen} screen
+   * @param {number} enter
+   * @param {boolean} reduced
+   * @returns {void}
+   */
+  function drawConfirm(ctx, m, state, screen, enter, reduced) {
+    const u = m.u;
+    const cx = Math.round(m.w / 2);
+    drawScrim(ctx, m, 0.78);
+
+    const panelW = Math.round(Math.min(m.w - 8 * u, Math.max(100 * u, m.w * 0.56)));
+    const headW = panelW - 12 * u;
+    const headScale = fitHeading(CONFIRM_HEADING, CONFIRM_TOP, CONFIRM_BOTTOM, headW, Math.max(2, u + 1), m.narrow);
+    const headSplit = headingSplits(CONFIRM_HEADING, headW, headScale);
+    const headH = headingHeight(headScale, headSplit, u);
+    const status = statusMemo(state.level, Math.floor(state.run.score));
+    const note = state.phase === 'levelComplete' ? CONFIRM_NOTE_CLEARED : CONFIRM_NOTE_RUN;
+    const noteScale = Math.min(
+      fitScaleAt(status, panelW - 12 * u, 'hud', u),
+      fitScaleAt(note, panelW - 12 * u, 'hud', u),
+    );
+    const noteH = heightAt('hud', noteScale);
+    const itemScale = fitScaleAt('Keep Going', panelW * 0.7, 'display', Math.min(scaleCap(m, 150), headScale), 1);
+    const rowH = heightAt('display', itemScale) + 5 * u;
+    const panelH = headH + 12 * u + 2 * noteH + 2 * u + 6 * u + rowH * screen.items.length + 3 * u;
+    const px = Math.round(cx - panelW / 2);
+    const py = Math.max(2 * u, Math.round((m.h - panelH) / 2)) + panelSlide(enter, u, reduced);
+
+    drawPanel(ctx, px, py, panelW, panelH, u, PANEL_END);
+    drawHeading(ctx, cx, py + 5 * u, CONFIRM_HEADING, CONFIRM_TOP, CONFIRM_BOTTOM, headScale, headSplit, u);
+    drawRule(ctx, cx, py + 5 * u + headH + 3 * u, Math.round(panelW * 0.32), u);
+    let y = py + headH + 12 * u;
+    drawAt(ctx, status, cx, y, 'hud', noteScale, 'hudGold', 'center');
+    y += noteH + 2 * u;
+    drawAt(ctx, note, cx, y, 'hud', noteScale, 'hudDim', 'center');
+    y += noteH + 6 * u;
+    drawItemList(ctx, m, state, screen, y, itemScale, rowH, reduced);
   }
 
   // ── Options ──
@@ -1712,17 +2059,20 @@ export function createMenus(overlayCanvas, callbacks) {
     // Wide: label on the left, control on the right. Narrow: the slider track moves to its own
     // line under the label, which also makes it a thumb-sized drag target on a phone.
     const stacked = m.narrow;
-    const panelW = Math.min(m.w - 4 * u, Math.max(stacked ? 92 * u : 110 * u, m.w * (stacked ? 0.88 : 0.74)));
+    const panelW = Math.round(Math.min(m.w - 4 * u, Math.max(stacked ? 92 * u : 110 * u, m.w * (stacked ? 0.88 : 0.74))));
     const inner = panelW - 12 * u;
-    // Three columns: label, control, value. The value column has to hold "100%" at full size, and
-    // a toggle's ON/OFF word shares it so sliders and switches line up down the panel.
-    const valueW = measureLine('100%', { font: 'hud', size: u });
     // A phone keeps the ON/OFF word (an unlabelled switch on a narrow panel is genuinely
     // ambiguous), and pays for it out of the switch's width rather than the label's: the whole row
     // is the tap target, so a narrower switch costs nothing to hit and the word costs nothing to
-    // read. `wordSize`/`wordW` are the column that word needs.
+    // read. **Every** value word on the panel — ON/OFF, the map's Off/Corner/Full, a slider's 80% —
+    // is drawn at this one size: slider values at a size up used to dwarf both the labels and the
+    // switches' words, and read as the loudest thing on the screen.
     const wordSize = stacked ? Math.max(1, u - 1) : u;
-    const wordW = stacked ? measureLine('OFF', { font: 'hud', size: wordSize }) : valueW;
+    const wordH = heightAt('hud', wordSize);
+    // Three columns: label, control, value. The value column has to hold "100%", and a toggle's
+    // ON/OFF word shares it so sliders and switches line up down the panel.
+    const valueW = measureAt('100%', 'hud', wordSize);
+    const wordW = stacked ? measureAt('OFF', 'hud', wordSize) : valueW;
     const switchW = stacked
       ? Math.min(8 * u, Math.round(inner * 0.18))
       : Math.min(18 * u, Math.round(inner * 0.3));
@@ -1737,12 +2087,12 @@ export function createMenus(overlayCanvas, callbacks) {
     const labelColW = inner - controlW - 3 * u;
     let labelScale = Math.max(1, u);
     for (let i = 0; i < count; i++) {
-      const fit = fitScale(items[i].label, labelColW, { font: 'display' }, labelScale);
+      const fit = fitScaleAt(items[i].label, labelColW, 'display', labelScale);
       if (fit < labelScale) labelScale = fit;
     }
 
-    const headScale = fitScale('Options', panelW * 0.6, { font: 'display' }, Math.max(2, u * 2), 1);
-    const headH = textHeight({ font: 'display', size: headScale });
+    const headScale = fitScaleAt('Options', panelW * 0.6, 'display', Math.max(2, u + 1), 1);
+    const headH = heightAt('display', headScale);
     const trackH = 5 * u;
 
     // Eight rows is the tallest screen in the game; on a short window (a phone held sideways) the
@@ -1753,7 +2103,7 @@ export function createMenus(overlayCanvas, callbacks) {
     let bodyH = 0;
     let panelH = 0;
     for (;;) {
-      labelH = textHeight({ font: 'display', size: labelScale });
+      labelH = heightAt('display', labelScale);
       flatRowH = labelH + 5 * u;
       stackedRowH = labelH + trackH + 8 * u;
       bodyH = 0;
@@ -1765,23 +2115,12 @@ export function createMenus(overlayCanvas, callbacks) {
       labelScale--;
     }
 
-    /**
-     * Height of one row, which depends on its kind only in the stacked layout.
-     * @param {MenuItem} item
-     * @returns {number}
-     */
-    const rowHeightOf = (item) => (stacked && item.kind === 'slider' ? stackedRowH : flatRowH);
     const px = Math.round(cx - panelW / 2);
     const py = Math.max(2 * u, Math.round((m.h - panelH) / 2)) + panelSlide(enter, u, reduced);
 
-    drawPanel(ctx, px, py, panelW, panelH, u, { frame: 'stone', alpha: 0.9 });
-    drawText(ctx, 'Options', cx, py + 4 * u, {
-      font: 'display',
-      size: headScale,
-      color: 'gothic',
-      align: 'center',
-    });
-    drawRule(ctx, cx, py + 4 * u + headH + 2 * u, Math.round(panelW * 0.3), u);
+    drawPanel(ctx, px, py, panelW, panelH, u, PANEL_OPTIONS);
+    drawAt(ctx, 'Options', cx, py + 5 * u, 'display', headScale, 'gothic', 'center');
+    drawRule(ctx, cx, py + 5 * u + headH + 2 * u, Math.round(panelW * 0.3), u);
 
     const left = px + 6 * u;
     const right = px + panelW - 6 * u;
@@ -1792,7 +2131,8 @@ export function createMenus(overlayCanvas, callbacks) {
       const selected = i === index;
       const enabled = rowEnabled[i];
       const rowY = Math.round(y);
-      const rowH = rowHeightOf(item);
+      // Row height depends on the kind only in the stacked layout (a slider's track gets a line).
+      const rowH = stacked && item.kind === 'slider' ? stackedRowH : flatRowH;
       const labelColor = !enabled ? 'gothicOff' : selected ? 'gothicHot' : 'gothic';
 
       if (selected) {
@@ -1805,13 +2145,8 @@ export function createMenus(overlayCanvas, callbacks) {
       recordRow(i, left - 3 * u, rowY - 2 * u, right - left + 6 * u, rowH - u);
 
       if (item.kind === 'back') {
-        const w = measureLine(item.label, { font: 'display', size: labelScale });
-        drawText(ctx, item.label, cx, rowY, {
-          font: 'display',
-          size: labelScale,
-          color: labelColor,
-          align: 'center',
-        });
+        const w = measureAt(item.label, 'display', labelScale);
+        drawAt(ctx, item.label, cx, rowY, 'display', labelScale, labelColor, 'center');
         if (selected) {
           const fs = Math.max(1, Math.round(labelScale * 0.8));
           drawFlame(
@@ -1819,19 +2154,14 @@ export function createMenus(overlayCanvas, callbacks) {
             cx - Math.round(w / 2) - ICON_SIZE.flameW * fs - 2 * u,
             rowY - fs,
             fs,
-            reduced ? 0 : ((clock * 11) | 0) % 3,
+            reduced ? 0 : ((anim.clock * 11) | 0) % 3,
           );
         }
         y += rowH;
         continue;
       }
 
-      drawText(ctx, item.label, left, rowY, {
-        font: 'display',
-        size: labelScale,
-        color: labelColor,
-        align: 'left',
-      });
+      drawAt(ctx, item.label, left, rowY, 'display', labelScale, labelColor, 'left');
 
       const key = /** @type {keyof Settings} */ (item.key);
 
@@ -1853,13 +2183,7 @@ export function createMenus(overlayCanvas, callbacks) {
         // colour before any word is parsed — the convention every touch UI already taught.
         ctx.fillStyle = on ? COLOR.goldPale : COLOR.stoneBright;
         ctx.fillRect(on ? bx + half : bx + u, by + u, half - u, bh - 2 * u);
-        drawText(ctx, on ? 'ON' : 'OFF', right, by + Math.round(bh / 2), {
-          font: 'hud',
-          size: wordSize,
-          color: on ? (selected ? 'hud' : 'hudGold') : 'hudDim',
-          align: 'right',
-          baseline: 'middle',
-        });
+        drawAt(ctx, on ? 'ON' : 'OFF', right, by + Math.round(bh / 2), 'hud', wordSize, on ? (selected ? 'hud' : 'hudGold') : 'hudDim', 'right', 'middle');
         y += rowH;
         continue;
       }
@@ -1881,16 +2205,12 @@ export function createMenus(overlayCanvas, callbacks) {
           // A phone has no room for three words beside the label, so it shows the live one only —
           // the same trade the toggle makes when it drops its ON/OFF word.
           const word = labelOf === undefined ? current : labelOf(current);
-          const wOfWord = measureLine(word, { font: 'hud', size: u });
+          const wOfWord = measureAt(word, 'hud', wordSize);
+          // The highlight is sized from the word it frames, not from the label's line: a box one
+          // label tall around a word drawn a size up let "Corner" spill out of it.
           ctx.fillStyle = withAlpha(COLOR.goldMid, selected ? 0.5 : 0.32);
-          ctx.fillRect(right - wOfWord - 2 * u, cy2 - Math.round(labelH / 2) + u, wOfWord + 4 * u, labelH);
-          drawText(ctx, word, right, cy2, {
-            font: 'hud',
-            size: u,
-            color: selected ? 'hud' : 'hudGold',
-            align: 'right',
-            baseline: 'middle',
-          });
+          ctx.fillRect(right - wOfWord - 2 * u, cy2 - (wordH >> 1) - u, wOfWord + 4 * u, wordH + 2 * u);
+          drawAt(ctx, word, right, cy2, 'hud', wordSize, selected ? 'hud' : 'hudGold', 'right', 'middle');
           y += rowH;
           continue;
         }
@@ -1905,24 +2225,20 @@ export function createMenus(overlayCanvas, callbacks) {
         let wordEdge = right + 3 * u;
         for (let v = values.length - 1; v >= 0; v--) {
           const word = labelOf === undefined ? values[v] : labelOf(values[v]);
-          const wOfWord = measureLine(word, { font: 'hud', size: u });
+          const wOfWord = measureAt(word, 'hud', wordSize);
           const on = values[v] === current;
           if (on) {
             ctx.fillStyle = withAlpha(COLOR.goldMid, selected ? 0.5 : 0.32);
-            ctx.fillRect(cxw - wOfWord - 2 * u, cy2 - Math.round(labelH / 2) + u, wOfWord + 4 * u, labelH);
+            ctx.fillRect(cxw - wOfWord - 2 * u, cy2 - (wordH >> 1) - u, wOfWord + 4 * u, wordH + 2 * u);
           }
-          drawText(ctx, word, cxw, cy2, {
-            font: 'hud',
-            size: u,
-            color: on ? (selected ? 'hud' : 'hudGold') : 'hudDim',
-            align: 'right',
-            baseline: 'middle',
-          });
+          drawAt(ctx, word, cxw, cy2, 'hud', wordSize, on ? (selected ? 'hud' : 'hudGold') : 'hudDim', 'right', 'middle');
           // Full row height, so a thumb aiming at a word does not have to find the text's own box.
           const wordX = cxw - wOfWord - 2 * u;
           recordChoiceWord(i, v, wordX, rowY - 2 * u, wordEdge - wordX, rowH - u);
           wordEdge = wordX;
-          cxw -= wOfWord + 5 * u;
+          // 7u between words: with a 2u highlight either side of the live one, 5u left the three
+          // words reading as one run ("OffCornerFull").
+          cxw -= wOfWord + 7 * u;
         }
         y += rowH;
         continue;
@@ -1931,8 +2247,12 @@ export function createMenus(overlayCanvas, callbacks) {
       // Slider.
       const min = item.min === undefined ? 0 : item.min;
       const max = item.max === undefined ? 1 : item.max;
-      const raw = typeof state.settings[key] === 'number' ? Number(state.settings[key]) : min;
-      const t = max > min ? clamp01((raw - min) / (max - min)) : 0;
+      // Read once into a local: `Number(settings[key])` handed the loaded value to a call, which
+      // boxed a fresh number for every slider on every frame.
+      const setting = state.settings[key];
+      const raw = typeof setting === 'number' ? setting : min;
+      const tr = max > min ? (raw - min) / (max - min) : 0;
+      const t = tr <= 0 ? 0 : tr >= 1 ? 1 : tr;
       // The value always sits in its own column at the right edge; the track ends before it.
       const trackX = stacked ? left : right - valueW - 3 * u - trackW;
       const ty = stacked
@@ -1959,13 +2279,7 @@ export function createMenus(overlayCanvas, callbacks) {
       );
 
       const valueText = sliderMemos[i](Math.round(raw * 1000), item.format === 'mult' ? 1 : 0, max);
-      drawText(ctx, valueText, right, ty + Math.round(trackH / 2), {
-        font: 'hud',
-        size: u,
-        color: selected ? 'hud' : 'hudDim',
-        align: 'right',
-        baseline: 'middle',
-      });
+      drawAt(ctx, valueText, right, ty + Math.round(trackH / 2), 'hud', wordSize, selected ? 'hud' : 'hudDim', 'right', 'middle');
 
       // The draggable region is the track, padded so a thumb can find it.
       const o = i * 4;
@@ -1981,20 +2295,46 @@ export function createMenus(overlayCanvas, callbacks) {
     // sideways) the hint is left out rather than drawn across the panel's bottom frame, which is
     // what tucking it against the screen edge used to do: the rows are the content, and the hint
     // only names the controls the rows already respond to.
-    const promptH = textHeight({ font: 'hud', size: u });
+    const prompt = primaryPointerIsCoarse() ? 'TAP OR DRAG TO ADJUST' : 'ARROWS ADJUST  ·  ESC BACK';
+    const promptScale = fitScaleAt(prompt, m.w - 8 * u, 'hud', wordSize);
     const promptY = py + panelH + 4 * u;
-    if (promptY + promptH <= m.h - u) {
-      drawPrompt(
-        ctx,
-        m,
-        primaryPointerIsCoarse() ? 'TAP OR DRAG TO ADJUST' : 'ARROWS ADJUST  ·  ESC BACK',
-        promptY,
-        reduced,
-      );
-    }
+    if (promptY + heightAt('hud', promptScale) <= m.h - u) drawPrompt(ctx, m, prompt, promptY, promptScale, reduced);
   }
 
   // ── Credits ──
+
+  /** The credits copy wrapped to the panel; see {@link layoutCredits}. @type {string[]} */
+  let creditsLines = [];
+  /** Which wrapped lines belong to the gold title line. @type {boolean[]} */
+  let creditsGold = [];
+  /** Width and scale the wrap was computed for. */
+  let creditsKey = -1;
+  /** Surface the credits text scale was fitted to, and that scale. */
+  let creditsFitKey = -1;
+  let creditsScale = 1;
+
+  /**
+   * Wrap the credits to a width at a text scale. Wrapping allocates, so the result is kept until
+   * the width or the scale changes — a resize, not a frame.
+   * @param {number} width UI pixels
+   * @param {number} scale
+   * @returns {void}
+   */
+  function layoutCredits(width, scale) {
+    const key = Math.round(width) * 16 + scale;
+    if (key === creditsKey) return;
+    creditsKey = key;
+    creditsLines = [];
+    creditsGold = [];
+    for (let i = 0; i < CREDITS_LINES.length; i++) {
+      const line = CREDITS_LINES[i];
+      const parts = line === '' ? [''] : wrapText(line, width, { font: 'hud', size: scale });
+      for (let k = 0; k < parts.length; k++) {
+        creditsLines.push(parts[k]);
+        creditsGold.push(i === 0);
+      }
+    }
+  }
 
   /**
    * @param {CanvasRenderingContext2D} ctx
@@ -2010,37 +2350,51 @@ export function createMenus(overlayCanvas, callbacks) {
     const cx = Math.round(m.w / 2);
     drawScrim(ctx, m, 0.7);
 
-    const panelW = Math.min(m.w - 6 * u, Math.max(110 * u, m.w * 0.7));
-    const lineScale = u;
-    const lineH = lineHeight({ font: 'hud', size: lineScale });
-    const headScale = fitScale('Credits', panelW * 0.6, { font: 'display' }, Math.max(2, u * 2), 1);
-    const headH = textHeight({ font: 'display', size: headScale });
-    const bodyH = CREDITS_LINES.length * lineH;
-    const itemScale = Math.max(1, u);
-    const rowH = textHeight({ font: 'display', size: itemScale }) + 4 * u;
-    const panelH = headH + 10 * u + bodyH + rowH + 8 * u;
+    // The panel widens for its longest line before any line shrinks. A phone cannot widen enough,
+    // so there the text drops at most one size and the rest is **wrapped** to the panel — at one
+    // font pixel per UI pixel "Engine, maze generator, bitmap fonts" is wider than a 390-pixel phone
+    // and ran off both edges of the screen.
+    let widest = 0;
+    for (let i = 0; i < CREDITS_LINES.length; i++) widest = Math.max(widest, measureAt(CREDITS_LINES[i], 'hud', 1));
+    const panelW = Math.round(Math.min(m.w - 6 * u, Math.max(110 * u, m.w * 0.7, widest * u + 14 * u)));
+    const textW = panelW - 12 * u;
+    const headScale = fitScaleAt('Credits', panelW * 0.6, 'display', Math.max(2, u + 1), 1);
+    const headH = heightAt('display', headScale);
+    // The way out is never louder than the heading it sits under (a phone drew a ×3 Back under a
+    // heading width-bound to ×2).
+    const itemScale = Math.max(1, Math.min(u, headScale - 1));
+    const rowH = heightAt('display', itemScale) + 4 * u;
+    // The fitted scale is remembered with the surface it was fitted to. Re-running the fit each frame
+    // alternated the wrap cache's key between two scales on a phone and re-wrapped the copy — about
+    // 11 kB of strings — on every frame.
+    const fitKey = (textW * 4096 + m.h) * 8 + u;
+    if (fitKey !== creditsFitKey) {
+      creditsFitKey = fitKey;
+      creditsScale = clamp(Math.floor(textW / Math.max(1, widest)), Math.max(1, u - 1), u);
+      for (;;) {
+        layoutCredits(textW, creditsScale);
+        const pitch = heightAt('hud', creditsScale) + creditsScale;
+        if (headH + 11 * u + creditsLines.length * pitch + rowH + 8 * u <= m.h - 4 * u || creditsScale <= 1) break;
+        creditsScale--;
+      }
+    }
+    const lineScale = creditsScale;
+    layoutCredits(textW, lineScale);
+    // The HUD face's line pitch: its height plus one row of leading.
+    const lineH = heightAt('hud', lineScale) + lineScale;
+    const panelH = headH + 11 * u + creditsLines.length * lineH + rowH + 8 * u;
     const px = Math.round(cx - panelW / 2);
     const py = Math.max(2 * u, Math.round((m.h - panelH) / 2)) + panelSlide(enter, u, reduced);
 
-    drawPanel(ctx, px, py, panelW, panelH, u, { frame: 'wood', alpha: 0.9 });
-    drawText(ctx, 'Credits', cx, py + 4 * u, {
-      font: 'display',
-      size: headScale,
-      color: 'gothic',
-      align: 'center',
-    });
-    drawRule(ctx, cx, py + 4 * u + headH + 2 * u, Math.round(panelW * 0.3), u);
+    drawPanel(ctx, px, py, panelW, panelH, u, PANEL_WOOD);
+    drawAt(ctx, 'Credits', cx, py + 5 * u, 'display', headScale, 'gothic', 'center');
+    drawRule(ctx, cx, py + 5 * u + headH + 2 * u, Math.round(panelW * 0.3), u);
 
-    let y = py + headH + 11 * u;
-    for (let i = 0; i < CREDITS_LINES.length; i++) {
-      const line = CREDITS_LINES[i];
+    let y = py + headH + 12 * u;
+    for (let i = 0; i < creditsLines.length; i++) {
+      const line = creditsLines[i];
       if (line.length > 0) {
-        drawText(ctx, line, cx, Math.round(y), {
-          font: 'hud',
-          size: lineScale,
-          color: i === 0 ? 'hudGold' : 'hud',
-          align: 'center',
-        });
+        drawAt(ctx, line, cx, Math.round(y), 'hud', lineScale, creditsGold[i] ? 'hudGold' : 'hud', 'center');
       }
       y += lineH;
     }
@@ -2054,6 +2408,10 @@ export function createMenus(overlayCanvas, callbacks) {
    * (`CONTROL_HINTS`); it is drawn here in the same panel style as Credits, because a first-person
    * maze whose player never learns about sprint, the map key or mouse look is a harder game than
    * it was designed to be.
+   *
+   * With a gamepad connected the table gains a third column — the pad binding for each action —
+   * under KEYS / PAD headings. The game has always supported a pad; before this, nothing on any
+   * screen said how to use one.
    * @param {CanvasRenderingContext2D} ctx
    * @param {SurfaceMetrics} m
    * @param {GameState} state
@@ -2068,60 +2426,78 @@ export function createMenus(overlayCanvas, callbacks) {
     drawScrim(ctx, m, state.phase === 'paused' ? 0.76 : 0.7);
 
     const touch = primaryPointerIsCoarse();
+    // `getGamepads()` builds an array, so it is asked on entry and then once a second, not per frame.
+    if (!touch && (padSeenAt < 0 || anim.clock - padSeenAt >= 1)) {
+      padSeenAt = anim.clock;
+      padShown = gamepadConnected();
+    }
     const hints = touch ? TOUCH_CONTROL_HINTS : controlHints;
+    const withPad = !touch && padShown && hintsHavePad(hints);
     const footer = touch ? KEYBOARD_HINT : TOUCH_HINT;
-    const panelW = Math.min(m.w - 4 * u, Math.max(110 * u, m.w * 0.74));
+    const panelW = Math.round(Math.min(m.w - 4 * u, Math.max(110 * u, m.w * 0.74)));
     const colW = panelW - 14 * u;
-    const headScale = fitScale('Controls', panelW * 0.6, { font: 'display' }, Math.max(2, u * 2), 1);
-    const headH = textHeight({ font: 'display', size: headScale });
-    const itemScale = Math.max(1, u);
-    const rowH = textHeight({ font: 'display', size: itemScale }) + 4 * u;
+    const headScale = fitScaleAt('Controls', panelW * 0.6, 'display', Math.max(2, u + 1), 1);
+    const headH = heightAt('display', headScale);
+    // The way out is never louder than the heading it sits under (a phone drew a ×3 Back under a
+    // heading width-bound to ×2).
+    const itemScale = Math.max(1, Math.min(u, headScale - 1));
+    const rowH = heightAt('display', itemScale) + 4 * u;
 
-    // One scale for every key/action pair, then the whole panel is shrunk until it fits the
-    // surface — ten rows is taller than the options screen, so a short window is the normal case
-    // rather than the exception.
-    let size = fitHintScale(hints, colW, Math.max(1, u));
+    // One scale for every row, then the whole panel is shrunk until it fits the surface — ten rows
+    // is taller than the options screen, so a short window is the normal case, not the exception.
+    let size = withPad ? fitHintColumns(hints, colW, u, Math.max(1, u)) : fitHintScale(hints, colW, Math.max(1, u));
     let lineH = 0;
+    let footSize = 0;
     let footH = 0;
     let panelH = 0;
     for (;;) {
-      lineH = textHeight({ font: 'hud', size }) + 2 * u;
-      footH = textHeight({ font: 'hud', size: Math.max(1, size - 1) }) + 3 * u;
-      panelH = headH + 11 * u + hints.length * lineH + footH + rowH + 7 * u;
+      lineH = heightAt('hud', size) + 2 * u;
+      // The footer is drawn at the table's size, or one step down — never smaller, because a line at
+      // half the size of everything else on the panel reads as a mistake — and dropped when neither
+      // fits.
+      footSize = measureAt(footer, 'hud', size) <= colW ? size : size > 1 && measureAt(footer, 'hud', size - 1) <= colW ? size - 1 : 0;
+      footH = footSize > 0 ? heightAt('hud', footSize) + 3 * u : u;
+      panelH = headH + 12 * u + (hints.length + (withPad ? 1 : 0)) * lineH + footH + rowH + 7 * u;
       if (panelH <= m.h - 4 * u || size <= 1) break;
       size--;
     }
     const px = Math.round(cx - panelW / 2);
     const py = Math.max(2 * u, Math.round((m.h - panelH) / 2)) + panelSlide(enter, u, reduced);
 
-    drawPanel(ctx, px, py, panelW, panelH, u, { frame: 'wood', alpha: 0.9 });
-    drawText(ctx, 'Controls', cx, py + 4 * u, {
-      font: 'display',
-      size: headScale,
-      color: 'gothic',
-      align: 'center',
-    });
-    drawRule(ctx, cx, py + 4 * u + headH + 2 * u, Math.round(panelW * 0.3), u);
+    drawPanel(ctx, px, py, panelW, panelH, u, PANEL_WOOD);
+    drawAt(ctx, 'Controls', cx, py + 5 * u, 'display', headScale, 'gothic', 'center');
+    drawRule(ctx, cx, py + 5 * u + headH + 2 * u, Math.round(panelW * 0.3), u);
 
     const left = px + 7 * u;
     const right = px + panelW - 7 * u;
-    let y = py + headH + 11 * u;
-    for (let i = 0; i < hints.length; i++) {
-      drawRow(ctx, hints[i].label, hints[i].keys, left, right, Math.round(y), size, 'hudGold', 'hud');
+    let y = py + headH + 12 * u;
+    if (withPad) {
+      // Three columns spread evenly across the panel: action, key, pad.
+      const labelW = maxHintWidth(hints, 0) * size;
+      const keysW = maxHintWidth(hints, 1) * size;
+      const padW = maxHintWidth(hints, 2) * size;
+      const gap = Math.max(2 * u, Math.floor((right - left - labelW - keysW - padW) / 2));
+      const keysX = left + labelW + gap;
+      const padX = keysX + keysW + gap;
+      drawAt(ctx, 'KEYS', keysX, Math.round(y), 'hud', size, 'hudDim');
+      drawAt(ctx, 'PAD', padX, Math.round(y), 'hud', size, 'hudDim');
       y += lineH;
+      for (let i = 0; i < hints.length; i++) {
+        const hint = hints[i];
+        drawAt(ctx, hint.label, left, Math.round(y), 'hud', size, 'hudGold');
+        drawAt(ctx, hint.keys, keysX, Math.round(y), 'hud', size, 'hud');
+        if (hint.pad !== undefined && hint.pad !== '') drawAt(ctx, hint.pad, padX, Math.round(y), 'hud', size, 'hud');
+        y += lineH;
+      }
+    } else {
+      for (let i = 0; i < hints.length; i++) {
+        drawRow(ctx, hints[i].label, hints[i].keys, left, right, Math.round(y), size, 'hudGold', 'hud');
+        y += lineH;
+      }
     }
-    // One line for the other kind of device, at the smallest size on the panel — and only if it
-    // fits: at one font pixel per UI pixel a 53-character sentence is twice the width of a phone's
-    // panel, and a footer running off both edges of the screen is worse than no footer.
-    const footSize = fitScale(footer, colW, { font: 'hud' }, Math.max(1, size - 1), 1);
-    if (measureLine(footer, { font: 'hud', size: footSize }) <= colW) {
-      drawText(ctx, footer, cx, Math.round(y + u), {
-        font: 'hud',
-        size: footSize,
-        color: 'hudDim',
-        align: 'center',
-      });
-    }
+    // One line for the other kind of device — a touch player learns a keyboard works, a keyboard
+    // player learns how the phone plays.
+    if (footSize > 0) drawAt(ctx, footer, cx, Math.round(y + u), 'hud', footSize, 'hudDim', 'center');
     y += footH;
     drawItemList(ctx, m, state, screen, Math.round(y + 2 * u), itemScale, rowH, reduced);
   }
@@ -2142,6 +2518,71 @@ export function createMenus(overlayCanvas, callbacks) {
     return Math.max(1, scale);
   }
 
+  /**
+   * The largest scale at which the three columns (action, keys, pad) fit side by side with at least
+   * a 2u gap between them.
+   * @param {ReadonlyArray<ControlHint>} hints
+   * @param {number} width
+   * @param {number} u
+   * @param {number} maxScale
+   * @returns {number}
+   */
+  function fitHintColumns(hints, width, u, maxScale) {
+    const unit = maxHintWidth(hints, 0) + maxHintWidth(hints, 1) + maxHintWidth(hints, 2);
+    if (unit <= 0) return maxScale;
+    return clamp(Math.floor((width - 4 * u) / unit), 1, Math.max(1, maxScale));
+  }
+
+  /**
+   * Widest entry of one column of the hint table, at scale 1.
+   * @param {ReadonlyArray<ControlHint>} hints
+   * @param {0|1|2} column 0 label, 1 keys, 2 pad
+   * @returns {number}
+   */
+  function maxHintWidth(hints, column) {
+    let w = column === 1 ? measureAt('KEYS', 'hud', 1) : column === 2 ? measureAt('PAD', 'hud', 1) : 0;
+    for (let i = 0; i < hints.length; i++) {
+      const h = hints[i];
+      const text = column === 0 ? h.label : column === 1 ? h.keys : h.pad === undefined ? '' : h.pad;
+      const tw = measureAt(text, 'hud', 1);
+      if (tw > w) w = tw;
+    }
+    return w;
+  }
+
+  /**
+   * Does any row of this table carry a pad binding?
+   * @param {ReadonlyArray<ControlHint>} hints
+   * @returns {boolean}
+   */
+  function hintsHavePad(hints) {
+    for (let i = 0; i < hints.length; i++) {
+      const pad = hints[i].pad;
+      if (pad !== undefined && pad !== '') return true;
+    }
+    return false;
+  }
+
+  /**
+   * Is a gamepad connected right now? `false` wherever the Gamepad API is missing or throws.
+   * @returns {boolean}
+   */
+  function gamepadConnected() {
+    try {
+      const nav = /** @type {any} */ (globalThis).navigator;
+      if (nav === undefined || nav === null || typeof nav.getGamepads !== 'function') return false;
+      const pads = nav.getGamepads();
+      if (pads === null || pads === undefined) return false;
+      for (let i = 0; i < pads.length; i++) {
+        const pad = pads[i];
+        if (pad !== null && pad !== undefined && pad.connected === true) return true;
+      }
+    } catch (err) {
+      return false;
+    }
+    return false;
+  }
+
   // ── Loading ──
 
   /**
@@ -2158,9 +2599,12 @@ export function createMenus(overlayCanvas, callbacks) {
     drawScrim(ctx, m, 0.82);
 
     const headText = 'Carving the labyrinth…';
-    const headScale = fitScale(headText, m.w * 0.86, { font: 'display' }, Math.max(2, u + 1), 1);
-    const headH = textHeight({ font: 'display', size: headScale });
-    const artScale = Math.max(3, Math.round(u * 2.5));
+    const headScale = fitScaleAt(headText, m.w * 0.86, 'display', Math.max(2, u + 1), 1);
+    const headH = heightAt('display', headScale);
+    // The torch and chisel are shown at u + 1, not 2.5u: past that a sprite pixel is several world
+    // texels wide and the loading art reads as a different game's. Never more than two steps above
+    // the heading either — a phone fits the line only at ×1, and ×4 art over it outshouted the words.
+    const artScale = Math.max(2, Math.min(u + 1, headScale + 2));
     const artH = (ICON_SIZE.flameH + 2) * artScale;
 
     // Composition: a lit torch with a chisel swinging at it, the line of text, then the dots.
@@ -2168,12 +2612,12 @@ export function createMenus(overlayCanvas, callbacks) {
     const groupH = artH + headH + 16 * u;
     let y = Math.round(cy - groupH / 2);
 
-    const swing = reduced ? 0 : Math.round(Math.sin(clock * 5.5) * 1.5 * u);
+    const swing = reduced ? 0 : Math.round(Math.sin(anim.clock * 5.5) * 1.5 * u);
     // Centre the *pair*, not the torch: the chisel hangs off its left, so centring the flame alone
     // would leave the whole group sitting left of the heading.
     const pickW = PICK_ART.w * artScale + 2 * u;
     const torchX = cx - Math.round((ICON_SIZE.flameW * artScale) / 2) + Math.round(pickW / 2);
-    drawFlame(ctx, torchX, y, artScale, reduced ? 0 : ((clock * 12) | 0) % 3);
+    drawFlame(ctx, torchX, y, artScale, reduced ? 0 : ((anim.clock * 12) | 0) % 3);
     drawArt(
       ctx,
       PICK_ART,
@@ -2184,18 +2628,13 @@ export function createMenus(overlayCanvas, callbacks) {
     );
     y += artH + 4 * u;
 
-    drawText(ctx, headText, cx, y, {
-      font: 'display',
-      size: headScale,
-      color: 'gothic',
-      align: 'center',
-    });
+    drawAt(ctx, headText, cx, y, 'display', headScale, 'gothic', 'center');
     y += headH + 6 * u;
 
     // Progress dots: honest about being indeterminate (the maze worker reports no progress), so
     // they cycle rather than pretending to fill a bar.
     const dots = 5;
-    const lit = reduced ? dots : ((clock * 6) | 0) % (dots + 1);
+    const lit = reduced ? dots : ((anim.clock * 6) | 0) % (dots + 1);
     const dotSize = 2 * u;
     const gap = 3 * u;
     const totalW = dots * dotSize + (dots - 1) * gap;
@@ -2209,20 +2648,10 @@ export function createMenus(overlayCanvas, callbacks) {
     // walking for ten minutes.
     const side = cellsForLevel(state.level);
     const banner = bannerMemo(state.level, side);
-    const bannerSize = fitScale(banner, m.w * 0.9, { font: 'hud' }, Math.max(1, u), 1);
-    drawText(ctx, banner, cx, y + 8 * u, {
-      font: 'hud',
-      size: bannerSize,
-      color: 'hudGold',
-      align: 'center',
-    });
+    const bannerSize = fitScaleAt(banner, m.w * 0.9, 'hud', Math.max(1, u), 1);
+    drawAt(ctx, banner, cx, y + 8 * u, 'hud', bannerSize, 'hudGold', 'center');
     const cells = side * side;
-    drawText(ctx, cellsMemo(cells), cx, y + 8 * u + textHeight({ font: 'hud', size: bannerSize }) + 2 * u, {
-      font: 'hud',
-      size: bannerSize,
-      color: 'hudDim',
-      align: 'center',
-    });
+    drawAt(ctx, cellsMemo(cells), cx, y + 8 * u + heightAt('hud', bannerSize) + 2 * u, 'hud', bannerSize, 'hudDim', 'center');
     rowCount = 0;
   }
 
@@ -2299,13 +2728,13 @@ export function createMenus(overlayCanvas, callbacks) {
    * @param {number} right
    * @param {number} y top edge
    * @param {number} u
-   * @param {number} size text scale
+   * @param {number} size text scale — from {@link stripScaleFor}, never the tally's
    * @param {number} alpha
    * @returns {number} the height drawn
    */
   function drawStatStrip(ctx, left, right, y, u, size, alpha) {
     if (statCount === 0) return 0;
-    const lineH = textHeight({ font: 'hud', size });
+    const lineH = heightAt('hud', size);
     const pitch = statRowPitch(u, size);
     const perRow = statCount >= 3 ? 2 : statCount;
     const colW = Math.floor((right - left) / perRow);
@@ -2315,17 +2744,38 @@ export function createMenus(overlayCanvas, callbacks) {
       const row = (i / perRow) | 0;
       const x = left + col * colW;
       const ry = y + row * pitch;
-      drawText(ctx, statLabels[i], x, ry, { font: 'hud', size, color: 'hudDim', alpha });
+      drawAt(ctx, statLabels[i], x, ry, 'hud', size, 'hudDim', 'left', 'top', alpha);
       // The value sits a clear 2u under its label: at u = 2 the old single unit made
       // LABYRINTH/16×16 read as one cramped block rather than as a label and a number.
-      drawText(ctx, statValues[i], x, ry + lineH + 2 * u, {
-        font: 'hud',
-        size,
-        color: 'hudBright',
-        alpha,
-      });
+      drawAt(ctx, statValues[i], x, ry + lineH + 2 * u, 'hud', size, 'hudBright', 'left', 'top', alpha);
     }
     return rows * pitch;
+  }
+
+  /**
+   * The largest scale, up to `maxScale`, at which every stat label and value fits **its own
+   * column** of the strip with a 3u gutter.
+   *
+   * WHY the strip has its own scale: it used to be drawn at the tally's row scale, which is fitted
+   * to label/value pairs across the whole panel — never to half of it. On a phone every game over
+   * then overprinted `LABYRINTH` with `EXPLORED` ("LABYRINTEXPLORED") and ran `REFUELS` into
+   * `WALKED`.
+   * @param {number} left
+   * @param {number} right
+   * @param {number} u
+   * @param {number} maxScale
+   * @returns {number}
+   */
+  function stripScaleFor(left, right, u, maxScale) {
+    if (statCount === 0) return Math.max(1, maxScale);
+    const perRow = statCount >= 3 ? 2 : statCount;
+    const colW = Math.floor((right - left) / perRow);
+    let unit = 0;
+    for (let i = 0; i < statCount; i++) {
+      unit = Math.max(unit, measureAt(statLabels[i], 'hud', 1), measureAt(statValues[i], 'hud', 1));
+    }
+    if (unit <= 0) return Math.max(1, maxScale);
+    return clamp(Math.floor((colW - 3 * u) / unit), 1, Math.max(1, maxScale));
   }
 
   /**
@@ -2337,7 +2787,10 @@ export function createMenus(overlayCanvas, callbacks) {
    * @returns {number}
    */
   function statRowPitch(u, size) {
-    return textHeight({ font: 'hud', size }) * 2 + 4 * u;
+    // Label, 2u, value, then 5u to the next pair. With 2u on both sides of every value the strip
+    // was a ladder of evenly spaced lines, and `24×24` read as belonging to the REFUELS under it as
+    // much as to the LABYRINTH over it: proximity is what makes a pair a pair.
+    return heightAt('hud', size) * 2 + 7 * u;
   }
 
   /**
@@ -2349,7 +2802,8 @@ export function createMenus(overlayCanvas, callbacks) {
    */
   function statStripHeight(rows, u, size) {
     if (rows === 0) return 0;
-    return (rows >= 3 ? 2 : 1) * statRowPitch(u, size) + 4 * u;
+    // 2u lead above the first label, and 6u under the last value (its pitch already holds 5u).
+    return (rows >= 3 ? 2 : 1) * statRowPitch(u, size) + u;
   }
 
   // ── Level complete ──
@@ -2368,13 +2822,9 @@ export function createMenus(overlayCanvas, callbacks) {
   const endLabels = ['', '', ''];
   /** @type {string[]} */
   const endValues = ['', '', ''];
-  /** One-element scratch for the single-row `fitRowScale` calls. @type {string[]} */
-  const oneLabel = [''];
-  /** @type {string[]} */
-  const oneValue = [''];
 
   /**
-   * The largest scale at which one label/value pair fits, without allocating a pair of arrays.
+   * The largest scale at which one label/value pair fits (the scalar twin of `fitRowScale`).
    * @param {string} label
    * @param {string} value
    * @param {number} width
@@ -2382,9 +2832,72 @@ export function createMenus(overlayCanvas, callbacks) {
    * @returns {number}
    */
   function fitOneRowScale(label, value, width, maxScale) {
-    oneLabel[0] = label;
-    oneValue[0] = value;
-    return fitRowScale(oneLabel, oneValue, width, maxScale);
+    const unit = measureAt(label, 'hud', 1) + measureAt(value, 'hud', 1) + 6;
+    return Math.max(1, Math.min(maxScale, Math.floor(width / unit)));
+  }
+
+  /**
+   * The largest display scale, up to `cap`, for a panel heading — on one line, or on a narrow
+   * surface on two (`top` over `bottom`) when splitting buys a size. A phone could only fit
+   * "Depth 15 Cleared" at ×1, which left the tally's TOTAL louder than the heading above it.
+   * @param {string} text the one-line heading
+   * @param {string} top first half
+   * @param {string} bottom second half
+   * @param {number} maxW UI pixels
+   * @param {number} cap
+   * @param {boolean} narrow
+   * @returns {number}
+   */
+  function fitHeading(text, top, bottom, maxW, cap, narrow) {
+    const one = fitScaleAt(text, maxW, 'display', cap);
+    if (!narrow) return one;
+    const two = Math.min(fitScaleAt(top, maxW, 'display', cap), fitScaleAt(bottom, maxW, 'display', cap));
+    return Math.max(one, two);
+  }
+
+  /**
+   * Does a heading drawn at `scale` need its two-line form?
+   * @param {string} text
+   * @param {number} maxW
+   * @param {number} scale
+   * @returns {boolean}
+   */
+  function headingSplits(text, maxW, scale) {
+    return measureAt(text, 'display', scale) > maxW;
+  }
+
+  /**
+   * Height of a heading in its one- or two-line form.
+   * @param {number} scale
+   * @param {boolean} split
+   * @param {number} u
+   * @returns {number}
+   */
+  function headingHeight(scale, split, u) {
+    const lineH = heightAt('display', scale);
+    return split ? 2 * lineH + u : lineH;
+  }
+
+  /**
+   * Draw a heading centred at `cx`, split when `split` says so.
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {number} cx
+   * @param {number} y
+   * @param {string} text
+   * @param {string} top
+   * @param {string} bottom
+   * @param {number} scale
+   * @param {boolean} split
+   * @param {number} u
+   * @returns {void}
+   */
+  function drawHeading(ctx, cx, y, text, top, bottom, scale, split, u) {
+    if (!split) {
+      drawAt(ctx, text, cx, y, 'display', scale, 'gothic', 'center');
+      return;
+    }
+    drawAt(ctx, top, cx, y, 'display', scale, 'gothic', 'center');
+    drawAt(ctx, bottom, cx, y + heightAt('display', scale) + u, 'display', scale, 'gothic', 'center');
   }
 
   /**
@@ -2412,7 +2925,7 @@ export function createMenus(overlayCanvas, callbacks) {
     let allDone = true;
     for (let i = 0; i < TALLY_ROWS; i++) {
       const due = TALLY_DELAY + i * TALLY_STAGGER;
-      if (tallyT >= due) {
+      if (anim.tallyT >= due) {
         tallyCounters[i].set(targets[i]);
       } else {
         allDone = false;
@@ -2430,77 +2943,79 @@ export function createMenus(overlayCanvas, callbacks) {
     const finals = tallyFinals;
     for (let i = 0; i < TALLY_ROWS; i++) finals[i] = tallyFinalMemos[i](Math.floor(targets[i]));
 
-    const panelW = Math.min(m.w - 4 * u, Math.max(100 * u, m.w * 0.68));
+    const panelW = Math.round(Math.min(m.w - 4 * u, Math.max(100 * u, m.w * 0.68)));
+    const px = Math.round(cx - panelW / 2);
+    const left = px + 7 * u;
+    const right = px + panelW - 7 * u;
+    const colW = right - left;
     const headText = clearedMemo(level);
-    const headScale = fitScale(headText, panelW * 0.86, { font: 'display' }, Math.max(2, u * 2), 1);
-    const headH = textHeight({ font: 'display', size: headScale });
-    const colW = panelW - 14 * u;
     // The expedition summary sits between the tally and the buttons: it is the record of the maze
     // you just walked, which at these sizes is a bigger story than the score.
     const statRows = buildRunStats(state);
-    // The panel is *fitted*, exactly as the options panel is (see `drawOptions`): computing a
-    // height once and centring it lets an oversized panel run off the bottom of the surface, which
-    // is what cut this frame off at 1280×720 (m.h = 360 against a 362-pixel panel). Shrink the
-    // rows first, then give up the expedition strip, then the buttons — in that order, because
-    // that is the order of what the screen is for.
+
+    // The panel is *fitted*: a height computed once and centred runs off a short surface. What
+    // gives way, in order, is what the screen is least about — the heading's size, then the
+    // buttons', then the expedition strip — and only then the tally, which is the content. The first
+    // version shrank the tally first, so at 1280×720 the rows came out the smallest text on the
+    // screen, below the heading, the buttons and even the prompt that skips them.
     let rowScale = fitRowScale(labels, finals, colW, u);
-    let itemScale = fitScale('Quit to Title', panelW * 0.7, { font: 'display' }, scaleCap(m, 150), 1);
+    let totalScale = Math.min(rowScale + 1, fitOneRowScale(labels[3], finals[3], colW, u + 1));
+    const headTop = clearedTopMemo(level);
+    const headW = panelW - 12 * u;
+    let headScale = fitHeading(headText, headTop, HEADING_CLEARED, headW, Math.max(2, u + 1), m.narrow);
+    let headSplit = false;
+    let itemScale = fitScaleAt('Quit to Title', panelW * 0.7, 'display', Math.min(scaleCap(m, 150), totalScale + 1), 1);
+    let stripScale = stripScaleFor(left, right, u, rowScale);
     let statsShown = statRows > 0;
-    let totalScale = 0;
-    let lineH = 0;
+    let rowLineH = 0;
+    let totalLineH = 0;
+    let headH = 0;
     let rowH = 0;
     let statH = 0;
     let panelH = 0;
     for (;;) {
       totalScale = Math.min(rowScale + 1, fitOneRowScale(labels[3], finals[3], colW, u + 1));
-      lineH = textHeight({ font: 'hud', size: totalScale }) + 4 * u;
-      rowH = textHeight({ font: 'display', size: itemScale }) + 4 * u;
-      statH = statsShown ? statStripHeight(statRows, u, rowScale) : 0;
+      rowLineH = heightAt('hud', rowScale) + 4 * u;
+      totalLineH = heightAt('hud', totalScale) + 4 * u;
+      headSplit = headingSplits(headText, headW, headScale);
+      headH = headingHeight(headScale, headSplit, u);
+      rowH = heightAt('display', itemScale) + 4 * u;
+      statH = statsShown ? statStripHeight(statRows, u, stripScale) : 0;
       panelH =
-        headH + 13 * u + lineH * TALLY_ROWS + 4 * u + statH + rowH * screen.items.length + 6 * u;
+        headH + 14 * u + rowLineH * (TALLY_ROWS - 1) + totalLineH + 4 * u + statH + rowH * screen.items.length + 6 * u;
       if (panelH <= m.h - 4 * u) break;
-      if (rowScale > 1) {
+      if (headScale > Math.max(2, totalScale)) headScale--;
+      else if (itemScale > Math.max(1, rowScale)) itemScale--;
+      else if (statsShown && stripScale > 1) stripScale--;
+      else if (statsShown) statsShown = false;
+      else if (rowScale > 1) {
         rowScale--;
-        continue;
-      }
-      if (statsShown) {
-        statsShown = false;
-        continue;
-      }
-      if (itemScale > 1) {
-        itemScale--;
-        continue;
-      }
-      break;
+        stripScale = Math.min(stripScale, rowScale);
+      } else if (itemScale > 1) itemScale--;
+      else if (headScale > 1) headScale--;
+      else break;
     }
-    const px = Math.round(cx - panelW / 2);
     const py = Math.max(2 * u, Math.round((m.h - panelH) / 2)) + panelSlide(enter, u, reduced);
 
-    drawPanel(ctx, px, py, panelW, panelH, u, { frame: 'stone', alpha: 0.9 });
-    drawText(ctx, headText, cx, py + 4 * u, {
-      font: 'display',
-      size: headScale,
-      color: 'gothic',
-      align: 'center',
-    });
-    drawRule(ctx, cx, py + 4 * u + headH + 2 * u, Math.round(panelW * 0.34), u);
+    drawPanel(ctx, px, py, panelW, panelH, u, PANEL_OPTIONS);
+    drawHeading(ctx, cx, py + 5 * u, headText, headTop, HEADING_CLEARED, headScale, headSplit, u);
+    drawRule(ctx, cx, py + 5 * u + headH + 2 * u, Math.round(panelW * 0.34), u);
 
-    const left = px + 7 * u;
-    const right = px + panelW - 7 * u;
-    let y = py + headH + 13 * u;
+    let y = py + headH + 14 * u;
     for (let i = 0; i < TALLY_ROWS; i++) {
+      const isTotal = i === TALLY_ROWS - 1;
+      const pitch = isTotal ? totalLineH : rowLineH;
       const due = TALLY_DELAY + i * TALLY_STAGGER;
-      if (tallyT < due) {
-        y += lineH;
+      if (anim.tallyT < due) {
+        y += pitch;
         continue;
       }
-      const isTotal = i === TALLY_ROWS - 1;
       if (isTotal) {
         ctx.fillStyle = COLOR.goldMid;
         ctx.fillRect(left, Math.round(y - 3 * u), right - left, Math.max(1, u >> 1));
       }
       // A row pops in a touch higher, then settles — 160 ms, just enough to feel struck.
-      const age = tallyT - due;
+      const age = anim.tallyT - due;
       const punch = reduced || age > 0.16 ? 0 : Math.round((1 - age / 0.16) * u);
       drawRow(
         ctx,
@@ -2513,7 +3028,7 @@ export function createMenus(overlayCanvas, callbacks) {
         isTotal ? 'hudGold' : 'hud',
         isTotal ? 'hudBright' : 'hudGold',
       );
-      y += lineH;
+      y += pitch;
     }
 
     y += 4 * u;
@@ -2521,11 +3036,11 @@ export function createMenus(overlayCanvas, callbacks) {
       // The strip fades in with the last tally row rather than arriving with the panel, so the
       // eye finishes the score before it is offered the expedition numbers — and its divider fades
       // with it, instead of hanging across an empty panel while the first rows are still due.
-      const statAlpha = tallyDone ? 1 : clamp01((tallyT - TALLY_DELAY - TALLY_ROWS * TALLY_STAGGER) * 2);
+      const statAlpha = tallyDone ? 1 : clamp01((anim.tallyT - TALLY_DELAY - TALLY_ROWS * TALLY_STAGGER) * 2);
       if (statAlpha > 0) {
-        ctx.fillStyle = withAlpha(COLOR.stoneDark, 0.5 * statAlpha);
+        ctx.fillStyle = withAlphaStep(COLOR.stoneDark, (0.5 * statAlpha * 64) | 0);
         ctx.fillRect(left, Math.round(y) - 2 * u, right - left, Math.max(1, u >> 1));
-        drawStatStrip(ctx, left, right, Math.round(y + 2 * u), u, rowScale, statAlpha);
+        drawStatStrip(ctx, left, right, Math.round(y + 2 * u), u, stripScale, statAlpha);
       }
       y += statH;
     }
@@ -2538,7 +3053,11 @@ export function createMenus(overlayCanvas, callbacks) {
       recordRow(0, px, py, panelW, panelH);
       rowEnabled[0] = true;
       rowCount = 1;
-      drawPrompt(ctx, m, skipPrompt(), Math.round(y + rowH / 2), reduced);
+      // At the tally's own size: the line that skips the rows is never louder than the rows.
+      const prompt = skipPrompt();
+      const promptScale = fitScaleAt(prompt, colW, 'hud', rowScale);
+      const promptY = Math.round(y + (rowH * screen.items.length - heightAt('hud', promptScale)) / 2);
+      drawPrompt(ctx, m, prompt, promptY, promptScale, reduced);
     }
   }
 
@@ -2557,7 +3076,9 @@ export function createMenus(overlayCanvas, callbacks) {
    * WHY the media query and not `maxTouchPoints` / `'ontouchstart' in window`: those report touch
    * *capability*, which every touchscreen laptop — and headless desktop Chrome — has, so a player
    * sitting at a keyboard was told to tap. `(pointer: coarse)` describes the input the device is
-   * actually driven with. Anything unavailable (Node, an old browser) reads as a desktop.
+   * actually driven with. Anything unavailable (Node, an old browser) reads as a desktop. The
+   * answer is re-asked on every screen change (see `advance`), so a hybrid device that gains or
+   * loses a mouse is described correctly on the next screen.
    * @returns {boolean}
    */
   function primaryPointerIsCoarse() {
@@ -2569,7 +3090,7 @@ export function createMenus(overlayCanvas, callbacks) {
   let coarsePointer = -1;
 
   /**
-   * The media query behind {@link primaryPointerIsCoarse}, asked once.
+   * The media query behind {@link primaryPointerIsCoarse}.
    * @returns {boolean}
    */
   function queryCoarsePointer() {
@@ -2596,16 +3117,18 @@ export function createMenus(overlayCanvas, callbacks) {
     const u = m.u;
     const cx = Math.round(m.w / 2);
     // The screen fades to near-black over the first second: the torch has gone out.
-    const fade = reduced ? 0.86 : 0.55 + 0.35 * clamp01(enterT / 1.2);
+    const fade = reduced ? 0.86 : 0.55 + 0.35 * clamp01(anim.enterT / 1.2);
     drawScrim(ctx, m, fade);
 
     const run = state.run;
     const best = state.best;
-    // `recordBest` has already folded the run into `best` by the time this screen shows, so a run
-    // that set the record is the one whose score *is* the record.
-    const newBest = run.score > 0 && run.score >= best.score;
+    // A record is a score *above* the best this run started with (`runStartBest`), exactly the rule
+    // `recordBest` applies in src/state. `state.best` already includes this run by now, so it cannot
+    // be the reference; with no earlier frame to read the starting record from, a run that equals
+    // the stored best is the likelier record.
+    const newBest = run.score > 0 && (runStartBest >= 0 ? run.score > runStartBest : run.score >= best.score);
 
-    const headText = 'Your torch has gone out';
+    const headText = HEADING_OUT;
     const labels = endLabels;
     labels[0] = 'SCORE';
     labels[1] = 'DEPTH REACHED';
@@ -2617,24 +3140,23 @@ export function createMenus(overlayCanvas, callbacks) {
     // one centred line of celebration rather than the same six digits twice.
     values[2] = newBest ? '' : bestScoreMemo(Math.floor(best.score));
 
-    const panelW = Math.min(m.w - 4 * u, Math.max(100 * u, m.w * 0.7));
-    const headScale = fitScale(
-      headText,
-      panelW * 0.9,
-      { font: 'display' },
-      Math.max(2, Math.round(u * 1.6)),
-      1,
-    );
-    const headH = textHeight({ font: 'display', size: headScale });
-    const colW = panelW - 14 * u;
+    const panelW = Math.round(Math.min(m.w - 4 * u, Math.max(100 * u, m.w * 0.7)));
+    const px = Math.round(cx - panelW / 2);
+    const left = px + 7 * u;
+    const right = px + panelW - 7 * u;
+    const colW = right - left;
     const statRows = buildRunStats(state);
-    // Fitted, for the reason spelled out in `drawComplete`: a panel measured once and centred runs
-    // off a short surface instead of shrinking to it.
+    // Fitted, in the order spelled out in `drawComplete`: heading, buttons, strip, then the rows.
     let rowScale = fitRowScale(labels, values, colW, u);
-    let itemScale = fitScale('Try Again', panelW * 0.6, { font: 'display' }, scaleCap(m, 150), 1);
+    let scoreScale = Math.min(rowScale + 1, fitOneRowScale(labels[0], values[0], colW, u + 1));
+    const headW = panelW - 12 * u;
+    let headScale = fitHeading(headText, HEADING_OUT_TOP, HEADING_OUT_BOTTOM, headW, Math.max(2, u + 1), m.narrow);
+    let headSplit = false;
+    let itemScale = fitScaleAt('Try Again', panelW * 0.6, 'display', Math.min(scaleCap(m, 150), scoreScale + 1), 1);
+    let stripScale = stripScaleFor(left, right, u, rowScale);
     let statsShown = statRows > 0;
-    let scoreScale = 0;
     let bestScale = 0;
+    let headH = 0;
     let scoreH = 0;
     let depthH = 0;
     let bestH = 0;
@@ -2645,46 +3167,37 @@ export function createMenus(overlayCanvas, callbacks) {
       scoreScale = Math.min(rowScale + 1, fitOneRowScale(labels[0], values[0], colW, u + 1));
       // The record line is drawn at the score's size whenever it fits the column there — on a
       // phone as well, now that it no longer has to share the line with a number.
-      bestScale = newBest ? fitScale(NEW_BEST_TEXT, colW, { font: 'hud' }, scoreScale, 1) : rowScale;
+      bestScale = newBest ? fitScaleAt(NEW_BEST_TEXT, colW, 'hud', scoreScale, 1) : rowScale;
       // Each row is spaced for its own size: one pitch for all three left a small DEPTH REACHED
       // floating in a gap measured for the score's double-height digits.
-      scoreH = textHeight({ font: 'hud', size: scoreScale }) + 4 * u;
-      depthH = textHeight({ font: 'hud', size: rowScale }) + 4 * u;
-      bestH = textHeight({ font: 'hud', size: bestScale }) + 4 * u;
-      rowH = textHeight({ font: 'display', size: itemScale }) + 4 * u;
-      statH = statsShown ? statStripHeight(statRows, u, rowScale) : 0;
-      panelH = headH + 14 * u + scoreH + depthH + bestH + 2 * u + statH + rowH * screen.items.length + 6 * u;
+      headSplit = headingSplits(headText, headW, headScale);
+      headH = headingHeight(headScale, headSplit, u);
+      scoreH = heightAt('hud', scoreScale) + 4 * u;
+      depthH = heightAt('hud', rowScale) + 4 * u;
+      bestH = heightAt('hud', bestScale) + 4 * u;
+      rowH = heightAt('display', itemScale) + 4 * u;
+      statH = statsShown ? statStripHeight(statRows, u, stripScale) : 0;
+      panelH = headH + 15 * u + scoreH + depthH + bestH + 2 * u + statH + rowH * screen.items.length + 6 * u;
       if (panelH <= m.h - 4 * u) break;
-      if (rowScale > 1) {
+      if (headScale > Math.max(2, scoreScale)) headScale--;
+      else if (itemScale > Math.max(1, rowScale)) itemScale--;
+      else if (statsShown && stripScale > 1) stripScale--;
+      else if (statsShown) statsShown = false;
+      else if (rowScale > 1) {
         rowScale--;
-        continue;
-      }
-      if (statsShown) {
-        statsShown = false;
-        continue;
-      }
-      if (itemScale > 1) {
-        itemScale--;
-        continue;
-      }
-      break;
+        stripScale = Math.min(stripScale, rowScale);
+      } else if (itemScale > 1) itemScale--;
+      else if (headScale > 1) headScale--;
+      else break;
     }
-    const px = Math.round(cx - panelW / 2);
     const py = Math.max(2 * u, Math.round((m.h - panelH) / 2)) + panelSlide(enter, u, reduced);
 
-    drawPanel(ctx, px, py, panelW, panelH, u, { frame: 'stone', alpha: 0.92 });
+    drawPanel(ctx, px, py, panelW, panelH, u, PANEL_END);
 
-    drawText(ctx, headText, cx, py + 4 * u, {
-      font: 'display',
-      size: headScale,
-      color: 'gothic',
-      align: 'center',
-    });
-    drawRule(ctx, cx, py + 4 * u + headH + 2 * u, Math.round(panelW * 0.34), u);
+    drawHeading(ctx, cx, py + 5 * u, headText, HEADING_OUT_TOP, HEADING_OUT_BOTTOM, headScale, headSplit, u);
+    drawRule(ctx, cx, py + 5 * u + headH + 2 * u, Math.round(panelW * 0.34), u);
 
-    const left = px + 7 * u;
-    const right = px + panelW - 7 * u;
-    let y = py + headH + 14 * u;
+    let y = py + headH + 15 * u;
     drawRow(ctx, labels[0], values[0], left, right, Math.round(y), scoreScale, 'hud', 'hudBright');
     y += scoreH;
     drawRow(ctx, labels[1], values[1], left, right, Math.round(y), rowScale, 'hudDim', 'hudGold');
@@ -2694,14 +3207,11 @@ export function createMenus(overlayCanvas, callbacks) {
       // **weight** — the score's size, gold, centred on the panel — and the pulse only breathes
       // across the top fifth of the alpha range: dropping to 40 % made the one line the screen
       // exists to celebrate read as a *disabled* row next to a fully opaque "DEPTH REACHED".
-      const flash = reduced ? 1 : 0.82 + 0.18 * (0.5 + 0.5 * Math.sin(clock * 7));
-      drawText(ctx, NEW_BEST_TEXT, cx, Math.round(y), {
-        font: 'hud',
-        size: bestScale,
-        color: 'hudGold',
-        align: 'center',
-        alpha: flash,
-      });
+      const flash = reduced ? 1 : 0.82 + 0.18 * (0.5 + 0.5 * Math.sin(anim.clock * 7));
+      const before = ctx.globalAlpha;
+      ctx.globalAlpha = before * flash;
+      drawAt(ctx, NEW_BEST_TEXT, cx, Math.round(y), 'hud', bestScale, 'hudGold', 'center');
+      ctx.globalAlpha = before;
     } else {
       drawRow(ctx, labels[2], values[2], left, right, Math.round(y), bestScale, 'hudDim', 'hudGold');
     }
@@ -2712,7 +3222,7 @@ export function createMenus(overlayCanvas, callbacks) {
     if (statH > 0) {
       ctx.fillStyle = withAlpha(COLOR.stoneDark, 0.5);
       ctx.fillRect(left, Math.round(y) - 2 * u, right - left, Math.max(1, u >> 1));
-      drawStatStrip(ctx, left, right, Math.round(y + 2 * u), u, rowScale, 1);
+      drawStatStrip(ctx, left, right, Math.round(y + 2 * u), u, stripScale, 1);
       y += statH;
     }
 

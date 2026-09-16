@@ -29,7 +29,9 @@
  * the order this expects. Either call alone is also safe.
  *
  * ## Hot path
- * A frame costs a few dozen canvas calls and the option objects handed to `drawText`. The
+ * A frame costs a few dozen canvas calls and allocates nothing: text goes through the scalar
+ * `drawAt`/`measureAt` forms (an options literal per call was ~2 kB of garbage a frame), and panel
+ * options are one reused object. The
  * formatted readouts are **memoised on their quantised inputs** (`createTextMemo`: whole seconds,
  * the rounded percentage, the integer score), so a readout allocates a string only on the frames
  * where its text actually changes — **nothing that scales with the size of
@@ -43,17 +45,15 @@
 
 import { clamp, clamp01 } from '../core/math.js';
 import { createLogger, isDebug } from '../core/log.js';
-import { COLOR, drawText, measureLine, textHeight } from './font.js';
+import { COLOR, drawAt, heightAt, measureAt } from './font.js';
 import {
   createCounter,
   createTextMemo,
-  formatClock,
   formatCount,
   formatDepth,
   formatDistance,
   formatInt,
   formatLabyrinth,
-  formatPercent,
   formatSigned,
   formatTime,
 } from './format.js';
@@ -66,10 +66,10 @@ import {
   drawWell,
   fillDisc,
   fillRing,
-  fitScale,
   ICON_SIZE,
   strokeRect,
   withAlpha,
+  withAlphaStep,
 } from './pixels.js';
 
 /** @typedef {import('../core/types.js').GameState} GameState */
@@ -86,6 +86,7 @@ export {
   ARROWS,
   ARROW_PALETTE,
   compileArt,
+  createArtSprite,
   drawArt,
   drawFlame,
   drawGemIcon,
@@ -97,10 +98,12 @@ export {
   fillDisc,
   fillRing,
   fitScale,
+  fitScaleAt,
   hexToRgb,
   ICON_SIZE,
   strokeRect,
   withAlpha,
+  withAlphaStep,
 } from './pixels.js';
 
 // The map's mode helpers are re-exported for `menus.js` (the options row) and `src/main.js` (the
@@ -150,6 +153,12 @@ const MAX_PIXEL_SCALE = 8;
  * @property {boolean} narrow true when the surface is too narrow for the side-by-side layouts —
  *   a phone in portrait, or a very small window. Both the HUD and the menus switch to stacked
  *   arrangements on it.
+ * @property {number} viewX  left edge of the 3-D world view, UI pixels (0 when unknown)
+ * @property {number} viewY  top edge of the world view, UI pixels (0 when unknown)
+ * @property {number} viewW  width of the world view, UI pixels (the surface width when unknown)
+ * @property {number} viewH  height of the world view, UI pixels (the surface height when unknown).
+ *   On a portrait phone the world is a 4:3 band with a deck above and below it (ARCHITECTURE.md
+ *   §4.7 "Layout"); a layout that ignores the band puts a menu row across its edge.
  */
 
 /**
@@ -166,6 +175,10 @@ const MAX_PIXEL_SCALE = 8;
  * @property {() => void} endFrame  close the frame (the next `beginFrameIfClosed` will clear)
  * @property {(clientX:number, clientY:number, out:Float64Array) => boolean} fromClient  map a
  *   pointer event's client coordinates into UI pixels; false when the element has no layout
+ * @property {(cssX:number, cssY:number, cssW:number, cssH:number) => void} setViewRect  where the
+ *   3-D view sits, in CSS pixels relative to the overlay's top-left corner. Optional: until it is
+ *   called the surface measures the page's `#view` element itself on every resize (see
+ *   `measureView`); calling it with a zero width reverts to that.
  */
 
 /**
@@ -204,7 +217,17 @@ export function createSurface(canvas) {
     originY: 0,
     u: 1,
     narrow: false,
+    viewX: 0,
+    viewY: 0,
+    viewW: 0,
+    viewH: 0,
   };
+
+  /**
+   * The world view's rectangle in overlay CSS pixels, as last given to `setViewRect` (`explicit`)
+   * or measured from the page. `w === 0` means unknown: the whole surface is treated as the view.
+   */
+  const viewCss = { x: 0, y: 0, w: 0, h: 0, explicit: false };
 
   /** @type {CanvasRenderingContext2D|null} */
   let ctx = null;
@@ -267,7 +290,82 @@ export function createSurface(canvas) {
       canvas.width = devW;
       canvas.height = devH;
     }
+    if (!viewCss.explicit) measureView();
+    applyView();
     return changed;
+  }
+
+  /**
+   * Measure the world view from the page when the composition root has not said where it is.
+   *
+   * WHY a fallback exists at all: the band a portrait phone letterboxes the world into is decided
+   * by `src/main.js` (§4.7 "Layout"), which sizes `#view` and *then* resizes the overlay — so by the
+   * time `resize` runs, the element's box is already final. Reading it here means the title and the
+   * HUD respect the band on the shipped page today; `setViewRect` is the explicit seam, and once it
+   * has been called this measurement is never taken again. Read-only, and only on resize.
+   * @returns {void}
+   */
+  function measureView() {
+    viewCss.w = 0;
+    if (canvas === null || canvas === undefined) return;
+    try {
+      const doc = /** @type {any} */ (canvas).ownerDocument;
+      if (doc === null || doc === undefined || typeof doc.getElementById !== 'function') return;
+      const view = doc.getElementById('view');
+      if (view === null || view === canvas || typeof view.getBoundingClientRect !== 'function') return;
+      const r = view.getBoundingClientRect();
+      const c = canvas.getBoundingClientRect();
+      if (!(r.width > 0 && r.height > 0 && c.width > 0 && c.height > 0)) return;
+      viewCss.x = r.left - c.left;
+      viewCss.y = r.top - c.top;
+      viewCss.w = r.width;
+      viewCss.h = r.height;
+    } catch (err) {
+      viewCss.w = 0;
+    }
+  }
+
+  /**
+   * Convert the view rectangle to UI pixels, clamped to the surface.
+   * @returns {void}
+   */
+  function applyView() {
+    const m = metrics;
+    if (!(viewCss.w > 0 && viewCss.h > 0 && m.cssW > 0 && m.cssH > 0 && m.px > 0)) {
+      m.viewX = 0;
+      m.viewY = 0;
+      m.viewW = m.w;
+      m.viewH = m.h;
+      return;
+    }
+    const sx = m.devW / m.cssW / m.px;
+    const sy = m.devH / m.cssH / m.px;
+    const x0 = clamp(Math.round(viewCss.x * sx - m.originX / m.px), 0, m.w);
+    const y0 = clamp(Math.round(viewCss.y * sy - m.originY / m.px), 0, m.h);
+    const x1 = clamp(Math.round((viewCss.x + viewCss.w) * sx - m.originX / m.px), x0, m.w);
+    const y1 = clamp(Math.round((viewCss.y + viewCss.h) * sy - m.originY / m.px), y0, m.h);
+    m.viewX = x0;
+    m.viewY = y0;
+    m.viewW = x1 - x0;
+    m.viewH = y1 - y0;
+  }
+
+  /**
+   * @param {number} cssX
+   * @param {number} cssY
+   * @param {number} cssW
+   * @param {number} cssH
+   * @returns {void}
+   */
+  function setViewRect(cssX, cssY, cssW, cssH) {
+    const ok = Number.isFinite(cssX) && Number.isFinite(cssY) && cssW > 0 && cssH > 0;
+    viewCss.explicit = ok;
+    viewCss.x = ok ? cssX : 0;
+    viewCss.y = ok ? cssY : 0;
+    viewCss.w = ok ? cssW : 0;
+    viewCss.h = ok ? cssH : 0;
+    if (!ok) measureView();
+    applyView();
   }
 
   /**
@@ -332,6 +430,7 @@ export function createSurface(canvas) {
     beginFrameIfClosed,
     endFrame,
     fromClient,
+    setViewRect,
   };
   if (canvas !== null && canvas !== undefined) SURFACES.set(canvas, surface);
   return surface;
@@ -426,6 +525,39 @@ const POP_LIFE = 1.15;
 const MAX_FRAME_DT = 0.25;
 
 /**
+ * A panel's painted frame, in borders: `drawPanel` draws a border **and** a bevel inside it, so the
+ * stone a readout must clear is two borders thick, not one.
+ */
+const FRAME_BORDERS = 2;
+
+/** Between the depth and the labyrinth size on the depth plaque. */
+const DEPTH_SEPARATOR = '·';
+
+/** Font pixels either side of that separator — a glyph's worth, so "3 · 24×24" never reads "3·24". */
+const DEPTH_GAP = 4;
+
+/** Ink width of one HUD glyph at scale 1. */
+const HUD_GLYPH_W = measureAt('0', 'hud', 1);
+
+/** Pen advance of the monospace HUD face at scale 1 (glyph plus its spacing column). */
+const HUD_ADVANCE = measureAt('00', 'hud', 1) - HUD_GLYPH_W;
+
+/**
+ * Width of an integer as `formatInt` prints it (`1,234,567`), without formatting it: the HUD face
+ * is monospace, so the width is a function of the character count alone.
+ * @param {number} n
+ * @param {number} size text scale
+ * @returns {number} UI pixels
+ */
+function intWidth(n, size) {
+  const v = Number.isFinite(n) ? Math.floor(Math.abs(n)) : 0;
+  let digits = 1;
+  for (let x = v; x >= 10; x = Math.floor(x / 10)) digits++;
+  const chars = digits + Math.floor((digits - 1) / 3) + (n < 0 ? 1 : 0);
+  return ((chars - 1) * HUD_ADVANCE + HUD_GLYPH_W) * size;
+}
+
+/**
  * One floating "+100".
  * @typedef {Object} Pop
  * @property {number} t      seconds since it spawned; < 0 means free
@@ -481,32 +613,63 @@ export function createHud(overlayCanvas, options) {
 
   // ── Animation state ──
   const scoreCounter = createCounter(0);
-  /** Wall-ish clock taken from `state.time`; see the file header on why the HUD has no dt. */
-  let lastTime = -1;
-  /** Seconds since boot, advanced by the clamped delta of `state.time`. */
-  let clock = 0;
+  /**
+   * The HUD's fractional per-frame numbers, as fields of one object rather than closure `let`s.
+   *
+   * WHY: a closure variable holding a non-integer is a boxed number, and every store boxes a new
+   * one — six of them advanced every frame were ~80 bytes of garbage a frame on their own. An
+   * object's number fields are updated in place.
+   */
+  const anim = {
+    /** Last `state.time` seen (plus the interpolation offset); −1 before the first frame. */
+    lastTime: -1,
+    /** Seconds since boot, advanced by the clamped delta of `state.time`; see the file header. */
+    clock: 0,
+    /** Smoothed fuel fraction, so an oil pickup sweeps the bar up instead of snapping. */
+    fuelShown: 1,
+    /** 0..1 ramp that fades the whole HUD in when a level starts. */
+    intro: 0,
+    /**
+     * Refill flare: 1 at the instant a flask lands, decaying to 0 over `REFILL_FLARE_TIME`. This is
+     * the tank economy's whole feedback loop — the player must *feel* the tank fill, because the
+     * thing they are managing is no longer a level timer but a chain of refuels.
+     */
+    refillFlare: 0,
+    /** Bar fraction the last refill started from, so the surge can be drawn as a sweep. */
+    refillFrom: 0,
+  };
   let lastScore = 0;
   let lastFuel = 0;
   let lastGems = 0;
   let lastLevel = 0;
-  /** Smoothed fuel fraction, so an oil pickup sweeps the bar up instead of snapping. */
-  let fuelShown = 1;
-  /** 0..1 ramp that fades the whole HUD in when a level starts. */
-  let intro = 0;
-  /**
-   * Refill flare: 1 at the instant a flask lands, decaying to 0 over `REFILL_FLARE_TIME`. This is
-   * the tank economy's whole feedback loop — the player must *feel* the tank fill, because the
-   * thing they are managing is no longer a level timer but a chain of refuels.
-   */
-  let refillFlare = 0;
-  /** Bar fraction the last refill started from, so the surge can be drawn as a sweep. */
-  let refillFrom = 0;
   /** Refuels taken this level (a fallback for when `state.run` does not carry the count). */
   let refuelCount = 0;
-  /** Fuel panel box, from {@link measureFuelPanel}, so the full map can lay out clear of it. */
+  // ── Panel geometry, recomputed once per frame by `layoutTopRow` ──
+  // Every number below is in UI pixels. They live in the closure rather than in a returned box so
+  // laying the top row out allocates nothing, and so the full map can read the gauge's box.
+  /** Border thickness handed to `drawPanel`; the painted frame is `FRAME_BORDERS` of these. */
+  let border = 1;
+  /** Frame + padding between a panel's outer edge and its content, horizontally. */
+  let insetX = 1;
+  /** Frame + padding, vertically. */
+  let insetY = 1;
+  /** The fuel panel's box and its parts. */
   let fuelPanelW = 0;
   let fuelPanelH = 0;
   let fuelBarW = 0;
+  let fuelBarH = 0;
+  let fuelIconScale = 1;
+  let fuelTextSize = 1;
+  let fuelContentH = 0;
+  /** The score panel's box and its parts. */
+  let scorePanelW = 0;
+  let scoreSize = 1;
+  let gemSize = 1;
+  let scoreContentH = 0;
+
+  /** Options handed to `drawPanel`, mutated per call instead of a literal per call per frame. */
+  /** @type {{frame:'stone'|'wood'|'iron', border:number, rivets:boolean, texture:boolean, alpha:number}} */
+  const panelOpts = { frame: 'stone', border: 1, rivets: true, texture: false, alpha: 0.72 };
 
   // ── Readout text, rebuilt only when the number behind it changes (see the file header) ──
   const fuelText = createTextMemo((sec) => formatTime(sec));
@@ -515,14 +678,7 @@ export function createHud(overlayCanvas, options) {
   const gemsText = createTextMemo((g, t) => formatCount(g, t));
   const depthText = createTextMemo((lv) => formatDepth(lv));
   const sizeText = createTextMemo((c, r) => formatLabyrinth(c, r));
-  const clockText = createTextMemo((sec) => formatClock(sec));
-  const mappedMemo = createTextMemo((pct) => 'MAPPED ' + formatPercent(pct / 100));
-  const tailMemo = createTextMemo((sec, pct) => formatClock(sec) + '  MAPPED ' + formatPercent(pct / 100));
   const distText = createTextMemo((d) => formatDistance(d));
-  /** The depth panel's lines, filled in place every frame instead of a fresh array. */
-  const depthLines = ['', '', '', ''];
-  /** Their colours, per slot. @type {string[]} */
-  const depthColors = ['hudGold', 'hudBright', 'hudDim', 'hudDim'];
 
   /** @type {Pop[]} */
   const pops = new Array(MAX_POPS);
@@ -541,10 +697,12 @@ export function createHud(overlayCanvas, options) {
     const p = pops[popCursor];
     popCursor = (popCursor + 1) % MAX_POPS;
     p.t = 0;
-    // Pops rise from just below the centre of the view: close enough to the action to be noticed,
-    // far enough down that they never sit over the crosshair region of the screen.
-    p.x = m.w * 0.5;
-    p.y = m.h * 0.58;
+    // Pops rise from just below the centre of the *world view*: close enough to the action to be
+    // noticed, far enough down that they never sit over the crosshair region. The view, not the
+    // surface — on a portrait phone the world is a band at 42 % of the height, and a pop centred on
+    // the surface rose out of the band's bottom edge into the control deck.
+    p.x = m.viewX + m.viewW * 0.5;
+    p.y = m.viewY + m.viewH * 0.58;
     // Deterministic spread from the pool cursor — no RNG, no allocation, never two on top of
     // each other.
     p.drift = (popCursor % 2 === 0 ? 1 : -1) * (6 + (popCursor % 3) * 5) * m.u;
@@ -571,10 +729,10 @@ export function createHud(overlayCanvas, options) {
     lastScore = 0;
     lastFuel = 0;
     lastGems = 0;
-    fuelShown = 1;
-    intro = 0;
-    refillFlare = 0;
-    refillFrom = 0;
+    anim.fuelShown = 1;
+    anim.intro = 0;
+    anim.refillFlare = 0;
+    anim.refillFrom = 0;
     refuelCount = 0;
     for (let i = 0; i < MAX_POPS; i++) pops[i].t = -1;
     mapView.reset();
@@ -594,14 +752,15 @@ export function createHud(overlayCanvas, options) {
    * Advance every animation from the state's own clock.
    * @param {GameState} state
    * @param {number} alpha interpolation factor
-   * @returns {number} the frame delta actually applied, in seconds
+   * @returns {void} (no return value: a fractional return from a call V8 does not inline is a boxed
+   *   number, which was garbage every frame for a value nobody read)
    */
   function advance(state, alpha) {
     const now = state.time + (Number.isFinite(alpha) ? clamp01(alpha) : 0) / 60;
-    let dt = lastTime < 0 ? 0 : now - lastTime;
+    let dt = anim.lastTime < 0 ? 0 : now - anim.lastTime;
     if (!(dt >= 0) || dt > MAX_FRAME_DT) dt = dt > MAX_FRAME_DT ? MAX_FRAME_DT : 0;
-    lastTime = now;
-    clock += dt;
+    anim.lastTime = now;
+    anim.clock += dt;
 
     const run = state.run;
 
@@ -610,9 +769,9 @@ export function createHud(overlayCanvas, options) {
       lastLevel = state.level;
       lastGems = run.gems;
       lastFuel = run.fuel;
-      fuelShown = run.fuelMax > 0 ? clamp01(run.fuel / run.fuelMax) : 0;
-      intro = 0;
-      refillFlare = 0;
+      anim.fuelShown = run.fuelMax > 0 ? clamp01(run.fuel / run.fuelMax) : 0;
+      anim.intro = 0;
+      anim.refillFlare = 0;
       refuelCount = 0;
       for (let i = 0; i < MAX_POPS; i++) pops[i].t = -1;
     }
@@ -633,14 +792,14 @@ export function createHud(overlayCanvas, options) {
         pop(fuelGained, 'fuel');
         // Arm the surge from wherever the bar currently *reads*, not from the true fuel: the bar
         // is smoothed, and the flare has to start where the eye last saw the level.
-        refillFrom = fuelShown;
-        refillFlare = 1;
+        anim.refillFrom = anim.fuelShown;
+        anim.refillFlare = 1;
         refuelCount++;
       }
-      if (intro < 1) intro = clamp01(intro + dt * 2.2);
+      if (anim.intro < 1) anim.intro = clamp01(anim.intro + dt * 2.2);
     } else if (state.phase === 'paused') {
       // Hold the intro at full while paused so resuming does not re-fade the HUD in.
-      intro = 1;
+      anim.intro = 1;
     }
     lastScore = run.score;
     lastFuel = run.fuel;
@@ -652,10 +811,10 @@ export function createHud(overlayCanvas, options) {
     const fuelTarget = run.fuelMax > 0 ? clamp01(run.fuel / run.fuelMax) : 0;
     // Exponential smoothing; the constant is a rate in 1/s, chosen so a full flask sweeps the bar
     // up in roughly a third of a second.
-    fuelShown += (fuelTarget - fuelShown) * (1 - Math.exp(-9 * dt));
-    if (Math.abs(fuelTarget - fuelShown) < 0.002) fuelShown = fuelTarget;
+    anim.fuelShown += (fuelTarget - anim.fuelShown) * (1 - Math.exp(-9 * dt));
+    if (Math.abs(fuelTarget - anim.fuelShown) < 0.002) anim.fuelShown = fuelTarget;
 
-    if (refillFlare > 0) refillFlare = Math.max(0, refillFlare - dt / REFILL_FLARE_TIME);
+    if (anim.refillFlare > 0) anim.refillFlare = Math.max(0, anim.refillFlare - dt / REFILL_FLARE_TIME);
 
     for (let i = 0; i < MAX_POPS; i++) {
       const p = pops[i];
@@ -663,7 +822,6 @@ export function createHud(overlayCanvas, options) {
       p.t += dt;
       if (p.t >= POP_LIFE) p.t = -1;
     }
-    return dt;
   }
 
   /**
@@ -685,7 +843,7 @@ export function createHud(overlayCanvas, options) {
     if (m.w < 32 || m.h < 32) return;
 
     // The HUD dims behind the pause menu instead of vanishing: the player is still reading it.
-    const globalAlpha = (phase === 'paused' ? 0.45 : 1) * (0.25 + 0.75 * intro);
+    const globalAlpha = (phase === 'paused' ? 0.45 : 1) * (0.25 + 0.75 * anim.intro);
     const prevAlpha = ctx.globalAlpha;
     ctx.globalAlpha = prevAlpha * globalAlpha;
 
@@ -695,26 +853,19 @@ export function createHud(overlayCanvas, options) {
     // The raster is maintained before anything is drawn, so the map and the "% mapped" readout
     // agree within the same frame. It is skipped entirely when the map is off — switching it back
     // on costs one rescan, not a frame of stale pixels.
-    if (mode !== 'off') mapView.update(state, clock);
+    if (mode !== 'off') mapView.update(state, anim.clock);
 
     // The full map takes the screen: drawing the play HUD under it would be noise over a diagram,
     // so only the gauges that answer "can I afford to stand here reading this" stay.
+    // Measure the top row before anything is drawn: the full map needs the gauge's box to lay its
+    // header out clear of it, and the corner panels share one height.
+    layoutTopRow(state, m, mode !== 'full');
+
     if (mode === 'full') {
       // The map's ground covers the whole surface, so the gauge is drawn *after* it — but the map
-      // needs the gauge's box first to lay its header out clear of it (beside it on a wide screen,
-      // under it on a phone). Hence the measurement is a pure function of the metrics, separate
-      // from the drawing.
-      measureFuelPanel(m);
-      mapView.drawFull(
-        ctx,
-        m,
-        state,
-        clock,
-        reduced,
-        // The gauge box, from the corner it is drawn in: the map lays its text out clear of it.
-        3 * m.u + fuelPanelW,
-        3 * m.u + fuelPanelH,
-      );
+      // needs the gauge's box first (beside it on a wide screen, under it on a phone), which is
+      // why the measurement above is separate from the drawing.
+      mapView.drawFull(ctx, m, state, anim.clock, reduced, 3 * m.u + fuelPanelW, 3 * m.u + fuelPanelH);
       drawFuelGauge(ctx, state, m, reduced);
       // No score pops over the full map: the player opened a diagram in order to read it, and a
       // pop is drawn at the *centre* of the screen, straight across the corridors they are
@@ -724,14 +875,10 @@ export function createHud(overlayCanvas, options) {
       return;
     }
 
-    // On a narrow surface the three top clusters cannot sit side by side, so the depth readout
-    // tucks under the fuel gauge instead of holding the centre.
-    const fuelH = drawFuelGauge(ctx, state, m, reduced);
-    // `drawFuelGauge` has just published `fuelPanelW`, which the score panel needs to know how much
-    // of the top row is left for it.
+    drawFuelGauge(ctx, state, m, reduced);
     drawScorePanel(ctx, state, m);
-    drawDepthPanel(ctx, state, m, fuelH);
-    const mapH = mode === 'corner' ? mapView.drawCorner(ctx, m, state, clock, reduced) : 0;
+    drawDepthPanel(ctx, state, m);
+    const mapH = mode === 'corner' ? mapView.drawCorner(ctx, m, state, anim.clock, reduced) : 0;
     drawCompass(ctx, state, m, reduced, mapH);
     drawPops(ctx, m, reduced);
     if (isDebug()) drawDebug(ctx, state, m, frameStats === undefined ? null : frameStats);
@@ -740,27 +887,103 @@ export function createHud(overlayCanvas, options) {
   }
 
   /**
-   * Size the fuel panel without drawing it.
+   * Lay out the top row — the fuel panel and the score panel — without drawing it.
    *
-   * Pure arithmetic on the metrics, so the full map can reserve space for the gauge before the
-   * gauge is drawn on top of it. Writes the three closure fields rather than allocating a box.
+   * Pure arithmetic on the metrics and the run, writing closure fields rather than allocating a
+   * box, so the full map can reserve space for the gauge before the gauge is drawn over it, and so
+   * the two corner panels can share one height (two plaques of different heights in the same row
+   * read as an accident).
+   *
+   * **Padding.** `drawPanel` paints a border *and* a bevel, so its frame is `FRAME_BORDERS` borders
+   * thick; content starts `insetX`/`insetY` in from the outer edge — the whole frame plus 3u (2u on a
+   * phone) of clear space. The first version allowed ~4u for a 2u frame, so a readout's shadow sat on
+   * the bevel on desktop and the depth panel's last line ran over its bottom frame on a phone.
+   * @param {GameState} state
    * @param {SurfaceMetrics} m
+   * @param {boolean} withScore false while the full map is open (only the gauge is drawn)
    * @returns {void}
    */
-  function measureFuelPanel(m) {
+  function layoutTopRow(state, m, withScore) {
     const u = m.u;
-    const iconW = ICON_SIZE.flameW * u;
-    const barH = 7 * u;
-    const lineH = textHeight({ font: 'hud', size: u });
+    const pad = 3 * u;
+    // A phone's panels get a thinner frame: at u = 3 a full-unit border is 6 UI pixels of stone —
+    // 30 device pixels — around a readout that is itself only a few characters wide.
+    border = m.narrow ? Math.max(1, u - 1) : u;
+    insetX = FRAME_BORDERS * border + (m.narrow ? 2 * u : 3 * u);
+    insetY = FRAME_BORDERS * border + 2 * u;
+
+    // ── Fuel ──
+    fuelIconScale = m.narrow ? Math.max(1, u - 1) : u;
+    fuelTextSize = m.narrow ? Math.max(1, u - 1) : u;
+    fuelBarH = (m.narrow ? 5 : 7) * u;
+    const iconW = ICON_SIZE.flameW * fuelIconScale;
+    const iconH = ICON_SIZE.torchH * fuelIconScale;
+    const fixedW = 2 * insetX + iconW + 3 * u;
     // On a narrow surface the gauge and the score panel share one row, and the score panel needs
-    // more than half of it for a six-figure number plus the gem tally — so the gauge is capped at
-    // 44 % of the width rather than being allowed to slide under it (measured at 390×844: the two
-    // panels used to overlap by ~35 UI pixels, eating the tank's own readout).
-    const cap = m.narrow ? m.w * 0.44 - iconW - 7 * u : Infinity;
-    fuelBarW = Math.min(64 * u, Math.max(20 * u, m.w * 0.28), cap);
-    fuelPanelW = iconW + fuelBarW + 7 * u;
-    // Tall enough for the torch beside the bar *and* the readout line under it.
-    fuelPanelH = Math.max(ICON_SIZE.torchH * u + 4 * u, barH + lineH + 8 * u);
+    // more than half of it — so the whole gauge is capped at 44 % of the width rather than being
+    // allowed to slide under the score (measured at 390×844: the two used to overlap).
+    const cap = m.narrow ? Math.floor(m.w * 0.44) - fixedW : Infinity;
+    fuelBarW = Math.round(Math.max(8 * u, Math.min(64 * u, Math.max(20 * u, m.w * 0.28), cap)));
+    fuelPanelW = fixedW + fuelBarW;
+    fuelContentH = Math.max(iconH, fuelBarH + 2 * u + heightAt('hud', fuelTextSize));
+
+    // ── Score ──
+    scoreContentH = 0;
+    scorePanelW = 0;
+    if (withScore) {
+      const run = state.run;
+      const scoreLine = scoreText(scoreCounter.value);
+      const gemsLine = gemsText(run.gems, run.gemsTotal);
+      if (m.narrow) {
+        // Fitted to the room the gauge leaves: with the massive-maze item counts the gem line is
+        // "8/820" rather than "8/12".
+        scoreSize = Math.max(1, u - 1);
+        gemSize = scoreSize;
+        const room = m.w - 3 * pad - fuelPanelW - 2 * insetX;
+        for (;;) {
+          const need = Math.max(scoreWidth(scoreLine, run.score, scoreSize), gemsWidth(gemsLine, gemSize));
+          if (need <= room) break;
+          if (scoreSize > gemSize && scoreSize > 1) scoreSize--;
+          else if (gemSize > 1) gemSize--;
+          else if (scoreSize > 1) scoreSize--;
+          else break;
+        }
+      } else {
+        // Double height only while the number is a modest share of the screen. A six-figure score
+        // at 2u was the loudest thing on the screen at the size cap, louder than the tank the
+        // player is actually managing. Decided on the *target* score, so the size never flips in
+        // the middle of a roll.
+        gemSize = u;
+        scoreSize = intWidth(run.score, 2 * u) <= m.w * 0.25 ? 2 * u : u;
+      }
+      scoreContentH = heightAt('hud', scoreSize) + u + heightAt('hud', gemSize);
+      scorePanelW =
+        2 * insetX +
+        Math.max(scoreWidth(scoreLine, run.score, scoreSize), gemsWidth(gemsLine, gemSize), 16 * u);
+    }
+    fuelPanelH = 2 * insetY + Math.max(fuelContentH, scoreContentH);
+  }
+
+  /**
+   * Width of the score readout: the wider of what is showing and what it is rolling to, so the
+   * panel grows once when a digit arrives instead of breathing while the counter rolls.
+   * @param {string} line the rolling value, formatted
+   * @param {number} target the true score
+   * @param {number} size
+   * @returns {number}
+   */
+  function scoreWidth(line, target, size) {
+    return Math.max(measureAt(line, 'hud', size), intWidth(target, size));
+  }
+
+  /**
+   * Width of the gem line: icon, a gap and the count.
+   * @param {string} line
+   * @param {number} size
+   * @returns {number}
+   */
+  function gemsWidth(line, size) {
+    return measureAt(line, 'hud', size) + (ICON_SIZE.gem + 2) * size;
   }
 
   /**
@@ -777,56 +1000,62 @@ export function createHud(overlayCanvas, options) {
    * @param {GameState} state
    * @param {SurfaceMetrics} m
    * @param {boolean} reduced reduced motion
-   * @returns {number} the panel's height in UI pixels, so the next cluster can stack under it
+   * @returns {void}
    */
   function drawFuelGauge(ctx, state, m, reduced) {
     const u = m.u;
     const pad = 3 * u;
-    const iconScale = u;
-    const iconW = ICON_SIZE.flameW * iconScale;
-    measureFuelPanel(m);
+    const iconW = ICON_SIZE.flameW * fuelIconScale;
+    const iconH = ICON_SIZE.torchH * fuelIconScale;
     const barW = fuelBarW;
-    const barH = 7 * u;
-    const lineH = textHeight({ font: 'hud', size: u });
+    const barH = fuelBarH;
     const panelW = fuelPanelW;
     const panelH = fuelPanelH;
 
-    const low = fuelShown <= LOW_FUEL_FRACTION;
-    const flare = reduced ? 0 : refillFlare;
+    const low = anim.fuelShown <= LOW_FUEL_FRACTION;
+    const flare = reduced ? 0 : anim.refillFlare;
     // The flame flickers on its own cycle; when the tank is low it stutters, which is the first
     // cue the player gets that the next flask has become urgent.
-    const flicker = reduced ? 0.5 : noise(clock * (low ? 17 : 9));
-    const frame = reduced ? 0 : ((clock * (low ? 14 : 8)) | 0) % 3;
+    // The flicker noise (see `noise`) is written out here: a fractional argument per frame to a call
+    // that is not inlined is a boxed number per frame.
+    const nt = anim.clock * (low ? 17 : 9);
+    const flicker = reduced ? 0.5 : 0.5 + 0.25 * Math.sin(nt) + 0.25 * Math.sin(nt * 1.7 + 1.3);
+    const frame = reduced ? 0 : ((anim.clock * (low ? 14 : 8)) | 0) % 3;
 
-    drawPanel(ctx, pad, pad, panelW, panelH, u, { frame: 'stone' });
+    panelOpts.frame = 'stone';
+    panelOpts.border = border;
+    panelOpts.rivets = true;
+    drawPanel(ctx, pad, pad, panelW, panelH, u, panelOpts);
     // Alarm and flare both live on the panel edge, where they are visible in peripheral vision:
     // the player is looking down a corridor, not at the gauge.
     if (low && !reduced) {
-      const pulse = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(clock * 6));
-      ctx.fillStyle = withAlpha(COLOR.alarm, pulse * 0.7);
-      strokeRect(ctx, pad, pad, panelW, panelH, Math.max(1, u >> 1));
+      const pulse = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(anim.clock * 6));
+      ctx.fillStyle = withAlphaStep(COLOR.alarm, (pulse * 0.7 * 64) | 0);
+      strokeRect(ctx, pad, pad, panelW, panelH, Math.max(1, border >> 1));
     } else if (flare > 0) {
-      ctx.fillStyle = withAlpha(COLOR.fireCore, flare * 0.8);
-      strokeRect(ctx, pad, pad, panelW, panelH, Math.max(1, u >> 1));
+      ctx.fillStyle = withAlphaStep(COLOR.fireCore, (flare * 0.8 * 64) | 0);
+      strokeRect(ctx, pad, pad, panelW, panelH, Math.max(1, border >> 1));
     }
 
-    const iconX = pad + 3 * u;
-    const iconY = pad + 2 * u;
+    // Content is centred vertically in the shared row height.
+    const top = pad + insetY + ((panelH - 2 * insetY - fuelContentH) >> 1);
+    const iconX = pad + insetX;
+    const iconY = top + ((fuelContentH - iconH) >> 1);
     // A refill relights the torch: the icon goes to full strength for the length of the flare
     // however low the tank was, which is the reward for the pickup.
-    drawTorchIcon(ctx, iconX, iconY, iconScale, frame, low && flare < 0.2 ? 0.3 : 1);
+    drawTorchIcon(ctx, iconX, iconY, fuelIconScale, frame, low && flare < 0.2 ? 0.3 : 1);
 
     // Bar well.
-    const barX = pad + iconW + 5 * u;
-    const barY = pad + 3 * u;
+    const barX = iconX + iconW + 3 * u;
+    const barY = top;
     drawWell(ctx, barX, barY, barW, barH, u, COLOR.void, low ? COLOR.fireDeep : COLOR.ironDark);
 
     const inner = barW - 2 * u;
     const gap = Math.max(1, u >> 1);
     // The surge: for the length of the flare the bar is drawn as if it were still filling, so the
     // eye sees the level *travel* even though the state changed in a single step.
-    const surge = flare > 0 ? refillFrom + (fuelShown - refillFrom) * (1 - flare * flare) : fuelShown;
-    const shown = flare > 0 ? Math.min(fuelShown, surge) : fuelShown;
+    const surge = flare > 0 ? anim.refillFrom + (anim.fuelShown - anim.refillFrom) * (1 - flare * flare) : anim.fuelShown;
+    const shown = flare > 0 ? Math.min(anim.fuelShown, surge) : anim.fuelShown;
     const lit = shown * FUEL_SEGMENTS;
     const fullSegs = Math.floor(lit);
     for (let i = 0; i < FUEL_SEGMENTS; i++) {
@@ -876,28 +1105,19 @@ export function createHud(overlayCanvas, options) {
     // level has cost (left) — the two numbers the refill economy is played on.
     const run = state.run;
     const textY = barY + barH + 2 * u;
+    const size = fuelTextSize;
     // Keyed on whole seconds, the resolution `formatTime` prints at.
     const timeText = fuelText(Math.floor(run.fuel));
-    drawText(ctx, timeText, barX + barW, textY, {
-      font: 'hud',
-      size: u,
-      color: low ? 'hudAlarm' : flare > 0 ? 'hudBright' : 'hudDim',
-      align: 'right',
-    });
+    drawAt(ctx, timeText, barX + barW, textY, 'hud', size, low ? 'hudAlarm' : flare > 0 ? 'hudBright' : 'hudDim', 'right');
     const refuels = refuelsOf(state);
     // "TANK" until the first flask, then a tally of them. The word is dropped rather than allowed
-    // to collide with the clock when the bar is narrow (a phone at u = 3 has no room for both).
+    // to collide with the clock when the bar is narrow (a phone has no room for both).
     const tankLabel = low ? 'LOW' : refuels > 0 ? refuelText(refuels) : 'TANK';
-    const timeW = measureLine(timeText, { font: 'hud', size: u });
-    const labelW = measureLine(tankLabel, { font: 'hud', size: u });
+    const timeW = measureAt(timeText, 'hud', size);
+    const labelW = measureAt(tankLabel, 'hud', size);
     if (labelW + timeW + 3 * u <= barW) {
-      drawText(ctx, tankLabel, barX, textY, {
-        font: 'hud',
-        size: u,
-        color: low ? 'hudAlarm' : 'hudDim',
-      });
+      drawAt(ctx, tankLabel, barX, textY, 'hud', size, low ? 'hudAlarm' : 'hudDim');
     }
-    return panelH;
   }
 
   /**
@@ -915,7 +1135,7 @@ export function createHud(overlayCanvas, options) {
   }
 
   /**
-   * Top-right: rolling score and the gem tally.
+   * Top-right: rolling score and the gem tally, sized by {@link layoutTopRow}.
    * @param {CanvasRenderingContext2D} ctx
    * @param {GameState} state
    * @param {SurfaceMetrics} m
@@ -927,130 +1147,120 @@ export function createHud(overlayCanvas, options) {
     const run = state.run;
     const scoreLine = scoreText(scoreCounter.value);
     const gemsLine = gemsText(run.gems, run.gemsTotal);
-    // A six-figure score at double size does not fit beside the fuel gauge on a phone — and with
-    // the massive-maze item counts the gem line is now "8/820" rather than "8/12", so the panel is
-    // fitted to the room the gauge actually leaves instead of being assumed to fit. Measured at
-    // 390×844: the two panels used to overlap by ~35 UI pixels and ate the tank's own readout.
-    let scoreSize = m.narrow ? u : 2 * u;
-    let gemSize = u;
-    const room = m.narrow ? m.w - 3 * pad - fuelPanelW : m.w;
-    for (;;) {
-      const need =
-        Math.max(
-          measureLine(scoreLine, { font: 'hud', size: scoreSize }),
-          measureLine(gemsLine, { font: 'hud', size: gemSize }) + (ICON_SIZE.gem + 2) * gemSize,
-        ) + 8 * u;
-      if (need <= room) break;
-      if (scoreSize > gemSize && scoreSize > 1) scoreSize--;
-      else if (gemSize > 1) gemSize--;
-      else if (scoreSize > 1) scoreSize--;
-      else break;
-    }
-    const scoreH = textHeight({ font: 'hud', size: scoreSize });
-    const gemH = textHeight({ font: 'hud', size: gemSize });
+    const px = m.w - pad - scorePanelW;
 
-    const scoreW = measureLine(scoreLine, { font: 'hud', size: scoreSize });
-    const gemsTextW = measureLine(gemsLine, { font: 'hud', size: gemSize });
-    const gemsW = gemsTextW + (ICON_SIZE.gem + 2) * gemSize;
-    const inner = Math.max(scoreW, gemsW, 20 * u);
-    const panelW = inner + 8 * u;
-    const panelH = scoreH + gemH + 9 * u;
-    const px = m.w - pad - panelW;
+    panelOpts.frame = 'stone';
+    panelOpts.border = border;
+    panelOpts.rivets = true;
+    drawPanel(ctx, px, pad, scorePanelW, fuelPanelH, u, panelOpts);
 
-    drawPanel(ctx, px, pad, panelW, panelH, u, { frame: 'stone' });
-
-    const right = m.w - pad - 4 * u;
-    drawText(ctx, scoreLine, right, pad + 3 * u, {
-      font: 'hud',
-      size: scoreSize,
-      color: 'hudGold',
-      align: 'right',
-    });
-
-    const gemY = pad + 3 * u + scoreH + 2 * u;
-    drawText(ctx, gemsLine, right, gemY, { font: 'hud', size: gemSize, color: 'hudGem', align: 'right' });
-    drawGemIcon(ctx, right - gemsW, gemY, gemSize);
+    const right = px + scorePanelW - insetX;
+    const top = pad + insetY + ((fuelPanelH - 2 * insetY - scoreContentH) >> 1);
+    drawAt(ctx, scoreLine, right, top, 'hud', scoreSize, 'hudGold', 'right');
+    const gemY = top + heightAt('hud', scoreSize) + u;
+    drawAt(ctx, gemsLine, right, gemY, 'hud', gemSize, 'hudGem', 'right');
+    drawGemIcon(ctx, right - gemsWidth(gemsLine, gemSize), gemY, gemSize);
   }
 
   /**
-   * Top-centre: the depth, how big this labyrinth is, how much of it is mapped, and the level
-   * clock. Deliberately small — the middle of the screen is where the game is.
+   * Top-centre: which depth this is and how big its labyrinth is — **one line**, `DEPTH 4 · 40×40`.
    *
-   * The size line is new for the massive-maze wave and it is not decoration: `16×16` and `128×128`
-   * are two different games, and a player who has just descended needs to know which one they are
-   * standing in without opening the map. `MAPPED %` is free — `map.js` maintains the count
-   * incrementally — and it is the only honest progress bar a maze this size can offer.
+   * The size is not decoration: `16×16` and `128×128` are two different games, and a player who has
+   * just descended needs to know which one they are standing in without opening the map. The
+   * level clock and the mapped share used to ride along on two more lines; they now live where a
+   * player goes to read them (the full map and the pause screen), because a four-line plaque in the
+   * middle of the top row made it the heaviest panel on screen for the least actionable facts.
+   *
+   * On a wide surface it is centred between the corner panels (or tucks under the gauge when a
+   * narrow window leaves no gap). On a phone it sits in the column under the gauge — the column is
+   * all it may use, because the touch overlay's MAP/PAUSE bar sits under the score panel — splitting
+   * onto two lines when one does not fit, and shrinking until it ends above the world band.
    * @param {CanvasRenderingContext2D} ctx
    * @param {GameState} state
    * @param {SurfaceMetrics} m
-   * @param {number} fuelH height of the fuel panel, for the stacked (narrow) layout
    * @returns {void}
    */
-  function drawDepthPanel(ctx, state, m, fuelH) {
+  function drawDepthPanel(ctx, state, m) {
     const u = m.u;
     const pad = 3 * u;
     const level = state.levelData;
     const hasMaze = level !== null && level !== undefined && level.maze !== undefined;
-    const pct = mappedPercent(state);
-    const seconds = Math.floor(state.run.levelTime);
-    // Wide: the clock and the mapped percentage share one row. Narrow: they get a row each, and
-    // the whole panel drops a text size — a phone at u = 3 cannot hold "01:42  MAPPED 94%" on one
-    // line and would otherwise run off the screen (measured at 390×844).
-    const stacked = m.narrow && pct >= 0;
-    // Filled in place: a fresh `[depth, size, tail]` array every frame was garbage for nothing.
-    const lines = depthLines;
-    let rows = 0;
-    lines[rows++] = depthText(state.level);
-    if (hasMaze) lines[rows++] = sizeText(level.maze.cols, level.maze.rows);
-    lines[rows++] = stacked || pct < 0 ? clockText(seconds) : tailMemo(seconds, pct);
-    if (stacked) lines[rows++] = mappedMemo(pct);
-    // Never wider than the screen: the size that fits wins over the size that was asked for.
-    const maxW = m.w - 2 * pad - 8 * u;
-    let size = m.narrow ? Math.max(1, u - 1) : u;
-    for (let i = 0; i < rows; i++) {
-      const fit = fitScale(lines[i], maxW, { font: 'hud' }, size, 1);
-      if (fit < size) size = fit;
-    }
-    const lineH = textHeight({ font: 'hud', size });
-    let w = 0;
-    for (let i = 0; i < rows; i++) {
-      const lw = measureLine(lines[i], { font: 'hud', size });
-      if (lw > w) w = lw;
-    }
-    const panelW = Math.min(m.w - 2 * pad, w + 8 * u);
-    const panelH = lineH * rows + (rows + 1) * 2 * u + u;
-    // Centre on a wide screen; stack under the fuel gauge when there is no room between the two
-    // top clusters.
-    const px = m.narrow ? pad : Math.round((m.w - panelW) / 2);
-    const py = m.narrow ? pad + fuelH + 2 * u : pad;
+    const depth = depthText(state.level);
+    const dims = hasMaze ? sizeText(level.maze.cols, level.maze.rows) : '';
 
-    drawPanel(ctx, px, py, panelW, panelH, u, { frame: 'wood', rivets: false });
-    const cx = px + Math.round(panelW / 2);
-    // Depth is gold, the size is the bright fact under it, the rest is quiet.
-    const colors = depthColors;
-    colors[1] = hasMaze ? 'hudBright' : 'hudDim';
-    let y = py + 4 * u;
-    for (let i = 0; i < rows; i++) {
-      drawText(ctx, lines[i], cx, y, { font: 'hud', size, color: colors[i], align: 'center' });
-      y += lineH + 2 * u;
+    let size = m.narrow ? Math.max(1, u - 1) : u;
+    let twoLines = false;
+    let px = 0;
+    let py = pad;
+    let panelW = 0;
+    let panelH = 0;
+    if (!m.narrow) {
+      // Centred in the gap between the corner panels, at the largest size that fits there.
+      const gapL = pad + fuelPanelW + 2 * u;
+      const gapR = m.w - pad - scorePanelW - 2 * u;
+      for (;;) {
+        panelW = 2 * insetX + depthLineWidth(depth, dims, size);
+        px = Math.round((m.w - panelW) / 2);
+        if ((px >= gapL && px + panelW <= gapR) || size <= Math.max(1, u - 1)) break;
+        size--;
+      }
+      if (px < gapL || px + panelW > gapR) {
+        // No gap at all (a 4:3 window near the narrow boundary): under the gauge instead.
+        px = pad;
+        py = pad + fuelPanelH + 2 * u;
+      }
+      panelH = 2 * insetY + heightAt('hud', size);
+    } else {
+      const column = fuelPanelW;
+      // The band's top edge, when the page has told the surface where the world is.
+      const floor = m.viewY > py + fuelPanelH ? m.viewY - 2 * u : m.h;
+      py = pad + fuelPanelH + 2 * u;
+      for (;;) {
+        const oneW = 2 * insetX + depthLineWidth(depth, dims, size);
+        twoLines = hasMaze && oneW > column;
+        panelW = twoLines
+          ? 2 * insetX + Math.max(measureAt(depth, 'hud', size), measureAt(dims, 'hud', size))
+          : oneW;
+        panelH = 2 * insetY + (twoLines ? 2 * heightAt('hud', size) + u : heightAt('hud', size));
+        if ((panelW <= column && py + panelH <= floor) || size <= 1) break;
+        size--;
+      }
+      px = pad;
     }
+
+    panelOpts.frame = 'wood';
+    panelOpts.border = border;
+    panelOpts.rivets = false;
+    drawPanel(ctx, px, py, panelW, panelH, u, panelOpts);
+    const cx = px + (panelW >> 1);
+    const top = py + insetY;
+    if (twoLines) {
+      drawAt(ctx, depth, cx, top, 'hud', size, 'hudGold', 'center');
+      drawAt(ctx, dims, cx, top + heightAt('hud', size) + u, 'hud', size, 'hudBright', 'center');
+      return;
+    }
+    // One line in three runs — depth in gold, a quiet separator, the size in bright — laid out from
+    // the measured widths so the group is centred as a whole.
+    let x = cx - (depthLineWidth(depth, dims, size) >> 1);
+    drawAt(ctx, depth, x, top, 'hud', size, 'hudGold');
+    if (dims === '') return;
+    x += measureAt(depth, 'hud', size) + DEPTH_GAP * size;
+    drawAt(ctx, DEPTH_SEPARATOR, x, top, 'hud', size, 'hudDim');
+    x += measureAt(DEPTH_SEPARATOR, 'hud', size) + DEPTH_GAP * size;
+    drawAt(ctx, dims, x, top, 'hud', size, 'hudBright');
   }
 
   /**
-   * The whole-number percentage of the level mapped — exactly the number `formatPercent` prints —
-   * or −1 when there is nothing to report (no level, or the map has never been opened so the
-   * incremental count has not been primed). A number rather than a string, so the readout can be
-   * memoised on it.
-   * @param {GameState} state
+   * Width of `DEPTH n · C×R` drawn as three runs (see {@link drawDepthPanel}).
+   * @param {string} depth
+   * @param {string} dims empty when no maze is loaded
+   * @param {number} size
    * @returns {number}
    */
-  function mappedPercent(state) {
-    const level = state.levelData;
-    if (level === null || level === undefined || level.maze === undefined) return -1;
-    const total = level.maze.width * level.maze.height;
-    const seen = mapView.exploredCount();
-    if (total <= 0 || seen <= 0) return -1;
-    return Math.round(clamp01(seen / total) * 100);
+  function depthLineWidth(depth, dims, size) {
+    const w = measureAt(depth, 'hud', size);
+    if (dims === '') return w;
+    return w + 2 * DEPTH_GAP * size + measureAt(DEPTH_SEPARATOR, 'hud', size) + measureAt(dims, 'hud', size);
   }
 
   /**
@@ -1089,7 +1299,10 @@ export function createHud(overlayCanvas, options) {
 
     const u = m.u;
     const r = 9 * u;
-    const lineH = textHeight({ font: 'hud', size: u });
+    // The readout is sized like every other phone readout (a step under the unit): at a full unit
+    // `63m` was the tallest text on a phone's HUD, louder than the score and the tank.
+    const textSize = m.narrow ? Math.max(1, u - 1) : u;
+    const lineH = heightAt('hud', textSize);
     const cx = Math.round(m.w / 2);
     // The readout hangs below the dial, so the dial itself lifts by a line. On a narrow surface the
     // corner map is directly to the right; lift again so the two never touch.
@@ -1131,7 +1344,7 @@ export function createHud(overlayCanvas, options) {
         t < 0
           ? COLOR.stoneMid
           : t > 0.72
-            ? near > 0.5 && !reduced && noise(clock * 6) > 0.5
+            ? near > 0.5 && !reduced && noise(anim.clock * 6) > 0.5
               ? COLOR.arcPale
               : COLOR.arcCyan
             : COLOR.arcMid;
@@ -1152,16 +1365,11 @@ export function createHud(overlayCanvas, options) {
     // Keyed on the whole tile count `formatDistance` prints; Infinity is a stable key.
     const distLine = distText(Math.round(dist));
     const distY = cy + r + 2 * u;
-    const distW = measureLine(distLine, { font: 'hud', size: u });
+    const distW = measureAt(distLine, 'hud', textSize);
     ctx.fillStyle = withAlpha(COLOR.void, 0.72);
     ctx.fillRect(Math.round(cx - distW / 2) - 2 * u, distY - u, distW + 4 * u, lineH + 2 * u);
-    drawText(ctx, distLine, cx, distY, {
-      font: 'hud',
-      size: u,
-      // Close to the exit the readout turns arcane, matching the needle tip and the portal hum.
-      color: near > 0.5 ? 'hudBright' : 'hudDim',
-      align: 'center',
-    });
+    // Close to the exit the readout turns arcane, matching the needle tip and the portal hum.
+    drawAt(ctx, distLine, cx, distY, 'hud', textSize, near > 0.5 ? 'hudBright' : 'hudDim', 'center');
   }
 
   /**
@@ -1187,19 +1395,17 @@ export function createHud(overlayCanvas, options) {
       const alpha = t < 0.7 ? 1 : 1 - (t - 0.7) / 0.3;
       const x = Math.round(p.x + (reduced ? 0 : p.drift * t));
       const y = Math.round(p.y - (reduced ? 12 * u * t : rise));
-      const textW = drawText(ctx, p.text, x, y, {
-        font: 'hud',
-        size,
-        color: p.color,
-        align: 'center',
-        alpha,
-      });
+      // Fade through the context rather than through a fractional argument (see `withAlphaStep`).
+      const before = ctx.globalAlpha;
+      ctx.globalAlpha = before * clamp01(alpha);
+      drawAt(ctx, p.text, x, y, 'hud', size, p.color, 'center');
+      ctx.globalAlpha = before;
       // The icon rides beside the number so a glance tells you *what* you picked up without
       // reading the value.
       if (p.icon !== 0) {
         const iconScale = Math.max(1, u);
         const iconW = (p.icon === 1 ? ICON_SIZE.gem : ICON_SIZE.oilW) * iconScale;
-        const iconX = Math.round(x - textW / 2 - iconW - u);
+        const iconX = Math.round(x - measureAt(p.text, 'hud', size) / 2 - iconW - u);
         const prev = ctx.globalAlpha;
         ctx.globalAlpha = prev * clamp01(alpha);
         if (p.icon === 1) drawGemIcon(ctx, iconX, y, iconScale);
@@ -1221,18 +1427,14 @@ export function createHud(overlayCanvas, options) {
     const u = m.u;
     // Deliberately the smallest text on screen: diagnostics must never crowd the game.
     const size = Math.max(1, u - 1);
-    const lineH = textHeight({ font: 'hud', size });
+    const lineH = heightAt('hud', size);
     const line =
       stats !== null && stats !== undefined
         ? `${stats.fps.toFixed(0)} FPS ${stats.frameMsAvg.toFixed(1)}MS P99 ${stats.frameMsP99.toFixed(1)} DROP ${stats.droppedFrames}`
         : 'NO FRAME STATS';
     const pos = `${state.player.x.toFixed(1)},${state.player.y.toFixed(1)} ${m.w}X${m.h}@${m.px}`;
-    drawText(ctx, line, 3 * u, m.h - 3 * u - lineH * 2 - size, {
-      font: 'hud',
-      size,
-      color: 'hudDim',
-    });
-    drawText(ctx, pos, 3 * u, m.h - 3 * u - lineH, { font: 'hud', size, color: 'hudDim' });
+    drawAt(ctx, line, 3 * u, m.h - 3 * u - lineH * 2 - size, 'hud', size, 'hudDim');
+    drawAt(ctx, pos, 3 * u, m.h - 3 * u - lineH, 'hud', size, 'hudDim');
   }
 
   /**

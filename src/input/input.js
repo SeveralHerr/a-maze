@@ -3,8 +3,10 @@
  * @file The single input funnel: keyboard, mouse (pointer lock), gamepad and touch collapsed into
  * one `InputFrame` per simulation step.
  *
- * Contract (ARCHITECTURE.md §4.3): `createInput(canvasEl, opts) → { poll, setOptions,
- * requestPointerLock, destroy, isTouch }`.
+ * Contract (ARCHITECTURE.md §4.3): `createInput(canvasEl, opts?) → { poll(), setOptions(o),
+ * requestPointerLock(), updateOverlay(state), destroy(), isTouch, pointerLocked }`, plus two
+ * additive members — `setBindings(tables)` (keyboard remap) and `wantsPointer` (for a
+ * "click to look" prompt) — documented on the {@link Input} typedef below.
  *
  * ## Invariants this module guarantees
  *
@@ -46,8 +48,7 @@ import {
   NAV_MASK,
   HOLD,
   HOLD_COUNT,
-  KEY_HOLD,
-  KEY_ACTION_MASK,
+  DEFAULT_BINDINGS,
   PREVENT_DEFAULT_CODES,
   GAMEPAD_BUTTON_ACTION,
   GAMEPAD_BUTTON_HOLD,
@@ -76,11 +77,24 @@ const MOUSE_RAD_PER_PX = 0.0024;
 const TOUCH_RAD_PER_PX = 0.0038;
 
 /**
- * Hard ceiling on a single `movementX` report, in pixels. Chrome is known to deliver one enormous
- * delta on the frame pointer lock engages (and some drivers spike on wake), which without this
- * clamp teleports the player's aim. 180 px is far more than any real 60 Hz mouse sample.
+ * Milliseconds after pointer lock engages during which `mousemove` is ignored; the very first move
+ * after engagement is always ignored too. That is where Chrome delivers its one bogus jumbo delta
+ * (the cursor's jump from wherever it was to the lock origin). Guarding the *moment* rather than
+ * clamping *every* event matters: Chrome coalesces `mousemove` per animation frame and sums
+ * `movementX`, and with `unadjustedMovement` those are raw device counts, so a 1600–3200 DPI mouse
+ * legitimately reports several hundred counts in one frame of an ordinary flick. A per-event clamp
+ * silently capped fast turns for exactly the players most likely to care. Losing one frame of real
+ * motion on engagement is imperceptible.
  */
-const MAX_MOUSE_DELTA_PX = 180;
+const LOCK_SETTLE_MS = 50;
+
+/**
+ * A single `movementX` larger than this, in pixels, is discarded (not clamped) as a driver or wake
+ * glitch. 2000 counts in one ~16 ms frame is ~120 000 counts/s — beyond any real sensor and hand —
+ * so nothing a human does is touched, while a garbage value is dropped rather than turned into a
+ * maximum-size spin. {@link MAX_LOOK_PER_POLL} still backstops a flood of plausible values.
+ */
+const MAX_MOUSE_EVENT_PX = 2000;
 
 /**
  * Hard ceiling on the yaw accumulated between two polls, in radians. Half a turn per sim step is
@@ -166,15 +180,27 @@ const PAD_AXIS_MAX = 8;
  */
 const GESTURE_GRACE_MS = 4000;
 
-/** Minimum gap between two *automatic* pointer-lock requests, in ms (a click always goes now). */
+/**
+ * Minimum gap between two *automatic* pointer-lock requests while one is still awaiting a verdict
+ * (or none has been refused yet), in ms. A click always goes now.
+ */
 const AUTO_LOCK_COOLDOWN_MS = 1200;
 
 /**
- * Consecutive refusals after which the automatic request gives up until the next successful lock.
- * Some environments (iframes without `allow="pointer-lock"`, Chrome's post-Escape cooldown) refuse
- * every time, and retrying twice a second forever would be a noise generator, not a feature.
+ * Gap before retrying after an automatic request was **refused**, in ms. Chrome refuses a lock
+ * requested within about a second of the player releasing it with Escape, which is exactly the
+ * Esc-pause → Enter-resume path; waiting the full cooldown after that refusal left the mouse dead
+ * for ~1.2 s. Short steps land the lock as soon as the browser allows it.
  */
-const AUTO_LOCK_MAX_FAILS = 3;
+const AUTO_LOCK_RETRY_MS = 250;
+
+/**
+ * Consecutive refusals after which the automatic request gives up until the next successful lock
+ * or click. 8 retries at {@link AUTO_LOCK_RETRY_MS} cover ~2 s — past Chrome's post-Escape window —
+ * while an environment that refuses every time (an iframe without `allow="pointer-lock"`) is left
+ * alone after that instead of being asked forever. {@link GESTURE_GRACE_MS} bounds it as well.
+ */
+const AUTO_LOCK_MAX_FAILS = 8;
 
 // ─── Public types ────────────────────────────────────────────────────────────────────────────
 
@@ -198,6 +224,8 @@ const AUTO_LOCK_MAX_FAILS = 3;
  * @property {HTMLElement|null} [touchRoot]
  *   Container for the on-screen controls. Defaults to `#touch`, else the canvas's parent.
  * @property {boolean} [touchOverlay]  set false to suppress the on-screen controls entirely
+ * @property {import('./bindings.js').BindingTables|null} [bindings]
+ *   keyboard layout from `createBindings(overrides)`; the default layout when omitted
  * @property {InputEnv} [env]          injectable globals (tests)
  */
 
@@ -209,9 +237,16 @@ const AUTO_LOCK_MAX_FAILS = 3;
  * @property {(state: {phase?: string, settings?: {mapMode?: string}}|null|undefined) => void} updateOverlay
  *   Forwards the phase — and the map mode, which decides where the button bar sits — to the touch
  *   overlay (no-op without one). Pass the whole `GameState`; call it once per frame.
+ * @property {(tables: import('./bindings.js').BindingTables|null|undefined) => void} setBindings
+ *   swap the keyboard layout (`createBindings(overrides)`; null restores the defaults). Held keys
+ *   are released, because a key held across the swap would decrement a different slot on keyup.
  * @property {() => void} destroy                   removes every listener and DOM node
  * @property {boolean} isTouch                      true once the device has proven it is touch
  * @property {boolean} pointerLocked                true while the canvas owns the pointer
+ * @property {boolean} wantsPointer
+ *   true while the game wants mouse look but does not have the pointer (playing, not touch, lock
+ *   supported, not locked) — the HUD can show "CLICK TO LOOK" from it. Covers the gap while the
+ *   browser refuses an automatic re-lock right after an Escape.
  */
 
 // ─── Implementation ──────────────────────────────────────────────────────────────────────────
@@ -254,6 +289,10 @@ export function createInput(canvasEl, opts) {
   let invertSign = o.invertLook === true ? -1 : 1;
   /** @type {() => boolean} */
   let shouldLockPointer = typeof o.shouldLockPointer === 'function' ? o.shouldLockPointer : () => false;
+
+  /** Active keyboard tables; swapped whole by `setBindings`, read with one property lookup each. */
+  let keyHold = DEFAULT_BINDINGS.keyHold;
+  let keyActionMask = DEFAULT_BINDINGS.keyActionMask;
 
   // ── Reused frame (invariant 1) ────────────────────────────────────────────────────────────
   /** @type {Set<InputAction>} */
@@ -334,6 +373,10 @@ export function createInput(canvasEl, opts) {
   let autoLockPending = false;
   /** Consecutive automatic refusals; at AUTO_LOCK_MAX_FAILS the module stops asking. */
   let autoLockFails = 0;
+  /** When the pointer lock last engaged; mouse moves inside LOCK_SETTLE_MS of it are dropped. */
+  let lockEngagedMs = -1e9;
+  /** True until the first mouse move after the lock engaged has been seen (and dropped). */
+  let lockFirstMove = false;
 
   // ── Listener bookkeeping (invariant 3) ────────────────────────────────────────────────────
   /** @type {{t:any, type:string, fn:Function, opt:any}[]} */
@@ -432,8 +475,8 @@ export function createInput(canvasEl, opts) {
     const code = e.code || codeFromKey(e.key);
     if (!code) return;
 
-    const slot = KEY_HOLD[code];
-    const mask = KEY_ACTION_MASK[code] | 0;
+    const slot = keyHold[code];
+    const mask = keyActionMask[code] | 0;
     if (slot === undefined && mask === 0) return; // not ours: leave the default alone
 
     const first = !heldCodes.has(code);
@@ -461,7 +504,7 @@ export function createInput(canvasEl, opts) {
     if (!e) return;
     const code = e.code || codeFromKey(e.key);
     if (!code || !heldCodes.delete(code)) return;
-    const slot = KEY_HOLD[code];
+    const slot = keyHold[code];
     if (slot !== undefined && hold[slot] > 0) hold[slot]--;
   }
 
@@ -509,11 +552,16 @@ export function createInput(canvasEl, opts) {
   function onMouseMove(e) {
     if (!e) return;
     if (!isLocked() && !(dragging && shouldLockPointer())) return;
-    let dx = e.movementX;
+    const dx = e.movementX;
     if (typeof dx !== 'number' || !Number.isFinite(dx)) return;
-    // Spike guard (see MAX_MOUSE_DELTA_PX).
-    if (dx > MAX_MOUSE_DELTA_PX) dx = MAX_MOUSE_DELTA_PX;
-    else if (dx < -MAX_MOUSE_DELTA_PX) dx = -MAX_MOUSE_DELTA_PX;
+    // Engagement spike guard (see LOCK_SETTLE_MS): only right after the lock lands.
+    if (lockFirstMove) {
+      lockFirstMove = false;
+      return;
+    }
+    if (now() - lockEngagedMs < LOCK_SETTLE_MS) return;
+    // Glitch guard (see MAX_MOUSE_EVENT_PX): discarded, never clamped into a maximum-size turn.
+    if (dx > MAX_MOUSE_EVENT_PX || dx < -MAX_MOUSE_EVENT_PX) return;
     addLook(dx * MOUSE_RAD_PER_PX);
   }
 
@@ -553,6 +601,10 @@ export function createInput(canvasEl, opts) {
     if (isLocked()) {
       autoLockPending = false;
       autoLockFails = 0;
+      lockEngagedMs = now();
+      lockFirstMove = true;
+    } else {
+      lockFirstMove = false;
     }
   };
 
@@ -581,7 +633,9 @@ export function createInput(canvasEl, opts) {
     if (isLocked() || !shouldLockPointer()) return;
     const t = now();
     if (t - lastGestureMs > GESTURE_GRACE_MS) return;
-    if (t - lastAutoLockMs < AUTO_LOCK_COOLDOWN_MS) return;
+    // A request still awaiting its verdict gets the full cooldown; a refused one is retried soon.
+    const gap = autoLockPending || autoLockFails === 0 ? AUTO_LOCK_COOLDOWN_MS : AUTO_LOCK_RETRY_MS;
+    if (t - lastAutoLockMs < gap) return;
     lastAutoLockMs = t;
     autoLockPending = true;
     requestPointerLock();
@@ -595,7 +649,7 @@ export function createInput(canvasEl, opts) {
     stickX = 0;
     stickY = 0;
     stickSprint = false;
-    if (overlay) overlay.setStick(false, 0, 0, 0, 0);
+    if (overlay) overlay.setStick(false, 0, 0, 0, 0, false);
   }
 
   /**
@@ -645,7 +699,7 @@ export function createInput(canvasEl, opts) {
     // Screen Y grows downward; forward is up the screen.
     stickY = -stickScratch[1];
     if (overlay) {
-      overlay.setStick(true, stickOriginX, stickOriginY, stickOriginX + dx, stickOriginY + dy);
+      overlay.setStick(true, stickOriginX, stickOriginY, stickOriginX + dx, stickOriginY + dy, stickSprint);
     }
   }
 
@@ -985,7 +1039,13 @@ export function createInput(canvasEl, opts) {
       // The right stick is read from axis 2 **only under standard mapping**. On an unmapped device
       // that index is as likely to be a trigger, a hat or a rudder, and a wrong guess here spins
       // the camera rather than merely doing nothing.
-      if (padStandard && axes.length >= 3) {
+      //
+      // A radial deadzone over the whole right stick (only its X is used), so a thumb pushing
+      // slightly off-horizontal loses turn speed exactly the way the left stick loses move speed.
+      if (padStandard && axes.length >= 4) {
+        radialDeadzone(axes[2], axes[3], DEADZONE, stickScratch);
+        padTurn += padTurnResponse(stickScratch[0]);
+      } else if (padStandard && axes.length === 3) {
         padTurn += padTurnResponse(axisDeadzone(axes[2], DEADZONE));
       }
     }
@@ -1127,6 +1187,25 @@ export function createInput(canvasEl, opts) {
     if (typeof next.shouldLockPointer === 'function') shouldLockPointer = next.shouldLockPointer;
   }
 
+  /**
+   * Swap the keyboard layout. Anything that is not a table pair restores the defaults.
+   * @param {import('./bindings.js').BindingTables|null|undefined} tables
+   */
+  function setBindings(tables) {
+    const ok =
+      !!tables &&
+      typeof tables === 'object' &&
+      !!tables.keyHold &&
+      typeof tables.keyHold === 'object' &&
+      !!tables.keyActionMask &&
+      typeof tables.keyActionMask === 'object';
+    keyHold = ok && tables ? tables.keyHold : DEFAULT_BINDINGS.keyHold;
+    keyActionMask = ok && tables ? tables.keyActionMask : DEFAULT_BINDINGS.keyActionMask;
+    // A key held across the swap would release a different slot than it pressed.
+    heldCodes.clear();
+    hold.fill(0);
+  }
+
   /** Remove every listener, node and style this module added (invariant 3). */
   function destroy() {
     if (destroyed) return;
@@ -1155,6 +1234,8 @@ export function createInput(canvasEl, opts) {
     clearHeld();
     pendingMask = 0;
   }
+
+  if (o.bindings) setBindings(o.bindings);
 
   // ── Wiring ────────────────────────────────────────────────────────────────────────────────
 
@@ -1200,6 +1281,7 @@ export function createInput(canvasEl, opts) {
     poll,
     setOptions,
     requestPointerLock,
+    setBindings,
     updateOverlay(state) {
       if (overlay) overlay.update(state);
     },
@@ -1209,6 +1291,10 @@ export function createInput(canvasEl, opts) {
     },
     get pointerLocked() {
       return isLocked();
+    },
+    get wantsPointer() {
+      if (destroyed || touchDetected || !target || typeof target.requestPointerLock !== 'function') return false;
+      return !isLocked() && shouldLockPointer() === true;
     },
   };
 }

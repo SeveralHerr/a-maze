@@ -62,6 +62,8 @@ const EMBER_LIFT = 0.55;
  * @property {Float32Array} fogLut  distance → 0..1 visibility
  * @property {number} fogScale      multiply a distance in tiles by this to index `fogLut`
  * @property {number} fogLutMax     last valid `fogLut` index
+ * @property {number} [levelFull]   shade level that shows a colour at its own brightness; levels
+ *   above it are the colormap's over-bright headroom. Optional — 63 when omitted.
  */
 
 /**
@@ -258,7 +260,7 @@ export function createParticles(capacity = 384) {
       const fade = life[i] / life0[i]; // 1 → 0 across the lifetime
       let fi = (tY * cam.fogScale) | 0;
       if (fi > cam.fogLutMax) fi = cam.fogLutMax;
-      let level = (63 * cam.fogLut[fi] * (0.35 + 0.65 * fade)) | 0;
+      let level = ((cam.levelFull > 0 ? cam.levelFull : 63) * cam.fogLut[fi] * (0.35 + 0.65 * fade)) | 0;
       if (level < 0) level = 0;
       else if (level > 63) level = 63;
       const rgba = cam.colormap[(level << 8) | color[i]];

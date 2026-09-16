@@ -42,23 +42,27 @@ tree is served locally (`npm run serve`) and uploaded to itch.io by CI.
   reached at level 15. `LEVEL.MAX_CELLS` in `balance.js` is the **single documented size knob** and
   the cap level is *derived* from it (`CAP_LEVEL`), never typed twice. Past the cap, levels get
   **harder, not bigger**: braid keeps rising (0→0.6 over 17 levels, square-root shaped, 0.6 from
-  level 18), the torch drains 1.5 % faster per level from `LEVEL.DRAIN_RAMP_START` (level 5, so the
-  ramp is felt inside the size curve) to a 1.35× ceiling, and oil thins from one flask per 20 cells
-  to one per 30. Levels run ~3.5 minutes at level 1 to ~13 minutes at the deepest.
+  level 18), the torch drains 3 % faster per level (`FUEL.DRAIN_PER_LEVEL`) from
+  `LEVEL.DRAIN_RAMP_START` (level 5, so the ramp is felt inside the size curve) to a 1.35× ceiling
+  (`FUEL.DRAIN_MAX`, 1.30× at the cap, 1.35× from level 17), and oil thins from one flask per 20
+  cells to one per 34 (`LEVEL.OIL_CELLS_END`). Levels run ~3.5 minutes at level 1 to ~13 minutes at the deepest.
 - **Torch economy _(a tank you keep refilling, not a budget)_:** `fuelMax` is a **tank** of
   110 s (level 1) → 150 s (the cap), **independent of maze area** — 64× the area buys 1.36× the
   tank. Oil flasks are the economy: their **count scales with area** so density is roughly constant
-  (≈ one per 20 cells early, thinning to one per 30 past the cap), each restoring **35 % of the
-  tank** (clamped 25–60 s ⇒ 38–53 s in practice). A level takes **7–22 refuels** to cross and the
+  (≈ one per 20 cells early, thinning to one per 34 past the cap), each restoring **35 % of the
+  tank on level 1, climbing to 44 % on the cap's tank** (`FUEL.OIL_FRACTION` →
+  `FUEL.OIL_FRACTION_END`, clamped 25–70 s ⇒ 38–66 s in practice) — bigger, rarer refills deeper
+  down are the shape of the tension curve. A level takes **7–22 refuels** to cross and the
   player is never more than ~60–90 s from darkness, whatever the depth. Gems scale with area too
   (≈ one per 50–60 cells), still favouring dead ends, and remain the score currency.
-  A flask is only consumed when at least `FUEL.OIL_MIN_USEFUL_FRACTION` (0.5) of its value would
+  A flask is only consumed when at least `FUEL.OIL_MIN_USEFUL_FRACTION` (0.55) of its value would
   land in the tank — otherwise it stays on the floor — and the low-fuel alarm fires at
   `FUEL.LOW_FRACTION` (0.25) of the tank.
   **Placement guarantee:** walking the solution path, the gap between consecutive *reachable* oil
   flasks (on the path or within `LEVEL.OIL_REACH_TILES` = 3 tiles of it) never exceeds
   `levelParams().oilTargetGap` — the path distance one flask pays for at a 2.0× wander factor with
-  20 % headroom. `src/maze/populate.js` places to it, `walkRefuelChain()` verifies it,
+  `gapSafety(level)` headroom — 30 % on level 1 (`FUEL.GAP_SAFETY` 0.7), easing to 20 % at the cap
+  (`FUEL.GAP_SAFETY_END` 0.8). `src/maze/populate.js` places to it, `walkRefuelChain()` verifies it,
   `tools/validate-mazes.mjs` asserts it for levels 1…30 × 25 seeds, and `src/state/feasibility.test.mjs`
   proves it end-to-end by walking 250 real levels with an autopilot. A level a competent player
   cannot chain refuels through is a **blocker**, not a balance note.
@@ -66,8 +70,8 @@ tree is served locally (`npm run serve`) and uploaded to itch.io by CI.
   _Consequence of the tank (deliberate, see `SCORE`):_ the clear bonus is roughly constant per level
   because the tank no longer grows, while gems scale with area (6 at level 1 → 273 at the cap), so
   the incentive tips from "get out fast" to "explore" as the labyrinth grows.
-- **Controls:** WASD/arrows move + turn, mouse look with pointer lock, Shift sprint (drains fuel
-  1.5×), M cycles the map **off → corner → full**, Esc/P pause, Enter/Space confirm. Touch: left
+- **Controls:** WASD/arrows move + turn, mouse look with pointer lock, Shift sprint (fast but
+  wasteful: drains fuel 2× at 1.6× speed, so a sprinted tile costs 1.25× a walked one), M cycles the map **off → corner → full**, Esc/P pause, Enter/Space confirm. Touch: left
   virtual stick move, right half drag to turn, tap buttons for pause/map. Gamepad: standard mapping.
 - **Feedback cues:** head bob, footstep sounds synced to bob, wall-bump thud + tiny camera
   shake, gem sparkle particles + chime + score pop, fuel pickup whoosh + light flare, low-fuel
@@ -226,7 +230,10 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
  *   walked this RUN (reset by `newGame` only). Both exist because on a 14-minute labyrinth those
  *   are the statistics that describe the run; the HUD shows the refuel tally live and the
  *   level-complete / game-over screens show both.
- * @property {{score:number, level:number}} best
+ * @property {{score:number, level:number}} best   `best.level` is the **deepest level reached** (the
+ *   level the run was on when it was folded in), not the deepest cleared. Folded in by
+ *   `sim.recordBest` on a level clear, on game over, and when a paused run is abandoned through
+ *   `toTitle` or `newGame` — abandoning a run keeps its score.
  * @property {Settings} settings
  * @property {{exitDist:number, nearExit:number, lowFuel:boolean}} derived   recomputed each step for renderer/hud/audio
  *   (`exitDist` is Infinity and `nearExit` 0 while no level is loaded — an honest "unknown")
@@ -340,8 +347,10 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   Also `gemScore`, `levelBonus`, `oilFuel`, `coerceSetting`, `defaultSettings`, `sanitizeSettings`,
   `sanitizeBest`, `MAP_MODES`, and the new derived helpers `CAP_LEVEL`, `tankSeconds(level)`,
   `drainRate(level)`, `travelTiles(seconds, drain)`, `estimatedPathTiles(level)` and
-  `resolveTank(level, offered)`. `FUEL.LOW_FRACTION` (0.25) is the `lowFuel` threshold;
-  `FUEL.OIL_MIN_USEFUL_FRACTION` (0.5) is how much of a flask must be usable before the sim consumes
+  `resolveTank(level, offered)`, and `gapSafety(level)` (the refuel-chain headroom multiplier,
+  `FUEL.GAP_SAFETY` 0.7 on level 1 → `FUEL.GAP_SAFETY_END` 0.8 at the cap, applied to
+  `oilTargetGap`). `FUEL.LOW_FRACTION` (0.25) is the `lowFuel` threshold;
+  `FUEL.OIL_MIN_USEFUL_FRACTION` (0.55) is how much of a flask must be usable before the sim consumes
   it (the same rule `feasibility.test.mjs` models); `LEVEL.DRAIN_RAMP_START` (5) is the last level
   that burns at 1× before `drainRate` climbs by `FUEL.DRAIN_PER_LEVEL`. Frozen tables `PLAYER / BUMP / BOB / WORLD / SIM / FUEL / SCORE /
   ATTRACT / LEVEL`. Removed with the old economy (nothing referenced them): `FUEL.BASE_SECONDS`,
@@ -367,14 +376,21 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   Edges the sketch left open, now pinned _(integrator decision)_:
   `newGame` is honoured from `title|gameOver|levelComplete|paused` but **ignored in `playing` and
   `loading`** — a run in progress is abandoned deliberately, through pause. `toTitle` is honoured
-  from `gameOver|levelComplete|paused` only. There is **no exit from `loading`**: `src/main.js`
+  from `gameOver|levelComplete|paused` only. `toTitle` and `newGame` from `paused` fold the
+  abandoned run into `best` through `recordBest` first (§3), so quitting never loses a record. There is **no exit from `loading`**: `src/main.js`
   owns that recovery instead (stale-build tokens, one reseeded retry, and a 12 s watchdog), which
   keeps the phase machine total and the failure handling in the one place that knows about workers.
   `levelData` and `explored` are deliberately preserved during `loading` so the renderer keeps a
   coherent backdrop behind the loading screen; `levelReady` swaps both atomically.
 
 ### 4.3 `src/input` (Wave 1)
-- `input.js` — `createInput(canvasEl:HTMLElement, opts?:{sensitivity?, invertLook?, shouldLockPointer?, touchRoot?, touchOverlay?, env?}) → { poll():InputFrame, setOptions(o), requestPointerLock(), updateOverlay(state), destroy(), isTouch:boolean, pointerLocked:boolean }`.
+- `input.js` — `createInput(canvasEl:HTMLElement, opts?:{sensitivity?, invertLook?, shouldLockPointer?, touchRoot?, touchOverlay?, bindings?, env?}) → { poll():InputFrame, setOptions(o), requestPointerLock(), updateOverlay(state), setBindings(tables), destroy(), isTouch:boolean, pointerLocked:boolean, wantsPointer:boolean }`.
+  _Additive (gauntlet round 2):_ `bindings` is a `BindingTables` from `createBindings(overrides)`
+  (default layout when omitted); `setBindings(tables)` swaps the keyboard layout at runtime (null or
+  garbage restores the defaults) and releases every held key, because a key held across the swap
+  would decrement a different slot on keyup; `wantsPointer` is true while the game wants mouse look
+  but does not own the pointer (playing, not touch, lock supported, not locked) — the hook for a
+  "click to look" prompt.
   Keyboard (`code`-based, layout independent), mouse w/ pointer lock, gamepad (deadzone 0.18),
   touch (virtual stick left 40% of screen, drag-look on right, rendered by `touch-overlay.js`).
   `poll()` reuses one frame object **and one `pressed` Set** (no alloc) — never retain either.
@@ -389,6 +405,18 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   disambiguate by phase.
 - `bindings.js` — default key map (`KeyW`/`ArrowUp` → forward, etc.) plus the lookup tables
   (`KEY_HOLD`, `KEY_ACTION_MASK`, `GAMEPAD_BUTTON_*`), the deadzone helpers and `CONTROL_HINTS`.
+  Remappable keyboard layer: `DEFAULT_KEY_BINDINGS` (code → names, in the JSON-safe vocabulary of
+  `HOLD_NAMES` + `InputAction`), `createBindings(overrides?) → BindingTables {keyHold, keyActionMask}`
+  (total on garbage; an override replaces that code's binding wholesale; `Escape` cannot be
+  remapped, so a bad remap can never lock a player out of the pause menu), `DEFAULT_BINDINGS`
+  (the default tables, built once; `KEY_HOLD`/`KEY_ACTION_MASK` are its two halves),
+  `keyLabel(code)` (keycap text) and `describeControls(tables?)` (the Controls-screen rows generated
+  from the tables, so hints follow a remap; `CONTROL_HINTS === describeControls(DEFAULT_BINDINGS)`).
+  **Persistence is deferred** _(integrator decision)_: nothing in the game edits a remap yet, so
+  `Settings` has no `keyBindings` field and main.js passes the default `CONTROL_HINTS`. When a remap
+  screen lands, add `keyBindings: BindingOverrides` to §3 `Settings` (sanitised in `balance.js`), and
+  main.js calls `input.setBindings(createBindings(settings.keyBindings))` and hands
+  `describeControls(thoseTables)` to the menus.
 - `touch-overlay.js` — `createTouchOverlay(root, {onAction?, document?}) → { update(state), setStick(...), destroy(), element }`
   draws the stick and pause/map buttons as DOM/CSS elements. `input.js` owns it and creates it
   lazily on the first real touch; `{touchOverlay:false}` opts out. The button bar carries the class
@@ -579,10 +607,20 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   `measureText` returns `{width, height, lines}`. Glyphs are blitted from per-(face,style) atlases
   built on first use. The overlay canvas is sized at the renderer's internal resolution ×2, so
   lettering is pixel-crisp.
+  _Additive:_ a **scalar per-frame API** that takes no options object — `drawAt(ctx, text, x, y,
+  font, size, color, align, baseline, alpha)`, `measureAt(text, font, size)`, `heightAt(font, size)`
+  — so the HUD and menus allocate nothing per frame; `setLayoutProbe(fn)` / `probeLayout(kind, x, y,
+  w, h, unit, label)` (a test hook the geometry/layout audits install to record every laid-out box;
+  a no-op when unset) and `fontCacheSize()` / `clearFontCache()` (atlas-cache introspection for the
+  allocation tests). Also `hasGlyph`, `faceInfo`, `glyphMask`.
 - `pixels.js` — the leaf pixel-art primitives, moved out of `hud.js` to break a would-be import
   cycle (`hud → map → hud`): `withAlpha`, `hexToRgb`, `compileArt`, `drawArt`, `drawPanel`,
   `drawWell`, `strokeRect`, `drawTorchIcon`, `drawGemIcon`, `drawOilIcon`, `drawPortalIcon`,
-  `drawFlame`, `fillDisc`, `fillRing`, `fitScale`, `ICON_SIZE`, `ARROWS`, `ARROW_PALETTE`.
+  `drawFlame`, `fillDisc`, `fillRing`, `fitScale`, `ICON_SIZE`, `ARROWS`, `ARROW_PALETTE`, plus the
+  additive `withAlphaStep(hex, step)` (`withAlpha` with the alpha pre-quantised to 64ths, 0…64,
+  so an animated alpha on the per-frame path passes a small integer and allocates nothing), `fitScaleAt(text, maxWidth, font, maxScale, minScale?)` (the scalar
+  twin of `fitScale`) and `createArtSprite(art, palette)` (large art such as the title wordmark, rasterised
+  lazily once so a draw is one `drawImage` instead of a `fillRect` per colour run).
   **`hud.js` re-exports every one of them verbatim**, so §4.6's published surface and every existing
   import path are unchanged. Module graph stays a strict DAG: `font/format/core → pixels → map →
   hud → menus`.
@@ -641,9 +679,14 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   quarter-tank graduations every 4 segments, a refill surge (the bar sweeps up from where the eye
   last saw it with a white-hot leading edge, the panel edge flares, the torch icon relights for the
   flare even at 3 % fuel), a recurring low-tank alarm (pulsing red outline, cooled flame, `LOW` chip)
-  and a `TANK ×N` refuel tally. The depth panel carries `DEPTH n / 16×16 / clock + MAPPED %`.
+  and a `TANK ×N` refuel tally. The depth panel is one line, `DEPTH n · C×R` (two lines on a
+  phone); the level clock and `MAPPED %` live on the full-map header and the pause screen.
   It prefers `run.refuels` (§3) and falls back to its own tally of rendered fuel rises.
-  Also exports the shared overlay `createSurface(canvas)`, `mapPointer`, the `pixels.js` primitives
+  Also exports the shared overlay `createSurface(canvas)` — whose `Surface` gained
+  `setViewRect(cssX, cssY, cssW, cssH)` (where the 3-D view sits inside the overlay, CSS px; a
+  zero width reverts to measuring `#view` on resize) and whose `SurfaceMetrics` gained
+  `viewX/viewY/viewW/viewH` (that rect in UI pixels, the whole surface when unknown), so layouts
+  keep rows off the edge of a portrait phone's world band — `mapPointer`, the `pixels.js` primitives
   re-exported verbatim, and the map-mode helpers (`MAP_MODES`, `MAP_MODE_LABEL`, `readMapMode`,
   `setMapMode`, `cycleMapMode`, `nextMapMode`, `normalizeMapMode`, `mapModeFromSettings`,
   `resetMapMode`) so main.js and `menus.js` need not know the map moved.
@@ -674,14 +717,23 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   **expedition strip** (`LABYRINTH`, `EXPLORED %`, `REFUELS`, `WALKED`), whose rows are omitted
   rather than shown as `--` when the data is absent. Also exports `cellsForLevel(level)`.
   `handleInput` returns **false** in `playing` and `loading` so main.js keeps its own
-  pause/map/mute hotkeys, and true on every menu screen. `handlePointer` returns true when it
+  pause/map/mute hotkeys, and true on every menu screen.
+  **Back / quit semantics _(gauntlet round 2)_:** back on `paused` resumes (`onResume`). Back on
+  `levelComplete` **never** leaves: it finishes the tally if one is rolling and moves the cursor to
+  *Quit to Title*. *Quit to Title* on the pause and level-complete screens opens a **`'confirm'`**
+  sub-screen ("Abandon the descent?", rows *Keep Going* / *Abandon*); only *Abandon* calls
+  `onQuit`, and back on it closes the dialog. Game over is unchanged: back calls `onQuit` (that run
+  is already over). `screen()` returns `'title' | 'options' | 'controls' | 'credits' | 'pause' |
+  'loading' | 'complete' | 'gameover' | 'confirm' | 'none'`. `onUiSound` may also carry `'uiBack'` and
+  `'uiDeny'` (main.js plays both as the back blip). `handlePointer` returns true when it
   consumed the event (main.js then suppresses the default, and no pointer lock is requested).
 - **Frame protocol:** `hud.render(state, stats, alpha)` **then** `menus.render(state)`. The HUD
   opens (and clears) the shared overlay frame; the menus only open one if nothing else did. The
   reverse order would erase the menu.
 - `audio.js` — `createAudio(options?) → { unlock(), handle(events:GameEvent[], state), setVolume(v, music), update(state), playUi(kind), suspend(), resume(), dispose(), stats(), unlocked, available }`
   **WebAudio-synthesized** SFX (footsteps, bump, gem chime with a combo pitch ladder, oil whoosh,
-  portal hum panned by bearing, heartbeat on low fuel, UI blips, level fanfare, game-over snuff)
+  portal hum panned by the **straight-line bearing to the exit, through walls** — "where is it", not
+  "which way is the path"; the sim exposes no next-path cell to pan toward — heartbeat on low fuel, UI blips, level fanfare, game-over snuff)
   and a soft generative dungeon drone, through sfx/music buses with per-bus reverb into a
   compressor and a tanh limiter (output can never clip). No audio files. No `AudioContext` is
   constructed until the first gesture — the module attaches its own one-shot gesture listeners, so
@@ -776,7 +828,9 @@ sized in JS to the largest box that preserves the framebuffer's aspect, snapped 
 multiple when that costs < 3 % (exact 3× at 720p), and centred — at 42 % of the height on a
 portrait phone, where the 4:3 framebuffer must letterbox and the deeper deck below the world holds
 the compass, the minimap and the thumb on the virtual stick. `#overlay` and `#touch` are inset by
-the safe-area insets instead, so a notch never sits on the fuel gauge.
+the safe-area insets instead, so a notch never sits on the fuel gauge. After sizing, `layout()` hands the band to the shared overlay surface with
+`hud.surface.setViewRect(...)` (overlay-relative CSS px) before `hud.resize`/`menus.resize`, so the UI
+lays out around the world band without measuring the DOM itself.
 
 **Focus:** losing window focus or the tab being hidden while `playing` dispatches `pause`; the
 cursor is hidden only while the pointer is locked (`body.locked`).

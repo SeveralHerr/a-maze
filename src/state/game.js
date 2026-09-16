@@ -20,12 +20,18 @@
  * offers "restart"), but never from `playing` or `loading`: a run in progress can only be
  * abandoned deliberately, via pause.
  *
+ * **Abandoning a run keeps its score.** `best` is folded in (`sim.recordBest`) on a level clear and
+ * on game over; `toTitle` and `newGame` from `paused` fold it in too, before the run is discarded,
+ * so quitting a ten-minute level from the pause menu cannot throw away the gems already collected
+ * or a record the run had already beaten. (main.js persists on `levelComplete`/`gameOver`; the
+ * quit path reaches storage on main.js's next persist unless it also persists on entering `title`.)
+ *
  * ## Events
  * `state.events` is cleared at the top of **every** dispatch, not only on `tick`. The contract only
  * requires clearing each step; clearing per action is a strict superset and it means the array
  * always holds exactly the events of the action just dispatched, so a store subscriber can route
  * them once with no risk of double-delivery or of a UI-driven event being silently dropped before
- * the next tick. The array identity never changes (`length = 0`), so consumers may hold a
+ * the next tick. The array identity never changes (it is emptied in place), so consumers may hold a
  * reference to it.
  */
 
@@ -47,12 +53,14 @@ import {
   completeLevel,
   createSimScratch,
   placePlayerAtStart,
+  recordBest,
   resetSimScratch,
   revealAround,
   setPhase,
   startAttract,
-  stepAttract,
-  stepPlaying,
+  stepAttractBody,
+  stepDt,
+  stepPlayingBody,
   updateDerived,
 } from './sim.js';
 
@@ -167,7 +175,7 @@ export function reducer(state, action) {
   if (typeof type !== 'string') return;
 
   // Events always describe exactly the action being dispatched (see file header).
-  state.events.length = 0;
+  clearEvents(state.events);
 
   switch (type) {
     case 'tick':
@@ -194,6 +202,8 @@ export function reducer(state, action) {
       return;
     case 'toTitle':
       if (TO_TITLE_FROM.indexOf(state.phase) >= 0) {
+        // Quitting from pause abandons a live run: its points still count toward the record.
+        if (state.phase === 'paused') recordBest(state);
         setPhase(state, 'title');
         // Re-seed the wander so the title camera starts from the maze start, whatever maze the
         // run left loaded. main.js may replace it with the demo maze via `levelReady`.
@@ -211,6 +221,21 @@ export function reducer(state, action) {
       // Unknown action types are ignored by design — forward compatibility with new UI actions.
       return;
   }
+}
+
+/**
+ * Empty the events array in place, **keeping its backing store**.
+ *
+ * `events.length = 0` makes V8 swap the elements for the shared empty store, so the next `push`
+ * (a footstep every ~18 ticks while walking) allocates a fresh 17-slot backing store — measured at
+ * ~3–6 B/tick of garbage from that alone. Popping trims nothing below V8's slack threshold, so the
+ * capacity survives and a push reuses it. A dispatch carries a handful of events at most, so the
+ * loop is a few iterations; the array identity never changes either way.
+ * @param {Array<unknown>} events
+ * @returns {void}
+ */
+function clearEvents(events) {
+  while (events.length > 0) events.pop();
 }
 
 // ─── tick ────────────────────────────────────────────────────────────────────────────────────
@@ -260,22 +285,24 @@ function axis(v) {
  * @returns {void}
  */
 function applyTick(state, rawDt, rawInput) {
-  const dt =
-    typeof rawDt === 'number' && Number.isFinite(rawDt) ? clamp(rawDt, 0, SIM.MAX_DT) : 0;
-  // A zero or negative dt advances nothing — including the interpolation snapshot, so a paused
-  // frame does not collapse the renderer's alpha blend.
-  if (dt <= 0) return;
+  // A zero, negative or non-finite dt advances nothing — including the interpolation snapshot, so a
+  // paused frame does not collapse the renderer's alpha blend.
+  if (typeof rawDt !== 'number' || !(rawDt > 0) || rawDt === Infinity) return;
+  const dt = rawDt > SIM.MAX_DT ? SIM.MAX_DT : rawDt;
+  // `dt` reaches the step through a typed-array slot, not as an argument: a double passed to a call
+  // the compiler does not inline is boxed into a new HeapNumber every tick (sim.js `_move`).
+  stepDt[0] = dt;
 
   state.time += dt;
   state.phaseTime += dt;
 
   const phase = state.phase;
   if (phase === 'playing') {
-    stepPlaying(state, dt, readInput(rawInput));
+    stepPlayingBody(state, readInput(rawInput));
     return;
   }
   if (phase === 'title') {
-    stepAttract(state, dt);
+    stepAttractBody(state);
     return;
   }
 
@@ -301,6 +328,8 @@ function applyTick(state, rawDt, rawInput) {
  */
 function applyNewGame(state, rawSeed) {
   if (NEW_GAME_FROM.indexOf(state.phase) < 0) return;
+  // Restarting from pause abandons a live run; fold it into `best` before the run is reset.
+  if (state.phase === 'paused') recordBest(state);
 
   const seed =
     typeof rawSeed === 'number' && Number.isFinite(rawSeed) ? rawSeed >>> 0 : state.seed >>> 0;

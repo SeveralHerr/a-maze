@@ -3,11 +3,23 @@
  * @file Pure simulation step logic (ARCHITECTURE.md §4.2) — movement, collision, pickups, fuel,
  * fog-of-war reveal, derived values and event emission.
  *
- * Everything here **mutates the store-owned `GameState` in place**. Nothing in this file allocates
- * in the steady state: the only objects created are `GameEvent`s, and only on the frames where
- * something actually happens (a footstep every ~0.3 s, a pickup, a phase change). All vector
+ * Everything here **mutates the store-owned `GameState` in place**. Nothing in this file creates an
+ * object in the steady state: the only objects created are `GameEvent`s, and only on the frames
+ * where something actually happens (a footstep every ~0.3 s, a pickup, a phase change). All vector
  * scratch lives in module-level typed arrays, reused across calls — safe because a step is a
  * single synchronous call and the game is single-threaded.
+ *
+ * That includes most **number boxing**, which is the easy one to miss. JS calls use a tagged
+ * convention, so a non-integer passed as an argument to a function the compiler does not inline
+ * becomes a fresh HeapNumber on every call. The big per-step functions (`stepPlaying`,
+ * `stepAttract`, `moveCircle`, `hasLineOfSight`) are therefore thin exported wrappers that park their
+ * floats in module-level `Float64Array` slots and call a body that reads them back, and the reducer
+ * hands `dt` over the same way (`stepDt`), and the reducer empties `state.events` without releasing
+ * its backing store (`game.js` `clearEvents`). Measured without GC over 400 000-tick chunks, a step
+ * standing still or turning in place allocates < 1 B (it was 48–64 B, and ~9 B more while turning);
+ * what remains while walking is the footstep `GameEvent` itself, ~2–4 B/tick averaged. That is
+ * short-lived young-generation garbage; `perf.test.mjs` pins turning < 2 B/tick and walking below
+ * the cost of one object per step, and separately proves that 100 000 steps retain nothing.
  *
  * ## Coordinate invariants
  * - World units are tiles; tile (tx,ty) spans [tx,tx+1)×[ty,ty+1) and its centre is (tx+.5, ty+.5).
@@ -74,7 +86,7 @@ import { ATTRACT, BOB, BUMP, FUEL, PLAYER, SCORE, WORLD, gemScore, levelBonus, o
  *
  * These are genuine pieces of simulation state (they must survive between steps and must be part
  * of the state for determinism), but they are implementation detail: no consumer outside
- * `src/state` reads them. See `contractDeviations` in the build report.
+ * `src/state` reads them. See ARCHITECTURE.md §4.2 (sim scratch).
  * @typedef {Object} SimScratch
  * @property {number} turnVel      smoothed keyboard turn rate, rad/s
  * @property {number} bumpCd       seconds until another bump event may fire
@@ -98,6 +110,8 @@ import { ATTRACT, BOB, BUMP, FUEL, PLAYER, SCORE, WORLD, gemScore, levelBonus, o
  * @property {number} atFromX      attract previous tile x (never immediately backtracked into)
  * @property {number} atFromY      attract previous tile y
  * @property {number} atSway       attract idle-sway phase, seconds
+ * @property {number} atTurnVel    attract camera's smoothed turn rate, rad/s
+ * @property {number} atSpeed      attract camera's smoothed forward speed, tiles/s
  * @property {Rng|null} rng        attract-mode wander stream (seeded from the demo maze)
  */
 
@@ -110,8 +124,27 @@ import { ATTRACT, BOB, BUMP, FUEL, PLAYER, SCORE, WORLD, gemScore, levelBonus, o
 
 // ─── Module-level scratch (reused; never escapes a synchronous call) ─────────────────────────
 
-/** Move result: [x, y, lostDx, lostDy]. @type {Float64Array} */
-const _move = new Float64Array(4);
+/**
+ * Collision I/O block for `moveCircleIO`: in [x, y, dx, dy, r], out [x, y, lostDx, lostDy].
+ *
+ * The hot paths pass their floats through this array instead of as call arguments on purpose. JS
+ * calls use a tagged convention, so every non-integer argument to a function the compiler does not
+ * inline (and `moveCircle` is far too big to inline) is boxed into a fresh HeapNumber on each call —
+ * measured at 48–64 B per step, ~3–4 kB/s of garbage at 60 Hz, from this one call. Typed-array
+ * slots are read back as raw doubles and cost nothing.
+ * @type {Float64Array}
+ */
+const _move = new Float64Array(5);
+
+/**
+ * The current step's `dt`, handed to the step bodies through a typed-array slot rather than as a
+ * call argument (see `_move`). Written and read within one synchronous call. Exported for the
+ * reducer only (`game.js` writes it and calls `stepPlayingBody` / `stepAttractBody` directly, so
+ * the value is never boxed whether or not the compiler inlines the public wrappers).
+ * @type {Float64Array}
+ */
+export const stepDt = new Float64Array(1);
+const _dt = stepDt;
 
 /** Attract-mode candidate tiles, packed x,y pairs (≤ 4 candidates). @type {Int32Array} */
 const _cand = new Int32Array(8);
@@ -161,6 +194,8 @@ export function createSimScratch() {
     atFromX: 0,
     atFromY: 0,
     atSway: 0,
+    atTurnVel: 0,
+    atSpeed: 0,
     rng: null,
   };
 }
@@ -190,6 +225,8 @@ export function resetSimScratch(sim) {
   sim.gridH = 0;
   sim.atValid = false;
   sim.atSway = 0;
+  sim.atTurnVel = 0;
+  sim.atSpeed = 0;
 }
 
 // ─── Item lookup grid ────────────────────────────────────────────────────────────────────────
@@ -369,6 +406,10 @@ export function solidAt(tiles, w, h, tx, ty) {
  * If the centre starts inside a solid tile (a level authored badly, or a teleport), the body is
  * allowed to move freely until it is out — failing open beats trapping the player forever.
  *
+ * This is the public, argument-passing form (ARCHITECTURE.md §4.2) for tools and tests. The sim's
+ * own hot paths call `moveCircleIO`, which is the same solver with its floats passed through a typed
+ * array so that a step boxes nothing (see `_move`).
+ *
  * @param {Uint8Array} tiles row-major tile array
  * @param {number} w tile columns
  * @param {number} h tile rows
@@ -382,6 +423,39 @@ export function solidAt(tiles, w, h, tx, ty) {
  * @returns {number} bitmask: 1 = x axis was blocked, 2 = y axis was blocked
  */
 export function moveCircle(tiles, w, h, x, y, dx, dy, r, out) {
+  const io = _moveArgs;
+  io[0] = x;
+  io[1] = y;
+  io[2] = dx;
+  io[3] = dy;
+  io[4] = r;
+  const blocked = moveCircleIO(tiles, w, h, io);
+  out[0] = io[0];
+  out[1] = io[1];
+  out[2] = io[2];
+  out[3] = io[3];
+  return blocked;
+}
+
+/** Private I/O block for the argument-passing `moveCircle`, so it never clobbers `_move`. */
+const _moveArgs = new Float64Array(5);
+
+/**
+ * `moveCircle` with its floats passed through `io` (see `_move` for why).
+ * @param {Uint8Array} tiles row-major tile array
+ * @param {number} w tile columns
+ * @param {number} h tile rows
+ * @param {Float64Array} io length ≥ 5. In: [x, y, dx, dy, r]. Out: [newX, newY, lostDx, lostDy]
+ *   (slot 4 is left as it was)
+ * @returns {number} bitmask: 1 = x axis was blocked, 2 = y axis was blocked
+ */
+function moveCircleIO(tiles, w, h, io) {
+  const x = io[0];
+  const y = io[1];
+  const dx = io[2];
+  const dy = io[3];
+  const r = io[4];
+  const out = io;
   let cx = x;
   let cy = y;
   let blocked = 0;
@@ -547,6 +621,34 @@ export function moveCircle(tiles, w, h, x, y, dx, dy, r, out) {
  * @returns {boolean} true when nothing solid lies strictly between the two tiles
  */
 export function hasLineOfSight(tiles, w, h, x0, y0, x1, y1) {
+  // Tiny wrapper so the compiler inlines it; the floats reach the body unboxed (see `_move`).
+  const io = _los;
+  io[0] = x0;
+  io[1] = y0;
+  io[2] = x1;
+  io[3] = y1;
+  return lineOfSightIO(tiles, w, h, io);
+}
+
+/**
+ * Line-of-sight scratch for `hasLineOfSight`: [x0, y0, x1, y1].
+ * @type {Float64Array}
+ */
+const _los = new Float64Array(4);
+
+/**
+ * The body of `hasLineOfSight`, reading its endpoints from `io`.
+ * @param {Uint8Array} tiles
+ * @param {number} w
+ * @param {number} h
+ * @param {Float64Array} io [x0, y0, x1, y1]
+ * @returns {boolean}
+ */
+function lineOfSightIO(tiles, w, h, io) {
+  const x0 = io[0];
+  const y0 = io[1];
+  const x1 = io[2];
+  const y1 = io[3];
   let tx = Math.floor(x0);
   let ty = Math.floor(y0);
   const gx = Math.floor(x1);
@@ -641,7 +743,13 @@ export function revealAround(state) {
       return;
     }
     budget--;
-    if (hasLineOfSight(tiles, w, h, px, py, tx + 0.5, ty + 0.5)) explored[idx] = 1;
+    // The unboxed form (see `_move`): a tile that is in range but hidden is re-probed every step,
+    // so boxing four doubles per probe here was up to ~100 B of garbage per step.
+    _los[0] = px;
+    _los[1] = py;
+    _los[2] = tx + 0.5;
+    _los[3] = ty + 0.5;
+    if (lineOfSightIO(tiles, w, h, _los)) explored[idx] = 1;
   }
   state.sim.revealCursor = 0;
 }
@@ -824,6 +932,12 @@ export function placePlayerAtStart(state) {
 /**
  * Fold the current run into `state.best`.
  *
+ * `best.level` means **the deepest level reached** (the level the run was on when it was folded
+ * in), not the deepest level cleared: dying on level 4 after clearing level 3 records 4, the same
+ * as clearing level 4. That matches what the menus show ("DEPTH") and is pinned in `game.test.mjs`.
+ * It is called on a level clear, on game over, and when a run is abandoned from pause, so a quit
+ * never throws away points already earned. Idempotent: folding the same run twice changes nothing.
+ *
  * `newBest` is measured against the best recorded **when the run started** (`sim.runBestScore`),
  * not against the live record — otherwise a mid-run update (level complete) would make the
  * game-over banner claim "no new best" for a run that beat the record several levels earlier.
@@ -884,8 +998,9 @@ export function endRun(state) {
  *   a win, not a loss.
  * - Pickups run *before* the drain, so a flask collected on the frame the torch would die saves it.
  *
- * Fuel drains at `FUEL.DRAIN × sim.drain`, where `sim.drain` is the level's multiplier (1 up to the
- * size cap, rising past it — `balance.drainRate`, installed by the `levelReady` reducer).
+ * Fuel drains at `FUEL.DRAIN × sim.drain × (FUEL.SPRINT_MULT while sprinting)`, where `sim.drain` is
+ * the level's multiplier: 1 through `LEVEL.DRAIN_RAMP_START`, then climbing `FUEL.DRAIN_PER_LEVEL`
+ * per level to `FUEL.DRAIN_MAX` (`balance.drainRate`, installed by the `levelReady` reducer).
  *
  * @param {SimState} state must be in phase `playing` with `levelData` loaded
  * @param {number} dt seconds, finite and > 0 (clamped by the caller)
@@ -893,6 +1008,20 @@ export function endRun(state) {
  * @returns {void}
  */
 export function stepPlaying(state, dt, input) {
+  // A deliberately tiny wrapper: the compiler inlines it into the reducer, so `dt` travels to the
+  // body through a typed-array slot instead of being boxed as a call argument (see `_move`).
+  _dt[0] = dt;
+  stepPlayingBody(state, input);
+}
+
+/**
+ * The body of `stepPlaying`, reading `dt` from `stepDt[0]` (internal to `src/state`).
+ * @param {SimState} state
+ * @param {SimInput} input
+ * @returns {void}
+ */
+export function stepPlayingBody(state, input) {
+  const dt = _dt[0];
   const level = state.levelData;
   if (level === null) return;
   const p = state.player;
@@ -961,7 +1090,12 @@ export function stepPlaying(state, dt, input) {
 
   // ── Collide ──────────────────────────────────────────────────────────────────────────────
   const speedBefore = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
-  const blocked = moveCircle(maze.tiles, w, h, p.x, p.y, p.vx * dt, p.vy * dt, PLAYER.RADIUS, _move);
+  _move[0] = p.x;
+  _move[1] = p.y;
+  _move[2] = p.vx * dt;
+  _move[3] = p.vy * dt;
+  _move[4] = PLAYER.RADIUS;
+  const blocked = moveCircleIO(maze.tiles, w, h, _move);
   const movedX = _move[0] - p.x;
   const movedY = _move[1] - p.y;
   p.x = _move[0];
@@ -1126,6 +1260,30 @@ function pickAttractTarget(state, initial) {
 }
 
 /**
+ * Has the attract camera reached its current target tile?
+ *
+ * Measured **along the leg** rather than as a radius around the tile centre: the camera eases its
+ * turns, so it can come into a tile a little off the centre line, and a radius test could then be
+ * missed entirely and leave it pressing on toward the wall beyond. "Standing in the target tile and
+ * no more than `ARRIVE` short of its centre along the direction of travel" cannot be missed, since a
+ * step (≤ 0.43 tiles at the `SIM.MAX_DT` clamp) is shorter than the part of the tile it covers.
+ * A zero-length leg (a 1-tile maze, standing still) falls back to the radius test.
+ * @param {SimState} state
+ * @returns {boolean}
+ */
+function attractArrived(state) {
+  const sim = state.sim;
+  const p = state.player;
+  const cx = sim.atTx + 0.5;
+  const cy = sim.atTy + 0.5;
+  const legX = sim.atTx - sim.atFromX;
+  const legY = sim.atTy - sim.atFromY;
+  if (legX === 0 && legY === 0) return dist2(p.x, p.y, cx, cy) <= ATTRACT.ARRIVE * ATTRACT.ARRIVE;
+  if (Math.floor(p.x) !== sim.atTx || Math.floor(p.y) !== sim.atTy) return false;
+  return (p.x - cx) * legX + (p.y - cy) * legY >= -ATTRACT.ARRIVE;
+}
+
+/**
  * Advance the title-screen attract camera one step.
  *
  * It walks corridor centre to corridor centre, so it physically cannot scrape a wall; the collision
@@ -1137,6 +1295,17 @@ function pickAttractTarget(state, initial) {
  * @returns {void}
  */
 export function stepAttract(state, dt) {
+  _dt[0] = dt; // see stepPlaying: keeps `dt` unboxed across the call
+  stepAttractBody(state);
+}
+
+/**
+ * The body of `stepAttract`, reading `dt` from `stepDt[0]` (internal to `src/state`).
+ * @param {SimState} state
+ * @returns {void}
+ */
+export function stepAttractBody(state) {
+  const dt = _dt[0];
   const level = state.levelData;
   if (level === null) return;
   const p = state.player;
@@ -1148,30 +1317,45 @@ export function stepAttract(state, dt) {
   p.pangle = p.angle;
 
   if (!sim.atValid) pickAttractTarget(state, true);
-  let tx = sim.atTx + 0.5;
-  let ty = sim.atTy + 0.5;
-  if (dist2(p.x, p.y, tx, ty) <= ATTRACT.ARRIVE * ATTRACT.ARRIVE) {
-    pickAttractTarget(state, false);
-    tx = sim.atTx + 0.5;
-    ty = sim.atTy + 0.5;
-  }
+  if (attractArrived(state)) pickAttractTarget(state, false);
+
+  // Aim point: the target tile centre pushed LOOKAHEAD tiles further along the leg being walked.
+  // Aiming at the bare centre made every tile a step change in the target — the heading error
+  // flipped sign on each arrival along a straight corridor. A point ahead on the corridor's centre
+  // line moves only along that line when the next tile is picked, so a straight walk no longer
+  // re-aims; a corner still jumps the aim, which the rate smoothing below absorbs.
+  const legX = sim.atTx - sim.atFromX;
+  const legY = sim.atTy - sim.atFromY;
+  const ax = sim.atTx + 0.5 + legX * ATTRACT.LOOKAHEAD;
+  const ay = sim.atTy + 0.5 + legY * ATTRACT.LOOKAHEAD;
 
   sim.atSway += dt;
   const sway = Math.sin(sim.atSway * TAU * ATTRACT.SWAY_HZ) * ATTRACT.SWAY_AMP;
-  const err = angleDiff(p.angle, Math.atan2(ty - p.y, tx - p.x) + sway);
-  // The proportional term is a RATE (rad/s), so it must be integrated over dt exactly like the cap
-  // it is clamped against. Comparing a raw `err × GAIN` (radians) with a per-frame step
-  // (`TURN_RATE × dt` ≈ 0.037 rad at 60 Hz) made the saturation band 60× too narrow *and*
-  // framerate-dependent, which turned the documented easing controller into a bang-bang one: the
-  // camera sat pinned at the rate cap and flipped sign every frame, a visible ±2°/frame buzz.
-  const maxTurn = ATTRACT.TURN_RATE * dt;
-  p.angle = wrapAngle(p.angle + clamp(err * ATTRACT.TURN_GAIN * dt, -maxTurn, maxTurn));
+  const err = angleDiff(p.angle, Math.atan2(ay - p.y, ax - p.x) + sway);
+  // Second-order steering. The proportional term is the *commanded* turn rate (rad/s, capped at
+  // TURN_RATE); the actual rate eases toward it at TURN_EASE_RATE, exactly like the player's
+  // keyboard turn. Assigning the command directly (the old controller) put a step change in the
+  // turn rate at every corner and every tile — measured 152 rad/s² peaks and 45 reversals in three
+  // minutes — which reads as a snap into each corner. Easing bounds the angular acceleration to
+  // TURN_EASE_RATE × 2·TURN_RATE whatever the maze does.
+  const command = clamp(err * ATTRACT.TURN_GAIN, -ATTRACT.TURN_RATE, ATTRACT.TURN_RATE);
+  sim.atTurnVel = damp(sim.atTurnVel, command, ATTRACT.TURN_EASE_RATE, dt);
+  p.angle = wrapAngle(p.angle + sim.atTurnVel * dt);
 
+  // Forward speed eases toward the cos-falloff target instead of being assigned it, for the same
+  // reason: a corner used to cut the speed from cruise to zero in one frame.
   const align = Math.cos(err);
-  const speed = align > 0 ? ATTRACT.SPEED * Math.pow(align, ATTRACT.SPEED_FALLOFF) : 0;
+  const want = align > 0 ? ATTRACT.SPEED * Math.pow(align, ATTRACT.SPEED_FALLOFF) : 0;
+  sim.atSpeed = damp(sim.atSpeed, want, ATTRACT.SPEED_EASE_RATE, dt);
+  const speed = sim.atSpeed;
   p.vx = Math.cos(p.angle) * speed;
   p.vy = Math.sin(p.angle) * speed;
-  moveCircle(maze.tiles, maze.width, maze.height, p.x, p.y, p.vx * dt, p.vy * dt, PLAYER.RADIUS, _move);
+  _move[0] = p.x;
+  _move[1] = p.y;
+  _move[2] = p.vx * dt;
+  _move[3] = p.vy * dt;
+  _move[4] = PLAYER.RADIUS;
+  moveCircleIO(maze.tiles, maze.width, maze.height, _move);
   const movedX = _move[0] - p.x;
   const movedY = _move[1] - p.y;
   p.x = _move[0];

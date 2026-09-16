@@ -113,6 +113,10 @@ test('mapPointer converts client coordinates into UI pixels', () => {
     originY: 0,
     u: 2,
     narrow: false,
+    viewX: 0,
+    viewY: 0,
+    viewW: 640,
+    viewH: 360,
   };
   const out = new Float64Array(2);
 
@@ -148,6 +152,10 @@ test('mapPointer accounts for the letterbox margin', () => {
     originY: 0,
     u: 1,
     narrow: true,
+    viewX: 0,
+    viewY: 0,
+    viewW: 166,
+    viewH: 100,
   };
   const out = new Float64Array(2);
   mapPointer(m, 0, 0, 500, 300, 1, 0, out);

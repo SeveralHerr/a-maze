@@ -31,7 +31,9 @@ import assert from 'node:assert/strict';
 
 import { buildLevel } from '../maze/level.js';
 import { TILE, DIR_COUNT, DIR_DX, DIR_DY } from '../maze/constants.js';
-import { FUEL, LEVEL, PLAYER, levelParams, oilFuel, travelTiles } from './balance.js';
+import { angleDiff, clamp } from '../core/math.js';
+import { FUEL, LEVEL, PLAYER, gapSafety, levelParams, oilFuel, travelTiles } from './balance.js';
+import { createInitialState, reducer } from './game.js';
 
 /** Levels to prove. 25 covers the whole size ramp (caps at 15) and ten levels past it. */
 const MAX_LEVEL = 25;
@@ -249,10 +251,10 @@ test(`feasibility: levels 1..${MAX_LEVEL} × ${SEEDS} seeds are winnable at a ${
   const overTarget = [];
   for (let level = 1; level <= MAX_LEVEL; level++) {
     const params = levelParams(level);
-    // The distance one flask *strictly* pays for: `oilTargetGap` is this with GAP_SAFETY headroom.
-    // A stretch longer than this cannot be chained however well the player plays, so it is the
-    // blocker line; the headroom is the target `populate.js` aims at, reported below.
-    const chainLimit = params.oilTargetGap / FUEL.GAP_SAFETY;
+    // The distance one flask *strictly* pays for: `oilTargetGap` is this with `gapSafety(level)`
+    // headroom. A stretch longer than this cannot be chained however well the player plays, so it is
+    // the blocker line; the headroom is the target `populate.js` aims at, reported below.
+    const chainLimit = params.oilTargetGap / gapSafety(level);
     // How far the player can get from the start line, before any flask exists to help.
     const tankReach = travelTiles(params.fuelSeconds, params.drain) / FUEL.WANDER;
     for (let s = 0; s < SEEDS; s++) {
@@ -320,7 +322,7 @@ test(`feasibility: levels 1..${MAX_LEVEL} × ${SEEDS} seeds are winnable at a ${
   }
   lines.push(
     `${runs.length} runs, all won. ${overTarget.length} exceeded the soft oilTargetGap target ` +
-      `(all within the ${(1 / FUEL.GAP_SAFETY).toFixed(2)}× chainable limit).`,
+      `(all within the ${(1 / FUEL.GAP_SAFETY_END).toFixed(2)}–${(1 / FUEL.GAP_SAFETY).toFixed(2)}× chainable limit).`,
   );
   console.log(lines.join('\n'));
 });
@@ -335,4 +337,172 @@ test('feasibility: a level with no flasks at all is correctly judged unwinnable'
   assert.equal(r.reachedExit, false, 'a 88×88 maze cannot be crossed on one tank');
   assert.equal(r.refuels, 0);
   assert.ok(r.diedAt > 0 && r.diedAt < r.pathLength);
+});
+
+// ─── The tension curve, on the real reducer ──────────────────────────────────────────────────
+
+/**
+ * A walking route over a built level, as tile indices: the solution path, plus — for a wanderer —
+ * side excursions of up to 20 tiles (walked out and back) spread along it until the route is about
+ * `wander` × the path. A path-only walker (`wander` 1) never steps off the path, so it ignores every
+ * flask that is not on it; a wanderer passes whatever lies down the side passages it explores.
+ * Deterministic for a given `seed`.
+ * @param {import('../core/types.js').LevelData} data
+ * @param {number} wander
+ * @param {number} seed
+ * @returns {number[]}
+ */
+function walkingRoute(data, wander, seed) {
+  const maze = data.maze;
+  const w = maze.width;
+  const path = Array.from(/** @type {Uint32Array} */ (data.validation.path));
+  const onPath = new Set(path);
+  const visited = new Set(path);
+  /** @type {number[]} */
+  const route = [];
+  const target = (wander - 1) * path.length;
+  let extra = 0;
+  let rs = seed >>> 0 || 1;
+  const rnd = () => (rs = (Math.imul(rs, 1664525) + 1013904223) >>> 0) / 4294967296;
+  for (let i = 0; i < path.length; i++) {
+    const t = path[i];
+    route.push(t);
+    if (target * ((i + 1) / path.length) - extra <= 0) continue;
+    const tx = t % w;
+    const ty = (t - tx) / w;
+    for (let dir = 0; dir < DIR_COUNT; dir++) {
+      const n = (ty + DIR_DY[dir]) * w + tx + DIR_DX[dir];
+      if (maze.tiles[n] !== TILE.FLOOR || visited.has(n)) continue;
+      /** @type {number[]} */
+      const trail = [n];
+      visited.add(n);
+      let cur = n;
+      while (trail.length < 20) {
+        const cx = cur % w;
+        const cy = (cur - cx) / w;
+        /** @type {number[]} */
+        const options = [];
+        for (let d2 = 0; d2 < DIR_COUNT; d2++) {
+          const m = (cy + DIR_DY[d2]) * w + cx + DIR_DX[d2];
+          if (maze.tiles[m] === TILE.FLOOR && !visited.has(m) && !onPath.has(m)) options.push(m);
+        }
+        if (options.length === 0) break;
+        cur = options[Math.floor(rnd() * options.length)];
+        visited.add(cur);
+        trail.push(cur);
+      }
+      for (const k of trail) route.push(k);
+      for (let k = trail.length - 2; k >= 0; k--) route.push(trail[k]);
+      route.push(t);
+      extra += trail.length * 2;
+      break;
+    }
+  }
+  return route;
+}
+
+/**
+ * Walk a route through the **real reducer** at 60 Hz, steering like a mouse player (yaw flick
+ * capped at 0.25 rad per step, forward held when roughly aligned), and report how low the tank got.
+ * @param {number} level
+ * @param {number} seed
+ * @param {number} wander
+ * @returns {{won:boolean, minFraction:number, lowFuelCues:number}}
+ */
+function reducerWalk(level, seed, wander) {
+  const data = buildLevel(levelParams(level), seed);
+  const route = walkingRoute(data, wander, seed);
+  const w = data.maze.width;
+  const s = createInitialState();
+  reducer(s, { type: 'newGame', seed });
+  s.level = level;
+  reducer(s, { type: 'levelReady', data });
+  const input = { moveX: 0, moveY: 0, turn: 0, lookDX: 0, sprint: false };
+  const tick = { type: 'tick', dt: 1 / 60, input };
+  const tank = s.run.fuelMax;
+  let wp = 0;
+  let min = s.run.fuel;
+  let cues = 0;
+  let stall = 0;
+  let last = -1;
+  while (s.phase === 'playing' && s.run.levelTime < 3600) {
+    for (;;) {
+      const t = route[wp];
+      const tx = (t % w) + 0.5;
+      const ty = Math.floor(t / w) + 0.5;
+      if (wp < route.length - 1 && Math.hypot(s.player.x - tx, s.player.y - ty) < 0.3) wp++;
+      else break;
+    }
+    if (wp !== last) {
+      last = wp;
+      stall = 0;
+    } else if (++stall > 600) {
+      assert.fail(`level ${level}, seed ${seed}: the reducer autopilot stalled at waypoint ${wp}`);
+    }
+    const t = route[wp];
+    const aimX = (t % w) + 0.5;
+    const aimY = Math.floor(t / w) + 0.5;
+    const err = angleDiff(s.player.angle, Math.atan2(aimY - s.player.y, aimX - s.player.x));
+    input.lookDX = clamp(err, -0.25, 0.25);
+    input.moveY = Math.abs(err) < 0.5 ? 1 : 0.2;
+    reducer(s, tick);
+    for (let i = 0; i < s.events.length; i++) if (s.events[i].type === 'lowFuel') cues++;
+    if (s.run.fuel < min) min = s.run.fuel;
+  }
+  return { won: s.phase === 'levelComplete', minFraction: min / tank, lowFuelCues: cues };
+}
+
+test('tension: the torch runs measurably lower deep in the curve, and every walk still wins', () => {
+  // Regression. With the old economy an explorer was topped up by a flask the moment the tank fell
+  // below ~82 %, the drain ramp was 1.075× at level 10 and every flask was 35 % of the tank, so the
+  // lowest tank of a 2×-wander run averaged 0.71 on level 1 and 0.64 on level 10, and `lowFuel`
+  // fired 0 times in 36 wandering runs: "L1 generous, L10 tense" was not delivered. This drives the
+  // shipped reducer — not a model of it — over two bands of real levels, with a wanderer and with a
+  // walker who never leaves the solution path (the one a thinner economy kills first).
+  const SEEDS_PER_LEVEL = 5;
+  /**
+   * @param {number[]} levels
+   * @param {number} wander
+   * @returns {{avgMin:number, cues:number}}
+   */
+  function band(levels, wander) {
+    let sum = 0;
+    let cues = 0;
+    let runs = 0;
+    for (const level of levels) {
+      for (let k = 0; k < SEEDS_PER_LEVEL; k++) {
+        const seed = 7_919 * (level + 3) + 104_729 * k;
+        const r = reducerWalk(level, seed, wander);
+        assert.ok(
+          r.won,
+          `BLOCKER — level ${level}, seed ${seed}: a ${wander}× walker on the real reducer ran out of torch`,
+        );
+        sum += r.minFraction;
+        cues += r.lowFuelCues;
+        runs++;
+      }
+    }
+    return { avgMin: sum / runs, cues };
+  }
+  const EARLY = [1, 2];
+  const DEEP = [10, 11, 12];
+  const early2 = band(EARLY, FUEL.WANDER);
+  const deep2 = band(DEEP, FUEL.WANDER);
+  const early1 = band(EARLY, 1);
+  const deep1 = band(DEEP, 1);
+  console.log(
+    `lowest tank, ${FUEL.WANDER}× wander: L${EARLY.join('/')} ${early2.avgMin.toFixed(3)} → ` +
+      `L${DEEP.join('/')} ${deep2.avgMin.toFixed(3)} (${deep2.cues} lowFuel cues)  ·  ` +
+      `path only: ${early1.avgMin.toFixed(3)} → ${deep1.avgMin.toFixed(3)} (${deep1.cues} cues)`,
+  );
+  assert.ok(
+    deep2.avgMin <= early2.avgMin - 0.12,
+    `a wandering player's lowest tank must fall with depth: ${early2.avgMin.toFixed(3)} → ${deep2.avgMin.toFixed(3)}`,
+  );
+  assert.ok(
+    deep1.avgMin <= early1.avgMin - 0.12,
+    `a direct player's lowest tank must fall with depth: ${early1.avgMin.toFixed(3)} → ${deep1.avgMin.toFixed(3)}`,
+  );
+  assert.equal(early2.cues + early1.cues, 0, 'the early levels are generous: no low-fuel alarm');
+  assert.ok(deep2.cues + deep1.cues > 0, 'the deep levels reach the low-fuel alarm at least sometimes');
 });

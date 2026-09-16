@@ -238,6 +238,59 @@ test('100 000 ticks on a max-size level allocate nothing that survives a GC', ()
   );
 });
 
+test('transient garbage: a step allocates less than one object, turning or walking', () => {
+  // The retained-heap test above cannot see short-lived garbage, because the GC it forces collects
+  // it. This one measures heap growth with NO collection in between. `heapUsed` moves in whole pages
+  // (~200 kB here), so chunks are 400 000 ticks — resolution ≈ 0.5 B/tick; at 5 000 ticks one page
+  // read as a phantom ~16 B/tick that a long probe (logs/state-alloc-turn.mjs) showed was not there.
+  // A chunk that a scavenge interrupted shrinks the heap and is skipped.
+  //
+  // Regressions pinned: every float passed as a call argument to a function the compiler does not
+  // inline is boxed, and the step used to do that to `dt` and to `moveCircle`'s x/y/dx/dy — 48–64 B
+  // per tick even standing still, ~9 B/tick more while turning. The sim now passes them through
+  // typed-array slots (sim.js header), and the reducer empties `state.events` without releasing its
+  // backing store (game.js `clearEvents`). What is left while walking is the footstep event itself
+  // (~28 B every ~18 ticks). Turning in place must stay under 2 B/tick; one object created per tick
+  // would be ≥ 28 B/tick.
+  const gc = getGc();
+  const { state } = installed(levelParams(15), 20_240_607, 15);
+  const input = { moveX: 0, moveY: 0, turn: 1, lookDX: 0.02, sprint: false };
+  const tick = { type: 'tick', dt: 1 / 60, input };
+  const CHUNK = 400_000;
+  /**
+   * @param {number} moveY
+   * @returns {number} median bytes per tick over the chunks no scavenge interrupted
+   */
+  function measure(moveY) {
+    input.moveY = moveY;
+    for (let i = 0; i < 100_000; i++) {
+      state.run.fuel = state.run.fuelMax;
+      reducer(state, tick);
+    }
+    /** @type {number[]} */
+    const perTick = [];
+    for (let c = 0; c < 3; c++) {
+      if (gc !== null) gc();
+      const before = process.memoryUsage().heapUsed;
+      for (let i = 0; i < CHUNK; i++) {
+        state.run.fuel = state.run.fuelMax;
+        reducer(state, tick);
+      }
+      const grown = process.memoryUsage().heapUsed - before;
+      if (grown >= 0) perTick.push(grown / CHUNK);
+    }
+    perTick.sort((a, b) => a - b);
+    return perTick.length > 0 ? perTick[perTick.length >> 1] : 0;
+  }
+  const turning = measure(0);
+  // Walking in a circle emits a footstep every ~18 ticks; that event object is ~2–4 B/tick averaged.
+  const walking = measure(1);
+  console.log(`transient garbage: turning ${turning.toFixed(2)} B/tick, walking ${walking.toFixed(2)} B/tick`);
+  if (gc === null) return; // without a forced GC the chunks are not comparable
+  assert.ok(turning < 2, `turning in place allocates ${turning.toFixed(2)} B/tick`);
+  assert.ok(walking < 12, `walking allocates ${walking.toFixed(2)} B/tick`);
+});
+
 test('explored is allocated once per level, from a pool, and always correctly sized', () => {
   const state = createInitialState();
   const big = allocExplored(state, 257 * 257);

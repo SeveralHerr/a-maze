@@ -22,9 +22,17 @@ import assert from 'node:assert/strict';
 
 import { createRaycaster } from './raycaster.js';
 import { createTextures } from './textures.js';
+import { C } from './palette.js';
+import { POSES, PREVIEW_TORCHES, buildPreviewMaze, previewItems } from './preview-scene.js';
 
 /** Painting textures costs ~20 ms; every test shares one set. */
 const textures = createTextures(7);
+
+/** The same painted set with every torch frame blanked to the transparency key. */
+const noTorchArt = {
+  ...textures,
+  torch: textures.torch.map((t) => ({ ...t, indices: new Uint8Array(t.indices.length) })),
+};
 
 /**
  * Minimal stand-in for a canvas with a 2-D context. `img` holds the last `ImageData` created, so a
@@ -108,6 +116,165 @@ function makeRenderer(cssW = 960, cssH = 540) {
   const rc = createRaycaster(canvas, { textures });
   rc.resize(cssW, cssH, 1);
   return { rc, read };
+}
+
+// ── Colour measurement helpers ───────────────────────────────────────────────────────────────
+// The art-direction tests measure rendered frames the way the critic measured the reference: mean
+// red-minus-blue (warmth) and luminance over wall and floor regions picked by geometry.
+
+/**
+ * @typedef {{buf:Uint32Array, w:number, h:number, z:Float32Array}} Frame
+ */
+
+/**
+ * Render one frame of a scene at 16:9 and return a copy of it with its depth buffer.
+ * @param {import('../core/types.js').Maze} maze
+ * @param {Parameters<typeof makeView>[1]} over
+ * @param {import('./textures.js').TextureSet} [set]
+ * @returns {Frame}
+ */
+function renderScene(maze, over, set) {
+  const { canvas, read } = fakeCanvas();
+  const rc = createRaycaster(canvas, { textures: set || textures });
+  rc.resize(960, 540, 1);
+  rc.render(makeView(maze, { time: 2, ...over }));
+  return { buf: read().slice(), w: rc.internalSize.w, h: rc.internalSize.h, z: rc.depth().slice(0, rc.internalSize.w) };
+}
+
+/**
+ * @param {Frame} f
+ * @param {number} x
+ * @param {number} y
+ * @returns {number} Rec. 601 luminance
+ */
+function lumAt(f, x, y) {
+  const c = f.buf[y * f.w + x];
+  return 0.299 * (c & 255) + 0.587 * ((c >>> 8) & 255) + 0.114 * ((c >>> 16) & 255);
+}
+
+/**
+ * @param {Frame} f
+ * @returns {number} mean luminance of the whole frame
+ */
+function meanLum(f) {
+  let sum = 0;
+  for (let y = 0; y < f.h; y++) for (let x = 0; x < f.w; x++) sum += lumAt(f, x, y);
+  return sum / (f.w * f.h);
+}
+
+/**
+ * @param {Frame} f
+ * @param {number} x
+ * @param {number} y
+ * @returns {boolean} the pixel lies on the wall span of its column
+ */
+function isWallPx(f, x, y) {
+  const lh = f.h / f.z[x];
+  return Math.abs(y + 0.5 - (f.h >> 1)) < lh / 2 - 1;
+}
+
+/**
+ * @param {Frame} f
+ * @param {number} x
+ * @param {number} y
+ * @returns {boolean} the pixel shows floor
+ */
+function isFloorPx(f, x, y) {
+  return y > f.h >> 1 && !isWallPx(f, x, y) && y + 0.5 - (f.h >> 1) > f.h / f.z[x] / 2 + 1;
+}
+
+/**
+ * @param {Frame} f
+ * @param {number} y a floor row
+ * @returns {number} distance of that floor row from the eye, tiles
+ */
+function rowDistOf(f, y) {
+  const half = f.h >> 1;
+  return half / (y - half + 0.5);
+}
+
+/**
+ * Warmth and brightness of a region.
+ * @param {Frame} f
+ * @param {(x:number, y:number) => boolean} pick
+ * @returns {{rb:number, lum:number, lumP50:number, n:number}}
+ */
+function regionStats(f, pick) {
+  let rb = 0;
+  /** @type {number[]} */
+  const lums = [];
+  for (let y = 0; y < f.h; y++) {
+    for (let x = 0; x < f.w; x++) {
+      if (!pick(x, y)) continue;
+      const c = f.buf[y * f.w + x];
+      rb += (c & 255) - ((c >>> 16) & 255);
+      lums.push(lumAt(f, x, y));
+    }
+  }
+  assert.ok(lums.length > 50, 'sampled region is empty');
+  const lum = lums.reduce((a, b) => a + b, 0) / lums.length;
+  lums.sort((a, b) => a - b);
+  return { rb: rb / lums.length, lum, lumP50: lums[lums.length >> 1], n: lums.length };
+}
+
+/**
+ * Rows of one screen column that are mortar: clearly darker than the column's median.
+ * @param {Frame} f
+ * @param {number} x
+ * @param {number} y0
+ * @param {number} y1
+ * @returns {Set<number>}
+ */
+function darkRows(f, x, y0, y1) {
+  const lums = [];
+  for (let y = y0; y < y1; y++) lums.push(lumAt(f, x, y));
+  const med = [...lums].sort((a, b) => a - b)[lums.length >> 1];
+  /** @type {Set<number>} */
+  const out = new Set();
+  lums.forEach((l, i) => {
+    if (l < med * 0.55) out.add(y0 + i);
+  });
+  // A column that is mostly dark is a head joint running down the seam, not a bed-joint profile.
+  return out.size > lums.length * 0.5 ? new Set() : out;
+}
+
+/**
+ * Parallel east-west corridors, one per listed row, each `length - 2` tiles long, separated by solid
+ * rows and sealed at both ends.
+ * @param {number[]} rows odd tile rows to open
+ * @param {number} [length]
+ * @returns {import('../core/types.js').Maze}
+ */
+function corridors(rows, length = 23) {
+  const height = Math.max(...rows) + 2;
+  const tiles = new Uint8Array(length * height).fill(1);
+  for (const r of rows) for (let x = 1; x < length - 2; x++) tiles[r * length + x] = 0;
+  return { width: length, height, cols: (length - 1) >> 1, rows: (height - 1) >> 1, tiles, start: { x: 1, y: rows[0] }, exit: { x: 1, y: rows[0] }, seed: 1 };
+}
+
+/**
+ * The same maze mirrored across its diagonal, so east-west corridors become north-south ones.
+ * @param {import('../core/types.js').Maze} m
+ * @returns {import('../core/types.js').Maze}
+ */
+function transposeMaze(m) {
+  const tiles = new Uint8Array(m.width * m.height);
+  for (let y = 0; y < m.height; y++) for (let x = 0; x < m.width; x++) tiles[x * m.height + y] = m.tiles[y * m.width + x];
+  return { width: m.height, height: m.width, cols: m.rows, rows: m.cols, tiles, start: { x: m.start.y, y: m.start.x }, exit: { x: m.exit.y, y: m.exit.x }, seed: m.seed };
+}
+
+/**
+ * The exact scene `preview.html?pose=N&t=12.5&light=1` shows.
+ * @param {number} pose
+ * @returns {{maze:import('../core/types.js').Maze, view:Parameters<typeof makeView>[1]}}
+ */
+function previewScene(pose) {
+  const maze = buildPreviewMaze();
+  const [x, y, angle] = POSES[pose];
+  return {
+    maze,
+    view: { player: { x, y, angle }, items: previewItems(), torches: PREVIEW_TORCHES.slice(), time: 12.5, light: 1 },
+  };
 }
 
 test('internal resolution is 240 rows, even, and clamped to 320…560 columns', () => {
@@ -275,24 +442,22 @@ test('wall torches light the wall they are mounted on and not the far side of it
   const torch = [{ x: 4, y: 2, face: /** @type {3} */ (3) }]; // north face: lights the y=1 corridor
 
   /**
-   * Mean luminance of the frame, with the player's own torch off so only the sconce is lighting.
+   * Mean luminance of the frame at the weakest player torch, so the sconce is most of the light.
    * @param {number} py which corridor to stand in
+   * @param {import('../core/types.js').Torch[]} torches
    * @returns {number}
    */
-  const brightness = (py) => {
-    const { rc, read } = makeRenderer(640, 360);
-    rc.render(makeView(maze, { player: { x: 2.5, y: py, angle: 0 }, torches: torch, light: 0 }));
-    const buf = read();
-    let sum = 0;
-    for (let i = 0; i < buf.length; i++) {
-      sum += (buf[i] & 255) + ((buf[i] >>> 8) & 255) + ((buf[i] >>> 16) & 255);
-    }
-    return sum / buf.length / 3;
-  };
+  const brightness = (py, torches) => meanLum(renderScene(maze, { player: { x: 2.5, y: py, angle: 0 }, torches, light: 0 }));
 
-  const lit = brightness(1.5);
-  const dark = brightness(3.5);
-  assert.ok(lit > dark * 1.5, `the torch's own corridor (${lit.toFixed(1)}) should be clearly brighter than the one behind its wall (${dark.toFixed(1)})`);
+  const lit = brightness(1.5, torch);
+  const litBare = brightness(1.5, []);
+  const behind = brightness(3.5, torch);
+  const behindBare = brightness(3.5, []);
+  assert.ok(lit > litBare * 1.25, `the torch's own corridor must be clearly lit by it (${litBare.toFixed(1)} → ${lit.toFixed(1)})`);
+  assert.ok(
+    Math.abs(behind - behindBare) < behindBare * 0.01,
+    `the corridor behind the torch's wall must not gain light (${behindBare.toFixed(1)} → ${behind.toFixed(1)})`,
+  );
 });
 
 // ── Wall-mounted billboards ──────────────────────────────────────────────────────────────────────
@@ -301,12 +466,6 @@ test('wall torches light the wall they are mounted on and not the far side of it
 // of 109 columns gone at 1.1 tiles). These tests measure a torch's on-screen footprint *exactly*:
 // the frame is rendered twice with identical lighting and particles, once with invisible torch art,
 // and the columns that differ are the ones the billboard painted.
-
-/** The same painted set with every torch frame blanked to the transparency key. */
-const noTorchArt = {
-  ...textures,
-  torch: textures.torch.map((t) => ({ ...t, indices: new Uint8Array(t.indices.length) })),
-};
 
 /**
  * Columns the wall torches painted in a frame.
@@ -437,59 +596,212 @@ test('a wall torch is still hidden by geometry genuinely in front of it', () => 
   assert.ok(ownSide.filter(Boolean).length > 10, 'the twin-corridor torch must be visible from its side');
 });
 
-test("the player's torch throws a warm pool that falls off into cool shadow", () => {
-  // The lighting's defining read. The first colormap parked all its warmth in the top few levels,
-  // which the player's own torch could never reach, so a wall a tile away was exactly as blue as
-  // one down the corridor and the floor's warmth was gone two tiles out. Measured on a straight
-  // corridor with no sconces, so only the player's torch and the fog are lighting it.
+test("the player's torch lights a pool that falls off into shadow without turning the stone warm", () => {
+  // Measured on a straight corridor with no sconces, so only the player's torch and the fog light it.
+  // Two failures this guards against, both shipped once: a colormap that kept every surface the
+  // same cool blue however close the torch was (no pool at all), and its overcorrection, which
+  // warmed materials by brightness until the cobbles ahead read r−b +48…+83 (tan sand) and the stone
+  // beside the player went neutral grey. The reference keeps blue-grey stone at full light; orange
+  // belongs to the wall sconces (next test).
   const width = 40;
   const height = 3;
   const tiles = new Uint8Array(width * height).fill(1);
   for (let x = 1; x < width - 1; x++) tiles[width + x] = 0;
   /** @type {import('../core/types.js').Maze} */
   const maze = { width, height, cols: 19, rows: 1, tiles, start: { x: 1, y: 1 }, exit: { x: 1, y: 1 }, seed: 1 };
-  const { rc, read } = makeRenderer();
-  rc.render(makeView(maze, { player: { x: 1.5, y: 1.5, angle: 0 }, exit: { x: 38, y: 1 }, light: 0.9 }));
-  const buf = read();
-  const w = rc.internalSize.w;
-  const h = rc.internalSize.h;
-  const z = rc.depth();
+  const frame = renderScene(maze, { player: { x: 1.5, y: 1.5, angle: 0 }, exit: { x: 38, y: 1 }, light: 0.9 });
+  const floorNear = regionStats(frame, (x, y) => isFloorPx(frame, x, y) && rowDistOf(frame, y) >= 1 && rowDistOf(frame, y) < 2.5);
+  const floorDark = regionStats(frame, (x, y) => isFloorPx(frame, x, y) && rowDistOf(frame, y) >= 4.5 && rowDistOf(frame, y) < 7);
+  const wallNear = regionStats(frame, (x, y) => frame.z[x] < 1.6 && isWallPx(frame, x, y));
+  const wallMid = regionStats(frame, (x, y) => frame.z[x] >= 2.5 && frame.z[x] < 4 && isWallPx(frame, x, y));
+  const wallFar = regionStats(frame, (x, y) => frame.z[x] > 6 && frame.z[x] < 12 && isWallPx(frame, x, y));
+  // A pool: bright near, falling off with distance.
+  assert.ok(floorNear.lum > floorDark.lum * 1.4, `the floor pool must fall off (${floorNear.lum.toFixed(1)} → ${floorDark.lum.toFixed(1)})`);
+  assert.ok(wallNear.lum > wallMid.lum * 1.15, `near stone must be lit harder than stone 3 tiles on (${wallNear.lum.toFixed(1)} vs ${wallMid.lum.toFixed(1)})`);
+  // …of blue-grey stone and grey cobbles, like the reference (walls r−b −20…−27, floor ≈ +9).
+  for (const [name, r] of /** @type {const} */ ([['near', wallNear], ['mid', wallMid], ['far', wallFar]])) {
+    assert.ok(r.rb <= -12, `${name} walls must stay blue-grey under the player's torch (r-b ${r.rb.toFixed(1)})`);
+  }
+  assert.ok(floorNear.rb > -12 && floorNear.rb < 25, `the lit floor is grey with a trace of warmth (r-b ${floorNear.rb.toFixed(1)})`);
+});
+
+test('the colour temperature of the preview corridor matches the reference', () => {
+  // `preview.html?pose=0` at a full tank: a long corridor with a sconce a tile behind the eye. The
+  // reference measures walls r−b −20…−27 with median luminance ~56 and floor r−b ≈ +9. Before this
+  // was fixed the same frame measured walls −5…+3 and floor +48…+83.
+  const scene = previewScene(0);
+  const frame = renderScene(scene.maze, scene.view);
+  const wallNear = regionStats(frame, (x, y) => frame.z[x] < 2 && isWallPx(frame, x, y));
+  const floorNear = regionStats(frame, (x, y) => isFloorPx(frame, x, y) && rowDistOf(frame, y) < 2.5);
+  assert.ok(wallNear.rb <= -10, `near stone must read blue-grey (r-b ${wallNear.rb.toFixed(1)})`);
+  assert.ok(floorNear.rb <= 30, `the near floor must not read as tan sand (r-b ${floorNear.rb.toFixed(1)})`);
+  assert.ok(
+    wallNear.lumP50 >= 35 && wallNear.lumP50 <= 75,
+    `near stone keeps the reference's mid-grey brightness (median luminance ${wallNear.lumP50.toFixed(0)})`,
+  );
+});
+
+test('a wall sconce throws an amber pool that stands out even beside a full tank', () => {
+  // The reference's defining lighting cue. Rendered with and without the sconce — lighting only, the
+  // flame art itself blanked — so every difference is the sconce's light. It used to only brighten
+  // (wall r−b −12 → −3, neutral) and, clamped at the same ceiling as the player's torch, add almost
+  // nothing at a full tank.
+  const maze = corridors([3]);
+  const torches = [{ x: 21, y: 3, face: /** @type {2} */ (2) }]; // on the end wall, facing the camera
+  const view = { player: { x: 18.3, y: 3.5, angle: 0 }, torches, light: 1, exit: { x: 1, y: 3 } };
+  const lit = renderScene(maze, view, noTorchArt);
+  const bare = renderScene(maze, { ...view, torches: [] }, noTorchArt);
+  // The pool: the last tile of the corridor and the end wall the sconce hangs on (1.6+ tiles out).
+  // The side walls beside the player are the player's own torch's, and must not decide this.
+  const wallPool = (/** @type {Frame} */ f) => (/** @type {number} */ x, /** @type {number} */ y) => f.z[x] >= 1.6 && isWallPx(f, x, y);
+  const floorPool = (/** @type {Frame} */ f) => (/** @type {number} */ x, /** @type {number} */ y) => isFloorPx(f, x, y) && rowDistOf(f, y) >= 1.6;
+  const regions = [
+    { name: 'wall', a: regionStats(lit, wallPool(lit)), b: regionStats(bare, wallPool(bare)), whole: [regionStats(lit, (x, y) => isWallPx(lit, x, y)), regionStats(bare, (x, y) => isWallPx(bare, x, y))] },
+    { name: 'floor', a: regionStats(lit, floorPool(lit)), b: regionStats(bare, floorPool(bare)), whole: [regionStats(lit, (x, y) => isFloorPx(lit, x, y)), regionStats(bare, (x, y) => isFloorPx(bare, x, y))] },
+  ];
+  for (const { name, a, b, whole } of regions) {
+    // Measured when this was written: wall −25 → +28, floor −11 → +30. Before the tint axis existed
+    // the same pool went −12 → −3 (brighter, but still neutral).
+    assert.ok(a.rb >= b.rb + 30 && a.rb > 10, `the ${name} under a sconce must turn amber (r-b ${b.rb.toFixed(1)} → ${a.rb.toFixed(1)})`);
+    assert.ok(a.lum >= b.lum * 1.15, `the sconce must still brighten the ${name} at a full tank (${b.lum.toFixed(1)} → ${a.lum.toFixed(1)})`);
+    // …and the warmth shows in the frame as a whole, not only in a few pixels next to the flame.
+    assert.ok(whole[0].rb >= whole[1].rb + 12, `the ${name}s in view barely warm (r-b ${whole[1].rb.toFixed(1)} → ${whole[0].rb.toFixed(1)})`);
+  }
+  // …and the pool is the warm thing in the frame: well away from the sconce the stone stays cool.
+  const far = renderScene(maze, { ...view, player: { x: 6.5, y: 3.5, angle: Math.PI } }, noTorchArt);
+  assert.ok(regionStats(far, (x, y) => isWallPx(far, x, y)).rb <= -12, 'stone 12 tiles from the sconce must stay blue-grey');
+});
+
+test('a sconce far down a dark corridor is still a visible orange flame', () => {
+  // Shaded through the same fog as the stone, a flame used to fade out by ~10 tiles, and dimmed
+  // through the surface gammas it faded to blue-grey rather than to ember-orange. A flame is its own
+  // light, so it must stay a beacon at corridor distances — and still vanish before `FAR`, where the
+  // walls it hangs on stop being drawn.
   /**
-   * Mean red-minus-blue over a set of pixels.
-   * @param {(x:number, y:number) => boolean} pick
-   * @returns {number}
+   * Pixels the flame art changes, with their mean warmth, for a sconce on the end wall `dist` ahead.
+   * @param {number} dist tiles from the eye to the end wall
+   * @returns {{n:number, rb:number}}
    */
-  const warmth = (pick) => {
-    let sum = 0;
+  const flame = (dist) => {
+    const length = Math.ceil(3.5 + dist) + 2;
+    const maze = corridors([3], length);
+    const endWall = length - 2;
+    const view = { player: { x: endWall - dist, y: 3.5, angle: 0 }, torches: [{ x: endWall, y: 3, face: /** @type {2} */ (2) }], light: 1, exit: { x: 1, y: 3 } };
+    const a = renderScene(maze, view);
+    const b = renderScene(maze, view, noTorchArt);
     let n = 0;
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        if (!pick(x, y)) continue;
-        const c = buf[y * w + x];
-        sum += (c & 255) - ((c >>> 16) & 255);
-        n++;
-      }
+    let rb = 0;
+    for (let i = 0; i < a.buf.length; i++) {
+      if (a.buf[i] === b.buf[i]) continue;
+      n++;
+      rb += (a.buf[i] & 255) - ((a.buf[i] >>> 16) & 255);
     }
-    assert.ok(n > 50, 'sampled region is empty');
-    return sum / n;
+    return { n, rb: n ? rb / n : 0 };
   };
-  const half = h >> 1;
-  /** A floor row's distance ahead of the eye, in tiles. */
-  const rowDist = (/** @type {number} */ y) => half / (y - half + 0.5);
-  const isWall = (/** @type {number} */ x, /** @type {number} */ y) => Math.abs(y - half) < h / z[x] / 2;
-  const floorNear = warmth((x, y) => y > half && !isWall(x, y) && rowDist(y) >= 1 && rowDist(y) < 2.5);
-  const floorFar = warmth((x, y) => y > half && !isWall(x, y) && rowDist(y) >= 2.5 && rowDist(y) < 3.5);
-  const floorDark = warmth((x, y) => y > half && !isWall(x, y) && rowDist(y) >= 4.5 && rowDist(y) < 7);
-  const wallNear = warmth((x, y) => z[x] < 1.6 && isWall(x, y));
-  const wallMid = warmth((x, y) => z[x] >= 2.5 && z[x] < 4 && isWall(x, y));
-  const wallFar = warmth((x, y) => z[x] > 6 && z[x] < 12 && isWall(x, y));
-  // Before the fix these read -9.8 / -15.9 on the floor and -29.1 / -22.6 on the walls: the pool
-  // was colder than the dark beyond it, and the nearest wall was the bluest thing on screen.
-  assert.ok(floorNear > 20, `the floor 1-2.5 tiles ahead should read warm (r-b ${floorNear.toFixed(1)})`);
-  assert.ok(floorFar > floorDark + 12, `the pool should still be warming the floor at 3 tiles (${floorFar.toFixed(1)} vs ${floorDark.toFixed(1)})`);
-  assert.ok(floorNear > floorDark + 30, `the pool must fall off into cool shadow (${floorNear.toFixed(1)} → ${floorDark.toFixed(1)})`);
-  assert.ok(wallNear > wallMid + 5, `a wall beside the player (${wallNear.toFixed(1)}) must be warmer than one 3 tiles on (${wallMid.toFixed(1)})`);
-  assert.ok(wallFar < 0, `walls down the corridor stay cool (r-b ${wallFar.toFixed(1)})`);
+  for (const dist of [12, 17]) {
+    const f = flame(dist);
+    assert.ok(f.n >= 6, `a sconce ${dist} tiles away must still show (${f.n} pixels)`);
+    assert.ok(f.rb >= 30, `a sconce ${dist} tiles away must read as fire, not grey (mean r-b ${f.rb.toFixed(1)})`);
+  }
+  assert.equal(flame(31.5).n, 0, 'a flame beyond the far plane must not be drawn');
+});
+
+test('torch light does not leak through walls into parallel corridors', () => {
+  // Reproduced in game before the fix: a sconce lit the next corridor over straight through a
+  // one-tile wall (+12.6 % luminance and a warm cast with no visible source). Three parallel
+  // corridors, the sconce in the middle one; each outer corridor must look exactly as it does with
+  // no torch at all, at every heading.
+  const maze = corridors([1, 3, 5]);
+  const torches = [
+    { x: 10, y: 2, face: /** @type {1} */ (1) }, // north wall of the middle corridor, facing south
+    { x: 12, y: 4, face: /** @type {3} */ (3) }, // south wall of the middle corridor, facing north
+  ];
+  const middle = renderScene(maze, { player: { x: 7.5, y: 3.5, angle: 0 }, torches, light: 0.4 }, noTorchArt);
+  const middleBare = renderScene(maze, { player: { x: 7.5, y: 3.5, angle: 0 }, torches: [], light: 0.4 }, noTorchArt);
+  assert.ok(meanLum(middle) > meanLum(middleBare) * 1.1, 'sanity: the middle corridor is lit by its sconces');
+  for (const py of [1.5, 5.5]) {
+    for (const angle of [0, 0.35, -0.35, Math.PI - 0.3]) {
+      const player = { x: 8.5, y: py, angle };
+      const withT = meanLum(renderScene(maze, { player, torches, light: 0.4 }, noTorchArt));
+      const without = meanLum(renderScene(maze, { player, torches: [], light: 0.4 }, noTorchArt));
+      assert.ok(
+        Math.abs(withT - without) <= without * 0.01,
+        `corridor y=${py - 0.5} at heading ${angle.toFixed(2)} gained light through the wall (${without.toFixed(2)} → ${withT.toFixed(2)})`,
+      );
+    }
+  }
+});
+
+test('mortar courses run unbroken across wall tile seams', () => {
+  // A per-tile vertical texture offset used to make the bed joints jump height at every tile seam,
+  // so each metre of a long wall read as its own slab. The painted variants share one course table
+  // (asserted in textures.test.mjs); this asserts the raycaster keeps those rows at the same world
+  // height on every tile. The wall art is replaced by pure course stripes — mortar on the last three
+  // texel rows of every 16 — so per-tile mirroring, horizontal offsets and variant choice cannot
+  // hide a jump, and the dark rows either side of each seam must coincide.
+  const stripes = new Uint8Array(64 * 64);
+  for (let y = 0; y < 64; y++) stripes.fill((y & 15) >= 13 ? C.stoneShadow : C.stoneBright, y * 64, (y + 1) * 64);
+  const striped = { ...textures, wall: textures.wall.map((t) => ({ ...t, indices: stripes })) };
+  const maze = corridors([3, 4, 5], 40); // a three-tile-deep hall: its north wall face is y = 3
+  let seams = 0;
+  let continuous = 0;
+  for (const camX of [6.1, 9.6, 13.1, 16.6]) {
+    const frame = renderScene(maze, { player: { x: camX, y: 5.5, angle: -Math.PI / 2 }, light: 1 }, striped);
+    const { w, h } = frame;
+    const dist = frame.z[w >> 1];
+    const top = Math.ceil((h >> 1) - h / dist / 2) + 1;
+    const bot = Math.floor((h >> 1) + h / dist / 2) - 1;
+    // Facing north, screen right is +x: the column where world x crosses an integer is a seam.
+    const planeLen = (0.5 * w) / h;
+    for (let tx = Math.ceil(camX - 3); tx <= camX + 3; tx++) {
+      const sx = Math.round((w / 2) * (1 + (tx - camX) / (dist * planeLen)));
+      if (sx < 4 || sx > w - 5) continue;
+      const left = darkRows(frame, sx - 3, top, bot);
+      const right = darkRows(frame, sx + 2, top, bot);
+      assert.ok(left.size > 0 && right.size > 0, `no mortar rows found beside the seam at x=${tx}`);
+      seams++;
+      let shared = 0;
+      for (const y of left) if (right.has(y)) shared++;
+      if (shared >= left.size * 0.9 && shared >= right.size * 0.9) continuous++;
+    }
+  }
+  assert.ok(seams >= 12, `expected to measure at least 12 seams, found ${seams}`);
+  assert.equal(continuous, seams, `bed joints continue across only ${continuous} of ${seams} seams`);
+});
+
+test('ceiling timber runs across the corridor whichever way the corridor runs', () => {
+  // The planks and beam are painted along +x, which is across a north-south corridor. East-west
+  // corridors used to get lengthwise plank stripes and, every third one, a beam down their length;
+  // they now take a transposed copy. Across-corridor timber reads as horizontal bands on screen, so
+  // each ceiling row is nearly uniform along x while the rows differ from each other.
+  /**
+   * @param {Frame} f
+   * @returns {number} mean within-row variance ÷ variance of the row means, over the near ceiling
+   */
+  const streakiness = (f) => {
+    const { w, h } = f;
+    const half = h >> 1;
+    const means = [];
+    let within = 0;
+    let n = 0;
+    for (let y = 0; y < half - 40; y++) {
+      const xs = [];
+      for (let x = Math.round(w * 0.3); x < Math.round(w * 0.7); x++) if (!isWallPx(f, x, y)) xs.push(lumAt(f, x, y));
+      if (xs.length < 40) continue;
+      const m = xs.reduce((a, b) => a + b, 0) / xs.length;
+      means.push(m);
+      within += xs.reduce((a, b) => a + (b - m) * (b - m), 0) / xs.length;
+      n++;
+    }
+    const mm = means.reduce((a, b) => a + b, 0) / means.length;
+    const between = means.reduce((a, b) => a + (b - mm) * (b - mm), 0) / means.length;
+    return within / n / Math.max(1e-6, between);
+  };
+  const ew = corridors([3], 40);
+  const ns = transposeMaze(ew);
+  const alongX = streakiness(renderScene(ew, { player: { x: 5.5, y: 3.5, angle: 0 }, light: 1 }));
+  const alongY = streakiness(renderScene(ns, { player: { x: 3.5, y: 5.5, angle: Math.PI / 2 }, light: 1 }));
+  assert.ok(alongX < alongY * 1.6, `east-west ceiling is streaked along the corridor (${alongX.toFixed(2)} vs ${alongY.toFixed(2)} north-south)`);
 });
 
 test('reduced motion removes camera shake entirely', () => {

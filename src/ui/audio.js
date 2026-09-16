@@ -6,12 +6,19 @@
  * file in the repository. The module owns one `AudioContext` and one fixed mixer graph:
  *
  * ```
- *   one-shot voices ─┬─► sfxBus ──┬─────────────► master ─► compressor ─► limiter ─► destination
- *   portal hum ──────┤            └─► sfxSend ─► [delay ⇄ feedback ─► damp] ─┘ (return into sfxBus)
- *   torch flame ─────┘
- *   music plucks ────┬─► musicBus ┬─────────────►
- *   dungeon drone ───┘            └─► musicSend ─► [delay ⇄ feedback ─► damp] (return into musicBus)
+ *   one-shot voices ─┬─► sfxBus ──────────────────────► master ─► compressor ─► limiter ─► destination
+ *   portal hum ──────┤     ▲
+ *   torch flame ─────┘     └── [convolver: 1.3 s synthetic stone-room IR] ◄─ sfxSend ◄─ voice sends
+ *   music plucks ────┬─► musicBus ────────────────────►
+ *   dungeon drone ───┘     ▲
+ *                          └── [convolver: 2.2 s darker hall IR] ◄─ musicSend ◄─ pluck sends
  * ```
+ *
+ * WHY a convolver with a *generated* impulse response: a single feedback delay line is an echo
+ * (discrete repeats every 120 ms read as flutter on a bell), not a room. Real diffusion needs either
+ * a bank of combs and allpasses or an IR; the IR is built once at unlock from the seeded RNG
+ * (early reflections + exponentially decaying stereo noise that darkens as it decays), so there is
+ * still not a single audio file in the repository.
  *
  * WHY a compressor and a limiter in front of the destination: a level-complete fanfare landing on
  * top of a portal hum, a heartbeat and four footsteps sums past 0 dBFS (measured: 1.32 on a
@@ -29,7 +36,8 @@
  * - **Bounded.** At most `maxVoices` one-shot voices exist at once (default 24). Voices are a
  *   pre-allocated pool; a new sound that cannot find a free slot steals the voice that is closest
  *   to finishing, and only from a lower priority — or from an equal one that would have finished
- *   first. A stolen voice is faded over ~6 ms rather than cut, so stealing cannot click.
+ *   first. A stolen voice is faded over ~8 ms (`AUDIO.STEAL_FADE`) rather than cut, so stealing
+ *   cannot click.
  * - **Leak-free.** Every voice disconnects all of its nodes on `ended`, and a per-frame reap
  *   releases any voice whose scheduled end time has passed (belt and braces: `onended` does not
  *   fire while a context is suspended) and disposes the short-lived tails of stolen voices.
@@ -37,7 +45,13 @@
  *   resulting phase change), so the phase handler defers to a menu blip it can see (`uiAnswered`).
  * - **Allocation-free per frame.** `update()` touches only numbers and pre-allocated objects; it
  *   allocates nothing unless it actually schedules a new sound (music pluck / heartbeat), which
- *   happens at most a few times per second.
+ *   happens at most a few times per second. Voice stealing reuses a fixed ring of retiring slots,
+ *   and the phrase engine plays from pre-allocated typed arrays.
+ * - **Audible on small speakers.** Phone speakers roll off below ~250 Hz and laptops below ~150 Hz,
+ *   so every body cue (heartbeat, bump, footstep) pairs its low thump with a transient or harmonic
+ *   above 200 Hz. A gameplay warning that only exists at 40–68 Hz does not exist on a phone.
+ * - **In key.** Every pitched cue that sounds over the ambience (gem ladder, bell, fanfare, record
+ *   chord) is derived from the current level key, so nothing rubs against the drone.
  *
  * ## Units
  * - All times are **seconds on the `AudioContext` clock** (`ctx.currentTime`), never wall clock.
@@ -137,7 +151,7 @@ export const AUDIO = Object.freeze({
   STEP_SPEED: Object.freeze({ min: 1.4, max: 5.1 }),
   /** Seconds between gems that still counts as a combo (audio-side, purely cosmetic). */
   COMBO_WINDOW: 1.6,
-  /** Highest combo step that still raises the arpeggio pitch. */
+  /** Highest combo step that still raises the arpeggio (one pentatonic scale step per combo). */
   COMBO_MAX: 7,
   /**
    * Heartbeat period (seconds) at the low-fuel threshold and at empty, plus the fuel fraction the
@@ -152,13 +166,11 @@ export const AUDIO = Object.freeze({
   TORCH: Object.freeze({ bed: 0.016, gapMin: 0.07, gapMax: 0.5 }),
   /**
    * Generative music. `root`/`droneHz` are the level-1 key (A); deeper levels transpose both by
-   * `MUSIC_KEYS` and thin the gaps toward `gapFloor`, reaching the floor at `depthSpan`.
-   * `depthSpan` is approximately the level the maze stops growing — being a level out changes
-   * nothing audible, so it is deliberately NOT a mirror of a gameplay constant.
+   * `MUSIC_KEYS` and scale the phrase gaps (see `PHRASE`) toward `gapFloor`, reaching the floor at
+   * `depthSpan`. `depthSpan` is approximately the level the maze stops growing — being a level out
+   * changes nothing audible, so it is deliberately NOT a mirror of a gameplay constant.
    */
   MUSIC: Object.freeze({
-    gapMin: 1.5,
-    gapMax: 4.4,
     root: 220,
     droneHz: 55,
     depthSpan: 15,
@@ -166,6 +178,38 @@ export const AUDIO = Object.freeze({
     droneCut: 320,
     droneCutFloor: 0.65,
   }),
+  /**
+   * Phrase engine for the generative line. `pulse` is the slow grid every onset sits on; a phrase
+   * is a `motifMin..motifMax`-note motif moving by scale steps, notes 1..`noteMaxPulses` pulses
+   * apart (the cadence note held `noteMaxPulses`), then a rest of `restMin..restMax` pulses scaled
+   * by depth. Every `evolveEvery` phrases the motif itself mutates, so a 13-minute deep level is
+   * never one loop. Degrees index the extended pentatonic above `root/2` (degree 5 = `root`).
+   */
+  PHRASE: Object.freeze({
+    pulse: 0.75,
+    motifMin: 4,
+    motifMax: 7,
+    noteMaxPulses: 3,
+    restMin: 4,
+    restMax: 8,
+    evolveEvery: 4,
+    degreeLo: 2,
+    degreeHi: 13,
+  }),
+  /**
+   * Synthetic reverb impulse responses: tail length (RT60-ish, seconds), a one-pole damping
+   * coefficient that closes further as the tail decays (0..1, higher = darker), the pre-delay and
+   * the energy the IR is normalised to (≈ the old echo loop's gain, so wet levels stay put).
+   */
+  REVERB: Object.freeze({
+    sfx: Object.freeze({ seconds: 1.3, damp: 0.35, dampEnd: 0.8, pre: 0.011, energy: 1.0 }),
+    music: Object.freeze({ seconds: 2.2, damp: 0.5, dampEnd: 0.88, pre: 0.02, energy: 1.25 }),
+  }),
+  /**
+   * Error budget: audio switches itself off only if `burst` internal errors land within `window`
+   * seconds. Isolated failures spread over a long run decay instead of adding up to a silent game.
+   */
+  FAIL: Object.freeze({ burst: 12, window: 10 }),
   /** How far a stolen voice is faded before it is cut, seconds (see `fadeSteal`). */
   STEAL_FADE: 0.008,
   /**
@@ -177,8 +221,18 @@ export const AUDIO = Object.freeze({
   TC: Object.freeze({ mix: 0.05, portal: 0.14, music: 0.6, key: 0.45 }),
 });
 
-/** A minor pentatonic over the root, in semitones (plus two upper-octave degrees). */
-const PENTATONIC = Object.freeze([0, 3, 5, 7, 10, 12, 15, 17, 19, 24]);
+/** One octave of the minor pentatonic, in semitones. Degrees above 4 wrap into higher octaves. */
+const PENTATONIC = Object.freeze([0, 3, 5, 7, 10]);
+
+/**
+ * Semitones above the scale origin for a (possibly negative) pentatonic degree.
+ * @param {number} degree integer
+ * @returns {number}
+ */
+function degreeSemis(degree) {
+  const oct = Math.floor(degree / 5);
+  return PENTATONIC[degree - oct * 5] + 12 * oct;
+}
 
 /**
  * The key each depth is played in, semitones from the level-1 root (A). One 10-note bag in one
@@ -196,7 +250,10 @@ const BELL_NOTES = Object.freeze([880, 659.25, 523.25, 440]);
 const FANFARE_ARP = Object.freeze([523.25, 659.25, 783.99, 1046.5]);
 /** …resolving onto a held C-major triad. */
 const FANFARE_CHORD = Object.freeze([523.25, 659.25, 783.99]);
-/** The "you beat your own record" chord that follows the game-over snuff: C5 · E5 · G5, rising. */
+/**
+ * The "you beat your own record" chord that follows the game-over snuff: C5 · E5 · G5, rising —
+ * the relative major of the level-1 key, transposed with the key like the fanfare.
+ */
 const NEW_BEST_TRIAD = Object.freeze([523.25, 659.25, 783.99]);
 
 /**
@@ -311,7 +368,13 @@ export function createAudio(options) {
   let dead = false;
   /** Suspended because the document is hidden (distinct from "not yet unlocked"). */
   let hiddenSuspended = false;
+  /** Suspended by an explicit `suspend()` call — the OS-interruption recovery must not undo it. */
+  let userSuspended = false;
+  /** Lifetime count of swallowed errors (telemetry only). */
   let failures = 0;
+  /** Errors in the current burst window, and when that window opened (see `fail`). */
+  let burstFailures = 0;
+  let burstStart = NaN;
   let disposed = false;
 
   // ── Continuous-cue state ────────────────────────────────────────────────────────────────────
@@ -331,6 +394,20 @@ export function createAudio(options) {
   let musicKey = 1; //     frequency multiplier for that level's key
   let gapScale = 1; //     pluck-gap multiplier: deeper levels are denser
 
+  // ── Phrase engine (generative line) ─────────────────────────────────────────────────────────
+  /**
+   * The level's motif (scale degrees) and its rhythm (pulses to the next note), plus the phrase
+   * currently being played — a copy of the motif with this pass's variation applied. All fixed-size
+   * typed arrays: generating or varying a phrase allocates nothing.
+   */
+  const MOTIF_CAP = 8;
+  const motif = new Int8Array(MOTIF_CAP);
+  const motifPulses = new Uint8Array(MOTIF_CAP);
+  let motifLen = 0; //      0 = no motif yet (generated lazily on the first note)
+  const phrase = new Int8Array(MOTIF_CAP);
+  let phraseStep = 0; //    index of the next note in `phrase`
+  let phraseCount = 0; //   phrases played since the motif was (re)generated
+  let lastDegree = 7; //    previous note, so a new motif starts near where the line left off
   // ── Voice pool ──────────────────────────────────────────────────────────────────────────────
   /**
    * @typedef {Object} Voice
@@ -360,13 +437,17 @@ export function createAudio(options) {
   let stolen = 0;
   let dropped = 0;
   /**
-   * Nodes of stolen voices, still connected while their few-millisecond fade plays out, with the
-   * ctx time each batch may be disposed. Two parallel arrays, drained by `reap`.
-   * @type {AnyNode[][]}
+   * Nodes of stolen voices, still connected while their few-millisecond fade plays out. A fixed
+   * ring of `maxVoices` slots (the first `retireCount` are in use), each with its own MAX_NODES
+   * backing array, so a steal copies references instead of allocating; `reap` swap-removes.
+   * @typedef {{nodes: AnyNode[], n: number, at: number}} RetireSlot
+   * @type {RetireSlot[]}
    */
-  const retiring = [];
-  /** @type {number[]} */
-  const retireAt = [];
+  const retiring = new Array(maxVoices);
+  for (let i = 0; i < maxVoices; i++) {
+    retiring[i] = { nodes: new Array(MAX_NODES).fill(null), n: 0, at: 0 };
+  }
+  let retireCount = 0;
 
   /** Reused stats object — §4.1 house style: never allocate for telemetry. */
   const statsOut = {
@@ -399,15 +480,30 @@ export function createAudio(options) {
   };
   let gestureAttached = false;
 
-  if (doc) {
-    addListener(doc, 'visibilitychange', onVisibility);
-    if (autoUnlock) {
-      addListener(doc, 'pointerdown', onGesture);
-      addListener(doc, 'keydown', onGesture);
-      addListener(doc, 'touchend', onGesture);
-      gestureAttached = true;
+  /**
+   * The context changed state on its own. WHY: iOS Safari moves a running context to
+   * 'interrupted' on a phone call or Siri, and any platform can suspend it on an audio-device
+   * change — while the page stays visible. The gesture listeners are long gone by then, so without
+   * this the game would stay silent until a reload. Re-arm them (a resume usually needs a fresh
+   * gesture) and try a resume straight away in case the platform allows it.
+   */
+  const onStateChange = () => {
+    try {
+      if (!ctx || dead) return;
+      if (isRunning()) {
+        detachGestures();
+        return;
+      }
+      if (ctx.state === 'closed' || isHidden() || hiddenSuspended || userSuspended) return;
+      attachGestures();
+      resumeContext();
+    } catch (err) {
+      fail(err);
     }
-  }
+  };
+
+  if (doc) addListener(doc, 'visibilitychange', onVisibility);
+  attachGestures();
 
   // ════════════════════════════════════════════════════════════════════════════════════════════
   // Error handling
@@ -415,17 +511,37 @@ export function createAudio(options) {
 
   /**
    * Swallow an internal error. Recorded once in the core ring buffer (the logger collapses
-   * repeats), and after a burst of failures audio switches itself off for good rather than
-   * limping along making noise in the console.
+   * repeats), and after a *burst* of failures — `AUDIO.FAIL.burst` within `AUDIO.FAIL.window`
+   * seconds — audio switches itself off for good rather than limping along. WHY a window and not
+   * a lifetime total: a handful of rare transient failures over a 30-level run must not add up to
+   * a silent game; only something failing every frame should.
    * @param {unknown} err
    */
   function fail(err) {
     failures++;
     log.error('audio error', err);
-    if (failures >= 12 && !dead) {
+    const t = failClock();
+    if (!(Math.abs(t - burstStart) <= AUDIO.FAIL.window)) {
+      burstStart = t;
+      burstFailures = 0;
+    }
+    burstFailures++;
+    if (burstFailures >= AUDIO.FAIL.burst && !dead) {
       dead = true;
       teardown();
     }
+  }
+
+  /**
+   * Seconds for the failure window: the audio clock when there is one (deterministic in tests),
+   * wall clock otherwise.
+   * @returns {number}
+   */
+  function failClock() {
+    const t = ctx ? ctx.currentTime : NaN;
+    if (typeof t === 'number' && Number.isFinite(t)) return t;
+    const perf = /** @type {any} */ (globalThis).performance;
+    return (perf && typeof perf.now === 'function' ? perf.now() : Date.now()) / 1000;
   }
 
   // ════════════════════════════════════════════════════════════════════════════════════════════
@@ -613,7 +729,7 @@ export function createAudio(options) {
    * @param {Voice} v
    * @param {number} [fadeAt] set only when the voice is being **stolen**: instead of cutting the
    *   waveform dead (a click, because the sample jumps to 0 from wherever the envelope was), the
-   *   head gain is ramped to silence over ~6 ms and the nodes are handed to `retiring` for the
+   *   head gain is ramped to silence over ~8 ms and the nodes are handed to `retiring` for the
    *   reap a few milliseconds later.
    */
   function releaseVoice(v, fadeAt) {
@@ -686,35 +802,52 @@ export function createAudio(options) {
     } catch {
       return false; // a param that refuses ramps: the hard cut is still correct, just clickier
     }
-    /** @type {AnyNode[]} */
-    const nodes = new Array(v.n);
+    // Bounded by construction: a steal storm cannot hold more than one pool's worth of tails. When
+    // the ring is full the tail closest to done (its fade is ~8 ms long, so all of them are nearly
+    // silent) is disposed to make room.
+    if (retireCount === maxVoices) {
+      let oldest = 0;
+      for (let i = 1; i < retireCount; i++) {
+        if (retiring[i].at < retiring[oldest].at) oldest = i;
+      }
+      retireOne(oldest);
+    }
+    const slot = retiring[retireCount++];
+    slot.at = stopAt;
+    slot.n = v.n;
     for (let i = 0; i < v.n; i++) {
-      nodes[i] = v.nodes[i];
+      const node = v.nodes[i];
+      slot.nodes[i] = node;
       v.nodes[i] = null;
       try {
-        if (nodes[i]) nodes[i].onended = null; // the voice is about to be reused: no late release
+        if (node) node.onended = null; // the voice is about to be reused: no late release
       } catch {
         /* read-only onended */
       }
       try {
-        if (nodes[i] && typeof nodes[i].stop === 'function') nodes[i].stop(stopAt);
+        if (node && typeof node.stop === 'function') node.stop(stopAt);
       } catch {
         /* never started */
       }
     }
-    retiring.push(nodes);
-    retireAt.push(stopAt);
-    // Bounded by construction: a steal storm cannot grow this past one pool's worth of tails.
-    if (retiring.length > maxVoices) retireOne(0);
     return true;
   }
 
-  /** @param {number} i index into `retiring` */
+  /**
+   * Dispose one retiring slot and swap-remove it (the last in-use slot takes its place), so the
+   * ring never shifts or allocates.
+   * @param {number} i index into `retiring`, < retireCount
+   */
   function retireOne(i) {
-    const nodes = retiring[i];
-    retiring.splice(i, 1);
-    retireAt.splice(i, 1);
-    if (nodes) disposeNodes(nodes, nodes.length);
+    const slot = retiring[i];
+    disposeNodes(slot.nodes, slot.n);
+    slot.n = 0;
+    const last = retireCount - 1;
+    if (i !== last) {
+      retiring[i] = retiring[last];
+      retiring[last] = slot;
+    }
+    retireCount = last;
   }
 
   /**
@@ -723,8 +856,9 @@ export function createAudio(options) {
    * @param {number} t ctx time
    */
   function reap(t) {
-    for (let i = retiring.length - 1; i >= 0; i--) {
-      if (retireAt[i] <= t) retireOne(i);
+    // Walking down is safe with swap-remove: the slot moved into `i` was already visited.
+    for (let i = retireCount - 1; i >= 0; i--) {
+      if (retiring[i].at <= t) retireOne(i);
     }
     if (liveVoices === 0) return;
     for (let i = 0; i < maxVoices; i++) {
@@ -791,9 +925,10 @@ export function createAudio(options) {
     musicBus = keep(newGain(0));
     connect(musicBus, master);
 
-    // Feedback-delay "reverb" per bus. Separate networks so muting music also mutes its tails.
-    sfxSend = buildReverb(sfxBus, 0.12, 0.3, 2600);
-    musicSend = buildReverb(musicBus, 0.3, 0.52, 1900);
+    // One reverb per bus, so muting music also mutes its tails. The SFX room is short and fairly
+    // bright (stone corridor); the music hall is longer and darker so the plucks bloom behind it.
+    sfxSend = buildReverb(sfxBus, AUDIO.REVERB.sfx);
+    musicSend = buildReverb(musicBus, AUDIO.REVERB.music);
 
     noiseBuffer = buildNoiseBuffer();
 
@@ -832,27 +967,101 @@ export function createAudio(options) {
   }
 
   /**
-   * A cheap Schroeder-ish tail: one delay line with damped feedback. WHY not a convolver: an
-   * impulse response is either a file (banned) or a multi-second noise buffer to synthesise; this
-   * costs three nodes and sounds right for a stone dungeon.
+   * A diffuse room: one `ConvolverNode` fed a synthetic impulse response (see `buildImpulse`).
+   * A few hundred thousand floats built once at unlock; the convolver then runs on the browser's
+   * own optimised (and, for long tails, background-threaded) path.
+   *
+   * Fallback for a context with no `createConvolver`: a damped feedback delay. It is an echo rather
+   * than a room, but a dry game would be worse, and no shipping browser takes this path.
    * @param {AnyNode} bus destination bus (the return lands here, so the bus gain rules the tail)
-   * @param {number} time delay time in seconds
-   * @param {number} feedback 0..1 loop gain (<1 or it never decays)
-   * @param {number} damp low-pass cutoff inside the loop, Hz
+   * @param {{seconds:number, damp:number, dampEnd:number, pre:number, energy:number}} spec
    * @returns {AnyNode} the send node callers connect voices into
    */
-  function buildReverb(bus, time, feedback, damp) {
+  function buildReverb(bus, spec) {
     const send = keep(newGain(1));
+    if (typeof ctx.createConvolver === 'function' && typeof ctx.createBuffer === 'function') {
+      const conv = keep(ctx.createConvolver());
+      try {
+        conv.normalize = false; // the IR carries its own calibrated energy; must precede `buffer`
+      } catch {
+        /* optional property */
+      }
+      conv.buffer = buildImpulse(spec);
+      connect(send, conv);
+      connect(conv, bus);
+      return send;
+    }
     const delay = keep(ctx.createDelay(1));
-    pSet(delay.delayTime, time, 0);
-    const fb = keep(newGain(clamp(feedback, 0, 0.92)));
-    const tone = keep(newFilter('lowpass', damp, 0.7));
+    pSet(delay.delayTime, spec.seconds * 0.12, 0);
+    const fb = keep(newGain(0.4));
+    const tone = keep(newFilter('lowpass', 2200, 0.7));
     connect(send, delay);
     connect(delay, tone);
     connect(tone, fb);
     connect(fb, delay); // the loop
     connect(tone, bus); // the return
     return send;
+  }
+
+  /**
+   * Synthesise a stereo room impulse response.
+   *
+   * - **Pre-delay** of a few ms of silence, so the dry hit stays distinct from its room.
+   * - **Early reflections:** six sparse taps at mutually prime millisecond offsets, alternating
+   *   sides — the "walls close by" cue a stone corridor has and a smooth noise tail lacks.
+   * - **Diffuse tail:** independent white noise per channel (decorrelated L/R is what makes it
+   *   wide), under an exponential envelope reaching -60 dB at `seconds`, through a one-pole low-pass
+   *   whose coefficient slides from `damp` to `dampEnd`: stone absorbs highs faster than lows, so the
+   *   tail darkens as it decays instead of hissing out.
+   * - Scaled so the IR's total energy (per channel) is `energy`: the wet level is a tuning number,
+   *   independent of length and sample rate.
+   *
+   * Uses its own RNG stream (seeded from the module seed) so building the IR does not shift the
+   * sequence the music and noise draw from.
+   * @param {{seconds:number, damp:number, dampEnd:number, pre:number, energy:number}} spec
+   * @returns {AnyNode} an AudioBuffer
+   */
+  function buildImpulse(spec) {
+    const sr = Number.isFinite(ctx.sampleRate) && ctx.sampleRate > 0 ? ctx.sampleRate : 44100;
+    const len = Math.max(2, Math.floor(sr * spec.seconds));
+    const buf = ctx.createBuffer(2, len, sr);
+    const irRng = createRng((seed ^ 0x5eed1e55) >>> 0);
+    const pre = Math.min(len - 1, Math.floor(sr * spec.pre));
+    // ln(1000) = 6.9: amplitude reaches 1/1000 (-60 dB) at the end of the buffer.
+    const decay = 6.907755 / Math.max(1, len - pre);
+    /** Early reflection offsets (ms after the pre-delay) and gains. */
+    const ER_MS = [7, 11, 17, 23, 31, 41];
+    for (let c = 0; c < 2; c++) {
+      const data = buf.getChannelData(c);
+      let lp = 0;
+      let energy = 0;
+      for (let i = pre; i < len; i++) {
+        const k = (i - pre) / (len - pre);
+        const a = lerp(spec.damp, spec.dampEnd, k);
+        lp = lp * a + (irRng.next() * 2 - 1) * (1 - a);
+        // The tail swells in over ~25 ms behind the early reflections instead of starting at full.
+        const onset = Math.min(1, (i - pre) / (sr * 0.025));
+        const v = lp * Math.exp(-decay * (i - pre)) * onset;
+        data[i] = v;
+        energy += v * v;
+      }
+      // A single-sample tap carries almost no energy next to a 50 000-sample tail, so the taps are
+      // sized against the tail's RMS-over-its-effective-length rather than as absolute numbers:
+      // each one stands a few times above the noise around it, which is what makes it read as a wall.
+      const tailRms = Math.sqrt(energy * 2 * decay);
+      for (let e = 0; e < ER_MS.length; e++) {
+        const at = pre + Math.floor((ER_MS[e] * sr) / 1000) + c * Math.floor(sr * 0.0013);
+        if (at >= len) continue;
+        const sign = (e + c) % 2 === 0 ? 1 : -1;
+        const tap = sign * (4 - e * 0.5) * tailRms;
+        const before = data[at];
+        data[at] = before + tap;
+        energy += data[at] * data[at] - before * before;
+      }
+      const scale = energy > 0 ? Math.sqrt(spec.energy / energy) : 0;
+      for (let i = 0; i < len; i++) data[i] *= scale;
+    }
+    return buf;
   }
 
   /**
@@ -886,8 +1095,11 @@ export function createAudio(options) {
     portalGain = keep(newGain(0));
     portalFilter = keep(newFilter('lowpass', AUDIO.PORTAL.cutMin, 6));
     connect(portalFilter, portalGain);
-    // Panning the hum turns it into a navigation aid: near the exit the player can hear which way
-    // to turn. Optional node — a context without StereoPanner just gets a centred hum.
+    // Panning the hum gives it a direction: near the exit the player hears which side it is on.
+    // It is the straight-line bearing *through walls* (the sim exposes no path), i.e. "where is it",
+    // not "which corridor leads there" — honest for a portal you can hear through stone, and the
+    // hum only blooms inside NEAR_EXIT_RANGE where the two rarely disagree for long.
+    // Optional node — a context without StereoPanner just gets a centred hum.
     portalPan = typeof ctx.createStereoPanner === 'function' ? keep(ctx.createStereoPanner()) : null;
     if (portalPan) {
       connect(portalGain, portalPan);
@@ -988,6 +1200,9 @@ export function createAudio(options) {
     const depth01 = clamp01((lv - 1) / Math.max(1, AUDIO.MUSIC.depthSpan - 1));
     // Deeper levels run longer, so the line has to arrive more often to cover the same minutes.
     gapScale = lerp(1, AUDIO.MUSIC.gapFloor, depth01);
+    // A new depth gets a new motif (composed lazily on its first note, so no RNG is spent here).
+    motifLen = 0;
+    phraseStep = 0;
     if (!live()) return;
     const t = now();
     for (let i = 0; i < keyedParams.length; i++) {
@@ -1275,37 +1490,61 @@ export function createAudio(options) {
     const base = (foot === 0 ? 540 : 430) * rng.range(0.94, 1.07);
     const dur = lerp(0.1, 0.14, intensity);
     sfxNoise('bandpass', base, base * 0.55, 1.3, t, 0.005, dur, amp, PRI.STEP);
-    sfx('sine', 82 * rng.range(0.95, 1.06), 54, t, 0.004, 0.1, amp * 0.5, PRI.STEP);
+    // The thump carries a 2nd harmonic (164 → 108 Hz) so its weight survives a laptop speaker.
+    sfx('sine', 82 * rng.range(0.95, 1.06), 54, t, 0.004, 0.1, amp * 0.5, PRI.STEP, 0, 2, 0.45);
   }
 
   /**
-   * Wall bump: a low sine thud that sags a fifth, plus a dull noise slap. Scales with the impact,
-   * so scraping a corner is a tap and running head-first into stone is a wallop.
+   * Wall bump: a low sine thud that sags, a dull noise body, and a short band-passed *slap* around
+   * 650 Hz — the stone-contact transient, and the part of the cue a phone speaker can actually
+   * play. Scales with the impact, so scraping a corner is a tap and running head-first into stone
+   * is a wallop.
    * @param {number} strength 0..1 from the sim
    */
   function playBump(strength) {
     const s = clamp01(strength);
     const t = now();
     const amp = lerp(0.14, 0.46, s);
-    sfx('sine', 126, 46, t, 0.004, lerp(0.18, 0.3, s), amp, PRI.CUE, 0.12);
+    // Inharmonic 2.3× partial: a knock on stone, not a tuned drum.
+    sfx('sine', 126, 46, t, 0.004, lerp(0.18, 0.3, s), amp, PRI.CUE, 0.12, 2.3, 0.4);
     sfxNoise('lowpass', 420, 130, 0.9, t, 0.003, 0.13, amp * 0.5, PRI.CUE);
+    // Band-passed white noise keeps only ~5 % of its power, hence the pre-filter gain above 1×.
+    sfxNoise('bandpass', 700, 450, 0.8, t, 0.002, lerp(0.05, 0.08, s), amp * 2.2, PRI.CUE, 0.1);
   }
 
   /**
-   * Gem pickup: a bright major arpeggio with an octave shimmer and a sparkle hiss.
-   * Rapid successive pickups raise the whole figure two semitones per combo step, so sweeping a
-   * dead end rewards the player with a rising melody instead of the same chime nine times.
+   * Frequency of a pentatonic degree in the current level key. Degree 0 is `root/2` (A3 at level 1),
+   * degree 5 is `root`, degree 10 is `root·2`.
+   * @param {number} degree integer, may be negative
+   * @returns {number} Hz
+   */
+  function degreeHz(degree) {
+    return AUDIO.MUSIC.root * 0.5 * musicKey * semitone(degreeSemis(degree));
+  }
+
+  /**
+   * Gem pickup: a bright three-note arpeggio with an octave shimmer and a sparkle hiss, **in the
+   * level key**. Degree 13 at level 1 is E5 (the chime this game shipped with); the figure is
+   * `degree, degree+3, degree+5`, which from E spells C-major-over-E and from every other scale
+   * step a fifth or a sixth plus the octave — always consonant, never outside the drone's scale.
+   * Rapid successive pickups climb *one scale step* per combo, so sweeping a dead end plays a
+   * rising pentatonic melody instead of the same chime nine times, or a whole-tone ladder that
+   * leaves the key on its second rung.
    * @param {number} [pan] -1..1, where the gem was relative to the player's facing
    */
   function playGem(pan = 0) {
     const t = now();
     comboCount = t < comboUntil ? Math.min(comboCount + 1, AUDIO.COMBO_MAX) : 0;
     comboUntil = t + AUDIO.COMBO_WINDOW;
-    const root = 659.25 * semitone(comboCount * 2); // E5 upward
-    // Major triad: unambiguously "good", against the minor ambience underneath.
-    sfx('triangle', root, root, t, 0.004, 0.26, 0.17, PRI.CUE, 0.25, 2, 0.22, pan);
-    sfx('triangle', root * 1.26, root * 1.26, t + 0.06, 0.004, 0.24, 0.15, PRI.CUE, 0.25, 2, 0.2, pan);
-    sfx('triangle', root * 1.5, root * 1.5, t + 0.12, 0.004, 0.34, 0.15, PRI.CUE, 0.3, 2, 0.24, pan);
+    const d = 13 + comboCount;
+    const f0 = degreeHz(d);
+    const f1 = degreeHz(d + 3);
+    const f2 = degreeHz(d + 5);
+    // The octave shimmer fades out as the ladder climbs, so a x7 combo does not turn to glass.
+    const shimmer = lerp(0.22, 0.1, comboCount / AUDIO.COMBO_MAX);
+    sfx('triangle', f0, f0, t, 0.004, 0.26, 0.17, PRI.CUE, 0.25, 2, shimmer, pan);
+    sfx('triangle', f1, f1, t + 0.06, 0.004, 0.24, 0.15, PRI.CUE, 0.25, 2, shimmer * 0.9, pan);
+    sfx('triangle', f2, f2, t + 0.12, 0.004, 0.34, 0.15, PRI.CUE, 0.3, 2, shimmer * 1.1, pan);
     sfxNoise('highpass', 5200, 9000, 0.7, t, 0.008, 0.22, 0.05, PRI.STEP, 0.2, pan);
   }
 
@@ -1386,7 +1625,7 @@ export function createAudio(options) {
     if (newBest) {
       // Placed after the snuff, not over it: the torch dies, *then* the score speaks.
       for (let i = 0; i < NEW_BEST_TRIAD.length; i++) {
-        const f = NEW_BEST_TRIAD[i];
+        const f = NEW_BEST_TRIAD[i] * musicKey; // relative major of the key the run ended in
         sfx('triangle', f, f, t + 1 + i * 0.1, 0.006, 0.8, 0.09, PRI.STING, 0.4, 2, 0.2);
       }
     }
@@ -1428,6 +1667,13 @@ export function createAudio(options) {
   /**
    * One lub-dub. Two sine thuds a fraction of the period apart, the second softer, with a scrap of
    * low noise for the body blow.
+   *
+   * WHY the harmonics and the click: the thuds live at 36–68 Hz, which a phone speaker (roll-off
+   * ~250 Hz) and most laptops (~150 Hz) cannot reproduce — the low-fuel warning used to be all but
+   * silent on exactly the devices the touch layout targets. Each thud therefore carries a 3rd
+   * harmonic (204 / 186 Hz at 0.45×) that the ear fuses with the fundamental (the missing-
+   * fundamental effect keeps it sounding low), and the lub gets a short (~10 ms audible) band-passed noise
+   * transient around 1 kHz: the valve "tick" that reads as a heartbeat on any speaker at all.
    * @param {number} t
    * @param {number} period current beat period (seconds) — the split scales with it
    * @param {number} urgency 0..1 (0 = just hit the threshold, 1 = about to go dark)
@@ -1435,9 +1681,12 @@ export function createAudio(options) {
   function scheduleHeartbeat(t, period, urgency) {
     const amp = lerp(0.2, 0.4, urgency);
     const split = period * AUDIO.HEART.split;
-    sfx('sine', 68, 40, t, 0.006, 0.19, amp, PRI.CUE);
-    sfx('sine', 62, 36, t + split, 0.006, 0.16, amp * 0.66, PRI.CUE);
+    sfx('sine', 68, 40, t, 0.006, 0.19, amp, PRI.CUE, 0, 3, 0.45);
+    sfx('sine', 62, 36, t + split, 0.006, 0.16, amp * 0.66, PRI.CUE, 0, 3, 0.45);
     sfxNoise('lowpass', 200, 90, 0.7, t, 0.004, 0.1, amp * 0.28, PRI.STEP);
+    // The tick: brighter and a touch longer as the torch dies, so urgency is audible up top too.
+    // Pre-filter gain is high because a Q 0.8 band keeps only a few percent of white noise's power.
+    sfxNoise('bandpass', 1000, 650, 0.8, t, 0.001, lerp(0.02, 0.03, urgency), amp * 2.4, PRI.CUE);
   }
 
   /**
@@ -1455,18 +1704,190 @@ export function createAudio(options) {
   // ── Generative music ────────────────────────────────────────────────────────────────────────
 
   /**
-   * Schedule one pluck (sometimes a dyad) from the minor pentatonic, with a long reverb send.
-   * A quarter of the notes drop an octave so the line does not sit in one register.
-   * @param {number} t
+   * The home degree (the root or the fifth, in any octave) a phrase whose penultimate note is `d`
+   * resolves to. Phrases cadence there, which is what makes a run of notes sound like a sentence
+   * ending. The nearest home *other than `d` itself* — a phrase that simply repeats its last note
+   * does not land, it stalls — preferring the one below on a tie, because falling cadences settle.
+   * @param {number} d
+   * @returns {number}
    */
-  function schedulePluck(t) {
-    const st = PENTATONIC[rng.int(PENTATONIC.length)];
-    const f = AUDIO.MUSIC.root * musicKey * semitone(st) * (rng.chance(0.25) ? 0.5 : 1);
-    const dur = rng.range(1.6, 2.6);
-    tone('triangle', f, f, t, 0.012, dur, 0.085, musicBus, musicSend, 0.75, PRI.MUSIC, 2, 0.14);
-    if (rng.chance(0.3)) {
-      const f2 = f * semitone(7); // a fifth above: consonant with anything else in the scale
-      tone('triangle', f2, f2, t + 0.09, 0.012, 1.5, 0.05, musicBus, musicSend, 0.75, PRI.MUSIC);
+  function cadenceNear(d) {
+    let best = AUDIO.PHRASE.degreeLo;
+    let bestDist = Infinity;
+    for (let c = AUDIO.PHRASE.degreeLo; c <= AUDIO.PHRASE.degreeHi; c++) {
+      const pc = ((c % 5) + 5) % 5;
+      if (c === d || (pc !== 0 && pc !== 3)) continue; // degree 0 = root, degree 3 = fifth
+      const dist = Math.abs(c - d);
+      if (dist < bestDist || (dist === bestDist && c < d)) {
+        best = c;
+        bestDist = dist;
+      }
+    }
+    return best;
+  }
+
+  /** @param {number} d @returns {number} */
+  function clampDegree(d) {
+    return d < AUDIO.PHRASE.degreeLo
+      ? AUDIO.PHRASE.degreeLo
+      : d > AUDIO.PHRASE.degreeHi
+        ? AUDIO.PHRASE.degreeHi
+        : d;
+  }
+
+  /**
+   * Move one inner note of `arr` a scale step, in whichever direction keeps it a *step* from both
+   * neighbours: different from each (a repeated note sounds like a stuck key, not a new idea) and
+   * no more than two degrees away (so variations accumulated over a long level can never drift the
+   * motif into leaps). When neither direction qualifies the note is left alone.
+   * @param {Int8Array} arr
+   * @param {number} i 1..motifLen-2
+   */
+  function nudge(arr, i) {
+    const dir = rng.chance(0.5) ? 1 : -1;
+    for (let k = 0; k < 2; k++) {
+      const cand = clampDegree(arr[i] + (k === 0 ? dir : -dir));
+      const a = cand - arr[i - 1];
+      const b = cand - arr[i + 1];
+      if (cand !== arr[i] && a !== 0 && b !== 0 && a <= 2 && a >= -2 && b <= 2 && b >= -2) {
+        arr[i] = cand;
+        return;
+      }
+    }
+  }
+
+  /**
+   * Compose (or, with `evolve`, mutate) the level's motif: a short random *walk* through the scale
+   * that ends on the root or the fifth, with a rhythm on the pulse grid whose final note is held
+   * longest. Writes the pre-allocated arrays only.
+   *
+   * The walk follows the two oldest rules of melody writing: move mostly by step (one degree two
+   * times in three, two degrees most of the rest), and allow at most **one leap** per motif, which
+   * is immediately answered by a step the other way (gap fill). It never repeats a note in place.
+   * @param {boolean} evolve keep the shape of the current motif, change its interior
+   */
+  function composeMotif(evolve) {
+    const P = AUDIO.PHRASE;
+    if (evolve && motifLen > 0) {
+      // Nudge one or two inner notes and maybe shift the whole figure a degree: the listener
+      // still recognises the idea, but it has moved on.
+      const moves = 1 + rng.int(2);
+      for (let m = 0; m < moves; m++) nudge(motif, 1 + rng.int(Math.max(1, motifLen - 2)));
+      if (rng.chance(0.4)) {
+        const shift = rng.chance(0.5) ? 1 : -1;
+        let fits = true;
+        for (let i = 0; i < motifLen; i++) {
+          const moved = motif[i] + shift;
+          if (moved < P.degreeLo || moved > P.degreeHi) fits = false;
+        }
+        if (fits) for (let i = 0; i < motifLen; i++) motif[i] += shift;
+      }
+      motif[motifLen - 1] = cadenceNear(motif[motifLen - 2]);
+      return;
+    }
+    motifLen = P.motifMin + rng.int(P.motifMax - P.motifMin + 1);
+    const mid = (P.degreeLo + P.degreeHi) * 0.5;
+    let d = clampDegree(lastDegree + rng.int(5) - 2);
+    let leapt = false;
+    let fill = 0; // direction the next note must step in after a leap (0 = free)
+    for (let i = 0; i < motifLen; i++) {
+      motif[i] = d;
+      motifPulses[i] = 1 + rng.int(P.noteMaxPulses - 1); // 1..noteMaxPulses-1 inside the phrase
+      let size;
+      let up;
+      if (fill !== 0) {
+        size = 1;
+        up = fill > 0;
+        fill = 0;
+      } else {
+        const r = rng.next();
+        size = r < 0.66 ? 1 : r < 0.95 || leapt ? 2 : 3;
+        // Lean back toward the middle of the range so the walk does not pin itself to an edge.
+        up = rng.next() < 0.5 + (mid - d) * 0.06;
+        if (size === 3) {
+          leapt = true;
+          fill = up ? -1 : 1;
+        }
+      }
+      let next = clampDegree(d + (up ? size : -size));
+      if (next === d) next = clampDegree(d + (up ? -size : size)); // bounced off an edge
+      d = next;
+    }
+    motif[motifLen - 1] = cadenceNear(motif[motifLen - 2]);
+    motifPulses[motifLen - 1] = P.noteMaxPulses; // the cadence note is held longest
+    phraseCount = 0;
+  }
+
+  /**
+   * Load the next pass of the motif into `phrase`. Even passes state the motif; odd passes vary it
+   * (a sequence one degree up or down, or one inner note answered a step away), always keeping the
+   * cadence on a home degree. Every `evolveEvery` passes the motif itself evolves.
+   */
+  function beginPhrase() {
+    if (motifLen === 0) composeMotif(false);
+    else if (phraseCount > 0 && phraseCount % AUDIO.PHRASE.evolveEvery === 0) composeMotif(true);
+    for (let i = 0; i < motifLen; i++) phrase[i] = motif[i];
+    if (phraseCount % 2 === 1) {
+      if (rng.chance(0.5)) {
+        // A sequence: the same shape a degree higher or lower (only if it fits the range intact).
+        const shift = rng.chance(0.5) ? 1 : -1;
+        let fits = true;
+        for (let i = 0; i < motifLen - 1; i++) {
+          const moved = phrase[i] + shift;
+          if (moved < AUDIO.PHRASE.degreeLo || moved > AUDIO.PHRASE.degreeHi) fits = false;
+        }
+        if (fits) for (let i = 0; i < motifLen - 1; i++) phrase[i] += shift;
+      } else {
+        nudge(phrase, 1 + rng.int(Math.max(1, motifLen - 2)));
+      }
+      phrase[motifLen - 1] = cadenceNear(phrase[motifLen - 2]);
+    }
+    phraseCount++;
+    phraseStep = 0;
+  }
+
+  /**
+   * Advance the phrase engine by one note: schedule it at `t` (unless `audible` is false — the line
+   * keeps its place while music is muted) and return the gap to the next onset, in seconds, on the
+   * pulse grid.
+   * @param {number} t
+   * @param {boolean} audible
+   * @returns {number}
+   */
+  function nextPluck(t, audible) {
+    if (motifLen === 0 || phraseStep >= motifLen) beginPhrase();
+    const i = phraseStep++;
+    const degree = phrase[i];
+    lastDegree = degree;
+    const cadence = i === motifLen - 1;
+    if (audible) schedulePluck(t, degree, cadence);
+    const P = AUDIO.PHRASE;
+    let pulses = motifPulses[i];
+    // Deeper levels shorten the *rests between phrases* (gapScale < 1) — the phrase itself keeps
+    // its rhythm, so the line gets more frequent without turning into a stream of eighth notes.
+    if (cadence) {
+      const rest = P.restMin + rng.int(P.restMax - P.restMin + 1);
+      pulses += Math.max(1, Math.round(rest * gapScale));
+    }
+    return P.pulse * pulses;
+  }
+
+  /**
+   * One pluck with a long reverb send. The last note of a phrase is longer and gains a consonant
+   * dyad beneath it (two scale steps down: a fourth under the root, a third under the fifth), so
+   * the cadence *lands*.
+   * @param {number} t
+   * @param {number} degree pentatonic degree (see `degreeHz`)
+   * @param {boolean} cadence
+   */
+  function schedulePluck(t, degree, cadence) {
+    const f = degreeHz(degree);
+    const dur = cadence ? rng.range(2.4, 3) : rng.range(1.5, 2.2);
+    const amp = cadence ? 0.09 : 0.08;
+    tone('triangle', f, f, t, 0.012, dur, amp, musicBus, musicSend, 0.75, PRI.MUSIC, 2, 0.14);
+    if (cadence) {
+      const f2 = degreeHz(degree - 2);
+      tone('triangle', f2, f2, t + 0.09, 0.02, dur * 0.8, 0.045, musicBus, musicSend, 0.75, PRI.MUSIC);
     }
   }
 
@@ -1515,10 +1936,16 @@ export function createAudio(options) {
           return false;
         }
         ctx = made;
+        try {
+          ctx.onstatechange = onStateChange;
+        } catch {
+          /* no statechange support: interruption recovery is simply unavailable */
+        }
         built = buildGraph();
       }
+      userSuspended = false; // a gesture is the player asking for sound
       resumeContext();
-      const running = live() && ctx.state !== 'suspended';
+      const running = live() && isRunning();
       // Keep the gesture listeners until the context is genuinely running: a programmatic unlock()
       // before any gesture leaves the context suspended, and the next real tap must still reach us.
       if (running) detachGestures();
@@ -1534,13 +1961,16 @@ export function createAudio(options) {
     }
   }
 
+  /**
+   * Resume the context from any resumable state. WHY not just 'suspended': iOS Safari parks a
+   * context in 'interrupted' after a call or Siri, and future states may appear; everything except
+   * 'running' and 'closed' is worth a resume() attempt. (A rejected resume — no user gesture — is
+   * expected and swallowed inside `callSafe`.)
+   */
   function resumeContext() {
     if (!ctx || dead) return;
-    if (ctx.state === 'suspended' || ctx.state === undefined) {
-      const p = callSafe(ctx, 'resume');
-      // resume() rejects when the gesture was not user-initiated — expected, and not an error.
-      if (p && typeof p.catch === 'function') p.catch(noop);
-    }
+    const st = ctx.state;
+    if (st !== 'running' && st !== 'closed') callSafe(ctx, 'resume');
     // Scheduler clocks are stale after a suspension: rebase them onto the live clock so the
     // look-ahead loops do not try to fill a multi-minute gap all at once.
     const t = now();
@@ -1789,8 +2219,7 @@ export function createAudio(options) {
       }
       if (pluckNext < t) pluckNext = t + rng.range(0.2, 0.9);
       while (pluckNext < t + AUDIO.LOOKAHEAD) {
-        if (musicOn) schedulePluck(pluckNext);
-        pluckNext += rng.range(AUDIO.MUSIC.gapMin, AUDIO.MUSIC.gapMax) * gapScale;
+        pluckNext += nextPluck(pluckNext, musicOn);
       }
     } catch (err) {
       fail(err);
@@ -1868,7 +2297,10 @@ export function createAudio(options) {
   /** Suspend the context (also done automatically while the document is hidden). */
   function suspend() {
     try {
-      if (ctx && !dead) callSafe(ctx, 'suspend');
+      if (ctx && !dead) {
+        userSuspended = true;
+        callSafe(ctx, 'suspend');
+      }
     } catch (err) {
       fail(err);
     }
@@ -1878,6 +2310,7 @@ export function createAudio(options) {
   function resume() {
     try {
       hiddenSuspended = false;
+      userSuspended = false;
       resumeContext();
     } catch (err) {
       fail(err);
@@ -1894,7 +2327,14 @@ export function createAudio(options) {
   function teardown() {
     try {
       for (let i = 0; i < maxVoices; i++) releaseVoice(voices[i]);
-      while (retiring.length) retireOne(retiring.length - 1);
+      while (retireCount > 0) retireOne(retireCount - 1);
+      if (ctx) {
+        try {
+          ctx.onstatechange = null;
+        } catch {
+          /* read-only on an exotic implementation */
+        }
+      }
       keyedParams.length = 0;
       keyedHz.length = 0;
       for (let i = 0; i < persistent.length; i++) {
@@ -1925,6 +2365,21 @@ export function createAudio(options) {
     } catch {
       // teardown is best-effort by definition: there is nothing left to degrade to.
     }
+  }
+
+  /** Attach the one-shot unlock listeners (at boot, and again after an OS interruption). */
+  function attachGestures() {
+    if (gestureAttached || !doc || !autoUnlock || disposed) return;
+    addListener(doc, 'pointerdown', onGesture);
+    addListener(doc, 'keydown', onGesture);
+    addListener(doc, 'touchend', onGesture);
+    gestureAttached = true;
+  }
+
+  /** @returns {boolean} the context is producing sound (a context with no `state` is assumed to) */
+  function isRunning() {
+    const st = ctx ? ctx.state : 'closed';
+    return st === undefined || st === 'running';
   }
 
   function detachGestures() {
@@ -1965,7 +2420,7 @@ export function createAudio(options) {
     dispose,
     stats,
     get unlocked() {
-      return live() && ctx.state !== 'suspended';
+      return live() && isRunning();
     },
     get available() {
       return !dead && !disposed;
@@ -2023,15 +2478,21 @@ function removeListener(target, type, fn) {
 }
 
 /**
- * Call an optional context method (`resume`/`suspend`/`close`) without caring whether it exists or
- * returns a promise.
+ * Call an optional context method (`resume`/`suspend`/`close`) without caring whether it exists,
+ * throws, or returns a promise that rejects. WHY the rejection handler lives here: every one of
+ * these can reject in normal operation (resume without a gesture, suspend/close on a closed
+ * context), and an unhandled rejection is console output production must not print.
  * @param {any} obj
  * @param {string} method
- * @returns {any} whatever the method returned, or undefined
+ * @returns {any} whatever the method returned (with its rejection already handled), or undefined
  */
 function callSafe(obj, method) {
   try {
-    if (obj && typeof obj[method] === 'function') return obj[method]();
+    if (obj && typeof obj[method] === 'function') {
+      const p = obj[method]();
+      if (p && typeof p.catch === 'function') p.catch(noop);
+      return p;
+    }
   } catch {
     /* suspend() on an already-closed context throws — harmless */
   }

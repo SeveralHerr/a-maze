@@ -13,121 +13,18 @@
 import { createLoop } from '../core/loop.js';
 import { createRng } from '../core/rng.js';
 import { lerpAngle, wrapAngle, clamp01 } from '../core/math.js';
-import { DIR_DX, DIR_DY } from '../maze/constants.js';
 import { createRaycaster } from './raycaster.js';
 import { createPost } from './post.js';
 import { PARTICLE, PARTICLE_COLORS } from './particles.js';
+import { POSES, PREVIEW_TORCHES, buildPreviewMaze, previewItems } from './preview-scene.js';
 
-// ─── The test maze ─────────────────────────────────────────────────────────────────────────────
+// ─── The test scene ────────────────────────────────────────────────────────────────────────────
+// The maze, torches, items and poses live in `preview-scene.js` so Node tests can render exactly
+// the frames this page shows.
 
-/**
- * Three concentric corridors joined by three doorways, with the exit portal in the middle. Chosen
- * over a generated maze because every feature the renderer has to get right is visible from a
- * short walk: long straight runs (texture perspective), inside and outside corners (wall shading),
- * doorways (sprite occlusion), and a dead centre to look back out of.
- * Legend: `#` wall, `.` floor. 15×15 tiles, sealed border, 7×7 logical cells.
- */
-const MAP = [
-  '###############',
-  '#.............#',
-  '#.#####.#####.#',
-  '#.#.........#.#',
-  '#.#.#######.#.#',
-  '#.#.#.....#.#.#',
-  '#.#.#.###.#.#.#',
-  '#.#.#.#.#...#.#',
-  '#.#.#.#.#.#.#.#',
-  '#.#.#.....#.#.#',
-  '#.#.#######.#.#',
-  '#.#.........#.#',
-  '#.###########.#',
-  '#.............#',
-  '###############',
-];
-
-/**
- * Build the `Maze` the renderer reads.
- * @returns {import('../core/types.js').Maze}
- */
-function buildMaze() {
-  const height = MAP.length;
-  const width = MAP[0].length;
-  const tiles = new Uint8Array(width * height);
-  for (let y = 0; y < height; y++) {
-    const row = MAP[y];
-    if (row.length !== width) throw new Error(`preview: map row ${y} is ${row.length} wide`);
-    for (let x = 0; x < width; x++) tiles[y * width + x] = row.charCodeAt(x) === 35 ? 1 : 0;
-  }
-  return {
-    width,
-    height,
-    cols: (width - 1) / 2,
-    rows: (height - 1) / 2,
-    tiles,
-    start: { x: 1, y: 1 },
-    exit: { x: 7, y: 7 },
-    seed: 1,
-  };
-}
-
-const maze = buildMaze();
-
-/**
- * True when the tile is walkable.
- * @param {number} x tile x
- * @param {number} y tile y
- * @returns {boolean}
- */
-function isFloor(x, y) {
-  return (
-    x >= 0 && y >= 0 && x < maze.width && y < maze.height && maze.tiles[y * maze.width + x] === 0
-  );
-}
-
-/**
- * Wall-mounted torches. Each entry is validated below: the tile must be a wall and the tile it
- * faces must be floor, or the torch would be buried inside the masonry.
- * @type {import('../core/types.js').Torch[]}
- */
-const torches = /** @type {import('../core/types.js').Torch[]} */ ([
-  { x: 4, y: 0, face: 1 },
-  { x: 10, y: 0, face: 1 },
-  { x: 0, y: 7, face: 0 },
-  { x: 14, y: 7, face: 2 },
-  { x: 7, y: 14, face: 3 },
-  { x: 4, y: 4, face: 3 },
-  { x: 8, y: 4, face: 3 },
-  { x: 2, y: 5, face: 0 },
-  { x: 12, y: 5, face: 2 },
-  { x: 6, y: 6, face: 3 },
-  { x: 8, y: 6, face: 3 },
-  { x: 6, y: 8, face: 1 },
-  { x: 8, y: 8, face: 1 },
-  { x: 2, y: 9, face: 0 },
-  { x: 12, y: 11, face: 2 },
-  { x: 4, y: 12, face: 1 },
-  { x: 10, y: 12, face: 1 },
-]).filter(
-  // A sconce must be bolted to a wall tile and face an open one, or it would be buried inside the
-  // masonry. `Torch.face` uses the maze module's direction numbering, so its tables apply directly.
-  (t) => !isFloor(t.x, t.y) && isFloor(t.x + DIR_DX[t.face], t.y + DIR_DY[t.face]),
-);
-
-/**
- * Collectibles at tile centres.
- * @type {import('../core/types.js').Item[]}
- */
-const items = [
-  { id: 1, kind: /** @type {const} */ ('gem'), x: 5.5, y: 1.5, taken: false },
-  { id: 2, kind: /** @type {const} */ ('gem'), x: 13.5, y: 5.5, taken: false },
-  { id: 3, kind: /** @type {const} */ ('gem'), x: 5.5, y: 13.5, taken: false },
-  { id: 4, kind: /** @type {const} */ ('gem'), x: 9.5, y: 3.5, taken: false },
-  { id: 5, kind: /** @type {const} */ ('gem'), x: 5.5, y: 9.5, taken: false },
-  { id: 6, kind: /** @type {const} */ ('gem'), x: 11.5, y: 9.5, taken: false },
-  { id: 7, kind: /** @type {const} */ ('oil'), x: 1.5, y: 5.5, taken: false },
-  { id: 8, kind: /** @type {const} */ ('oil'), x: 13.5, y: 11.5, taken: false },
-  { id: 9, kind: /** @type {const} */ ('oil'), x: 7.5, y: 11.5, taken: false },
-];
+const maze = buildPreviewMaze();
+const torches = PREVIEW_TORCHES.slice();
+const items = previewItems();
 
 // ─── Camera ────────────────────────────────────────────────────────────────────────────────────
 
@@ -151,21 +48,6 @@ const ROUTE = [
   [9.5, 9.5],
   [7.5, 9.5],
   [7.5, 7.5],
-];
-
-/**
- * Fixed camera poses for deterministic screenshots (`?pose=N`): `[x, y, angleRadians]`. Chosen so
- * that between them they show every feature the renderer has: long-run perspective, wall torches
- * and their light pools, both item types, the portal, and an inside corner.
- * 0 long corridor · 1 lit hall · 2 portal chamber · 3 torch close-up · 4 oil flask · 5 corner turn.
- */
-const POSES = [
-  [1.5, 6.5, -Math.PI / 2],
-  [1.7, 1.5, 0],
-  [7.5, 10.2, -Math.PI / 2],
-  [3.4, 1.5, 0],
-  [13.5, 13.0, -Math.PI / 2],
-  [3.5, 13.5, Math.PI],
 ];
 
 /** Walking speed, tiles per second. */

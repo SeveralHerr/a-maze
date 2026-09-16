@@ -17,7 +17,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { PALETTE, PALETTE_RGB, PALETTE_SIZE, isPaletteColor } from './palette.js';
+import { PALETTE, PALETTE_RGB, PALETTE_SIZE, RAMPS, isPaletteColor } from './palette.js';
 import { SIZE, createTextures } from './textures.js';
 
 const AREA = SIZE * SIZE;
@@ -300,22 +300,72 @@ function mortarRows(indices) {
   return rows;
 }
 
-test('wall variants put their course joints on different rows, so no rail runs down a corridor', () => {
-  // With one shared course table every wall tile in the game had its joints on the same texel
-  // rows; down a 257-tile corridor those fused (each with a lit bevel on top) into bright unbroken
-  // rails. Each variant now has its own phase, and the raycaster slides plain/cracked tiles
-  // vertically — which is only legal because the texture wraps on a joint.
-  const phases = set.wall.map((t) => mortarRows(t.indices).join(','));
-  for (let i = 0; i < phases.length; i++) {
-    assert.ok(phases[i].length > 0, `wall[${i}] has no detectable course joints`);
-    for (let j = i + 1; j < phases.length; j++) {
-      assert.notEqual(phases[i], phases[j], `wall[${i}] and wall[${j}] share every course joint`);
+test('every wall variant puts its bed joints on the same rows, so courses run unbroken along a wall', () => {
+  // The variants used to carry their own course phases (and the raycaster slid tiles vertically) to
+  // stop lit bevels fusing into rails down a corridor; the joints then jumped height at every tile
+  // seam. Now the rails are broken per block (bevel strength, tone, grain) and the joints must agree.
+  // The shared table is four 16-texel courses starting on row 8, with the 3-texel mortar bed at the
+  // bottom of each: joints on rows 5-7, 21-23, 37-39 and 53-55.
+  const phase = (/** @type {number} */ y) => (y - 8) & 15;
+  const joint = (/** @type {number} */ y) => phase(y) >= 13;
+  for (const i of [0, 1, 2, 3]) {
+    const rows = mortarRows(set.wall[i].indices);
+    // Every row that reads as a joint must be on (or, for the dark block-bottom shading, directly
+    // above) the shared bed — no variant may put a joint anywhere else.
+    for (const r of rows) assert.ok(phase(r) >= 12, `wall[${i}] has a joint on row ${r}, off the shared courses`);
+    if (i < 2) {
+      // Moss hides some mortar on the mossy and vined variants. The plain wall must show every joint
+      // row; the cracked one carries a trace of moss (0.12) that may creep over part of one joint
+      // (its three rows), never more.
+      let missing = 0;
+      for (let y = 0; y < SIZE; y++) if (joint(y) && !rows.includes(y)) missing++;
+      assert.ok(missing <= (i === 0 ? 0 : 3), `wall[${i}] is missing ${missing} joint rows (${rows.join(',')})`);
+    } else {
+      assert.ok(rows.length >= 6, `wall[${i}] shows too few joints (${rows.join(',')})`);
     }
   }
+  const plain = mortarRows(set.wall[0].indices);
+  // The eye sits at exactly half the wall height, so texel row 32 is on the horizon at every distance.
+  // A joint there is a dead-straight line across every wall on screen (it shipped once), so the rows
+  // around the eye line must be block face.
+  for (let y = 29; y <= 35; y++) assert.ok(!plain.includes(y), `a course joint sits at eye level (row ${y})`);
+  // The bond still wraps: the course that starts on row 56 continues through row 0.
+  assert.ok(!plain.includes(0) && !plain.includes(SIZE - 1), 'the wrapping course must be continuous block face');
+});
+
+test('block bevels vary in strength, so the shared joints cannot fuse into bright rails', () => {
+  // With every joint at the same height, a uniform lit top edge would run the length of a corridor
+  // as one bright line per course. Measure the top-edge row of each course: its tone must vary.
+  const indices = set.wall[0].indices;
+  /** @type {Set<number>} */
+  const tones = new Set();
+  for (const edge of [8, 24, 40, 56]) {
+    for (let x = 0; x < SIZE; x += 3) tones.add(Math.round(lum(indices, x, edge)));
+  }
+  assert.ok(tones.size >= 4, `the lit top edges use only ${tones.size} tones — they would read as rails`);
+});
+
+test('block faces carry single-texel grain', () => {
+  // Close up a face covers hundreds of screen pixels, and the flat weathering patches alone read as
+  // smeared concrete. Count flecks: a texel one stone-ramp step off a flat run above and below it.
+  const stone = Array.from(RAMPS.stone);
   for (const i of [0, 1]) {
-    const rows = mortarRows(set.wall[i].indices);
-    assert.ok(rows.includes(SIZE - 1), `wall[${i}] must end on a mortar joint to wrap vertically`);
-    assert.ok(!rows.includes(0), `wall[${i}] must start on a block's lit top edge, not in mortar`);
+    const t = set.wall[i].indices;
+    const at = (/** @type {number} */ x, /** @type {number} */ y) => t[((y & 63) << 6) | (x & 63)];
+    let flecks = 0;
+    for (let y = 0; y < SIZE; y++) {
+      for (let x = 0; x < SIZE; x++) {
+        const c = at(x, y);
+        const step = stone.indexOf(c);
+        const up = at(x, y - 1);
+        const upStep = stone.indexOf(up);
+        if (step < 2 || upStep < 2 || up === c || at(x, y + 1) !== up) continue;
+        if (Math.abs(upStep - step) !== 1) continue;
+        if (at(x - 1, y) === up || at(x + 1, y) === up) flecks++;
+      }
+    }
+    // Eight blocks per texture; the painter scatters 8–14 flecks on each, most of them measurable.
+    assert.ok(flecks >= 32, `wall[${i}] has only ${flecks} grain flecks`);
   }
 });
 

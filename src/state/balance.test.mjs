@@ -22,6 +22,7 @@ import {
   defaultSettings,
   drainRate,
   estimatedPathTiles,
+  gapSafety,
   gemScore,
   levelBonus,
   levelParams,
@@ -114,7 +115,7 @@ test('levelParams: item counts are a density over the area, hundreds of them dee
   assert.ok(Math.abs(p1.oil - p1.cells / LEVEL.OIL_CELLS_START) <= 1, 'one flask per ~20 cells');
   assert.ok(Math.abs(p1.gems - p1.cells / LEVEL.GEM_CELLS_START) <= 1, 'one gem per ~50 cells');
   const pc = levelParams(CAP_LEVEL);
-  assert.ok(pc.oil > 500 && pc.oil < 600, `~546 flasks at the cap (${pc.oil})`);
+  assert.ok(pc.oil > 430 && pc.oil < 530, `~482 flasks at the cap (${pc.oil})`);
   assert.ok(pc.gems > 250 && pc.gems < 300, `~273 gems at the cap (${pc.gems})`);
   assert.ok(pc.oil + pc.gems < 1000, 'the sim and renderer are sized for ≤ ~900 items');
   // Density thins with depth: the deep levels are emptier per cell than level 1.
@@ -127,9 +128,9 @@ test('levelParams: oilTargetGap is a distance one flask can actually pay for', (
   for (let lv = 1; lv <= 30; lv++) {
     const p = levelParams(lv);
     const flask = oilFuel(p.fuelSeconds);
-    // A flask must buy the wander-inflated walk across the gap, with GAP_SAFETY to spare.
+    // A flask must buy the wander-inflated walk across the gap, with the level's headroom to spare.
     const cost = (p.oilTargetGap * FUEL.WANDER * FUEL.TRAVEL_OVERHEAD * p.drain) / PLAYER.WALK_SPEED;
-    assert.ok(cost <= flask * FUEL.GAP_SAFETY + 1e-9, `level ${lv}: gap ${p.oilTargetGap} costs ${cost.toFixed(1)} s of a ${flask.toFixed(1)} s flask`);
+    assert.ok(cost <= flask * gapSafety(lv) + 1e-9, `level ${lv}: gap ${p.oilTargetGap} costs ${cost.toFixed(1)} s of a ${flask.toFixed(1)} s flask`);
     // …and a full tank must cover at least one gap, or the first leg is impossible.
     assert.ok(travelTiles(p.fuelSeconds, p.drain) / FUEL.WANDER > p.oilTargetGap, `level ${lv}: the first leg fits in a tank`);
     assert.ok(Number.isInteger(p.oilTargetGap) && p.oilTargetGap > 0);
@@ -213,14 +214,45 @@ test('oilFuel: scales with the tank and stays inside its clamps', () => {
   assert.equal(oilFuel(1e9), FUEL.OIL_MAX);
   const mid = oilFuel(110);
   assert.ok(mid > FUEL.OIL_MIN && mid < FUEL.OIL_MAX, `a mid-size tank scales (${mid})`);
-  assert.ok(oilFuel(150) >= oilFuel(110), 'monotonic in the tank size');
+  for (let tank = 0; tank <= 400; tank += 0.5) {
+    assert.ok(oilFuel(tank + 0.5) >= oilFuel(tank), `monotonic in the tank size at ${tank}`);
+  }
+  assert.ok(Math.abs(oilFuel(FUEL.TANK_START) / FUEL.TANK_START - FUEL.OIL_FRACTION) < 1e-12);
+  assert.ok(Math.abs(oilFuel(FUEL.TANK_END) / FUEL.TANK_END - FUEL.OIL_FRACTION_END) < 1e-12);
+  assert.ok(FUEL.OIL_FRACTION_END >= FUEL.OIL_FRACTION, 'flasks grow (never shrink) with depth');
   // Every tank the level curve can produce must land strictly inside the clamps, or the flask
-  // stops tracking the tank and the 35 %-per-flask economy quietly stops holding.
+  // stops tracking the tank and the per-flask economy quietly stops holding.
   for (let lv = 1; lv <= 40; lv++) {
     const tank = levelParams(lv).fuelSeconds;
     const v = oilFuel(tank);
     assert.ok(v > FUEL.OIL_MIN && v < FUEL.OIL_MAX, `level ${lv}: flask ${v} s of a ${tank} s tank`);
-    assert.ok(Math.abs(v / tank - FUEL.OIL_FRACTION) < 1e-9, 'the clamps never bind on the curve');
+    const frac = v / tank;
+    assert.ok(
+      frac >= FUEL.OIL_FRACTION - 1e-9 && frac <= FUEL.OIL_FRACTION_END + 1e-9,
+      `level ${lv}: the clamps never bind on the curve (${frac})`,
+    );
+    assert.ok(v < tank, `level ${lv}: a flask is never a whole tank`);
+  }
+});
+
+test('sprint: a sprinted tile always costs more torch than a walked one', () => {
+  // Regression: FUEL.SPRINT_MULT 1.5 against PLAYER.SPRINT_MULT 1.6 made sprinting 37 % faster AND
+  // 6 % cheaper per tile, so the only trade-off in the controls ran backwards.
+  const premium = FUEL.SPRINT_MULT / PLAYER.SPRINT_MULT;
+  assert.ok(premium >= FUEL.SPRINT_TILE_PREMIUM_MIN, `fuel per sprinted tile is ${premium.toFixed(3)}× a walked one`);
+  assert.ok(FUEL.SPRINT_TILE_PREMIUM_MIN >= 1.15);
+  assert.ok(PLAYER.SPRINT_MULT > 1, 'sprint is still faster');
+});
+
+test('gapSafety: headroom ramps over the size curve and never reaches 1', () => {
+  assert.equal(gapSafety(1), FUEL.GAP_SAFETY);
+  assert.equal(gapSafety(CAP_LEVEL), FUEL.GAP_SAFETY_END);
+  assert.equal(gapSafety(1e6), FUEL.GAP_SAFETY_END);
+  assert.equal(gapSafety(NaN), FUEL.GAP_SAFETY);
+  for (let lv = 1; lv <= 40; lv++) {
+    const g = gapSafety(lv);
+    assert.ok(g > 0 && g < 1, `level ${lv}: ${g} keeps the chain provably closed`);
+    if (lv > 1) assert.ok(g >= gapSafety(lv - 1), `non-decreasing at level ${lv}`);
   }
 });
 
