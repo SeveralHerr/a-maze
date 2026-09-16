@@ -17,14 +17,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { PALETTE, PALETTE_RGB, PALETTE_SIZE, RAMPS, isPaletteColor } from './palette.js';
-import { SIZE, createTextures } from './textures.js';
+import { C, PALETTE, PALETTE_RGB, PALETTE_SIZE, RAMPS, isPaletteColor } from './palette.js';
+import { MAP_FLOOR_ROW, SIZE, createTextures } from './textures.js';
 
 const AREA = SIZE * SIZE;
 
 /** Surfaces that tile against their neighbours; sprites are excluded. */
 const SURFACE_KEYS = /** @type {const} */ (['wall', 'floor', 'ceiling']);
-const SPRITE_KEYS = /** @type {const} */ (['torch', 'portal', 'gem', 'oil', 'sparkle']);
+const SPRITE_KEYS = /** @type {const} */ (['torch', 'portal', 'gem', 'oil', 'sparkle', 'map']);
 const ALL_KEYS = [...SURFACE_KEYS, ...SPRITE_KEYS];
 
 const set = createTextures(1234);
@@ -282,6 +282,54 @@ test('emissive art is flagged, and only glow art carries a stipple mask', () => 
       if (st[p] === 1) assert.notEqual(t.indices[p], 0, `stipple on a transparent texel at ${p}`);
     }
   }
+});
+
+test('the map scroll is a dim, solid, still parchment roll with a red ribbon (§4.8)', () => {
+  assert.ok(Array.isArray(set.map), 'map must be an array like every other field');
+  assert.equal(set.map.length, 1, 'the scroll is a single still frame');
+  const tex = set.map[0];
+  assert.equal(tex.emissive, false, 'the scroll is not a light source');
+  assert.equal(tex.stipple, null, 'no stippled halo: it must be looked for');
+
+  const parchment = new Set(RAMPS.map);
+  const ribbon = new Set(RAMPS.seal);
+  let paper = 0;
+  let red = 0;
+  let lowest = -1;
+  let minX = SIZE;
+  let maxX = -1;
+  let minY = SIZE;
+  for (let y = 0; y < SIZE; y++) {
+    for (let x = 0; x < SIZE; x++) {
+      const idx = tex.indices[(y << 6) | x];
+      if (idx === 0) continue;
+      assert.ok(parchment.has(idx) || ribbon.has(idx), `texel ${x},${y} (index ${idx}) is not parchment or ribbon`);
+      if (parchment.has(idx)) paper++;
+      else red++;
+      if (y > lowest) lowest = y;
+      if (y < minY) minY = y;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+    }
+  }
+  assert.ok(paper > 400, `too little parchment (${paper} texels) to read as a roll`);
+  assert.ok(red > 30 && red < paper / 3, `the ribbon is an accent: ${red} red vs ${paper} parchment texels`);
+  assert.equal(lowest, MAP_FLOOR_ROW, 'the raycaster rests MAP_FLOOR_ROW on the floor, so the art must end there');
+  // A roll lying on its side: much wider than tall, and in the lower half of the sprite.
+  assert.ok(maxX - minX + 1 >= (lowest - minY + 1) * 2, 'the scroll must be a landscape roll');
+  assert.ok(minY > SIZE / 2, 'the scroll lies low in its sprite so it can rest on the floor');
+
+  // Dim: nothing brighter than the parchment's own highlight, and none of the glow colours.
+  const lumOf = (/** @type {number} */ i) =>
+    0.299 * PALETTE_RGB[i * 3] + 0.587 * PALETTE_RGB[i * 3 + 1] + 0.114 * PALETTE_RGB[i * 3 + 2];
+  for (const idx of new Set(tex.indices)) {
+    if (idx === 0) continue;
+    assert.ok(lumOf(idx) <= lumOf(C.goldLight), `index ${idx} is brighter than the dim-art ceiling`);
+    assert.ok(![C.white, C.fireCore, C.fireHot, C.gemSpec, C.goldPale].includes(idx), `glow colour ${idx} in the scroll`);
+  }
+
+  const again = createTextures(1234).map[0];
+  assert.deepEqual(again.indices, tex.indices, 'the scroll repaints identically for a seed');
 });
 
 /**

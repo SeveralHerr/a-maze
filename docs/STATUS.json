@@ -1,6 +1,6 @@
 {
- "updated": "2026-09-16T18:11:00.646Z",
- "iteration": 7,
+ "updated": "2026-09-16T19:00:00.000Z",
+ "iteration": 8,
  "passThreshold": 8.5,
  "wave": "gauntlet-stopped-r2",
  "waves": {
@@ -787,6 +787,19 @@
     "ui": 7.2
    },
    "verifyPass": true
+  },
+  {
+   "iteration": 8,
+   "updated": "2026-09-16T19:00:00.000Z",
+   "wave": "pickup-reach+map-scroll",
+   "summary": "PICKUP_RADIUS 0.45->0.75 (corner-cut miss), EXIT_RADIUS 0.55->0.8, swept pickup test in collectAround. Map locked per level until a hidden map scroll (ItemKind 'map', off-route dead end, detour 4..gap/4) is found: run.mapFound, HUD lock + 'Map Found' banner + notice, scroll sprite, audio cue, touch MAP dim. ARCHITECTURE §4.8.",
+   "gates": {
+    "npmTest": "37/37 files",
+    "validateMazes": "117306 mazes, 0 failures, 750/750 scrolls at off-route dead end",
+    "stress": "OK",
+    "browserSmoke": "headless Chrome seed 1337: locked on arrival, M shows notice without changing mapMode, walking into scroll unlocks, M cycles to full, 0 page errors"
+   },
+   "verifyPass": null
   }
  ],
  "openIssues": [
@@ -794,6 +807,8 @@
   "LEVEL.PATH_TILES_PER_SIDE = 13 overestimates the shipped route at the deepest braid (~7.1 measured). It feeds only the par FLOOR, which populate.js overrides with the real path, so nothing is wrong today - but the constant reads stale.",
   "gatherLights still picks the nearest 8 torches. At the new density (~1300 on level 15) more than 8 sconces can be within lighting range in a braided junction. MAX_LIGHTS is the knob and the ring search makes 12 or 16 nearly free.",
   "No typecheck runs anywhere in the repo (no tsconfig, no tsc dependency), so // @ts-check is enforced only by an editor.",
-  "The phone depth panel is four rows tall and its lower edge sits close to the top of the 3-D band in portrait. Cosmetic, within tolerance, but it is the tightest spot in the mobile layout."
+  "The phone depth panel is four rows tall and its lower edge sits close to the top of the 3-D band in portrait. Cosmetic, within tolerance, but it is the tightest spot in the mobile layout.",
+  "verify.mjs (full ~8 min autopilot run) was not re-run after the map-scroll wave; only a targeted headless smoke check was. Its autopilot ignores the scroll, so the map stays locked in its screenshots.",
+  "Oil flasks are still left on the floor when <55% would land; with the larger pickup radius this is now the most likely remaining 'walked past an item' report. Consider a HUD cue ('tank full') when standing on a skipped flask."
  ]
 }

@@ -39,8 +39,9 @@
  * A level now carries up to ~820 items and a 257×257 tile grid, so nothing here may be O(items) or
  * O(tiles) per step:
  * - **Pickups** query a uniform bucket grid (`buildItemGrid`, built once per level in the
- *   `levelReady` reducer, flat `Int32Array`s reused across levels). The pickup disc is 0.9 tiles
- *   across and a bucket is 4, so a step touches at most 2×2 buckets — a handful of items.
+ *   `levelReady` reducer, flat `Int32Array`s reused across levels). The pickup capsule (the step's
+ *   swept segment, ≤ 1.28 tiles, grown by the 0.75 radius) is at most 2.78 tiles across and a
+ *   bucket is 4, so a step touches at most 2×2 buckets — a handful of items.
  * - **Fog of war** probes at most `WORLD.REVEAL_BUDGET` tiles inside a fixed 7×7 window.
  * - **`explored`** is allocated once per level (and reused from a pool across levels).
  * Everything else is O(1). `perf.test.mjs` pins this on real generated levels: a step on a 128×128
@@ -158,6 +159,14 @@ const _candW = new Int32Array(4);
  * degenerate level (a zero-second flask) from making the test vacuous.
  */
 const OIL_MIN_GAIN = 1;
+
+/**
+ * Longest per-axis displacement, in tiles, that `collectAround` will sweep. The real maximum is
+ * `WALK_SPEED × SPRINT_MULT × SIM.MAX_DT` = 1.28; anything beyond this is a teleport (a test or tool
+ * moving the player by hand) and is treated as a point test at the destination, which also keeps
+ * the bucket box within 2×2 whatever `px/py` hold.
+ */
+const MAX_SWEEP = 1.5;
 
 /** Bit returned by `moveCircle` when the x axis was blocked. */
 const BLOCKED_X = 1;
@@ -757,9 +766,16 @@ export function revealAround(state) {
 // ─── Pickups ─────────────────────────────────────────────────────────────────────────────────
 
 /**
- * Collect every item whose centre is within `WORLD.PICKUP_RADIUS` of the player.
+ * Collect every item whose centre is within `WORLD.PICKUP_RADIUS` of the segment the player's
+ * centre travelled this step (`player.px,py` → `player.x,y`; ARCHITECTURE.md §4.8).
  *
- * Only the buckets overlapping the pickup disc are visited (2×2 at most), so the cost does not
+ * Testing the swept segment rather than only the end point means a fast step (sprint at the
+ * `SIM.MAX_DT` clamp covers 1.28 tiles) cannot hop over an item. The segment is a chord between two
+ * positions the collision solver produced, so it cannot reach through a wall either: an item behind
+ * a one-tile wall is ≥ 1.72 from both end points, and a chord no longer than 1.28 between them stays
+ * ≥ √(1.72² − 0.64²) ≈ 1.60 from it — more than twice the radius.
+ *
+ * Only the buckets overlapping the capsule's bounding box are visited (2×2 at most), so the cost does not
  * depend on how many items the level holds — the difference between a 6×6 level with 4 items and a
  * 128×128 level with 820. The grid is built by `buildItemGrid`; if it describes a different level
  * (a consumer swapped `levelData` without going through the reducer) it is rebuilt once here rather
@@ -787,15 +803,29 @@ function collectAround(state) {
   // the grid exists to avoid. It cannot happen (the reducer sanitises input and `moveCircle` only
   // returns finite values), which is exactly why the guard is one comparison rather than a fix-up.
   if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) return;
+  const x1 = p.x;
+  const y1 = p.y;
+  // Segment start = where this step began (`stepPlayingBody` snapshots px/py before moving). A
+  // non-finite or implausibly distant snapshot degrades to the plain disc test at the end point, so
+  // the bounding box below can never grow into a scan of the whole grid.
+  let x0 = p.px;
+  let y0 = p.py;
+  if (!(Math.abs(x1 - x0) <= MAX_SWEEP) || !(Math.abs(y1 - y0) <= MAX_SWEEP)) {
+    x0 = x1;
+    y0 = y1;
+  }
+  const sx = x1 - x0;
+  const sy = y1 - y0;
+  const len2 = sx * sx + sy * sy;
   const r = WORLD.PICKUP_RADIUS;
   const pr2 = r * r;
   const cell = WORLD.ITEM_GRID_TILES;
 
-  // The disc's bounding box in bucket coordinates. r ≪ cell, so this is at most 2×2 buckets.
-  let bx0 = Math.floor((p.x - r) / cell);
-  let bx1 = Math.floor((p.x + r) / cell);
-  let by0 = Math.floor((p.y - r) / cell);
-  let by1 = Math.floor((p.y + r) / cell);
+  // The capsule's bounding box in bucket coordinates. Segment + 2r < cell, so at most 2×2 buckets.
+  let bx0 = Math.floor(((x0 < x1 ? x0 : x1) - r) / cell);
+  let bx1 = Math.floor(((x0 < x1 ? x1 : x0) + r) / cell);
+  let by0 = Math.floor(((y0 < y1 ? y0 : y1) - r) / cell);
+  let by1 = Math.floor(((y0 < y1 ? y1 : y0) + r) / cell);
   if (!(bx0 >= 0)) bx0 = 0;
   if (!(by0 >= 0)) by0 = 0;
   if (!(bx1 < gw)) bx1 = gw - 1;
@@ -813,7 +843,17 @@ function collectAround(state) {
         // non-finite coordinates is filed into bucket 0 by `bucketOf` — tiles 0…3 × 0…3, which is
         // where the player spawns — and `NaN > pr2` is false, so the old form auto-collected it on
         // the first frame of the level. Same comparison count, opposite answer for garbage.
-        if (!(dist2(p.x, p.y, it.x, it.y) <= pr2)) continue;
+        // Closest point on the segment: t = clamp(((item − start) · seg) / |seg|², 0, 1). A NaN t
+        // (garbage item, or a zero-length step) falls to 0, and the distance below is then NaN for
+        // a garbage item — still rejected — or the plain end-point distance for a still player.
+        const ix = it.x;
+        const iy = it.y;
+        let t = len2 > 0 ? ((ix - x0) * sx + (iy - y0) * sy) / len2 : 0;
+        if (!(t > 0)) t = 0;
+        else if (t > 1) t = 1;
+        const cx = ix - (x0 + sx * t);
+        const cy = iy - (y0 + sy * t);
+        if (!(cx * cx + cy * cy <= pr2)) continue;
         takeItem(state, it);
       }
     }
@@ -821,7 +861,7 @@ function collectAround(state) {
 }
 
 /**
- * Apply one item pickup: score a gem, or refill the torch from a flask.
+ * Apply one item pickup: score a gem, refill the torch from a flask, or unlock the map.
  * @param {SimState} state
  * @param {Item} it the item under the player (not yet taken)
  * @returns {void}
@@ -829,6 +869,14 @@ function collectAround(state) {
 function takeItem(state, it) {
   const run = state.run;
   const sim = state.sim;
+  if (it.kind === 'map') {
+    // The level's hidden map scroll (ARCHITECTURE.md §4.8): always taken, unlocks the map, and is
+    // worth nothing — no score, no combo, never part of `gemsTotal`.
+    it.taken = true;
+    run.mapFound = true;
+    state.events.push({ type: 'pickup', kind: 'map', x: it.x, y: it.y, value: 0 });
+    return;
+  }
   if (it.kind === 'gem') {
     it.taken = true;
     run.gems++;

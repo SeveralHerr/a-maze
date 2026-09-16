@@ -530,6 +530,9 @@ export function cornerWindow(px, py, span, mw, mh, out) {
  *   the HUD keeps on screen over it (right and bottom edges, UI pixels)
  * @property {() => number} exploredCount  explored tiles, maintained incrementally
  * @property {() => MapStats} stats  live, reused object — never retain a copy
+ * @property {() => void} invalidate  make the next `update` one exact full rescan (O(tiles), once)
+ *   instead of the incremental box — the HUD calls it when a hidden map becomes visible again, so
+ *   whatever was explored while it was hidden appears on that very frame (§4.8)
  * @property {() => void} reset
  * @property {() => void} dispose
  */
@@ -725,11 +728,16 @@ export function createMapView(options) {
     for (let i = 0; i < items.length; i++) {
       const it = items[i];
       if (it === null || it === undefined || it.taken === true) continue;
+      // Only gems and flasks are charted. The map scroll (§4.8) is deliberately absent — a map that
+      // marked where the map is would defeat the hunt, and it is taken before the map can be read
+      // anyway — and any kind this module does not know is skipped rather than drawn as a gem.
+      const kind = it.kind === 'oil' ? ITEM_OIL : it.kind === 'gem' ? ITEM_GEM : ITEM_NONE;
+      if (kind === ITEM_NONE) continue;
       const tx = Math.floor(it.x);
       const ty = Math.floor(it.y);
       if (tx < 0 || ty < 0 || tx >= w || ty >= h) continue;
       const idx = ty * w + tx;
-      itemLayer[idx] = it.kind === 'oil' ? ITEM_OIL : ITEM_GEM;
+      itemLayer[idx] = kind;
       liveIdx[liveCount] = idx;
       liveItems[liveCount] = it;
       liveCount++;
@@ -1635,12 +1643,23 @@ export function createMapView(options) {
     liveIdx = new Int32Array(0);
   }
 
+  /**
+   * Force the next update onto the exact path. The raster itself stays valid (it only ever gains
+   * pixels for explored tiles), so this is a catch-up, not a rebuild from zero: `paintTiles` paints
+   * just the tiles revealed while nobody was looking.
+   * @returns {void}
+   */
+  function invalidate() {
+    needsFullScan = true;
+  }
+
   return {
     update,
     drawCorner,
     drawFull,
     exploredCount: () => explored,
     stats: () => stats,
+    invalidate,
     reset,
     dispose,
   };

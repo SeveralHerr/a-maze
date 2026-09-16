@@ -529,6 +529,99 @@ test('bump: sliding along a wall is silent', () => {
   assert.ok(s.player.y < 10.5 - 2, 'and the player still made progress along it');
 });
 
+// ─── Pickup reach (ARCHITECTURE.md §4.8) ─────────────────────────────────────────────────────
+
+/**
+ * @param {number} id
+ * @param {import('../core/types.js').ItemKind} kind
+ * @param {number} x
+ * @param {number} y
+ * @returns {import('../core/types.js').Item}
+ */
+function itemAt(id, kind, x, y) {
+  return { id, kind, x, y, taken: false };
+}
+
+test('pickups: cutting an L-corner collects the item on the corner tile', () => {
+  // Regression for "you can walk right by items". The corridor turns from east to south at tile
+  // (3,1); the gem sits on that tile's centre. The player cuts the corner on a diagonal that passes
+  // 0.25 from the inner wall vertex (3,2) — just clear of the 0.22 body — so its closest approach to
+  // the gem is √0.5 − 0.25 ≈ 0.457: outside the old 0.45 radius, inside the new one.
+  const maze = mazeFrom([
+    '######',
+    '#S..##',
+    '###.##',
+    '###.##',
+    '###E##',
+    '######',
+  ]);
+  const gem = itemAt(1, 'gem', 3.5, 1.5);
+  const s = playing(maze, [gem], 100);
+  const off = 0.25 / Math.SQRT2;
+  const p = s.player;
+  p.x = 3 + off - 0.6;
+  p.y = 2 - off - 0.6;
+  p.px = p.x;
+  p.py = p.y;
+  p.angle = Math.PI / 4;
+  p.vx = PLAYER.WALK_SPEED * Math.SQRT1_2;
+  p.vy = PLAYER.WALK_SPEED * Math.SQRT1_2;
+  let closest = Infinity;
+  let collectedAt = -1;
+  for (let i = 0; i < 60 && p.x < 3 + off + 0.6; i++) {
+    step(s, 1 / 60, input({ moveY: 1 }));
+    closest = Math.min(closest, Math.hypot(p.x - gem.x, p.y - gem.y));
+    if (gem.taken && collectedAt < 0) collectedAt = i;
+  }
+  assert.ok(closest > 0.45, `the route is the regression case (closest approach ${closest.toFixed(3)})`);
+  assert.ok(closest <= WORLD.PICKUP_RADIUS, 'and within the new reach');
+  assert.equal(gem.taken, true, 'the corner gem was collected');
+  assert.equal(s.run.gems, 1);
+});
+
+test('pickups: an item on the far side of a one-tile wall is never collected', () => {
+  const maze = mazeFrom([
+    '#######',
+    '#S.#.E#',
+    '#######',
+  ]);
+  const gem = itemAt(1, 'gem', 4.5, 1.5);
+  const s = playing(maze, [gem], 100);
+  // Press into the wall from the adjacent tile, walking and sprinting, at normal and clamped dt.
+  for (const dt of [1 / 60, 0.25]) {
+    for (let i = 0; i < 120; i++) step(s, dt, input({ moveY: 1, sprint: i % 2 === 0 }));
+    assert.ok(s.player.x <= 3 - PLAYER.RADIUS + 1e-9, 'pressed flat against the wall');
+    assert.equal(gem.taken, false, `nothing grabbed through the wall at dt=${dt}`);
+    s.run.fuel = 100;
+  }
+  assert.equal(s.run.gems, 0);
+  assert.equal(s.phase, 'playing');
+});
+
+test('pickups: a sprint step at the dt clamp sweeps its whole path, not just its end point', () => {
+  // Open room, player sprinting east at full speed with dt = SIM.MAX_DT (1.28 tiles per step). The
+  // gem sits 0.7 off the line of travel, half way along the step: both end points are
+  // √(0.64² + 0.7²) ≈ 0.95 away, so only the swept test can see it.
+  const maze = openMaze(12);
+  const gem = itemAt(1, 'gem', 5.5, 5.5);
+  const s = playing(maze, [gem], 100);
+  const speed = PLAYER.WALK_SPEED * PLAYER.SPRINT_MULT;
+  const dt = 0.25;
+  const p = s.player;
+  p.x = gem.x - (speed * dt) / 2;
+  p.y = gem.y + 0.7;
+  p.angle = 0;
+  p.vx = speed;
+  p.vy = 0;
+  const x0 = p.x;
+  step(s, dt, input({ moveY: 1, sprint: true }));
+  assert.ok(Math.abs(p.x - x0 - speed * dt) < 1e-9, 'the step covered the full 1.28 tiles');
+  assert.ok(Math.hypot(x0 - gem.x, 0.7) > WORLD.PICKUP_RADIUS, 'the start is out of reach');
+  assert.ok(Math.hypot(p.x - gem.x, p.y - gem.y) > WORLD.PICKUP_RADIUS, 'so is the end');
+  assert.equal(gem.taken, true, 'the gem passed under the swept path was collected');
+  assert.ok(s.events.some((e) => e.type === 'pickup'));
+});
+
 // ─── Derived ─────────────────────────────────────────────────────────────────────────────────
 
 test('updateDerived: exitDist, nearExit ramp and lowFuel', () => {

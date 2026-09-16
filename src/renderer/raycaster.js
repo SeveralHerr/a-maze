@@ -51,7 +51,7 @@
 import { hash2, createRng } from '../core/rng.js';
 import { DIR_DX, DIR_DY, TILE } from '../maze/constants.js';
 import { C, LITTLE_ENDIAN, PALETTE_RGB, PALETTE_SIZE, pack } from './palette.js';
-import { createTextures, SIZE as TEX } from './textures.js';
+import { createTextures, MAP_FLOOR_ROW, SIZE as TEX } from './textures.js';
 import { createParticles, PARTICLE, PARTICLE_COLORS } from './particles.js';
 import { createSpriteIndex } from './sprite-index.js';
 
@@ -406,6 +406,26 @@ const GEM_SPARKLE_RATE = 1.1;
 
 /** Gems only twinkle within this distance, in tiles — beyond it the motes are sub-pixel. */
 const GEM_SPARKLE_RANGE2 = 64;
+
+/**
+ * World height, in tiles, of the map scroll billboard (§4.8). The roll spans ~47 of its 64 texels,
+ * so it lies ~0.37 tiles long on the floor: larger than a gem so its shape survives the distance,
+ * but it gets no glow, no sparkle and no light boost, so it still has to be looked for.
+ */
+const MAP_SPRITE_SCALE = 0.5;
+
+/**
+ * `vOff` that rests the scroll's lowest painted row (`MAP_FLOOR_ROW`) on the floor. The sprite's
+ * centre (texel row 32) sits at world height `0.5 - vOff`, and the art's bottom edge is
+ * `(MAP_FLOOR_ROW + 1 - 32) / 64` of the sprite below it.
+ */
+const MAP_SPRITE_VOFF = 0.5 - (MAP_SPRITE_SCALE * (MAP_FLOOR_ROW + 1 - TEX / 2)) / TEX;
+
+/**
+ * Light multiplier for the scroll. Gems get 1.25 and flasks 1.1 so they pop out of the gloom; the
+ * parchment gets exactly the light that falls on it — being hard to spot is the design.
+ */
+const MAP_LIGHT_GAIN = 1;
 
 /**
  * Walkable tile id, from the maze module's own vocabulary (§2 allows `src/renderer` to import
@@ -1956,7 +1976,12 @@ export function createRaycaster(canvas, options) {
           if (d2 > far2) continue;
           const it = items[entries[k]];
           if (it.taken) continue;
-          const isGem = it.kind === 'gem';
+          const kind = it.kind;
+          const isGem = kind === 'gem';
+          const isMap = kind === 'map';
+          // An unknown kind is skipped, never drawn as a gem or a flask: a new item type must get
+          // its own art here rather than silently borrowing another pickup's look.
+          if (!isGem && !isMap && kind !== 'oil') continue;
           const d = Math.sqrt(d2);
           // Gems twinkle: a slow mote drifting off the crystal. In a corridor lit only by a failing
           // torch, that movement is what makes a pickup readable from a distance. Emitted before
@@ -1980,6 +2005,28 @@ export function createRaycaster(canvas, options) {
             }
           }
           if (!inFrustum(dx, dy)) continue;
+          if (isMap) {
+            // The hidden map scroll (§4.8): one still frame lying on the floor. No bob, no spin, no
+            // sparkle, no light gain — it is lit only by what falls on it, and takes the sconce's
+            // amber like the cobbles around it. A texture set without scroll art draws nothing.
+            const mapFrames = textures.map;
+            if (!mapFrames || mapFrames.length === 0) continue;
+            // `illumFlat` sets `illumWarmFx` as a side effect, so it must run first.
+            const mapLvl = levelFx(illumFlat(it.x, it.y, allLights, lightN) * MAP_LIGHT_GAIN, d, 1);
+            addSprite(
+              it.x,
+              it.y,
+              mapFrames[0],
+              MAP_SPRITE_SCALE,
+              MAP_SPRITE_VOFF,
+              mapLvl,
+              illumWarmFx,
+              d2,
+              -1,
+              0,
+            );
+            continue;
+          }
           const frames = isGem ? textures.gem : textures.oil;
           const phase = (it.id | 0) * 0.7;
           // Gentle bob and a slow spin — enough life that a pickup catches the eye down a corridor.

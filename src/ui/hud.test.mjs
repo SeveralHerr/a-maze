@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 
 import {
   ICON_SIZE,
+  MAP_FOUND_TEXT,
   compassGems,
   compileArt,
   createHud,
@@ -18,6 +19,9 @@ import {
   mapPointer,
   withAlpha,
 } from './hud.js';
+import { clearFontCache } from './font.js';
+import { countExplored } from './map.js';
+import { collectLayout, installFakeDocument } from './layout-audit.test-util.mjs';
 
 /**
  * A minimal stand-in for a canvas element: enough for the surface to size itself, with no 2-D
@@ -462,4 +466,226 @@ test('the HUD survives a level with no data and a low tank', () => {
   state.levelData = null;
   state.explored = null;
   assert.doesNotThrow(() => hud.render(state, null, 0));
+});
+
+// ─── The hidden map scroll (ARCHITECTURE.md §4.8) ─────────────────────────────────────────────
+
+/**
+ * Text labels drawn by one frame.
+ * @param {any} hud
+ * @param {any} state
+ * @returns {string[]}
+ */
+function frameTexts(hud, state) {
+  return collectLayout(() => hud.render(state, null, 0))
+    .filter((b) => b.kind === 'text')
+    .map((b) => b.label);
+}
+
+/**
+ * Advance the sim clock one frame and return the frame's text labels.
+ * @param {any} hud
+ * @param {any} state
+ * @param {number} [dt]
+ * @returns {string[]}
+ */
+function step(hud, state, dt = 1 / 60) {
+  state.time += dt;
+  return frameTexts(hud, state);
+}
+
+/**
+ * Run `body` with a fake `document`, so the map raster (and the glyph atlases) really exist, then
+ * restore Node's globals and drop the atlases built against the fake canvases, so the tests above
+ * that count blits keep running against a DOM-less font.
+ * @param {() => void} body
+ */
+function withRaster(body) {
+  const restore = installFakeDocument();
+  try {
+    body();
+  } finally {
+    restore();
+    clearFontCache();
+  }
+}
+
+test('mapLocked reads run.mapFound, and a missing field is found', () => {
+  const hud = createHud(null);
+  assert.equal(hud.mapLocked(playingState({ mapFound: false })), true);
+  assert.equal(hud.mapLocked(playingState({ mapFound: true })), false);
+  assert.equal(hud.mapLocked(playingState()), false, 'an older state without the field never locks');
+  assert.equal(hud.mapLocked(/** @type {any} */ (null)), false);
+  assert.equal(hud.mapLocked(/** @type {any} */ ({})), false);
+  assert.equal(hud.mapLocked(/** @type {any} */ ({ run: null })), false);
+  // The lock never rewrites the player's preference.
+  assert.equal(hud.mapMode({ mapMode: 'full' }), 'full');
+});
+
+test('a locked map draws nothing in corner or full and lays out exactly as for off', () => {
+  withRaster(() => {
+    for (const [w, h, dpr] of [[1280, 720, 1], [390, 844, 3]]) {
+      for (const phase of ['playing', 'paused']) {
+        /** @param {'off'|'corner'|'full'} mode @param {boolean} locked */
+        const shoot = (mode, locked) => {
+          const canvas = drawableCanvas(w, h);
+          const hud = createHud(canvas, { map: mode });
+          hud.resize(w, h, dpr);
+          const state = playingState({ mapFound: !locked });
+          state.phase = phase;
+          hud.render(state, null, 0);
+          const { fills, draws, rects } = canvas.__ctx.calls;
+          return { fills, draws, rects: JSON.stringify(rects), explored: hud.mapStats().explored };
+        };
+        const off = shoot('off', false);
+        for (const mode of /** @type {const} */ (['corner', 'full'])) {
+          const open = shoot(mode, false);
+          assert.ok(open.draws > off.draws, `${w}x${h} ${phase} ${mode}: sanity — the unlocked map blits`);
+          const locked = shoot(mode, true);
+          assert.equal(locked.draws, off.draws, `${w}x${h} ${phase} ${mode}: no map blit while locked`);
+          assert.equal(locked.fills, off.fills, `${w}x${h} ${phase} ${mode}: same fills as off`);
+          assert.equal(locked.rects, off.rects, `${w}x${h} ${phase} ${mode}: identical layout to off`);
+          assert.equal(locked.explored, 0, 'no raster work while locked');
+        }
+      }
+    }
+  });
+});
+
+test('unlocking shows everything explored while locked on that frame, with one catch-up scan', () => {
+  withRaster(() => {
+    const hud = createHud(drawableCanvas(1280, 720), { map: 'corner' });
+    hud.resize(1280, 720, 1);
+    // A 64-cell maze: 129×129 = 16 641 tiles, four times the rolling sweep's per-frame budget, so
+    // only an exact rescan can put a far-away reveal on the raster within one frame.
+    const cols = 64;
+    const width = cols * 2 + 1;
+    const state = playingState({ mapFound: true });
+    const tiles = new Uint8Array(width * width).fill(1);
+    for (let cy = 0; cy < cols; cy++) {
+      for (let cx = 0; cx < cols; cx++) tiles[(cy * 2 + 1) * width + cx * 2 + 1] = 0;
+    }
+    Object.assign(state.levelData.maze, {
+      width,
+      height: width,
+      cols,
+      rows: cols,
+      tiles,
+      exit: { x: width - 2, y: width - 2 },
+    });
+    state.explored = new Uint8Array(width * width);
+    for (let i = 0; i < 200; i++) state.explored[i] = 1;
+
+    step(hud, state);
+    const stats = hud.mapStats();
+    assert.equal(stats.explored, countExplored(state.explored));
+    const rebuilds = stats.rebuilds;
+
+    // Lock for a handful of frames — well inside the view's stale-gap timer — and explore the far
+    // corner meanwhile.
+    state.run.mapFound = false;
+    for (let i = 0; i < 5; i++) step(hud, state);
+    for (let y = width - 20; y < width; y++) {
+      for (let x = width - 20; x < width; x++) state.explored[y * width + x] = 1;
+    }
+    step(hud, state);
+    assert.equal(stats.rebuilds, rebuilds, 'nothing is scanned while locked');
+
+    state.run.mapFound = true;
+    step(hud, state);
+    assert.equal(stats.explored, countExplored(state.explored), 'the unlock frame is complete');
+    assert.equal(stats.rebuilds, rebuilds + 1, 'by exactly one catch-up scan');
+    for (let i = 0; i < 10; i++) step(hud, state);
+    assert.equal(stats.rebuilds, rebuilds + 1, 'and none after it');
+    assert.ok(stats.scanned < width * width, 'back on the incremental path');
+  });
+});
+
+test('"Map Found" fires once, on the false → true edge of run.mapFound only', () => {
+  const hud = createHud(drawableCanvas(1280, 720), { map: 'corner' });
+  hud.resize(1280, 720, 1);
+  const count = (/** @type {string[]} */ t) => t.filter((s) => s === MAP_FOUND_TEXT).length;
+
+  // A level that starts locked: no banner.
+  const state = playingState({ mapFound: false });
+  assert.equal(count(step(hud, state)), 0);
+  for (let i = 0; i < 30; i++) assert.equal(count(step(hud, state)), 0, 'locked is not an event');
+
+  // The pickup.
+  state.run.mapFound = true;
+  assert.equal(count(step(hud, state)), 1, 'the banner is raised on the edge');
+  let shown = 1;
+  for (let i = 0; i < 60 * 4; i++) shown += count(step(hud, state)) > 0 ? 1 : 0;
+  assert.ok(shown > 60 && shown < 60 * 3, `it stays up for a couple of seconds (${shown} frames)`);
+  for (let i = 0; i < 60; i++) assert.equal(count(step(hud, state)), 0, 'and goes away; true stays quiet');
+
+  // A new level: installed and locked in one dispatch (a new levelData). No banner.
+  state.levelData = { ...state.levelData };
+  state.level++;
+  state.run.mapFound = false;
+  assert.equal(count(step(hud, state)), 0);
+
+  // A level with no map item: found from its first frame. No banner, even though the previous
+  // frame was locked.
+  state.levelData = { ...state.levelData };
+  state.level++;
+  state.run.mapFound = true;
+  for (let i = 0; i < 10; i++) assert.equal(count(step(hud, state)), 0, 'a level without a scroll never fires');
+
+  // A new run: reset(), and its first level is unlocked on the same level number and data.
+  state.run.mapFound = false;
+  step(hud, state);
+  hud.reset();
+  state.run.mapFound = true;
+  assert.equal(count(step(hud, state)), 0, 'reset() resyncs without firing');
+
+  // Outside `playing` the delta is adopted silently.
+  state.run.mapFound = false;
+  step(hud, state);
+  state.phase = 'paused';
+  state.run.mapFound = true;
+  assert.equal(count(step(hud, state)), 0);
+  state.phase = 'playing';
+  assert.equal(count(step(hud, state)), 0);
+
+  // And the real edge still fires after all of that.
+  state.run.mapFound = false;
+  step(hud, state);
+  state.run.mapFound = true;
+  assert.equal(count(step(hud, state)), 1);
+});
+
+test('notice(text) shows a centred one-line banner for about 1.6 s, reduced motion included', () => {
+  const text = 'NO MAP - FIND THE SCROLL';
+  for (const reducedMotion of [false, true]) {
+    for (const [w, h, dpr] of [[1280, 720, 1], [390, 844, 3]]) {
+      const hud = createHud(drawableCanvas(w, h), { map: 'off' });
+      hud.resize(w, h, dpr);
+      const state = playingState({ mapFound: false });
+      state.settings.reducedMotion = reducedMotion;
+      step(hud, state);
+      hud.notice(text);
+      const m = hud.surface.metrics;
+      let frames = 0;
+      /** @type {number[]} */
+      const ys = [];
+      for (let i = 0; i < 60 * 3; i++) {
+        state.time += 1 / 60;
+        const boxes = collectLayout(() => hud.render(state, null, 0)).filter(
+          (b) => b.kind === 'text' && b.label === text,
+        );
+        if (boxes.length === 0) continue;
+        frames++;
+        const b = boxes[0];
+        ys.push(b.y);
+        assert.ok(Math.abs(b.x + b.w / 2 - (m.viewX + m.viewW / 2)) <= 2, `${w}x${h}: centred on the view`);
+        assert.ok(b.x >= 0 && b.x + b.w <= m.w, `${w}x${h}: on screen`);
+      }
+      assert.ok(frames >= 85 && frames <= 100, `${w}x${h} reduced=${reducedMotion}: ${frames} frames ≈ 1.6 s`);
+      if (reducedMotion) assert.equal(new Set(ys).size, 1, 'reduced motion: the banner does not move');
+    }
+  }
+  const hud = createHud(null);
+  assert.doesNotThrow(() => hud.notice(''));
+  assert.doesNotThrow(() => hud.notice(/** @type {any} */ (null)));
 });

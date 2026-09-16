@@ -147,6 +147,8 @@ export function createInitialState(settings, best) {
       // live and the end screens show both.
       refuels: 0,
       distance: 0,
+      // No level is loaded yet, so there is no scroll to find; `levelReady` sets it (§4.8).
+      mapFound: true,
     },
     best: sanitizedBest,
     settings: sanitizeSettings(settings),
@@ -348,6 +350,10 @@ function applyNewGame(state, rawSeed) {
   run.bestCombo = 0;
   run.refuels = 0;
   run.distance = 0;
+  // Locked until `levelReady` decides (§4.8). `false`, not `true`: the HUD shows "MAP FOUND" on a
+  // false→true delta, so resetting to true here would flash that banner at the start of every run
+  // that follows one where the scroll was never found.
+  run.mapFound = false;
 
   resetSimScratch(state.sim);
   state.sim.rng = null;
@@ -401,7 +407,7 @@ function isLevelData(data) {
     const it = d.items[i];
     if (it === null || typeof it !== 'object') return false;
     if (!Number.isFinite(it.x) || !Number.isFinite(it.y)) return false;
-    if (it.kind !== 'gem' && it.kind !== 'oil') return false;
+    if (it.kind !== 'gem' && it.kind !== 'oil' && it.kind !== 'map') return false;
   }
   for (let i = 0; i < d.torches.length; i++) {
     const t = d.torches[i];
@@ -453,20 +459,27 @@ function applyLevelReady(state, data) {
   // Once per level, never per step: a level carries up to ~820 items (ARCHITECTURE.md §4.2).
   buildItemGrid(state);
 
+  const run = state.run;
+  // Items are state-owned once installed; reset `taken` so a replayed/cached level is playable.
+  // The same pass decides whether the map is locked (§4.8): a level with a scroll starts locked, a
+  // level without one (fixtures, previews, older cached levels) must not lock the map for ever.
+  const items = level.items;
+  const playable = phase === 'loading';
+  let gems = 0;
+  let hasMap = false;
+  for (let i = 0; i < items.length; i++) {
+    const kind = items[i].kind;
+    if (playable) items[i].taken = false;
+    if (kind === 'gem') gems++;
+    else if (kind === 'map') hasMap = true;
+  }
+  run.mapFound = !hasMap;
+
   if (phase === 'title') {
     startAttract(state);
     return;
   }
 
-  // Items are state-owned once installed; reset `taken` so a replayed/cached level is playable.
-  const items = level.items;
-  let gems = 0;
-  for (let i = 0; i < items.length; i++) {
-    items[i].taken = false;
-    if (items[i].kind === 'gem') gems++;
-  }
-
-  const run = state.run;
   // The tank is `src/state`'s number, not the maze's (see balance.resolveTank): the torch economy
   // depends on it being small and independent of the maze's area.
   const fuel = resolveTank(state.level, level.fuel);

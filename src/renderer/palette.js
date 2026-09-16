@@ -151,6 +151,20 @@ const ENTRIES = /** @type {const} */ ([
   ['fog', 0x0a0e18], // cool blue-black the colormap fades everything into
   ['void', 0x05070c], // deepest shadow, below fog
   ['white', 0xffffff],
+
+  // ── Map scroll: aged parchment rolled and tied with a red wax-sealed ribbon (§4.8). ──────────
+  // Appended after the ambient block rather than slotted in beside gold, so no existing index moves.
+  // Deliberately desaturated and a notch darker than `gold*`: the scroll is the one pickup that is
+  // meant to be *looked for*, so it must not read as a warm light source down a torch-lit corridor.
+  ['mapShadow', 0x2e1d10], // the hollow of the roll and the underside that touches the floor
+  ['mapDark', 0x5c4127], // tan in shadow
+  ['mapMid', 0x8f7049], // tan body
+  ['mapLight', 0xa98e63], // cream-tan lit face
+  ['mapPale', 0xcbb68c], // worn cream highlight along the top of the roll
+  ['sealShadow', 0x240808], // knot crease, wax rim
+  ['sealDark', 0x4a0f0d], // ribbon in shadow
+  ['sealMid', 0x7a1a14], // ribbon & wax body
+  ['sealLight', 0xa8352a], // the one lit bead on the wax
 ]);
 
 /** Number of palette slots, including the transparency key at index 0. */
@@ -211,7 +225,8 @@ function ramp(...names) {
  * Material ramps, dark → light. Textures pick a step with `rampPick()` (ordered dither), which is
  * why every ramp is an evenly-spaced perceptual run: dithering between neighbours must not show a
  * hue jump.
- * @type {Readonly<Record<'stone'|'moss'|'cobble'|'wood'|'iron'|'fire'|'arcane'|'gem'|'oil'|'gold', Uint8Array>>}
+ * `map` is the parchment of the hidden map scroll; `seal` is its dark red ribbon and wax accent.
+ * @type {Readonly<Record<'stone'|'moss'|'cobble'|'wood'|'iron'|'fire'|'arcane'|'gem'|'oil'|'gold'|'map'|'seal', Uint8Array>>}
  */
 export const RAMPS = Object.freeze({
   stone: ramp(
@@ -251,6 +266,8 @@ export const RAMPS = Object.freeze({
   gem: ramp('gemDeep', 'gemMid', 'gemBright', 'gemPale', 'gemSpec'),
   oil: ramp('oilDeep', 'oilDark', 'oilMid', 'oilLight', 'oilPale'),
   gold: ramp('goldDark', 'goldMid', 'goldBase', 'goldLight', 'goldPale'),
+  map: ramp('mapShadow', 'mapDark', 'mapMid', 'mapLight', 'mapPale'),
+  seal: ramp('sealShadow', 'sealDark', 'sealMid', 'sealLight'),
 });
 
 /** Every packed colour, for O(1) "is this on-palette?" checks in tests. */

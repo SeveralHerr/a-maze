@@ -21,6 +21,7 @@ import {
   DIR_N,
   MAX_CELLS_PER_SIDE,
   WORKER_CELL_THRESHOLD,
+  MAP_MIN_DETOUR_TILES,
   cellToTile,
   tileToCell,
 } from './constants.js';
@@ -66,4 +67,8 @@ test('cell ↔ tile mapping is the odd lattice and round-trips', () => {
 test('the size guard and worker threshold are the documented values', () => {
   assert.equal(MAX_CELLS_PER_SIDE, 4096);
   assert.equal(WORKER_CELL_THRESHOLD, 400);
+});
+
+test('the map scroll minimum detour is the §4.8 value', () => {
+  assert.equal(MAP_MIN_DETOUR_TILES, 4);
 });

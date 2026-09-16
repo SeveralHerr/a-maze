@@ -217,6 +217,11 @@ export const AUDIO = Object.freeze({
    * handler stays quiet instead of flamming a second identical square figure on top of it.
    */
   UI_ECHO: 0.25,
+  /**
+   * Map-scroll cue (§4.8): parchment crackles in the rustle, when the chime enters after the cue
+   * starts (seconds), and the shortest gap between two map cues (seconds).
+   */
+  MAP: Object.freeze({ crackles: 4, chimeAt: 0.2, minGap: 0.5 }),
   /** Smoothing time constants for the continuously-driven parameters. */
   TC: Object.freeze({ mix: 0.05, portal: 0.14, music: 0.6, key: 0.45 }),
 });
@@ -388,6 +393,7 @@ export function createAudio(options) {
   let comboCount = 0;
   let comboUntil = 0; //  ctx time at which the gem combo lapses
   let lastStepAt = -1; //  rate limit so a stuck footstep event storm cannot machine-gun
+  let lastMapAt = -Infinity; //  rate limit for the map-scroll cue (see `playMap`)
   let lastUpdateT = -1; // ctx time of the previous update(), -1 = never
   let lastUiSoundAt = -1; // ctx time of the last UI blip, whatever path played it
   let depthLevel = 0; //   level the ambience is currently keyed to (0 = never set)
@@ -1559,6 +1565,38 @@ export function createAudio(options) {
     sfx('sine', 392, 587, t + 0.04, 0.03, 0.42, 0.08, PRI.CUE, 0, 0, 0.3, pan);
   }
 
+  /**
+   * Map scroll (§4.8): parchment unrolling, then a soft rising chime.
+   *
+   * The rustle is a run of short band-passed noise crackles climbing from ~1.8 to ~4.6 kHz over a
+   * papery low-passed swish — the sound of dry vellum opening — and it deliberately has no tonal
+   * body, which is what keeps it from being mistaken for the oil whoosh. The chime enters as the
+   * scroll finishes opening: three soft sines rising through the level key (degrees 10 → 12 → 15,
+   * i.e. root·2, a fourth up, an octave up) with a faint bell partial, slower and gentler than the
+   * gem arpeggio and on its own register, so "the map" and "a gem" never read as the same event.
+   * It does not touch the gem combo ladder. Rate-limited like the footsteps, although a level only
+   * holds one scroll — a replayed event must never stack two.
+   * @param {number} [pan] -1..1, where the scroll was relative to the player's facing
+   */
+  function playMap(pan = 0) {
+    const t = now();
+    if (t - lastMapAt < AUDIO.MAP.minGap) return;
+    lastMapAt = t;
+    // Parchment: the swish first, then the crackles, each a little later, brighter and quieter.
+    sfxNoise('lowpass', 900, 2600, 0.6, t, 0.04, 0.36, 0.12, PRI.CUE, 0.12, pan);
+    const n = AUDIO.MAP.crackles;
+    for (let i = 0; i < n; i++) {
+      const f = lerp(1800, 4600, i / (n - 1)) * rng.range(0.92, 1.08);
+      const at = t + i * 0.055 + rng.range(0, 0.018);
+      sfxNoise('bandpass', f, f * 0.8, 2.2, at, 0.003, 0.05, 0.3 - i * 0.04, PRI.CUE, 0.08, pan);
+    }
+    // The chime, once the scroll is open.
+    const c = t + AUDIO.MAP.chimeAt;
+    sfx('sine', degreeHz(10), degreeHz(10), c, 0.02, 0.7, 0.09, PRI.CUE, 0.4, 2.76, 0.12, pan);
+    sfx('sine', degreeHz(12), degreeHz(12), c + 0.11, 0.02, 0.7, 0.085, PRI.CUE, 0.4, 2.76, 0.12, pan);
+    sfx('sine', degreeHz(15), degreeHz(15), c + 0.22, 0.03, 1.1, 0.08, PRI.CUE, 0.5, 2.76, 0.1, pan);
+  }
+
   /** Low fuel: a detuned minor-second swell that arrives just before the first heartbeat. */
   function playLowFuel() {
     const t = now();
@@ -2016,8 +2054,12 @@ export function createAudio(options) {
               // The event carries the item's world position, so a gem on your left can sound as
               // if it were on your left. Same bearing maths as the portal hum.
               const pan = pickupPan(e.x, e.y, state);
+              // Every kind is routed explicitly: the map scroll has its own cue (and must not
+              // advance the gem combo ladder), and an unknown future kind stays silent rather than
+              // passing itself off as a gem (a kind-less pickup keeps the old gem default).
               if (e.kind === 'oil') playOil(pan);
-              else playGem(pan);
+              else if (e.kind === 'map') playMap(pan);
+              else if (e.kind === 'gem' || e.kind === undefined) playGem(pan);
             }
             break;
           }

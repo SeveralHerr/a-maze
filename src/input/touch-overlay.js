@@ -10,7 +10,8 @@
  * a 1-pixel black drop shadow — i.e. the same gold-on-stone palette as the in-game lettering.
  *
  * Responsibilities kept *out* of here: no touch tracking (that is `input.js`, which owns the
- * gesture state for all devices), no game state (the overlay only reads `state.phase`), no
+ * gesture state for all devices), no game state (the overlay only reads `state.phase`, `settings.mapMode` and
+ * `run.mapFound`), no
  * per-frame work (`update()` early-returns unless the phase changed, and the stick is only
  * repainted when `input.js` reports a new thumb position).
  *
@@ -22,10 +23,11 @@
 /**
  * The handle returned by {@link createTouchOverlay}.
  * @typedef {Object} TouchOverlay
- * @property {(state: {phase?: string, settings?: {mapMode?: string}}|null|undefined) => void} update
+ * @property {(state: {phase?: string, settings?: {mapMode?: string}, run?: {mapFound?: boolean}}|null|undefined) => void} update
  *   Bind visibility to the game phase. Controls show only while `phase === 'playing'` (a pause or
  *   title menu draws its own buttons). The map mode only sets the bar's `data-map` styling hook;
- *   it never moves a button. Safe to call every frame: it costs two compares.
+ *   it never moves a button. While `run.mapFound === false` the bar carries `data-map-locked="1"`
+ *   and the MAP button is dimmed (opacity only). Safe to call every frame: a few compares.
  * @property {(active: boolean, originX: number, originY: number, knobX: number, knobY: number, sprint?: boolean) => void} setStick
  *   Move/show/hide the virtual stick. Coordinates are **CSS pixels in viewport space** (i.e. raw
  *   `Touch.clientX/clientY`), matching what `input.js` already tracks. `sprint` lights the knob up
@@ -61,6 +63,9 @@ const CLICK_SUPPRESS_MS = 700;
  * below the header line, so MAP opens and closes the map from exactly the same spot.
  */
 const BAR_DROP_PX = 64;
+
+/** MAP button opacity while the level's map scroll has not been found (§4.8). Dim, not gone. */
+const MAP_LOCKED_OPACITY = '0.4';
 
 /** Knob look while the flick-to-sprint latch is on: brighter rim and a hot glow (fuel burns 1.5×). */
 const KNOB_SPRINT_BORDER = '#ffd37a';
@@ -268,6 +273,7 @@ export function createTouchOverlay(root, opts) {
   // ── Mutable view state (cached so we only touch the DOM on a real change) ─────────────────
   let visible = true; // visible until the first update() binds us to a phase
   let mapAttr = ''; // last `data-map` written
+  let mapLocked = false; // last `data-map-locked` state written
   let knobSprint = false;
   let stickShown = false;
   let ringX = NaN;
@@ -299,6 +305,20 @@ export function createTouchOverlay(root, opts) {
       if (attr !== mapAttr) {
         mapAttr = attr;
         bar.setAttribute('data-map', attr);
+      }
+
+      // The map is locked until the level's scroll is found (ARCHITECTURE.md §4.8). The button
+      // stays exactly where it is and still fires — main.js answers a locked press with a notice —
+      // it only dims, so the player can see the instrument exists but is not earned yet. Opacity
+      // only: never a position change (see BAR_DROP_PX). Only an explicit `false` locks, so an
+      // older state without the field keeps the button lit.
+      const run = state ? /** @type {any} */ (state).run : null;
+      const locked = !!run && run.mapFound === false;
+      if (locked !== mapLocked) {
+        mapLocked = locked;
+        if (locked) bar.setAttribute('data-map-locked', '1');
+        else if (typeof bar.removeAttribute === 'function') bar.removeAttribute('data-map-locked');
+        mapBtn.style.opacity = locked ? MAP_LOCKED_OPACITY : '';
       }
 
       // Anything that is not the playing phase is a menu, and menus own the screen: hiding the

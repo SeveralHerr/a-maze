@@ -25,6 +25,8 @@
  *   • every item on a floor tile, on a tile centre, inside the grid, not `taken`
  *   • no two items on the same tile
  *   • every item reachable from the start (a gem behind a wall is a lie the HUD tells)
+ *   • exactly one hidden map scroll (§4.8) — zero only when no free floor tile is left — not on the
+ *     start or exit; its detour depth off the route is reported per level
  *   • the exit is still the **BFS-farthest** cell, so a massive maze has a massive route
  *   • torches on wall tiles facing a corridor; the level replays exactly from its seed
  *
@@ -241,6 +243,48 @@ function bfsFromStart(maze) {
   return dist;
 }
 
+/** Scratch for {@link bfsFromPath}; separate from `distScratch`, which is still in use by then. */
+let pathDistScratch = new Int32Array(0);
+
+/**
+ * Multi-source BFS distance in tiles from the nearest solution-path tile (the map scroll's detour
+ * depth). Reuses `queueScratch`, so it must run after {@link bfsFromStart} has finished.
+ * @param {import('../src/core/types.js').Maze} maze
+ * @param {Uint32Array|null} path
+ * @returns {Int32Array} distance per tile, −1 where unreachable
+ */
+function bfsFromPath(maze, path) {
+  const { width, height, tiles } = maze;
+  const total = width * height;
+  if (pathDistScratch.length < total) pathDistScratch = new Int32Array(total);
+  const dist = pathDistScratch;
+  const queue = queueScratch;
+  dist.fill(-1, 0, total);
+  if (!path) return dist;
+  let head = 0;
+  let tail = 0;
+  for (let i = 0; i < path.length; i++) {
+    if (dist[path[i]] >= 0) continue;
+    dist[path[i]] = 0;
+    queue[tail++] = path[i];
+  }
+  while (head < tail) {
+    const idx = queue[head++];
+    const x = idx % width;
+    const y = (idx - x) / width;
+    for (let d = 0; d < 4; d++) {
+      const nx = x + DIR_DX[d];
+      const ny = y + DIR_DY[d];
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+      const n = ny * width + nx;
+      if (tiles[n] !== TILE.FLOOR || dist[n] >= 0) continue;
+      dist[n] = dist[idx] + 1;
+      queue[tail++] = n;
+    }
+  }
+  return dist;
+}
+
 /**
  * Every per-level assertion: items, reachability, the exit's farthest-cell property, torches, and
  * the refuel chain.
@@ -248,7 +292,8 @@ function bfsFromStart(maze) {
  * @param {import('../src/core/types.js').LevelData} data
  * @param {ReturnType<typeof levelParams>} params
  * @param {string} where
- * @returns {{gems:number, oils:number, walk:ReturnType<typeof walkRefuelChain>, feasibility:number}}
+ * @returns {{gems:number, oils:number, maps:number, mapDetour:number, mapDeadEnd:boolean,
+ *   walk:ReturnType<typeof walkRefuelChain>, feasibility:number}}
  */
 function checkLevel(data, params, where) {
   const { maze, items } = data;
@@ -261,6 +306,8 @@ function checkLevel(data, params, where) {
   // ── Items: on a floor tile centre, inside the grid, unique, reachable, not pre-taken ──────────
   let gems = 0;
   let oils = 0;
+  let maps = 0;
+  let mapIdx = -1;
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     const tx = item.x - 0.5;
@@ -281,10 +328,39 @@ function checkLevel(data, params, where) {
     if (item.taken) fail(where, `item ${item.id} starts taken`);
     if (item.kind === 'gem') gems++;
     else if (item.kind === 'oil') oils++;
-    else fail(where, `item ${item.id} has unknown kind ${String(item.kind)}`);
+    else if (item.kind === 'map') {
+      maps++;
+      mapIdx = idx;
+    } else fail(where, `item ${item.id} has unknown kind ${String(item.kind)}`);
   }
   if (items.length > 0 && items[items.length - 1].id !== items.length - 1) {
     fail(where, 'item ids are not a dense 0..n-1 range');
+  }
+
+  // ── The hidden map scroll (§4.8): exactly one, off start/exit, unstacked (checked above) ─────
+  const startIdx = maze.start.y * width + maze.start.x;
+  const exitIdx = maze.exit.y * width + maze.exit.x;
+  /** Off-path depth of the scroll, −1 when there is none. */
+  let mapDetour = -1;
+  let mapDeadEnd = false;
+  if (maps > 1) fail(where, `expected exactly one map scroll, got ${maps}`);
+  if (maps === 0) {
+    // Zero is legal only when there is literally no free floor tile left for it.
+    const path = data.validation.path;
+    let free = 0;
+    for (let i = 0; i < total; i++) if (tiles[i] === TILE.FLOOR && used[i] === 0 && dist[i] >= 0) free++;
+    free -= used[startIdx] === 0 ? 1 : 0;
+    if (exitIdx !== startIdx && used[exitIdx] === 0) free--;
+    if (path) for (let i = 1; i < 3 && i < path.length; i++) if (path[i] !== exitIdx && used[path[i]] === 0) free--;
+    if (free > 0) fail(where, `no map scroll although ${free} free floor tiles remain`);
+  } else {
+    if (mapIdx === startIdx) fail(where, 'the map scroll is on the start tile');
+    if (mapIdx === exitIdx) fail(where, 'the map scroll is on the exit tile');
+    const fromPath = bfsFromPath(maze, data.validation.path);
+    mapDetour = fromPath[mapIdx];
+    let n = 0;
+    for (let d = 0; d < 4; d++) if (tiles[mapIdx + DIR_DX[d] + DIR_DY[d] * width] === TILE.FLOOR) n++;
+    mapDeadEnd = n === 1 && mapDetour > 0;
   }
 
   // Counts are floors, never ceilings: the refuel chain may add flasks, and the scatter may add
@@ -346,7 +422,7 @@ function checkLevel(data, params, where) {
   if (!(data.par > 0 && Number.isFinite(data.par))) fail(where, `par ${data.par} is not a usable target`);
   if (data.par < budget.directTime) fail(where, `par ${data.par} is below the optimal route time ${budget.directTime}`);
 
-  return { gems, oils, walk, feasibility };
+  return { gems, oils, maps, mapDetour, mapDeadEnd, walk, feasibility };
 }
 
 /**
@@ -373,6 +449,9 @@ function runLevels() {
     let torches = 0;
     let flasks = 0;
     let ms = 0;
+    /** @type {number[]} */
+    const mapDetours = [];
+    let mapDeadEnds = 0;
 
     for (let s = 0; s < LEVEL_SEEDS; s++) {
       const seed = level * 7919 + s * 104729;
@@ -401,6 +480,8 @@ function runLevels() {
       oils = r.oils;
       flasks = r.walk.flasks;
       torches = data.torches.length;
+      if (r.maps === 1) mapDetours.push(r.mapDetour);
+      if (r.mapDeadEnd) mapDeadEnds++;
 
       // Determinism of the whole level, not just the maze.
       if (s === 0) {
@@ -414,6 +495,7 @@ function runLevels() {
     const n = Math.max(1, LEVEL_SEEDS);
     worstReserve = Math.min(worstReserve, reserveWorst);
     worstFeasibility = Math.max(worstFeasibility, feasWorst);
+    mapDetours.sort((a, b) => a - b);
     levels.push({
       level,
       size: `${params.cols}x${params.rows}`,
@@ -431,6 +513,13 @@ function runLevels() {
       reserve: Math.round(reserveWorst * 1000) / 1000,
       feasibility: Math.round(feasWorst * 1000) / 1000,
       msPerBuild: Math.round((ms / n) * 100) / 100,
+      mapDetour: {
+        min: mapDetours.length > 0 ? mapDetours[0] : -1,
+        median: mapDetours.length > 0 ? mapDetours[mapDetours.length >> 1] : -1,
+        max: mapDetours.length > 0 ? mapDetours[mapDetours.length - 1] : -1,
+        limit: Math.floor(Number(params.oilTargetGap) / 4),
+      },
+      mapDeadEnds,
     });
   }
 
@@ -464,16 +553,27 @@ console.log(
 );
 console.log(
   `  ${'lvl'.padEnd(4)}${'size'.padEnd(9)}${'path'.padStart(6)}${'tank'.padStart(6)}${'gems'.padStart(6)}${'oil'.padStart(6)}` +
-    `${'chain'.padStart(7)}${'torch'.padStart(7)}${'maxgap'.padStart(7)}${'limit'.padStart(7)}${'walked'.padStart(8)}${'reserve'.padStart(9)}${'feas'.padStart(7)}${'ms'.padStart(7)}`,
+    `${'chain'.padStart(7)}${'torch'.padStart(7)}${'maxgap'.padStart(7)}${'limit'.padStart(7)}${'walked'.padStart(8)}${'reserve'.padStart(9)}${'feas'.padStart(7)}${'ms'.padStart(7)}` +
+    `${'map min/med/max'.padStart(17)}`,
 );
-console.log(`  ${'-'.repeat(95)}`);
+console.log(`  ${'-'.repeat(112)}`);
 for (const l of campaign.levels) {
   if (l.level > 12 && l.level % 3 !== 0 && l.level !== LEVELS) continue; // keep the table readable
   console.log(
     `  ${String(l.level).padEnd(4)}${l.size.padEnd(9)}${String(l.path).padStart(6)}${String(l.tank).padStart(6)}` +
       `${String(l.gems).padStart(6)}${String(l.oils).padStart(6)}${String(l.chainFlasks).padStart(7)}${String(l.torches).padStart(7)}` +
       `${String(l.maxGap).padStart(7)}${String(l.gapLimit).padStart(7)}${String(l.walked).padStart(8)}${`${(l.reserve * 100).toFixed(0)}%`.padStart(9)}` +
-      `${l.feasibility.toFixed(2).padStart(7)}${l.msPerBuild.toFixed(1).padStart(7)}`,
+      `${l.feasibility.toFixed(2).padStart(7)}${l.msPerBuild.toFixed(1).padStart(7)}` +
+      `${`${l.mapDetour.min}/${l.mapDetour.median}/${l.mapDetour.max}`.padStart(17)}`,
+  );
+}
+{
+  const outOfBand = campaign.levels.filter((l) => l.mapDetour.min < 4 || l.mapDetour.max > l.mapDetour.limit).map((l) => l.level);
+  const deadEnds = campaign.levels.reduce((n, l) => n + l.mapDeadEnds, 0);
+  console.log(
+    `\n  map scroll: detour depth (tiles off the route) shown min/median/max per level; ` +
+      `${deadEnds}/${campaign.built} scrolls at an off-route dead end; ` +
+      `levels with a detour outside [4, oilTargetGap/4]: ${outOfBand.length > 0 ? outOfBand.join(', ') : 'none'}`,
   );
 }
 console.log(

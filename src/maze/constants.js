@@ -95,6 +95,15 @@ export const MAX_CELLS_PER_SIDE = 4096;
 export const WORKER_CELL_THRESHOLD = 400;
 
 /**
+ * Minimum detour, in tiles, from the solution path to the level's hidden map scroll
+ * (ARCHITECTURE.md §4.8): the scroll sits at the end of a dead-end branch at least this deep, so it
+ * is out of sight from the route and finding it is a decision, not an accident. The upper bound is
+ * `floor(oilTargetGap / 4)` each way, which keeps the detour affordable on one tank. It lives here
+ * rather than in `src/state/balance.js` because `src/maze` may not import `src/state`.
+ */
+export const MAP_MIN_DETOUR_TILES = 4;
+
+/**
  * Tile coordinate of a logical cell coordinate (the "odd lattice" mapping).
  * @param {number} c cell column or row index (0-based)
  * @returns {number} tile column or row index (always odd)

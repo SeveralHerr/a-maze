@@ -17,7 +17,8 @@
  * - **Ceiling** — dark brown planks with grain, nails and knots, and a heavier cross beam every
  *   few tiles.
  * - **Sprites** — iron sconce with a 4-frame flame, a swirling violet/cyan portal, a faceted
- *   spinning gem, an amber oil flask, and a sparkle.
+ *   spinning gem, an amber oil flask, a sparkle, and a rolled parchment map scroll tied with a red
+ *   ribbon (deliberately dim — it is hidden, not a beacon).
  *
  * INVARIANTS (the raycaster depends on all of these):
  * - Textures are `SIZE × SIZE` with `SIZE = 64`, **row-major**: `index = (y << 6) | x`.
@@ -86,6 +87,7 @@ const BAYER = Float32Array.from(
  * @property {Texture[]} gem        8 spin frames
  * @property {Texture[]} oil        4 bob frames
  * @property {Texture[]} sparkle    4 frames, emissive
+ * @property {Texture[]} map        1 frame: the hidden map scroll (§4.8), solid, not emissive
  */
 
 /** Scratch mask reused by the wall painter (mortar map). Painting is single-threaded and
@@ -997,6 +999,146 @@ function paintOil(seed, frame) {
 }
 
 /**
+ * Texel row the map scroll's art rests on (the bottom of its ribbon tails). The raycaster anchors
+ * this row to the floor, so it is exported rather than re-derived there.
+ */
+export const MAP_FLOOR_ROW = 55;
+
+/**
+ * Paint the hidden map scroll (§4.8): a roll of aged parchment lying on its side, tied round the
+ * middle with a dark red ribbon, a wax seal on the knot and two ribbon tails splayed on the floor.
+ *
+ * Read order at 240p, which is what the shapes are sized for: the long pale cylinder with a dark
+ * outline says "roll"; the spiral on the left end cap says "rolled sheet" rather than "log" or
+ * "bone"; the red band and seal say "scroll". There is no halo and no stipple — the scroll is meant
+ * to be found, not to announce itself — and the parchment ramp sits below `gold*` in brightness.
+ * @param {number} seed
+ * @returns {Uint8Array}
+ */
+function paintMap(seed) {
+  const buf = new Uint8Array(AREA);
+  const rng = createRng(seed);
+  const map = RAMPS.map;
+  const seal = RAMPS.seal;
+
+  const x0 = 9; // left end cap centre column
+  const x1 = 53; // right end cap centre column
+  const yc = 44; // roll axis row
+  const r = 8; // roll radius: rows yc-r .. yc+r
+  const capW = 3; // half-width of the end-cap ellipse (the roll is seen slightly from the left)
+
+  // ── Body: a cylinder lit from above-left. Flat bands, not a dither — at 2–6 px per texel a
+  // dithered gradient reads as noise, where three hard bands read as a round thing.
+  for (let y = yc - r; y <= yc + r; y++) {
+    const v = (y - yc) / r; // -1 top … +1 bottom
+    let t = 0.78 - 0.62 * ((v + 1) / 2);
+    if (v < -0.55 && v > -0.95) t += 0.2; // specular strip along the top of the roll
+    for (let x = x0; x <= x1; x++) {
+      // Fibres: sparse single-texel flecks one step darker, plus a couple of faint age stains.
+      const n = h01(x, y, seed);
+      const tt = t - (n > 0.9 ? 0.25 : 0) - (vnoise(x, y, 8, seed ^ 0x3a7) > 0.72 ? 0.18 : 0);
+      putClip(buf, x, y, rampPickFlat(map, tt));
+    }
+  }
+
+  // ── Outer sheet edge: where the last turn of parchment ends, a dark seam with a lit lip under it,
+  // running the length of the roll. It is the single cue that separates a scroll from a rod.
+  const seamY = yc + 3;
+  for (let x = x0 + 2; x <= x1 - 2; x++) {
+    // The lip wanders by a texel so it reads as paper, not as a machined groove.
+    const dy = h01(x >> 3, 7, seed ^ 0x51) > 0.6 ? 1 : 0;
+    putClip(buf, x, seamY + dy, C.mapShadow);
+    putClip(buf, x, seamY + dy + 1, C.mapLight);
+  }
+
+  // ── Right end: a rounded, shaded cap so the roll has volume.
+  for (let y = yc - r; y <= yc + r; y++) {
+    const v = (y - yc) / r;
+    const half = Math.round(capW * Math.sqrt(Math.max(0, 1 - v * v)));
+    for (let x = x1 + 1; x <= x1 + half; x++) putClip(buf, x, y, v < -0.3 ? C.mapMid : C.mapDark);
+    putClip(buf, x1 + half + 1, y, C.mapShadow);
+  }
+
+  // ── Left end: the cut face of the roll, showing the spiral of rolled sheets.
+  for (let y = yc - r; y <= yc + r; y++) {
+    const v = (y - yc) / r;
+    const half = Math.round(capW * Math.sqrt(Math.max(0, 1 - v * v)));
+    for (let x = x0 - half; x <= x0 + half; x++) {
+      const ex = (x - x0) / (capW + 0.5);
+      const ey = (y - yc) / (r + 0.5);
+      const d = Math.sqrt(ex * ex + ey * ey); // 0 centre … 1 rim of the ellipse
+      // Alternating paper and gap rings; a slow angular drift turns concentric rings into a spiral.
+      const ring = ((d * 4.2 + Math.atan2(ey, ex) / (Math.PI * 2)) | 0) & 1;
+      putClip(buf, x, y, d < 0.2 ? C.mapShadow : ring ? C.mapDark : C.mapPale);
+    }
+    putClip(buf, x0 - half - 1, y, C.mapShadow);
+  }
+
+  // ── Silhouette outline along the top and bottom of the roll.
+  for (let x = x0; x <= x1; x++) {
+    putClip(buf, x, yc - r - 1, C.mapShadow);
+    putClip(buf, x, yc + r + 1, C.mapShadow);
+  }
+
+  // ── Ribbon band round the middle, shaded with the same cylinder light as the paper.
+  const rx = 30 + rng.int(3);
+  for (let y = yc - r; y <= yc + r; y++) {
+    const v = (y - yc) / r;
+    const t = v < -0.4 ? 0.95 : v < 0.35 ? 0.6 : 0.3;
+    putClip(buf, rx - 1, y, rampPickFlat(seal, t - 0.3));
+    putClip(buf, rx, y, rampPickFlat(seal, t));
+    putClip(buf, rx + 1, y, rampPickFlat(seal, t - 0.3));
+  }
+  // Band edges bite into the outline so the ribbon visibly wraps *round* the roll.
+  for (let x = rx - 1; x <= rx + 1; x++) {
+    putClip(buf, x, yc - r - 1, C.sealShadow);
+    putClip(buf, x, yc + r + 1, C.sealShadow);
+  }
+
+  // ── Ribbon tails: from the knot down the front of the roll, splaying out onto the floor, with a
+  // swallowtail notch at each end.
+  const ky = yc + 1;
+  for (const side of [-1, 1]) {
+    let x = rx + side;
+    for (let y = ky; y <= MAP_FLOOR_ROW; y++) {
+      if (y > yc + r - 1) x += side; // below the roll the tail lies flat and fans outward
+      putClip(buf, x, y, C.sealMid);
+      putClip(buf, x + side, y, C.sealDark);
+    }
+    // Notched end: a texel of floor showing between the two points.
+    putClip(buf, x + side * 2, MAP_FLOOR_ROW, C.sealDark);
+    putClip(buf, x + side, MAP_FLOOR_ROW, 0);
+    putClip(buf, x + side * 2, MAP_FLOOR_ROW - 1, C.sealMid);
+  }
+
+  // ── Knot loops either side of the seal.
+  for (const side of [-1, 1]) {
+    for (let dy = -3; dy <= 1; dy++) {
+      for (let dx = 2; dx <= 6; dx++) {
+        const edge = dx === 6 || dy === -3 || dy === 1;
+        putClip(buf, rx + side * dx, ky - 1 + dy, edge ? C.sealDark : dy < 0 ? C.sealLight : C.sealMid);
+      }
+    }
+    putClip(buf, rx + side * 4, ky - 1, C.sealShadow); // the hole through the loop
+    putClip(buf, rx + side * 5, ky - 1, C.sealShadow);
+  }
+
+  // ── Wax seal: a lumpy disc on the knot, one lit bead top-left, dark rim.
+  for (let dy = -3; dy <= 3; dy++) {
+    for (let dx = -3; dx <= 3; dx++) {
+      const d = dx * dx + dy * dy;
+      if (d > 10) continue;
+      const c = d > 6 ? C.sealShadow : dx + dy < -1 ? C.sealMid : C.sealDark;
+      putClip(buf, rx + dx, ky - 1 + dy, c);
+    }
+  }
+  putClip(buf, rx - 1, ky - 2, C.sealLight);
+  putClip(buf, rx, ky - 1, C.sealMid);
+
+  return buf;
+}
+
+/**
  * Paint one frame of a four-point sparkle (gem pickup, portal motes).
  * @param {number} frame 0..3
  * @param {Uint8Array} stipple out-param
@@ -1135,5 +1277,10 @@ export function createTextures(seed = 0xa11a2e) {
   const sparkle = [];
   for (let f = 0; f < 4; f++) sparkle.push(finishStippled((st) => paintSparkle(f, st), true));
 
-  return { seed: usedSeed, size: SIZE, wall, floor, ceiling, torch, portal, gem, oil, sparkle };
+  // One still frame: the scroll lies on the floor and neither spins nor glows (§4.8). Still an
+  // array, like every other field, so the raycaster indexes it through the same path.
+  /** @type {Texture[]} */
+  const map = [finish(paintMap(s('map')), null, false)];
+
+  return { seed: usedSeed, size: SIZE, wall, floor, ceiling, torch, portal, gem, oil, sparkle, map };
 }

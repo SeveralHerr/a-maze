@@ -525,6 +525,33 @@ const POP_LIFE = 1.15;
 const MAX_FRAME_DT = 0.25;
 
 /**
+ * The headline shown when the level's map scroll is picked up (ARCHITECTURE.md §4.8). Title case
+ * because it is set in the gothic display face, which the menus also set in title case ("Paused",
+ * "Options") — blackletter capitals in a row are hard to read.
+ */
+export const MAP_FOUND_TEXT = 'Map Found';
+
+/** Seconds the "Map Found" banner stays up. Longer than a notice: it is a reward, not a hint. */
+const MAP_FOUND_LIFE = 2.4;
+
+/** Seconds a `notice(text)` stays up (§4.8: ~1.6 s). */
+const NOTICE_LIFE = 1.6;
+
+/** A banner's fade (and, with motion on, drop) in, in 64ths of a second (≈ 0.19 s). */
+const BANNER_IN_64 = 12;
+
+/** A banner's fade out at the end of its life, in 64ths of a second (0.4 s). */
+const BANNER_OUT_64 = 26;
+
+/** How long the "Map Found" plaque's gold edge flare lasts, in 64ths of a second (≈ 0.6 s). */
+const BANNER_FLARE_64 = 38;
+
+/** Banner kinds. */
+const BANNER_NONE = 0;
+const BANNER_MAP_FOUND = 1;
+const BANNER_NOTICE = 2;
+
+/**
  * A panel's painted frame, in borders: `drawPanel` draws a border **and** a bevel inside it, so the
  * stone a readout must clear is two borders thick, not one.
  */
@@ -581,6 +608,13 @@ function intWidth(n, size) {
  *   the new mode (the `map` hotkey; `src/main.js` then persists it — see the module header)
  * @property {(settings?:any) => MapMode} mapMode  the mode in force right now
  * @property {() => import('./map.js').MapStats} mapStats  live map cost accounting (reused object)
+ * @property {(state:GameState|null|undefined) => boolean} mapLocked  true while this level's map
+ *   scroll has not been found (`state.run.mapFound === false`, §4.8). A missing field reads as
+ *   found, so an older state never locks. While locked the map draws nothing in any mode and the
+ *   HUD lays out as for `'off'`; `mapMode()` still reports the player's preference.
+ * @property {(text:string) => void} notice  show a short centred one-line notice (~1.6 s) — e.g.
+ *   `'NO MAP - FIND THE SCROLL'` when the map hotkey is pressed while locked. Replaces whatever
+ *   banner is up. Store a constant string: the HUD keeps the reference, it does not copy it.
  * @property {() => void} dispose
  */
 
@@ -644,6 +678,23 @@ export function createHud(overlayCanvas, options) {
   let lastLevel = 0;
   /** Refuels taken this level (a fallback for when `state.run` does not carry the count). */
   let refuelCount = 0;
+
+  // ── Map scroll (§4.8) ──
+  /** `run.mapFound` as last seen; the banner fires on its false → true edge only. */
+  let lastMapFound = true;
+  /** The level the map-found tracker was synced against; a new `levelData` resyncs, never fires. */
+  /** @type {object|null} */
+  let mapFoundLevel = null;
+  /** Set by `reset()`: the next frame adopts `mapFound` as-is instead of reading a delta. */
+  let mapFoundSync = true;
+  /** Whether the last drawn frame had the map hidden by the lock, so unlocking can catch up. */
+  let mapWasLocked = false;
+
+  /**
+   * The one banner slot, shared by "Map Found" and `notice()` — the newest wins, because two
+   * centred banners stacked over the corridor are one too many.
+   */
+  const banner = { kind: BANNER_NONE, t: -1, life: 0, text: '' };
   // ── Panel geometry, recomputed once per frame by `layoutTopRow` ──
   // Every number below is in UI pixels. They live in the closure rather than in a returned box so
   // laying the top row out allocates nothing, and so the full map can read the gauge's box.
@@ -735,7 +786,64 @@ export function createHud(overlayCanvas, options) {
     anim.refillFrom = 0;
     refuelCount = 0;
     for (let i = 0; i < MAX_POPS; i++) pops[i].t = -1;
+    // A new run starts locked on a fresh level: that is not a discovery, so the next frame adopts
+    // `mapFound` rather than comparing it against the old run's value.
+    mapFoundSync = true;
+    mapWasLocked = false;
+    banner.kind = BANNER_NONE;
+    banner.t = -1;
     mapView.reset();
+  }
+
+  /**
+   * @param {GameState|null|undefined} state
+   * @returns {boolean}
+   */
+  function mapLocked(state) {
+    if (state === null || state === undefined || typeof state !== 'object') return false;
+    const run = state.run;
+    return run !== null && run !== undefined && /** @type {any} */ (run).mapFound === false;
+  }
+
+  /**
+   * @param {string} text
+   * @returns {void}
+   */
+  function notice(text) {
+    if (typeof text !== 'string' || text === '') return;
+    banner.kind = BANNER_NOTICE;
+    banner.text = text;
+    banner.life = NOTICE_LIFE;
+    banner.t = 0;
+  }
+
+  /**
+   * Track `run.mapFound` and raise the "Map Found" banner on its false → true edge.
+   *
+   * Derived from the state, never from the `pickup` event, for the same reason as the score pops
+   * (see `advance`). Three things resync the tracker without firing, so only a real pickup can:
+   * a new `levelData` (`levelReady` installs the level and sets `mapFound` in one dispatch — to
+   * false for a level with a scroll, to true for one without), a `reset()` (a new run), and any
+   * frame outside `playing` (the scroll is only ever collected while playing).
+   * @param {GameState} state
+   * @returns {void}
+   */
+  function trackMapFound(state) {
+    const found = !mapLocked(state);
+    const level = state.levelData === undefined ? null : state.levelData;
+    if (mapFoundSync || level !== mapFoundLevel || state.phase !== 'playing') {
+      mapFoundSync = false;
+      mapFoundLevel = level;
+      lastMapFound = found;
+      return;
+    }
+    if (found && !lastMapFound) {
+      banner.kind = BANNER_MAP_FOUND;
+      banner.text = MAP_FOUND_TEXT;
+      banner.life = MAP_FOUND_LIFE;
+      banner.t = 0;
+    }
+    lastMapFound = found;
   }
 
   /**
@@ -822,6 +930,16 @@ export function createHud(overlayCanvas, options) {
       p.t += dt;
       if (p.t >= POP_LIFE) p.t = -1;
     }
+
+    if (banner.t >= 0) {
+      banner.t += dt;
+      if (banner.t >= banner.life) {
+        banner.t = -1;
+        banner.kind = BANNER_NONE;
+      }
+    }
+    // After the aging, so a banner raised this frame starts at t = 0.
+    trackMapFound(state);
   }
 
   /**
@@ -848,11 +966,19 @@ export function createHud(overlayCanvas, options) {
     ctx.globalAlpha = prevAlpha * globalAlpha;
 
     const reduced = state.settings !== undefined && state.settings.reducedMotion === true;
-    const mode = forcedMap !== null ? forcedMap : readMapMode(state.settings);
+    // Until this level's map scroll is found (§4.8) the map does not exist: no corner window, no
+    // full map, and every layout below behaves exactly as for 'off'. The player's chosen mode is
+    // untouched, so the map returns in that mode the moment the scroll is picked up.
+    const locked = mapLocked(state);
+    const mode = locked ? 'off' : forcedMap !== null ? forcedMap : readMapMode(state.settings);
 
     // The raster is maintained before anything is drawn, so the map and the "% mapped" readout
     // agree within the same frame. It is skipped entirely when the map is off — switching it back
-    // on costs one rescan, not a frame of stale pixels.
+    // on costs one rescan, not a frame of stale pixels. Coming out of the lock forces that rescan
+    // explicitly rather than trusting the stale-gap timer, so everything explored while the map
+    // was hidden is on the raster on the unlock frame itself — once, not per frame.
+    if (mapWasLocked && !locked) mapView.invalidate();
+    mapWasLocked = locked;
     if (mode !== 'off') mapView.update(state, anim.clock);
 
     // The full map takes the screen: drawing the play HUD under it would be noise over a diagram,
@@ -869,7 +995,9 @@ export function createHud(overlayCanvas, options) {
       drawFuelGauge(ctx, state, m, reduced);
       // No score pops over the full map: the player opened a diagram in order to read it, and a
       // pop is drawn at the *centre* of the screen, straight across the corridors they are
-      // tracing. The gauge is the one readout the argument above keeps.
+      // tracing. The gauge is the one readout the argument above keeps. A banner is the exception:
+      // it is short-lived, and "Map Found" lands exactly when the full map snaps open.
+      drawBanner(ctx, m, reduced);
       if (isDebug()) drawDebug(ctx, state, m, frameStats === undefined ? null : frameStats);
       ctx.globalAlpha = prevAlpha;
       return;
@@ -881,9 +1009,82 @@ export function createHud(overlayCanvas, options) {
     const mapH = mode === 'corner' ? mapView.drawCorner(ctx, m, state, anim.clock, reduced) : 0;
     drawCompass(ctx, state, m, reduced, mapH);
     drawPops(ctx, m, reduced);
+    drawBanner(ctx, m, reduced);
     if (isDebug()) drawDebug(ctx, state, m, frameStats === undefined ? null : frameStats);
 
     ctx.globalAlpha = prevAlpha;
+  }
+
+  /**
+   * The centred one-line banner: "Map Found" in gold gothic lettering on a timber plaque, or a
+   * `notice()` in the HUD face on stone.
+   *
+   * It sits in the upper part of the **world view** (not the surface — a portrait phone's world is
+   * a band) where it reads without covering the crosshair region or the pops rising from below
+   * centre. It fades in and out; with motion on it also drops a few pixels into place and the
+   * "Map Found" plaque's edge flares gold for its first moments. Reduced motion keeps the fades
+   * only. Allocation-free: the text is a stored reference and the panel options object is reused.
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {SurfaceMetrics} m
+   * @param {boolean} reduced
+   * @returns {void}
+   */
+  function drawBanner(ctx, m, reduced) {
+    if (banner.t < 0 || banner.kind === BANNER_NONE) return;
+    const u = m.u;
+    // Every animated quantity is taken in integer 64ths here: a fractional value handed across a
+    // call V8 does not inline is a boxed number, i.e. garbage every frame the banner is up.
+    const t64 = (banner.t * 64) | 0;
+    // Starts at a quarter rather than at zero, so the frame that raised it already shows it.
+    const in64 = t64 < BANNER_IN_64 ? 16 + ((48 * t64) / BANNER_IN_64) | 0 : 64;
+    const left64 = ((banner.life - banner.t) * 64) | 0;
+    const out64 = left64 < BANNER_OUT_64 ? ((64 * left64) / BANNER_OUT_64) | 0 : 64;
+    const alpha64 = in64 < out64 ? in64 : out64;
+    if (alpha64 <= 0) return;
+
+    const gothic = banner.kind === BANNER_MAP_FOUND;
+    const font = gothic ? 'display' : 'hud';
+    const maxW = Math.max(16 * u, m.viewW - 12 * u);
+    // Largest integer scale whose plaque fits the view: 2u for the headline on a desktop, a unit
+    // for a notice; stepped down on a phone.
+    let size = gothic ? (m.narrow ? u : 2 * u) : m.narrow ? Math.max(1, u - 1) : u;
+    const frame = Math.max(1, m.narrow ? u - 1 : u);
+    // Clear space inside the painted frame (`FRAME_BORDERS` borders) for the lettering's ink: the
+    // display face carries an outline all round plus a two-pixel shadow, the HUD face a one-pixel
+    // shadow — both scale with the text.
+    let padX = 0;
+    let padY = 0;
+    for (;;) {
+      const ink = gothic ? 2 * size : size;
+      padX = FRAME_BORDERS * frame + ink + 3 * u;
+      padY = FRAME_BORDERS * frame + ink + u;
+      if (size <= 1 || measureAt(banner.text, font, size) + 2 * padX <= maxW) break;
+      size--;
+    }
+    const textW = measureAt(banner.text, font, size);
+    const textH = heightAt(font, size);
+    const w = textW + 2 * padX;
+    const h = textH + 2 * padY;
+    const x = m.viewX + ((m.viewW - w) >> 1);
+    const drop = reduced || in64 >= 64 ? 0 : ((64 - in64) * 6 * u) >> 6;
+    const y = m.viewY + ((m.viewH * 13) >> 6) - drop;
+
+    // The context alpha is only touched while fading: once the banner is fully up it costs no
+    // floating-point load or store at all (a double read off the context is a fresh heap number
+    // in V8's lower tiers).
+    const fading = alpha64 < 64;
+    const before = fading ? ctx.globalAlpha : 1;
+    if (fading) ctx.globalAlpha = (before * alpha64) / 64;
+    panelOpts.frame = gothic ? 'wood' : 'stone';
+    panelOpts.border = frame;
+    panelOpts.rivets = gothic;
+    drawPanel(ctx, x, y, w, h, u, panelOpts);
+    if (gothic && !reduced && t64 < BANNER_FLARE_64) {
+      ctx.fillStyle = withAlphaStep(COLOR.goldLight, ((BANNER_FLARE_64 - t64) * 58) / BANNER_FLARE_64 | 0);
+      strokeRect(ctx, x, y, w, h, Math.max(1, u));
+    }
+    drawAt(ctx, banner.text, x + (w >> 1), y + padY, font, size, gothic ? 'gothic' : 'hudBright', 'center');
+    if (fading) ctx.globalAlpha = before;
   }
 
   /**
@@ -1475,6 +1676,8 @@ export function createHud(overlayCanvas, options) {
     cycleMap,
     mapMode,
     mapStats: () => mapView.stats(),
+    mapLocked,
+    notice,
     dispose,
   };
 }

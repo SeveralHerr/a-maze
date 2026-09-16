@@ -47,7 +47,7 @@
  * @property {number} seed
  */
 
-/** @typedef {'gem'|'oil'} ItemKind */
+/** @typedef {'gem'|'oil'|'map'} ItemKind  'map' = the level's hidden map scroll (ARCHITECTURE.md §4.8) */
 
 /**
  * A collectible. `x,y` are the tile centre (tx+0.5, ty+0.5) in world units.
@@ -151,7 +151,9 @@
  * "how many times did I refill the torch" and "how far did I walk" are the statistics that describe
  * the run, where a small maze was fully described by time and gems. `refuels` counts flasks burned
  * **this level** (reset by `levelReady`); `distance` accumulates tiles walked over the whole **run**.
- * @typedef {{score:number, gems:number, gemsTotal:number, fuel:number, fuelMax:number, levelTime:number, totalTime:number, levelScore:number, bestCombo:number, refuels:number, distance:number}} RunStats
+ * `mapFound` is true once this level's map scroll is picked up (or the level has none); the map is
+ * locked until then (ARCHITECTURE.md §4.8).
+ * @typedef {{score:number, gems:number, gemsTotal:number, fuel:number, fuelMax:number, levelTime:number, totalTime:number, levelScore:number, bestCombo:number, refuels:number, distance:number, mapFound:boolean}} RunStats
  */
 
 /**

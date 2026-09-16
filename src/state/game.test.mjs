@@ -187,6 +187,7 @@ test('createInitialState: a clean, valid, contract-shaped state', () => {
     bestCombo: 0,
     refuels: 0,
     distance: 0,
+    mapFound: true,
   });
   assert.equal(s.derived.exitDist, Infinity);
   assert.equal(s.derived.lowFuel, false);
@@ -632,6 +633,73 @@ test('pickups: an item with non-finite coordinates is never collected', () => {
   assert.equal(s.run.score, score, 'the Infinity gem scored nothing');
   assert.equal(items[1].taken, false);
   assert.equal(items[2].taken, false);
+});
+
+// ─── Map scroll (ARCHITECTURE.md §4.8) ───────────────────────────────────────────────────────
+
+test('map scroll: levelReady locks the map only when the level has a scroll', () => {
+  const withMap = started(level([item(1, 'gem', 2.5, 1.5), item(2, 'map', 3.5, 1.5)]));
+  assert.equal(withMap.phase, 'playing', 'a map item is valid level data');
+  assert.equal(withMap.run.mapFound, false, 'a level with a scroll starts locked');
+  assert.equal(withMap.run.gemsTotal, 1, 'the scroll never counts toward gemsTotal');
+
+  const without = started(level([item(1, 'gem', 2.5, 1.5)]));
+  assert.equal(without.run.mapFound, true, 'no scroll → the map is never locked');
+
+  // A new level re-decides from its own items, and newGame re-locks until that decision.
+  without.run.mapFound = true;
+  reducer(without, { type: 'debugWin' });
+  reducer(without, { type: 'nextLevel' });
+  reducer(without, { type: 'levelReady', data: level([item(1, 'map', 2.5, 1.5)]) });
+  assert.equal(without.run.mapFound, false, 'the next level with a scroll locks it again');
+  reducer(without, { type: 'pause' });
+  reducer(without, { type: 'newGame', seed: 3 });
+  assert.equal(without.run.mapFound, false, 'newGame resets it (false: no spurious MAP FOUND delta)');
+  reducer(without, { type: 'levelReady', data: level([]) });
+  assert.equal(without.run.mapFound, true);
+});
+
+test('map scroll: picking it up unlocks the map, emits a pickup, and scores nothing', () => {
+  const s = started(level([item(1, 'map', 1.5, 1.5)]));
+  assert.equal(s.run.mapFound, false);
+  const score = s.run.score;
+  ticks(s, 1);
+  assert.equal(s.run.mapFound, true, 'the scroll under the player is taken');
+  assert.equal(/** @type {any} */ (s.levelData).items[0].taken, true);
+  const e = /** @type {any} */ (s.events.find((x) => x.type === 'pickup'));
+  assert.deepEqual(e, { type: 'pickup', kind: 'map', x: 1.5, y: 1.5, value: 0 });
+  assert.equal(s.run.score, score, 'no score');
+  assert.equal(s.run.gems, 0, 'not a gem');
+  assert.equal(s.run.bestCombo, 0, 'no combo');
+  ticks(s, 1);
+  assert.equal(countEvents(s, 'pickup'), 0, 'taken once');
+});
+
+test('map scroll: a full tank does not leave the scroll on the floor', () => {
+  const s = started(level([item(1, 'map', 1.5, 1.5)], 100));
+  assert.equal(s.run.fuel, s.run.fuelMax);
+  ticks(s, 1);
+  assert.equal(s.run.mapFound, true);
+});
+
+test('map scroll: the title demo maze accepts a scroll and the attract camera never takes it', () => {
+  const s = createInitialState();
+  reducer(s, { type: 'levelReady', data: level([item(1, 'map', 2.5, 1.5)]) });
+  assert.equal(s.phase, 'title');
+  assert.notEqual(s.levelData, null);
+  for (let i = 0; i < 600; i++) reducer(s, { type: 'tick', dt: 1 / 60, input: frame() });
+  assert.equal(/** @type {any} */ (s.levelData).items[0].taken, false, 'attract mode does not collect');
+  assert.ok(Number.isFinite(s.player.x) && Number.isFinite(s.player.y));
+});
+
+test('map scroll: a misspelt kind is still rejected', () => {
+  for (const kind of ['Map', 'scroll', 'maps', '']) {
+    const s = createInitialState();
+    reducer(s, { type: 'newGame', seed: 1 });
+    reducer(s, { type: 'levelReady', data: { ...level(), items: [{ id: 1, kind, x: 1.5, y: 1.5 }] } });
+    assert.equal(s.phase, 'loading', `kind ${JSON.stringify(kind)} must be rejected`);
+    assert.equal(s.levelData, null);
+  }
 });
 
 test('levelReady: the tank is the state module’s number, never the maze’s', () => {

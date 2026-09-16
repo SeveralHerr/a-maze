@@ -92,7 +92,7 @@ async function bytesPerFrame(frame) {
 
 const skip = session === null ? 'node:inspector is unavailable' : false;
 
-test('the HUD stays inside the per-frame allocation budget in every map mode', { skip }, async () => {
+test('the HUD stays inside the per-frame allocation budget in every map mode, locked or not', { skip }, async () => {
   for (const [w, h, dpr] of [[1280, 720, 1], [390, 844, 3]]) {
     // One HUD per page, as in the game: the mode changes through the settings, not by building a
     // new HUD (a dozen instances sharing one module is a different optimisation profile from the
@@ -117,6 +117,43 @@ test('the HUD stays inside the per-frame allocation budget in every map mode', {
         `hud ${mode} ${w}x${h}: ${bytes.toFixed(1)} B allocated per frame (budget ${BUDGET_BYTES_PER_FRAME})`,
       );
     }
+
+    // The hidden map scroll (§4.8), on the same HUD — see the note above about one instance.
+    for (const mode of /** @type {const} */ (['corner', 'full'])) {
+      setMapMode(mode);
+      state.settings.mapMode = mode;
+      state.settings.minimap = true;
+
+      // Locked, with the "no map" notice kept up by pressing the map key about once a second —
+      // far more often than a player would, so fade-ins are a fifth of the measured frames.
+      state.run.mapFound = false;
+      let frame = 0;
+      const locked = await bytesPerFrame(() => {
+        state.time += 1 / 60;
+        if ((frame++ & 63) === 0) hud.notice('NO MAP - FIND THE SCROLL');
+        hud.render(state, null, 0);
+      });
+      assert.ok(hud.mapLocked(state));
+      assert.ok(
+        locked <= BUDGET_BYTES_PER_FRAME,
+        `hud locked ${mode} ${w}x${h}: ${locked.toFixed(1)} B allocated per frame (budget ${BUDGET_BYTES_PER_FRAME})`,
+      );
+
+      // A pathological case: the scroll "found" again every ~1 s — the gothic banner raised and
+      // fading in, the map's one-off catch-up scan and the lock/unlock layout switch, over and
+      // over. (It happens once per level in the real game.)
+      frame = 0;
+      const found = await bytesPerFrame(() => {
+        state.time += 1 / 60;
+        state.run.mapFound = (frame++ & 63) >= 32;
+        hud.render(state, null, 0);
+      });
+      assert.ok(
+        found <= BUDGET_BYTES_PER_FRAME,
+        `hud map-found ${mode} ${w}x${h}: ${found.toFixed(1)} B allocated per frame (budget ${BUDGET_BYTES_PER_FRAME})`,
+      );
+    }
+    state.run.mapFound = true;
   }
 });
 

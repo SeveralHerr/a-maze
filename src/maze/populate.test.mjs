@@ -16,6 +16,7 @@ import { generateMaze } from './generator.js';
 import { validateMaze } from './validator.js';
 import { populateLevel, fuelBudget, walkRefuelChain } from './populate.js';
 import { TILE } from './constants.js';
+import { hashString } from '../core/rng.js';
 
 /**
  * Generate + validate + populate in one step.
@@ -33,7 +34,7 @@ function build(p, seed) {
 /**
  * Count items of one kind.
  * @param {import('./populate.js').Population} pop
- * @param {'gem'|'oil'} kind
+ * @param {import('../core/types.js').ItemKind} kind
  * @returns {number}
  */
 function countOf(pop, kind) {
@@ -181,6 +182,7 @@ test('oil flasks stay on the route the player is actually walking', () => {
     const { maze, validation, pop } = build(params, seed);
     const onPath = new Set(validation.path);
     for (const it of pop.items) {
+      if (it.kind === 'map') continue;
       assert.equal(it.kind, 'oil');
       total++;
       if (!onPath.has((it.y - 0.5) * maze.width + (it.x - 0.5))) offPath++;
@@ -284,6 +286,182 @@ test('a 128×128 level is deterministic and stays inside the item budget', () =>
   assert.equal(used.size, a.pop.items.length, 'duplicate tile at scale');
 });
 
+// ─── The hidden map scroll (ARCHITECTURE.md §4.8) ──────────────────────────────────────────────
+
+/**
+ * Independent re-derivation of the §4.8 geometry: distance to the nearest solution-path tile and
+ * the path index of the junction that nearest-path BFS reached it from.
+ * @param {import('../core/types.js').Maze} maze
+ * @param {Uint32Array} path
+ * @returns {{dist:Int32Array, junction:Int32Array, onPath:Set<number>}}
+ */
+function pathFields(maze, path) {
+  const { width, height, tiles } = maze;
+  const dist = new Int32Array(width * height).fill(-1);
+  const junction = new Int32Array(width * height).fill(-1);
+  const queue = [];
+  path.forEach((idx, i) => {
+    if (dist[idx] >= 0) return;
+    dist[idx] = 0;
+    junction[idx] = i;
+    queue.push(idx);
+  });
+  for (let h = 0; h < queue.length; h++) {
+    const idx = queue[h];
+    const x = idx % width;
+    const y = (idx - x) / width;
+    for (const [dx, dy] of [[1, 0], [0, 1], [-1, 0], [0, -1]]) {
+      const nx = x + dx;
+      const ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+      const n = ny * width + nx;
+      if (tiles[n] !== TILE.FLOOR || dist[n] >= 0) continue;
+      dist[n] = dist[idx] + 1;
+      junction[n] = junction[idx];
+      queue.push(n);
+    }
+  }
+  return { dist, junction, onPath: new Set(path) };
+}
+
+/**
+ * @param {import('../core/types.js').Maze} maze
+ * @param {number} idx
+ * @returns {boolean}
+ */
+function isDeadEnd(maze, idx) {
+  const w = maze.width;
+  let n = 0;
+  for (const o of [1, -1, w, -w]) if (maze.tiles[idx + o] === TILE.FLOOR) n++;
+  return n === 1;
+}
+
+/**
+ * @param {import('./populate.js').Population} pop
+ * @param {number} width
+ * @returns {number[]} tile indices of the map items
+ */
+function mapTiles(pop, width) {
+  return pop.items.filter((i) => i.kind === 'map').map((i) => (i.y - 0.5) * width + (i.x - 0.5));
+}
+
+test('MAP: exactly one scroll per level, never on start/exit/the first route tiles, never stacked', () => {
+  const sizes = [[2, 2], [3, 3], [8, 8], [16, 16], [1, 12], [12, 1], [40, 40]];
+  for (const [cols, rows] of sizes) {
+    for (const braid of [0, 0.3, 1]) {
+      for (let seed = 0; seed < 6; seed++) {
+        const where = `${cols}×${rows} braid ${braid} seed ${seed}`;
+        const { maze, validation, pop } = build({ cols, rows, braid, gemDensity: 40, oilDensity: 20 }, seed);
+        const path = /** @type {Uint32Array} */ (validation.path);
+        assert.equal(countOf(pop, 'map'), 1, `${where}: expected one map item`);
+        const [idx] = mapTiles(pop, maze.width);
+        assert.equal(maze.tiles[idx], TILE.FLOOR, `${where}: map in a wall`);
+        const reserved = new Set([maze.start.y * maze.width + maze.start.x, maze.exit.y * maze.width + maze.exit.x]);
+        for (let i = 0; i < 3 && i < path.length; i++) reserved.add(path[i]);
+        assert.equal(reserved.has(idx), false, `${where}: map on a reserved tile`);
+        const used = new Set(pop.items.map((i) => (i.y - 0.5) * maze.width + (i.x - 0.5)));
+        assert.equal(used.size, pop.items.length, `${where}: map stacked on another item`);
+        assert.ok(pathFields(maze, path).dist[idx] >= 0, `${where}: map unreachable`);
+        const map = pop.items.find((i) => i.kind === 'map');
+        assert.equal(map?.taken, false);
+        assert.equal(map?.id, pop.items.length - 1, 'the map is appended last with the next dense id');
+      }
+    }
+  }
+});
+
+test('MAP: hidden at the end of a qualifying dead-end branch whenever one exists', () => {
+  let qualifiedLevels = 0;
+  const depths = [];
+  for (const [side, braid, gap] of [[16, 0, 40], [24, 0.1, 44], [48, 0.2, 60], [96, 0.3, 80]]) {
+    for (let seed = 0; seed < (side > 48 ? 3 : 10); seed++) {
+      const params = { cols: side, rows: side, braid, gemDensity: 50, oilDensity: 25, oilTargetGap: gap };
+      const { maze, validation, pop } = build(params, seed * 31 + side);
+      const path = /** @type {Uint32Array} */ (validation.path);
+      const { dist, junction, onPath } = pathFields(maze, path);
+      const maxDetour = Math.floor(gap / 4);
+      const window = Math.floor(0.6 * (path.length - 1));
+      const occupied = new Set(pop.items.filter((i) => i.kind !== 'map').map((i) => (i.y - 0.5) * maze.width + (i.x - 0.5)));
+      for (let i = 0; i < 3; i++) occupied.add(path[i]);
+      occupied.add(maze.exit.y * maze.width + maze.exit.x);
+
+      const qualifying = new Set();
+      for (let idx = 0; idx < maze.tiles.length; idx++) {
+        if (maze.tiles[idx] !== TILE.FLOOR || onPath.has(idx) || occupied.has(idx) || !isDeadEnd(maze, idx)) continue;
+        if (dist[idx] >= 4 && dist[idx] <= maxDetour && junction[idx] <= window) qualifying.add(idx);
+      }
+      const [idx] = mapTiles(pop, maze.width);
+      assert.equal(onPath.has(idx), false, `${side}² seed ${seed}: the map is on the solution path`);
+      if (qualifying.size > 0) {
+        qualifiedLevels++;
+        assert.ok(qualifying.has(idx), `${side}² seed ${seed}: map at depth ${dist[idx]} junction ${junction[idx]} is not a qualifying dead end`);
+        depths.push(dist[idx]);
+      }
+    }
+  }
+  assert.ok(qualifiedLevels >= 20, `only ${qualifiedLevels} levels had a qualifying dead end — the test is not testing`);
+  assert.ok(Math.min(...depths) >= 4);
+});
+
+test('MAP: the choice is seeded — same seed same tile, different seeds spread out', () => {
+  const p = { cols: 24, rows: 24, braid: 0.1, gemDensity: 50, oilDensity: 25 };
+  const tiles = new Set();
+  for (let seed = 0; seed < 8; seed++) {
+    const a = build(p, seed);
+    const b = build(p, seed);
+    assert.deepEqual(mapTiles(a.pop, a.maze.width), mapTiles(b.pop, b.maze.width));
+    tiles.add(`${seed}:${mapTiles(a.pop, a.maze.width)[0]}`);
+  }
+  // Every seed is a different maze, so this mostly pins "it varies at all" — the tile indices differ.
+  assert.ok(new Set([...tiles].map((t) => t.split(':')[1])).size >= 6);
+});
+
+test('MAP: adding the scroll changed no oil flask and no gem for a given seed (golden layouts)', () => {
+  // Fingerprints of the oil+gem item list recorded from populate.js immediately BEFORE the map
+  // scroll was added. A change here means the new stream leaked into the old ones.
+  const golden = [
+    [{ cols: 16, rows: 16, braid: 0, gemDensity: 50, oilDensity: 20, fuelSeconds: 110 }, 1, 820075842, 18],
+    [{ cols: 40, rows: 40, braid: 0.15, gemDensity: 55, oilDensity: 25, fuelSeconds: 121, oilTargetGap: 40 }, 77, 2154034811, 93],
+    [{ cols: 128, rows: 128, braid: 0.35, gemDensity: 60, oilDensity: 30, fuelSeconds: 150 }, 4242, 3860516084, 819],
+  ];
+  for (const [p, seed, hash, count] of golden) {
+    const { pop } = build(/** @type {never} */ (p), /** @type {number} */ (seed));
+    const rest = pop.items.filter((i) => i.kind !== 'map');
+    const s = rest.map((i) => `${i.id}:${i.kind}:${i.x},${i.y}`).join('|');
+    assert.equal(rest.length, count);
+    assert.equal(hashString(s), hash, `oil/gem layout drifted for ${JSON.stringify(p)} seed ${seed}`);
+  }
+});
+
+test('MAP: the refuel chain ignores the scroll entirely', () => {
+  const params = { cols: 48, rows: 48, braid: 0.2, oilDensity: 25, gemDensity: 55, fuelSeconds: 121 };
+  for (let seed = 0; seed < 4; seed++) {
+    const { maze, validation, pop } = build(params, seed);
+    const withMap = walkRefuelChain(maze, validation, pop.items, params);
+    const without = walkRefuelChain(maze, validation, pop.items.filter((i) => i.kind !== 'map'), params);
+    assert.deepEqual(withMap, without);
+    assert.equal(withMap.ok, true);
+  }
+});
+
+test('MAP: degenerate mazes never throw; no free floor means no scroll', () => {
+  // 1×1: start === exit is the only floor tile. 1×2 / 2×1: start, gap, exit — all reserved.
+  for (const [cols, rows] of [[1, 1], [1, 2], [2, 1]]) {
+    const { pop } = build({ cols, rows, gems: 0, oil: 0 }, 3);
+    assert.equal(countOf(pop, 'map'), 0, `${cols}×${rows} has no free floor, so no map`);
+  }
+  // A long 1×N corridor has no off-path tile at all: the scroll falls back onto a free route tile.
+  const corridor = build({ cols: 1, rows: 20, braid: 0, gems: 0, oil: 0 }, 5);
+  assert.equal(countOf(corridor.pop, 'map'), 1);
+  // Braid 1 removes (nearly) every dead end; the scroll must still land, off the route when possible.
+  for (let seed = 0; seed < 6; seed++) {
+    const { maze, validation, pop } = build({ cols: 20, rows: 20, braid: 1 }, seed);
+    assert.equal(countOf(pop, 'map'), 1);
+    const onPath = new Set(validation.path);
+    assert.equal(onPath.has(mapTiles(pop, maze.width)[0]), false, `braid 1 seed ${seed}: map on the route`);
+  }
+});
+
 // ─── The tank ────────────────────────────────────────────────────────────────────────────────
 
 test('fuel is a TANK: params.fuelSeconds is the tank, not a floor under a path-derived budget', () => {
@@ -352,7 +530,8 @@ test('populateLevel rejects a maze it cannot read instead of producing nonsense'
 test('a missing or unsolvable validation still yields a usable, safe level', () => {
   const maze = generateMaze({ cols: 8, rows: 8, seed: 3 });
   const pop = populateLevel(maze, /** @type {never} */ ({ path: null, pathLength: -1 }), { gems: 4, oil: 2 }, 3);
-  assert.equal(pop.items.length, 6, 'items fall back to a plain scatter');
+  assert.equal(pop.items.length, 7, 'items fall back to a plain scatter (6 + the map scroll)');
+  assert.equal(countOf(pop, 'map'), 1, 'the map scroll still lands via the farthest-tile fallback');
   assert.ok(pop.fuel >= 20, 'a tank is still produced');
   const used = new Set(pop.items.map((i) => (i.y - 0.5) * maze.width + (i.x - 0.5)));
   assert.equal(used.size, pop.items.length);

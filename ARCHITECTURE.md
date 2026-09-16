@@ -35,7 +35,7 @@ tree is served locally (`npm run serve`) and uploaded to itch.io by CI.
 - **Loop (arcade):** each level is a procedurally generated **massive** maze. The player carries a
   **torch whose fuel is the timer**. Fuel drains in real time; when it runs low the light radius
   visibly shrinks and the screen edges darken. Collect **gems** (+score) and **oil flasks** (+fuel);
-  reach the glowing **exit portal** to descend. Each descent grows the maze (to a cap) and
+  reach the glowing **exit portal** to descend. The **map is locked** on every level until the player finds that level's hidden **map scroll** (§4.8). Each descent grows the maze (to a cap) and
   multiplies score. Fuel hits 0 → game over → score summary → high score saved.
 - **Size curve _(massive mazes)_:** level 1 is **16×16 cells = 33×33 tiles**, growing **+8 cells per
   side per level** to a cap of **128×128 cells = 257×257 tiles = 16 384 cells ≈ 33 000 floor tiles**,
@@ -71,7 +71,7 @@ tree is served locally (`npm run serve`) and uploaded to itch.io by CI.
   because the tank no longer grows, while gems scale with area (6 at level 1 → 273 at the cap), so
   the incentive tips from "get out fast" to "explore" as the labyrinth grows.
 - **Controls:** WASD/arrows move + turn, mouse look with pointer lock, Shift sprint (fast but
-  wasteful: drains fuel 2× at 1.6× speed, so a sprinted tile costs 1.25× a walked one), M cycles the map **off → corner → full**, Esc/P pause, Enter/Space confirm. Touch: left
+  wasteful: drains fuel 2× at 1.6× speed, so a sprinted tile costs 1.25× a walked one), M cycles the map **off → corner → full** (once this level's map scroll is found), Esc/P pause, Enter/Space confirm. Touch: left
   virtual stick move, right half drag to turn, tap buttons for pause/map. Gamepad: standard mapping.
 - **Feedback cues:** head bob, footstep sounds synced to bob, wall-bump thud + tiny camera
   shake, gem sparkle particles + chime + score pop, fuel pickup whoosh + light flare, low-fuel
@@ -156,7 +156,7 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
  * @property {number} seed
  */
 /**
- * @typedef {'gem'|'oil'} ItemKind
+ * @typedef {'gem'|'oil'|'map'} ItemKind   'map' = the level's hidden map scroll (§4.8)
  * @typedef {{id:number, kind:ItemKind, x:number, y:number, taken:boolean}} Item   x,y = tile centre (tx+0.5)
  * @typedef {{x:number, y:number, face:0|1|2|3}} Torch  wall tile + face (0=E,1=S,2=W,3=N) the flame is mounted on
  */
@@ -225,7 +225,8 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
  * @property {Uint8Array|null} explored   width*height, 1 = seen (map fog of war). Up to 257×257 =
  *   66 049 bytes, so it is a VIEW onto a grow-only pool (`sim.allocExplored`) — exact length,
  *   zeroed, indexed identically by every consumer, one buffer for a whole 30-level run.
- * @property {{score:number, gems:number, gemsTotal:number, fuel:number, fuelMax:number, levelTime:number, totalTime:number, levelScore:number, bestCombo:number, refuels:number, distance:number}} run
+ * @property {{score:number, gems:number, gemsTotal:number, fuel:number, fuelMax:number, levelTime:number, totalTime:number, levelScore:number, bestCombo:number, refuels:number, distance:number, mapFound:boolean}} run
+ *   `mapFound` = this level's map scroll has been picked up (reset by `levelReady`, §4.8).
  *   `refuels` = oil flasks burned THIS LEVEL (reset by `levelReady`); `distance` = tiles actually
  *   walked this RUN (reset by `newGame` only). Both exist because on a 14-minute labyrinth those
  *   are the statistics that describe the run; the HUD shows the refuel tally live and the
@@ -309,8 +310,8 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   scraping along a wall cannot inflate it.
 - `sim.js` — pure step logic called by the reducer on `tick`: movement with acceleration/friction,
   **circle-vs-tile collision with wall sliding** (radius 0.22, sub-stepped at 0.2 tiles so
-  tunnelling is impossible at any dt), head bob & footsteps, item pickups (radius 0.45), fuel
-  drain, exit detection (within 0.55 of exit centre), explored-tile reveal (radius 3 with
+  tunnelling is impossible at any dt), head bob & footsteps, item pickups (radius 0.75 — see §4.8 for why), fuel
+  drain, exit detection (within 0.8 of exit centre), explored-tile reveal (radius 3 with
   line-of-sight via DDA, budgeted per step), `derived` fields, event emission. Exports the pieces
   main.js and the tools need by name: `moveCircle`, `hasLineOfSight`, `solidAt`, `stepPlaying`,
   `stepAttract`, `startAttract`, `updateDerived`, `revealAround`, `placePlayerAtStart`, `setPhase`,
@@ -321,7 +322,7 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   66 049 tiles:
   - **Pickups** query a uniform 4-tile bucket grid in CSR form (`WORLD.ITEM_GRID_TILES`, two flat
     `Int32Array`s, grow-only pooled), built **once per level** by `buildItemGrid` in the `levelReady`
-    reducer and never per step. `collectAround` visits at most the 2×2 buckets overlapping the pickup
+    reducer and never per step. `collectAround` visits at most the 2×2 buckets overlapping the swept pickup
     disc. Taken items stay in the grid (removing them would be the O(items) work being avoided), and
     a non-finite player position bails early so the clamp can never degenerate into a full scan.
     Measured: 0.675 µs/step on a 128×128 level with 819 items vs 0.635 µs on the old 6×6 level with
@@ -510,14 +511,14 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   `ArrayBuffer`s on the books (48.9 MB → 0.0 MB, measured).
 
 ### 4.5 `src/renderer` (Wave 1 shell, Wave 3 polish)
-- `palette.js` — the master palette (**66 colours**, hard limit 256) sampled from the art
+- `palette.js` — the master palette (**75 colours**, hard limit 256; `map` parchment + `seal` red ramps for the scroll) sampled from the art
   reference; every material needs a 5–9 step ramp for the ordered dither to avoid banding at 240p.
   All textures and UI colours come from here. Exports `PALETTE`, `PALETTE_RGB`, `C` (name → index),
   `RAMPS`, `pack`, `hex`, `rgba`, `nearestIndex`.
 - `textures.js` — `createTextures(seed) → TextureSet` procedurally paints 64×64 pixel-art
   textures (indices + packed pixels + a stipple mask): `wall[4]` (plain, cracked, mossy, vined),
   `floor[3]` (two cobbles + iron grate), `ceiling[2]` (planks, planks + beam), `portal[8]`,
-  `torch[4]`, `gem[8]`, `oil[4]`, `sparkle[4]`. **Every field is an array** — consumers index them,
+  `torch[4]`, `gem[8]`, `oil[4]`, `map[1]` (the scroll; `MAP_FLOOR_ROW` export rests it on the floor), `sparkle[4]`. **Every field is an array** — consumers index them,
   and the raycaster picks a per-tile variant by hash. Deterministic and Node-safe (no DOM) so it
   can be unit tested; ~20 ms for a full set.
 - `sprite-index.js` — `createSpriteIndex(cell = INDEX_CELL) → SpriteIndex` with
@@ -665,7 +666,7 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
     correctness depends on it. If the sim ever reveals further, the local box would miss tiles — the
     rolling sweep still catches them within ~0.3 s, so it degrades to a slight lag rather than a
     hole, but the constant must be raised to match.
-- `hud.js` — `createHud(overlayCanvas, {map?:'off'|'corner'|'full', minimap?:boolean|MapMode}) → { render(state, frameStats?, alpha?), resize(cssW, cssH, dpr?), surface, pop(value, kind?), cycleMap(settings?), mapMode(settings?), mapStats(), reset(), dispose() }`
+- `hud.js` — `createHud(overlayCanvas, {map?:'off'|'corner'|'full', minimap?:boolean|MapMode}) → { render(state, frameStats?, alpha?), resize(cssW, cssH, dpr?), surface, pop(value, kind?), cycleMap(settings?), mapMode(settings?), mapStats(), mapLocked(state), notice(text), reset(), dispose() }`
   (`minimap: true` still means `'corner'`, so an older call site keeps working):
   fuel gauge, score with rolling counter + pop-up deltas, gem count, depth, level timer, compass
   needle toward the exit **plus a distance-to-exit readout in tiles** — both free on depths 1–2 and
@@ -846,8 +847,56 @@ seed. `?debug=1` additionally turns on the logger and the HUD's FPS readout. `?f
 during boot on purpose, so the failure screen — the one path playing the game cannot reach — can be
 looked at.
 
+### 4.8 Pickup reach and the hidden map scroll (cross-module seam)
+
+**Pickup reach.** `WORLD.PICKUP_RADIUS` is **0.75**. At 0.45 the player could walk past an item:
+cutting an L-turn or junction keeps the player's centre `PLAYER.RADIUS` (0.22) from the wall corner,
+which is √0.5 ≈ 0.707 from the tile centre, so the closest approach was ≈ 0.49 > 0.45. Walls are
+whole tiles, so an item behind a wall is always ≥ 1.72 away: any radius below ~1.5 cannot grab
+through a wall, and 0.75 still keeps the pickup disc inside the 2×2 bucket query. `WORLD.EXIT_RADIUS`
+stays larger than `PICKUP_RADIUS` (0.8). `collectAround` also tests the swept segment from the
+previous step's position (`player.px/py`) to the current one, so a sprinting step can never skip an
+item — still no allocation, still ≤ 2 buckets per axis (the longest step is 1.28 tiles at `MAX_DT` sprinting, and 1.28 + 2×0.75 < 4; a jump over 1.5 tiles per axis — a teleport — falls back to the plain disc test).
+The "oil only when ≥ 55 % would land" rule is unchanged.
+
+**Map scroll.**
+- `ItemKind` gains `'map'`. `populateLevel` places **exactly one** map item per level, on a
+  reachable floor tile that is not the start, not the exit and not shared with another item.
+  "Hidden" means: at the end of a **dead-end branch off the solution path** (not on the path),
+  preferring branches whose detour (off-path depth) is meaningful but affordable — at least
+  `MAP_MIN_DETOUR_TILES` = 4 (exported from `src/maze/constants.js`; maze may not import balance) and at most
+  a quarter of `params.oilTargetGap` each way — and whose junction with the path lies in the first
+  60 % of the path, so the map is still worth having when found. Deterministic per seed (own `items.map` RNG
+  fork, so oil/gem placement is byte-identical with or without it). Fallback tiers: any junction
+  position → the shallowest off-path dead end past the cap → the farthest-from-path free floor tile;
+  a maze with no free floor (1×1, 1×2) gets no scroll. The first 3 path tiles stay reserved. Placed **after** oil and
+  gems, never displacing an oil flask (the refuel guarantee is untouched). `validate-mazes.mjs`
+  asserts exactly one map item per level, reachable, not on start/exit, not stacked.
+- `src/state`: `run.mapFound` is reset by `levelReady` to **`true` if the level has no map item**
+  (fixtures, previews, older cached levels) and `false` otherwise, in `title` too. The initial state
+  is `true`; `newGame` sets it `false` so a restart never shows a spurious false→true "MAP FOUND".
+  `takeItem` always consumes a map item: `taken = true`, `run.mapFound = true`, emits
+  `{type:'pickup', kind:'map', x, y, value:0}`. It does not score and does not count toward
+  `gemsTotal`. `isLevelData` accepts `'map'`.
+- `src/ui/hud.js` + `map.js`: while `state.run.mapFound` is false the map draws **nothing** in any
+  mode (corner and full), and the compass / layout behave as if the mode were `'off'`. The HUD
+  derives a **"Map Found"** banner (`MAP_FOUND_TEXT`, title case like every gothic label; `MapView.invalidate()` does the one catch-up rescan on unlock) from the `mapFound` false→true delta (same rule as the score
+  pops — not from the event). `hud.mapLocked(state) → boolean` is exported for main.js.
+  `hud.notice(text)` shows a short centred one-line notice (~1.6 s, reduced-motion aware).
+  `map.js`'s item layer ignores `'map'` items (they are never drawn as gems). `mapStats()` unchanged.
+- `src/ui/audio.js`: a distinct parchment-unroll/chime cue for `pickup` with `kind:'map'`.
+- `src/renderer`: a **rolled parchment scroll** billboard sprite for `'map'` items (texture in
+  `textures.js`, colours in `palette.js` under a `map` ramp), deliberately dim — no glow, no light
+  source — so it has to be looked for. `raycaster.js` must not treat an unknown kind as a gem.
+- `src/input/touch-overlay.js`: `update(state)` sets `data-map-locked="1"` on the bar while
+  `state.run.mapFound === false` and dims the MAP button (opacity only — position never changes).
+- `src/main.js`: on the `map` hotkey while `hud.mapLocked(state)`, it does **not** cycle or persist
+  the mode; it calls `hud.notice('No Map - Find the Scroll')`. `routeEvents` gives `kind:'map'` its
+  own particle burst colour and world flash. The persisted `mapMode` preference is untouched by the
+  lock, so the map comes back in the player's chosen mode the moment the scroll is found.
+
 ## 5. Quality gates (automated)
-- `npm test` — every `src/*/*.test.mjs` (node:test) in its own process (**578 tests in 35 files**).
+- `npm test` — every `src/*/*.test.mjs` (node:test) in its own process (**678 tests in 37 files**).
   Two of those files, `src/state/perf.test.mjs` and `src/state/feasibility.test.mjs`, import
   `src/maze` as a **test-only** dependency: the §2 runtime rule is unchanged (`src/state` still
   imports only `src/maze/constants.js` at runtime), but a feasibility proof over fake mazes would

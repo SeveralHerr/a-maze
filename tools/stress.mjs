@@ -252,7 +252,7 @@ function runGameplayMax(seeds) {
     items += data.items.length;
     for (const it of data.items) {
       if (it.kind === 'gem') gems++;
-      else oils++;
+      else if (it.kind === 'oil') oils++; // the one 'map' scroll per level (§4.8) is neither
     }
     torches += data.torches.length;
     path += data.validation.pathLength;

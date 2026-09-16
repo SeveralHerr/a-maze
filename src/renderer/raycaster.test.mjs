@@ -416,6 +416,119 @@ test('sprites in view are drawn, and sprites behind the camera are not', () => {
   assert.equal(rc.stats().sprites, withItem - 1, 'a taken item must disappear');
 });
 
+/**
+ * A copy of the shared texture set with the named sprite fields blanked to the transparency key, so a
+ * test can tell which art a sprite was drawn with.
+ * @param {...('gem'|'oil'|'map')} keys
+ * @returns {import('./textures.js').TextureSet}
+ */
+function blankArt(...keys) {
+  /** @type {any} */
+  const out = { ...textures };
+  for (const k of keys) {
+    out[k] = textures[k].map((t) => ({ ...t, indices: new Uint8Array(t.indices.length) }));
+  }
+  return out;
+}
+
+test('a map item is drawn with the scroll art, and only with it (§4.8)', () => {
+  const maze = room();
+  const player = { x: 1.6, y: 2.5, angle: 0 };
+  const scroll = [{ id: 1, kind: /** @type {const} */ ('map'), x: 2.6, y: 2.5, taken: false }];
+  // The exit portal at (3,3) is always queued, so compare against the same scene without the item.
+  const empty = renderScene(maze, { player, items: [] });
+  const shown = renderScene(maze, { player, items: scroll });
+  assert.notDeepEqual(shown.buf, empty.buf, 'the scroll must put pixels on screen');
+
+  // Blanking the gem and flask art changes nothing: the scroll borrows neither.
+  const noGemOil = renderScene(maze, { player, items: scroll }, blankArt('gem', 'oil'));
+  assert.deepEqual(noGemOil.buf, shown.buf, 'a map item must not be drawn with gem or oil art');
+  // Blanking the scroll art removes it entirely.
+  const noMap = renderScene(maze, { player, items: scroll }, blankArt('map'));
+  assert.deepEqual(noMap.buf, empty.buf, 'the map item must be drawn with textures.map');
+
+  const { rc } = makeRenderer();
+  rc.render(makeView(maze, { player, items: [] }));
+  const base = rc.stats().sprites;
+  rc.render(makeView(maze, { player, items: scroll }));
+  assert.equal(rc.stats().sprites, base + 1, 'one scroll, one sprite');
+  rc.render(makeView(maze, { player, items: [{ ...scroll[0], taken: true }] }));
+  assert.equal(rc.stats().sprites, base, 'a taken scroll disappears');
+});
+
+test('the scroll lies on the floor and is not lifted to gem height', () => {
+  // The lowest scroll pixel on screen must sit at the floor line of its distance: the horizon plus
+  // half a wall height (eye height 0.5 tiles). A gem hovers; the scroll must not.
+  const maze = room();
+  const player = { x: 1.6, y: 2.5, angle: 0 };
+  const dist = 1;
+  const empty = renderScene(maze, { player, items: [] });
+  const shown = renderScene(maze, {
+    player,
+    items: [{ id: 1, kind: 'map', x: player.x + dist, y: 2.5, taken: false }],
+  });
+  let lowest = -1;
+  let highest = shown.h;
+  for (let y = 0; y < shown.h; y++) {
+    for (let x = 0; x < shown.w; x++) {
+      if (shown.buf[y * shown.w + x] !== empty.buf[y * shown.w + x]) {
+        if (y > lowest) lowest = y;
+        if (y < highest) highest = y;
+      }
+    }
+  }
+  const floorLine = (shown.h >> 1) + shown.h / dist / 2;
+  assert.ok(Math.abs(lowest + 1 - floorLine) <= 2, `scroll bottom at row ${lowest}, floor line at ${floorLine}`);
+  assert.ok(highest > shown.h >> 1, `the scroll (top row ${highest}) must stay below the eye line`);
+});
+
+test('an unknown item kind is skipped, not drawn as a gem', () => {
+  const maze = room();
+  const player = { x: 1.6, y: 2.5, angle: 0 };
+  const empty = renderScene(maze, { player, items: [] });
+  const bogus = /** @type {any} */ ([{ id: 1, kind: 'relic', x: 2.6, y: 2.5, taken: false }]);
+  const drawn = renderScene(maze, { player, items: bogus });
+  assert.deepEqual(drawn.buf, empty.buf, 'an unknown kind must draw nothing');
+
+  const { rc } = makeRenderer();
+  rc.render(makeView(maze, { player, items: [] }));
+  const base = rc.stats().sprites;
+  rc.render(makeView(maze, { player, items: bogus }));
+  assert.equal(rc.stats().sprites, base);
+});
+
+test('the scroll does not twinkle: no sparkle motes, unlike a gem', () => {
+  const maze = room();
+  const player = { x: 1.6, y: 2.5, angle: 0 };
+  /**
+   * @param {'gem'|'map'} kind
+   * @returns {number} live particles after two simulated seconds
+   */
+  const motes = (kind) => {
+    const { rc } = makeRenderer();
+    const items = [{ id: 1, kind, x: 2.6, y: 2.5, taken: false }];
+    for (let f = 0; f <= 120; f++) rc.render(makeView(maze, { player, items, time: 1 + f / 60 }));
+    return rc.stats().particles;
+  };
+  assert.ok(motes('gem') > 0, 'control: a gem nearby emits sparkle motes');
+  assert.equal(motes('map'), 0, 'the scroll must not draw attention to itself');
+});
+
+test('preview pose 6 shows the map scroll, and no other pose can see it', () => {
+  const withoutMap = (/** @type {number} */ pose) => {
+    const { maze, view } = previewScene(pose);
+    return renderScene(maze, { ...view, items: previewItems().filter((i) => i.kind !== 'map') });
+  };
+  for (let pose = 0; pose < POSES.length; pose++) {
+    const { maze, view } = previewScene(pose);
+    const frame = renderScene(maze, view);
+    const control = withoutMap(pose);
+    const same = frame.buf.every((c, i) => c === control.buf[i]);
+    if (pose === 6) assert.equal(same, false, 'pose 6 must show the scroll');
+    else assert.equal(same, true, `pose ${pose} changed when the scroll was added to the scene`);
+  }
+});
+
 test('wall torches light the wall they are mounted on and not the far side of it', () => {
   // The lighting model's subtlest rule: a sconce must pool light on its own wall (the flame stands
   // slightly proud of it) while contributing nothing through the masonry to the corridor behind.

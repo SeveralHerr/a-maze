@@ -675,6 +675,76 @@ test('rapid gem pickups raise the arpeggio pitch (combo), a slow one resets it',
   assert.ok(Math.abs(f3 - f0) < 1e-6, 'the combo lapses back to the base pitch');
 });
 
+test('the map scroll has its own cue: not the gem chime, not the oil whoosh, no combo step', () => {
+  const { ctx, audio } = makeAudio();
+  audio.unlock();
+  const state = makeState();
+
+  /**
+   * What one pickup of `kind` builds: its oscillator fundamentals and its noise filter types.
+   * @param {string} kind
+   */
+  function cue(kind) {
+    const mark = ctx.ops.length;
+    const nodes = ctx.nodes.length;
+    audio.handle([{ type: 'pickup', kind, x: 1, y: 1, value: 0 }], state);
+    const added = ctx.nodes.slice(nodes);
+    const freqs = ctx
+      .opsSince(mark)
+      .filter((o) => o.param === 'frequency' && o.node.kind === 'osc' && o.method === 'set')
+      .map((o) => Math.round(o.value));
+    return {
+      freqs,
+      oscTypes: added.filter((n) => n.kind === 'osc').map((n) => n.type),
+      noise: added.filter((n) => n.kind === 'bufferSource').length,
+      filters: added.filter((n) => n.kind === 'filter').map((n) => n.type),
+    };
+  }
+
+  const gem = cue('gem');
+  ctx.advance(AUDIO.COMBO_WINDOW + 0.5);
+  const oil = cue('oil');
+  ctx.advance(2);
+  const map = cue('map');
+  assert.ok(map.freqs.length >= 3, `the map cue has a chime (${map.freqs})`);
+  assert.ok(map.noise >= 3, 'and a parchment rustle made of several crackles');
+  assert.notDeepEqual(map.freqs, gem.freqs, 'not the gem arpeggio');
+  assert.notDeepEqual(map.freqs, oil.freqs, 'not the oil refill');
+  assert.ok(!map.oscTypes.includes('triangle'), 'no gem/oil triangle voice in the map cue');
+  assert.ok(map.filters.includes('bandpass') && map.filters.includes('lowpass'));
+  // Fundamentals only (each note also carries a quiet 2.76× bell partial): three notes, rising.
+  const notes = map.freqs.filter((f) => f < 1000);
+  assert.equal(notes.length, 3, `three chime notes (${map.freqs})`);
+  assert.ok(notes[0] < notes[1] && notes[1] < notes[2], `the chime rises (${notes})`);
+
+  // A replayed event inside the throttle window builds nothing.
+  const again = cue('map');
+  assert.equal(again.freqs.length + again.noise, 0, 'the map cue is rate-limited');
+
+  // The map cue does not touch the gem combo ladder: gem, map, gem climbs exactly one rung — the
+  // same as gem, gem — and a map on its own never starts a combo.
+  ctx.advance(AUDIO.COMBO_WINDOW + 0.5);
+  const base = cue('gem').freqs[0];
+  ctx.advance(0.1);
+  const rung1 = cue('gem').freqs[0];
+  assert.ok(rung1 > base, 'sanity: two quick gems climb');
+  ctx.advance(AUDIO.COMBO_WINDOW + 0.5);
+  assert.equal(cue('gem').freqs[0], base);
+  ctx.advance(0.1);
+  assert.ok(cue('map').freqs.length > 0);
+  ctx.advance(0.1);
+  assert.equal(cue('gem').freqs[0], rung1, 'a map between two gems is not a combo step');
+  ctx.advance(AUDIO.COMBO_WINDOW + 0.5);
+  assert.ok(cue('map').freqs.length > 0);
+  ctx.advance(0.1);
+  assert.equal(cue('gem').freqs[0], base, 'a map alone never starts a combo');
+
+  // An unknown kind is silent rather than a gem.
+  ctx.advance(3);
+  const unknown = cue('relic');
+  assert.equal(unknown.freqs.length + unknown.noise, 0);
+});
+
 test('bump strength scales the thud', () => {
   const { ctx, audio } = makeAudio();
   audio.unlock();

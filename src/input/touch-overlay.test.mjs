@@ -192,6 +192,54 @@ test('the MAP button never moves when the map mode changes (a second tap must la
   m.overlay.destroy();
 });
 
+test('a locked map dims the MAP button and flags the bar, without moving anything', () => {
+  const m = mount();
+  const bar = m.layer.childNodes[2];
+  // The fake DOM has no removeAttribute; give the bar the real browser behaviour.
+  bar.removeAttribute = (/** @type {string} */ k) => {
+    delete bar.attributes[k];
+  };
+  const mapBtn = m.layer.findByText('MAP');
+  const pauseBtn = m.layer.findByText('PAUSE');
+  const geometry = () => [bar.style.cssText, bar.style.transform, mapBtn.style.cssText, mapBtn.style.transform, mapBtn.style.margin].join('|');
+
+  m.overlay.update({ phase: 'playing', settings: { mapMode: 'corner' }, run: { mapFound: true } });
+  const before = geometry();
+  assert.equal(bar.attributes['data-map-locked'], undefined);
+  assert.ok(!mapBtn.style.opacity, 'lit while the map is found');
+
+  m.overlay.update({ phase: 'playing', settings: { mapMode: 'corner' }, run: { mapFound: false } });
+  assert.equal(bar.attributes['data-map-locked'], '1');
+  assert.ok(Number(mapBtn.style.opacity) > 0 && Number(mapBtn.style.opacity) < 1, 'dimmed, not hidden');
+  assert.ok(!pauseBtn.style.opacity, 'PAUSE is untouched');
+  assert.equal(geometry(), before, 'locking moves nothing');
+
+  // The button still fires while locked: main.js answers it with a notice.
+  mapBtn.dispatchEvent({ type: 'touchstart', cancelable: true });
+  mapBtn.dispatchEvent({ type: 'touchend' });
+  assert.deepEqual(m.fired, ['map']);
+
+  // Writes only on a change.
+  mapBtn.style.opacity = 'SENTINEL';
+  m.overlay.update({ phase: 'playing', settings: { mapMode: 'corner' }, run: { mapFound: false } });
+  assert.equal(mapBtn.style.opacity, 'SENTINEL');
+  mapBtn.style.opacity = '0.4';
+
+  m.overlay.update({ phase: 'playing', settings: { mapMode: 'corner' }, run: { mapFound: true } });
+  assert.equal(bar.attributes['data-map-locked'], undefined, 'the flag is removed on unlock');
+  assert.ok(!mapBtn.style.opacity);
+  assert.equal(geometry(), before);
+
+  // An older state without the field (or no run at all) is treated as found.
+  m.overlay.update({ phase: 'playing', run: { mapFound: false } });
+  m.overlay.update({ phase: 'playing', run: {} });
+  assert.equal(bar.attributes['data-map-locked'], undefined);
+  m.overlay.update({ phase: 'playing', run: { mapFound: false } });
+  m.overlay.update({ phase: 'playing' });
+  assert.equal(bar.attributes['data-map-locked'], undefined);
+  m.overlay.destroy();
+});
+
 test('the bar rests below the full map header line in every mode', () => {
   const m = mount();
   const bar = m.layer.childNodes[2];

@@ -129,10 +129,16 @@ export const BOB = Object.freeze({
  * Distances and budgets for interacting with the level.
  */
 export const WORLD = Object.freeze({
-  /** Pickup radius in tiles (ARCHITECTURE.md §4.2). Generous so items never feel sticky. */
-  PICKUP_RADIUS: 0.45,
-  /** Distance to the exit tile centre that counts as "reached" (§4.2). */
-  EXIT_RADIUS: 0.55,
+  /**
+   * Pickup radius in tiles (ARCHITECTURE.md §4.2, §4.8). It was 0.45, and the player could walk
+   * straight past an item: cutting an L-turn keeps the body's centre `PLAYER.RADIUS` (0.22) from the
+   * wall corner, which is √0.5 ≈ 0.707 from the corner tile's centre, so the closest approach was
+   * ≈ 0.49. 0.75 covers that with margin, and still cannot reach through a wall — an item behind a
+   * one-tile wall is always ≥ 1.72 from any position the body can occupy.
+   */
+  PICKUP_RADIUS: 0.75,
+  /** Distance to the exit tile centre that counts as "reached" (§4.2). Kept above `PICKUP_RADIUS`. */
+  EXIT_RADIUS: 0.8,
   /** Fog-of-war reveal radius in tiles. */
   REVEAL_RADIUS: 3,
   /**
@@ -154,8 +160,9 @@ export const WORLD = Object.freeze({
    *
    * A level now carries hundreds of items (≈ 820 at the size cap), so the pickup test may not scan
    * them. The grid is built once per level and queried with the 2×2 buckets that can overlap the
-   * pickup disc. 4 tiles is the sweet spot: `PICKUP_RADIUS` (0.45) is far below it, so the query
-   * can never touch more than 2 buckets per axis, while a bucket still covers only 16 tiles and
+   * pickup capsule (the step's swept segment grown by the radius). 4 tiles is the sweet spot: the
+   * longest step (`WALK_SPEED × SPRINT_MULT × SIM.MAX_DT` = 1.28) plus twice `PICKUP_RADIUS` (0.75)
+   * is 2.78 tiles, below it, so the query can never touch more than 2 buckets per axis, while a bucket still covers only 16 tiles and
    * therefore holds a handful of items at any density the level curve can produce.
    */
   ITEM_GRID_TILES: 4,

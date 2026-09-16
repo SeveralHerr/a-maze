@@ -94,6 +94,25 @@ test('every ramp is ordered dark → light', () => {
   }
 });
 
+test('the map scroll has a parchment ramp and a dark red seal ramp (§4.8)', () => {
+  assert.ok(RAMPS.map instanceof Uint8Array && RAMPS.map.length >= 5, 'map ramp: shadow, dark, mid, light, pale');
+  assert.ok(RAMPS.seal instanceof Uint8Array && RAMPS.seal.length >= 3, 'seal ramp for ribbon and wax');
+  const rgb = (/** @type {number} */ i) => [PALETTE_RGB[i * 3], PALETTE_RGB[i * 3 + 1], PALETTE_RGB[i * 3 + 2]];
+  // Parchment is warm and desaturated: red ≥ green ≥ blue, and never as bright as the UI's gold.
+  for (const i of RAMPS.map) {
+    const [r, g, b] = rgb(i);
+    assert.ok(r >= g && g >= b, `${PALETTE_NAMES[i]} is not a warm parchment tone`);
+  }
+  const top = rgb(RAMPS.map[RAMPS.map.length - 1]);
+  const gold = rgb(C.goldPale);
+  assert.ok(top[0] + top[1] + top[2] < gold[0] + gold[1] + gold[2], 'the scroll must be dimmer than goldPale');
+  // Seal: clearly red, dark.
+  for (const i of RAMPS.seal) {
+    const [r, g, b] = rgb(i);
+    assert.ok(r > g * 2 && r > b * 2 && r < 200, `${PALETTE_NAMES[i]} is not a dark red`);
+  }
+});
+
 test('isPaletteColor recognises exactly the palette', () => {
   for (let i = 0; i < PALETTE_SIZE; i++) assert.equal(isPaletteColor(PALETTE[i]), true);
   assert.equal(isPaletteColor(pack(1, 2, 3, 255)), false);

@@ -30,6 +30,9 @@
  * - **Gems** are the score currency: dead ends first, then tiles far from the solution path — the
  *   reward for the risk of leaving the route. They are scattered by area density so a 128×128 maze
  *   is not a 16×16 maze with the same handful of gems in it.
+ * - **The map scroll** (exactly one, §4.8) is placed last, at the end of a dead-end branch off the
+ *   solution path — see {@link placeMapScroll}. It is not oil, so the refuel chain and
+ *   {@link walkRefuelChain} never see it, and its own RNG fork leaves oil/gem placement unchanged.
  * - **Torches** are mounted on corridor walls at least {@link TORCH_SPACING} tiles apart, so the
  *   renderer's point lights never stack up into a flat, evenly lit room, and so the count stays
  *   proportional to floor area rather than to tile count.
@@ -70,7 +73,7 @@
  * 1..30 across ≥ 25 seeds each; a level where the chain cannot be walked is a release blocker.
  *
  * ## Cost at the gameplay maximum (128×128 cells = 257×257 tiles)
- * Four `Int32Array(width·height)` scratch buffers (~1 MB, all released on return), a handful of
+ * Five `Int32Array(width·height)` scratch buffers (~1.3 MB, all released on return), a handful of
  * O(tiles) passes, and ≤ {@link MAX_ITEMS_PER_KIND} items per kind. No pass is O(items²).
  *
  * `WALK_SPEED`, `CORNER_FACTOR` and the oil-refuel constants duplicate knowledge owned by
@@ -81,7 +84,7 @@
 
 import { createRng, hash2 } from '../core/rng.js';
 import { clamp } from '../core/math.js';
-import { TILE, DIR_COUNT, DIR_DX, DIR_DY, DIR_OPPOSITE } from './constants.js';
+import { TILE, DIR_COUNT, DIR_DX, DIR_DY, DIR_OPPOSITE, MAP_MIN_DETOUR_TILES } from './constants.js';
 
 /** @typedef {import('../core/types.js').Maze} Maze */
 /** @typedef {import('../core/types.js').Validation} Validation */
@@ -223,6 +226,12 @@ const MAX_FUEL = 3600;
  * every push is still bounds-checked.
  */
 const PROBE_SCRATCH = 64;
+
+/**
+ * The map scroll's branch must leave the solution path within this fraction of the route (by path
+ * index), so the map is found while there is still most of the level left to use it on (§4.8).
+ */
+const MAP_JUNCTION_WINDOW = 0.6;
 
 // ─── Fuel budget ─────────────────────────────────────────────────────────────────────────────
 
@@ -464,6 +473,9 @@ export function populateLevel(maze, validation, params, seed) {
   const chainRng = root.fork('items.oil.chain');
   const oilRng = root.fork('items.oil');
   const gemRng = root.fork('items.gem');
+  // `fork` depends only on the root identity and the salt, never on draws, so this stream is
+  // independent of — and invisible to — the oil and gem streams above.
+  const mapSeed = root.fork('items.map').u32() | 0;
   const torchSeed = root.fork('torches').u32() | 0;
 
   const budget = fuelBudget(validation && validation.pathLength > 0 ? validation.pathLength : 1, params, cells);
@@ -517,6 +529,12 @@ export function populateLevel(maze, validation, params, seed) {
   let gems = scatterByBuckets(items, 'gem', gemQuota, ctx, true, gemRng);
   if (gems < gemQuota) gems += scatterByBuckets(items, 'gem', gemQuota - gems, ctx, false, gemRng);
   if (gems < gemQuota) fillByStride(items, 'gem', gemQuota - gems, ctx, gemRng);
+
+  // 4. The hidden map scroll (§4.8) — last, so it can never displace a flask or a gem, and on its
+  //    own forked stream so adding it left every oil/gem position for a given seed unchanged.
+  const askedGap = Number(params?.oilTargetGap);
+  const mapGap = Number.isFinite(askedGap) && askedGap >= 1 ? Math.floor(askedGap) : budget.gap;
+  placeMapScroll(items, ctx, path, Math.floor(mapGap / 4), mapSeed);
 
   const torches = placeTorches(tiles, width, height, torchSeed);
 
@@ -894,6 +912,98 @@ function placeRefuelChain(out, ctx, path, gap, rng) {
     placed++;
   }
   return placed;
+}
+
+/**
+ * Place the level's single hidden map scroll (ARCHITECTURE.md §4.8).
+ *
+ * One multi-source BFS from the solution path labels every floor tile with the path index of the
+ * junction it hangs off (`ctx.stamp` is reused for that: the chain probes are finished), then one
+ * scan over the grid keeps the best free tile of each fallback tier:
+ *
+ * 1. a **dead end off the path**, detour (`pathDist`) in [{@link MAP_MIN_DETOUR_TILES}, `maxDetour`],
+ *    junction in the first {@link MAP_JUNCTION_WINDOW} of the route — uniformly by seeded hash;
+ * 2. the same with any junction;
+ * 3. a dead end off the path deeper than `maxDetour` — the shallowest such, ties by hash;
+ * 4. the **farthest-from-path** free floor tile — ties by hash (also the only tier when there is no
+ *    path, e.g. an unsolvable test fixture).
+ *
+ * The first non-empty tier wins. Free = FLOOR and not `occupied` (so never the start, the exit, the
+ * first three route tiles, or a tile that already carries an item). No free floor ⇒ no map item,
+ * which `src/state` reads as "the map is unlocked". Cost: one BFS + one scan, O(tiles), one queue.
+ *
+ * @param {Item[]} out
+ * @param {Ctx} ctx
+ * @param {Uint32Array|null} path
+ * @param {number} maxDetour largest preferred detour, tiles (`floor(oilTargetGap / 4)`)
+ * @param {number} seed int32 hash seed from the level's `items.map` stream
+ * @returns {number} the chosen tile index, or −1 when nothing was placed
+ */
+function placeMapScroll(out, ctx, path, maxDetour, seed) {
+  const { tiles, width, height, total, occupied, pathDist, pathIndexOf } = ctx;
+  const junction = ctx.stamp;
+  const hasPath = path !== null && path.length > 0;
+  let lastJunction = -1;
+
+  if (hasPath) {
+    junction.fill(-1);
+    const queue = new Int32Array(total);
+    let head = 0;
+    let tail = 0;
+    for (let i = 0; i < path.length; i++) {
+      const idx = path[i];
+      if (idx < 0 || idx >= total || junction[idx] >= 0) continue;
+      junction[idx] = i;
+      queue[tail++] = idx;
+    }
+    while (head < tail) {
+      const idx = queue[head++];
+      const x = idx % width;
+      const y = (idx - x) / width;
+      for (let d = 0; d < DIR_COUNT; d++) {
+        const nx = x + DIR_DX[d];
+        const ny = y + DIR_DY[d];
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        const nIdx = ny * width + nx;
+        if (tiles[nIdx] !== TILE.FLOOR || junction[nIdx] >= 0) continue;
+        junction[nIdx] = junction[idx];
+        queue[tail++] = nIdx;
+      }
+    }
+    lastJunction = Math.floor(MAP_JUNCTION_WINDOW * (path.length - 1));
+  }
+
+  // Best tile and score per tier (index 0..3). Scores are < 2^48, exact in a double.
+  let t0 = -1, t1 = -1, t2 = -1, t3 = -1;
+  let s0 = -1, s1 = -1, s2 = -1, s3 = -1;
+  for (let y = 1; y < height - 1; y++) {
+    const row = y * width;
+    for (let x = 1; x < width - 1; x++) {
+      const idx = row + x;
+      if (tiles[idx] !== TILE.FLOOR || occupied[idx] !== 0) continue;
+      const pd = pathDist[idx];
+      if (hasPath && pd < 0) continue; // unreachable from the route (fixtures only)
+      const h = hash2(x, y, seed);
+
+      if (hasPath && pd >= MAP_MIN_DETOUR_TILES && pathIndexOf[idx] < 0 && floorNeighbours(tiles, width, idx) === 1) {
+        if (pd <= maxDetour) {
+          if (junction[idx] >= 0 && junction[idx] <= lastJunction) {
+            if (h > s0) { s0 = h; t0 = idx; }
+          } else if (h > s1) { s1 = h; t1 = idx; }
+        } else {
+          const s = (65535 - Math.min(pd, 65535)) * 4294967296 + h;
+          if (s > s2) { s2 = s; t2 = idx; }
+        }
+      }
+      const s = Math.min(Math.max(pd, 0), 65535) * 4294967296 + h;
+      if (s > s3) { s3 = s; t3 = idx; }
+    }
+  }
+
+  const chosen = t0 >= 0 ? t0 : t1 >= 0 ? t1 : t2 >= 0 ? t2 : t3;
+  if (chosen < 0) return -1;
+  pushItem(out, occupied, 'map', chosen, width);
+  return chosen;
 }
 
 /**

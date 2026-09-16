@@ -380,6 +380,20 @@ test('a gap in updates (map switched off) forces one exact rescan', () => {
   assert.equal(view.exploredCount(), countExplored(state.explored));
 });
 
+test('invalidate() makes exactly the next update one exact rescan (the map-lock catch-up)', () => {
+  const { view } = makeView();
+  const state = makeState(64, 64); // 129×129: a far reveal is out of one sweep's reach
+  reveal(state, 1, 1, 3);
+  view.update(state, 0);
+  reveal(state, 120, 120, 6);
+  view.invalidate();
+  view.update(state, 0.016); // no stale gap: only the invalidation can explain a rescan
+  assert.equal(view.stats().rebuilds, 2);
+  assert.equal(view.exploredCount(), countExplored(state.explored));
+  view.update(state, 0.032);
+  assert.equal(view.stats().rebuilds, 2, 'one catch-up, not a rebuild per frame');
+});
+
 test('the rolling sweep reconciles a reveal the box could never have seen', () => {
   const { view } = makeView();
   const state = makeState(16, 16); // 33×33 = 1089 tiles, under one sweep budget
@@ -411,6 +425,44 @@ test('taken items are repainted without ever scanning the item list per frame', 
   // And the frames after it cost nothing extra.
   view.update(state, MAP.PRUNE_INTERVAL + 0.02);
   assert.equal(view.stats().painted, 0);
+});
+
+test('the map scroll is never charted — not as a gem, not at all — and unknown kinds are skipped', () => {
+  /**
+   * Rasterise a fully explored 8×8 level holding `items` and return the tile raster's bytes.
+   * @param {any[]} items
+   * @returns {Uint8ClampedArray}
+   */
+  const raster = (items) => {
+    /** @type {any} */
+    let img = null;
+    const view = createMapView({
+      createCanvas: (w, h) => {
+        const c = fakeCanvas(w, h);
+        const make = c.__ctx.createImageData;
+        c.__ctx.createImageData = (/** @type {number} */ cw, /** @type {number} */ ch) => {
+          const made = make(cw, ch);
+          if (img === null) img = made;
+          return made;
+        };
+        return c;
+      },
+      now: () => 0,
+    });
+    const state = makeState(8, 8);
+    state.levelData.items = items;
+    state.explored.fill(1);
+    view.update(state, 0);
+    return img.data;
+  };
+  const at = { x: 5.5, y: 3.5, taken: false };
+  const empty = raster([]);
+  const withMap = raster([{ id: 0, kind: 'map', ...at }]);
+  const withGem = raster([{ id: 0, kind: 'gem', ...at }]);
+  const withRelic = raster([{ id: 0, kind: 'relic', ...at }]);
+  assert.notDeepEqual(withGem, empty, 'sanity: a gem is charted');
+  assert.deepEqual(withMap, empty, 'the scroll leaves its tile as plain floor');
+  assert.deepEqual(withRelic, empty, 'an unknown kind is not drawn as a gem');
 });
 
 test('a mismatched explored buffer is refused rather than read out of bounds', () => {

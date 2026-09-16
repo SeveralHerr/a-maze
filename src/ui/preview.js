@@ -44,6 +44,15 @@ const showHint = params.get('hint') === '1';
  * layout the title and the HUD have to respect on a real phone.
  */
 const bandParam = params.get('band') === '1';
+/**
+ * `?maplock=1`: the level's map scroll has not been found (ARCHITECTURE.md §4.8) — no map in any
+ * mode, the HUD laid out as for OFF. Press M for the "no map" notice (what `src/main.js` does), F to
+ * find the scroll. `?maplock=found`: start locked and pick the scroll up half a second in, so a frozen
+ * `?t=0.8&maplock=found` screenshot shows the "Map Found" banner.
+ */
+const mapLockParam = params.get('maplock');
+/** Seconds into the preview at which `?maplock=found` picks the scroll up. */
+const MAP_FOUND_AT = 0.5;
 /** `?pad=1`: pretend a gamepad is connected, so the Controls panel shows its PAD column. */
 if (params.get('pad') === '1') {
   try {
@@ -236,6 +245,7 @@ const state = {
     // for this wave). The preview supplies them so the four-row summary layout is exercised.
     refuels: 4,
     distance: 1240,
+    mapFound: mapLockParam !== '1' && mapLockParam !== 'found',
   },
   best: { score: 12750, level: 6 },
   settings: {
@@ -410,12 +420,23 @@ const KEYS = {
 };
 
 window.addEventListener('keydown', (ev) => {
+  if (ev.code === 'KeyF' && state.phase === 'playing') {
+    // Find the scroll (stands in for the sim's `takeItem`): the HUD raises its banner from the delta.
+    state.run.mapFound = true;
+    return;
+  }
   const action = KEYS[ev.code];
   if (action === undefined) return;
   ev.preventDefault();
   if (state.phase === 'playing' && (action === 'back' || action === 'pause')) {
     state.phase = 'paused';
     state.phaseTime = 0;
+    return;
+  }
+  // The map hotkey while the scroll is missing: main.js neither cycles nor persists, it notifies.
+  if (state.phase === 'playing' && action === 'map') {
+    if (hud.mapLocked(state)) hud.notice('NO MAP - FIND THE SCROLL');
+    else hud.cycleMap(state.settings);
     return;
   }
   menus.handleInput(frameWith(action), state);
@@ -698,6 +719,9 @@ function step(dt) {
   state.time += dt;
   state.phaseTime += dt;
   if (state.phase === 'playing') walk(dt);
+  if (mapLockParam === 'found' && !state.run.mapFound && state.phase === 'playing' && state.phaseTime >= MAP_FOUND_AT) {
+    state.run.mapFound = true;
+  }
 
   drawBackdrop(state.time);
   if (screenParam === 'font') {
@@ -712,7 +736,7 @@ function step(dt) {
     const m = hud.surface.metrics;
     const ms = hud.mapStats();
     hintEl.textContent =
-      `screen ${menus.screen()}  phase ${state.phase}  map ${hud.mapMode(state.settings)}
+      `screen ${menus.screen()}  phase ${state.phase}  map ${hud.mapMode(state.settings)}${hud.mapLocked(state) ? ' (locked)' : ''}
 ` +
       `ui ${m.w}x${m.h} @${m.px}  u${m.u}  dpr${(m.devW / m.cssW).toFixed(2)}
 ` +
@@ -764,6 +788,12 @@ if (frozen) {
     for (let i = 0; i < 3 && now !== mode; i++) now = hud.cycleMap(state.settings);
     return now;
   },
+  /** Lock or unlock the map (§4.8); unlocking raises the "Map Found" banner. */
+  setMapFound: (/** @type {boolean} */ found) => {
+    state.run.mapFound = found === true;
+  },
+  /** Show a one-line notice, as main.js does for a locked map hotkey. */
+  notice: (/** @type {string} */ text) => hud.notice(text),
   /** What the demo level actually is, so the driver can label its measurements. */
   maze: { cells: CELLS, tiles: MAP_W, items: items.length },
 };

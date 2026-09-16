@@ -118,6 +118,9 @@ export function previewItems() {
     { id: 7, kind: 'oil', x: 1.5, y: 5.5, taken: false },
     { id: 8, kind: 'oil', x: 13.5, y: 11.5, taken: false },
     { id: 9, kind: 'oil', x: 7.5, y: 11.5, taken: false },
+    // The hidden map scroll (§4.8), down the west inner corridor. No existing pose can see this
+    // tile, so adding it left every measured preview frame byte-identical; pose 6 looks at it.
+    { id: 10, kind: 'map', x: 3.5, y: 7.5, taken: false },
   ];
 }
 
@@ -125,7 +128,8 @@ export function previewItems() {
  * Fixed camera poses for deterministic screenshots (`preview.html?pose=N`): `[x, y, angleRadians]`.
  * Chosen so that between them they show every feature the renderer has: long-run perspective, wall
  * torches and their light pools, both item types, the portal, and an inside corner.
- * 0 long corridor · 1 lit hall · 2 portal chamber · 3 torch close-up · 4 oil flask · 5 corner turn.
+ * 0 long corridor · 1 lit hall · 2 portal chamber · 3 torch close-up · 4 oil flask · 5 corner turn ·
+ * 6 map scroll (two tiles ahead, under the sconce on the west wall).
  * @type {ReadonlyArray<readonly [number, number, number]>}
  */
 export const POSES = Object.freeze([
@@ -135,4 +139,5 @@ export const POSES = Object.freeze([
   /** @type {const} */ ([3.4, 1.5, 0]),
   /** @type {const} */ ([13.5, 13.0, -Math.PI / 2]),
   /** @type {const} */ ([3.5, 13.5, Math.PI]),
+  /** @type {const} */ ([3.5, 9.7, -Math.PI / 2]),
 ]);

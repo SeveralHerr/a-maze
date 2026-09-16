@@ -410,6 +410,26 @@ function boot() {
       const ev = events[i];
       switch (ev.type) {
         case 'pickup': {
+          if (ev.kind === 'map') {
+            // The map scroll (§4.8): a pale parchment puff and a soft warm-white flash. The HUD
+            // shows its own "MAP FOUND" banner from the `run.mapFound` delta, not from here.
+            raycaster.particles.burst(
+              PARTICLE.SPARK,
+              ev.x,
+              ev.y,
+              0.36,
+              22,
+              1.6,
+              0.8,
+              PARTICLE_COLORS.dust,
+              fxRng.next,
+            );
+            worldFlash.r = 255;
+            worldFlash.g = 240;
+            worldFlash.b = 200;
+            worldFlash.a = Math.min(0.5, worldFlash.a + 0.34);
+            break;
+          }
           const gem = ev.kind === 'gem';
           // Sparkle burst at the item, and a short warm tint inside the world (not over the HUD —
           // the two flash paths must not be used for the same event, or the pop doubles).
@@ -610,7 +630,11 @@ function boot() {
     if (state.phase === 'playing' && (pressed.has('pause') || pressed.has('back'))) {
       store.dispatch({ type: 'pause' });
     }
-    if (pressed.has('map')) {
+    if (pressed.has('map') && hud.mapLocked(state)) {
+      // Locked until this level's scroll is found (§4.8). The persisted preference is left alone
+      // so the map returns in the player's chosen mode the moment it unlocks.
+      hud.notice('No Map - Find the Scroll');
+    } else if (pressed.has('map')) {
       // Three states now (§4.6): OFF → CORNER → FULL. The HUD owns the cycle because it owns the
       // overlay that draws it; main.js only persists the result. Both keys are written: `mapMode`
       // is what the map restores from, `minimap` is the legacy mirror other consumers still read.
