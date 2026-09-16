@@ -29,15 +29,15 @@ const MAX_SCORE = 999999999;
 const MAX_CLOCK_SECONDS = 99 * 60 + 59;
 
 /**
- * Rolling-counter tuning. A counter closes the gap in `DURATION` seconds, but never slower than
- * `MIN_RATE` units/second — otherwise a `+10` pop would crawl — and never slower than 1 unit per
- * frame at 60 Hz, so it always terminates.
+ * Rolling-counter tuning. A roll lasts `DURATION` seconds **whatever the gap** — a `+300` gem and a
+ * `+12,000` level bonus land in the same beat — except that a small change never crawls slower
+ * than `MIN_RATE` units per second, so a `+10` is an increment rather than a fade.
  * @type {Readonly<Record<string, number>>}
  */
 export const ROLL = Object.freeze({
-  /** Seconds to close the whole remaining gap at the current rate. */
-  DURATION: 0.42,
-  /** Floor on the roll rate, in units/second. */
+  /** Seconds one roll lasts, from the moment its target is set. */
+  DURATION: 0.55,
+  /** A roll shorter than `DURATION` still moves at least this many units per second. */
   MIN_RATE: 60,
   /** Gap below which the counter simply snaps (stops the last few units dribbling). */
   SNAP_EPSILON: 0.5,
@@ -267,12 +267,15 @@ export function formatUnits(n, unit) {
 /**
  * Create a rolling counter.
  *
- * The roll rate is proportional to the remaining gap (`gap / ROLL.DURATION`) with a floor, so a
- * `+100` gem pop and a `+12,000` level bonus both finish in about the same time while a small
- * change still moves fast enough to read as an increment rather than a fade.
+ * Each roll is a **fixed-length ease-out** from wherever the display was when the target changed:
+ * fast off the mark, settling onto the number. The first version moved at a rate proportional to
+ * the remaining gap, which is an exponential decay — it never quite arrives, so a 8,531-point total
+ * spent its last two seconds dribbling through single digits and the level-complete tally took
+ * 4.6 s before its buttons appeared. A fixed duration makes the tally's rhythm the stagger between
+ * rows, which is the thing that was designed.
  *
- * It keeps a float accumulator internally and exposes only the rounded integer, so the value
- * never flickers between two neighbouring numbers on slow frames.
+ * It keeps a float position internally and exposes only an integer truncated toward where the roll
+ * started, so the value never flickers between neighbours and never shows a number not yet earned.
  *
  * @param {number} [initial] starting value (default 0)
  * @returns {Counter}
@@ -280,8 +283,12 @@ export function formatUnits(n, unit) {
 export function createCounter(initial = 0) {
   let current = safeInt(initial);
   let target = current;
-  /** Float position; `value` is this rounded toward the target. */
+  /** Float position; `value` is this truncated toward the start of the roll. */
   let pos = current;
+  /** Where the current roll started, how long it lasts and how far into it we are (seconds). */
+  let from = current;
+  let span = 0;
+  let elapsed = 0;
 
   const counter = {
     get value() {
@@ -298,7 +305,14 @@ export function createCounter(initial = 0) {
      * @returns {void}
      */
     set(v) {
-      target = safeInt(v);
+      const next = safeInt(v);
+      // Called every frame with the same value by design; only a real retarget starts a new roll.
+      if (next === target) return;
+      target = next;
+      from = pos;
+      elapsed = 0;
+      const gap = target - from < 0 ? from - target : target - from;
+      span = Math.min(ROLL.DURATION, gap / ROLL.MIN_RATE);
     },
     /**
      * @param {number} v
@@ -308,6 +322,9 @@ export function createCounter(initial = 0) {
       target = safeInt(v);
       pos = target;
       current = target;
+      from = target;
+      span = 0;
+      elapsed = 0;
     },
     /**
      * @param {number} dt seconds
@@ -316,31 +333,70 @@ export function createCounter(initial = 0) {
     update(dt) {
       if (current === target) return false;
       const step = typeof dt === 'number' && Number.isFinite(dt) && dt > 0 ? dt : 0;
-      const gap = target - pos;
-      const dist = gap < 0 ? -gap : gap;
-      if (dist <= ROLL.SNAP_EPSILON || step === 0) {
+      if (step === 0) {
         // A zero dt still resolves a sub-unit gap: `update(0)` must never leave the counter
         // permanently one unit short of its target.
-        if (dist <= ROLL.SNAP_EPSILON) {
-          pos = target;
-          current = target;
-          return true;
-        }
-        return false;
-      }
-      const rate = Math.max(ROLL.MIN_RATE, dist / ROLL.DURATION);
-      const move = rate * step;
-      if (move >= dist) {
+        const left = target - pos < 0 ? pos - target : target - pos;
+        if (left > ROLL.SNAP_EPSILON) return false;
         pos = target;
-      } else {
-        pos += gap < 0 ? -move : move;
+        current = target;
+        return true;
       }
-      // Truncate toward the start of the roll so the readout never overshoots its target.
-      const shown = gap > 0 ? Math.floor(pos) : Math.ceil(pos);
+      elapsed += step;
+      const k = span > 0 ? Math.min(1, elapsed / span) : 1;
+      // Ease-out cubic: most of the distance early, a visible settle at the end, and never past 1,
+      // so the display can neither overshoot nor undershoot.
+      const inv = 1 - k;
+      pos = from + (target - from) * (1 - inv * inv * inv);
+      const left = target - pos < 0 ? pos - target : target - pos;
+      if (k >= 1 || left <= ROLL.SNAP_EPSILON) pos = target;
+      // Truncate toward the start of the roll so the readout never shows an unearned value.
+      const shown = pos === target ? target : target > from ? Math.floor(pos) : Math.ceil(pos);
       if (shown === current) return false;
       current = shown;
       return true;
     },
   };
   return counter;
+}
+
+// ─── Per-frame label memo ────────────────────────────────────────────────────────────────────
+
+/**
+ * A one-slot memo for a label built from up to three numbers: the string is rebuilt only when one
+ * of the numbers changes, and the previous string is handed back otherwise.
+ *
+ * WHY it exists: the overlay re-renders every frame, but the numbers it prints change a few times
+ * a second at most — the fuel clock once a second, the score only while it rolls, the depth once a
+ * level. Every `formatX()` call and template literal allocates a fresh string, so a HUD that
+ * formats its readouts per frame produces a steady trickle of garbage for no visible change. The
+ * caller passes the *quantised* inputs (whole seconds, the rounded percentage), which is what makes
+ * the key stable between the frames where the text really is the same.
+ *
+ * Keys are compared with `Object.is`, so `NaN` and `Infinity` (an unloaded level's exit distance)
+ * are stable keys too. The memo is total: a throwing builder yields `''` rather than an exception
+ * in the middle of a render. Calling it allocates nothing.
+ * @param {(a:number, b:number, c:number) => string} build
+ * @returns {(a:number, b?:number, c?:number) => string}
+ */
+export function createTextMemo(build) {
+  let lastA = 0;
+  let lastB = 0;
+  let lastC = 0;
+  let text = '';
+  let primed = false;
+  return function memo(a, b = 0, c = 0) {
+    if (primed && Object.is(a, lastA) && Object.is(b, lastB) && Object.is(c, lastC)) return text;
+    lastA = a;
+    lastB = b;
+    lastC = c;
+    primed = true;
+    try {
+      const out = build(a, b, c);
+      text = typeof out === 'string' ? out : '';
+    } catch (err) {
+      text = '';
+    }
+    return text;
+  };
 }

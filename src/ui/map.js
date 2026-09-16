@@ -52,10 +52,10 @@
  * `minimap` as a boolean or adopts a `mapMode` string.
  */
 
-import { clamp } from '../core/math.js';
+import { clamp, clamp01 } from '../core/math.js';
 import { createLogger } from '../core/log.js';
 import { COLOR, drawText, measureLine, textHeight } from './font.js';
-import { formatCount, formatDistance, formatPercent, formatLabyrinth } from './format.js';
+import { createTextMemo, formatCount, formatDistance, formatPercent, formatLabyrinth } from './format.js';
 import {
   ARROWS,
   ARROW_PALETTE,
@@ -114,11 +114,18 @@ export function nextMapMode(mode) {
 }
 
 /**
+ * The part of `Settings` the map reads. Deliberately loose: the settings object may come from a
+ * state module that predates `mapMode`, or from persisted storage, and every reader here treats
+ * both fields as untrusted.
+ * @typedef {{mapMode?:unknown, minimap?:unknown}} MapSettings
+ */
+
+/**
  * What the *settings* say the mode is, ignoring any local choice.
  *
  * `settings.mapMode` wins when `src/state` carries it. Otherwise the legacy boolean
  * `settings.minimap` maps to off/corner, which is what every build before this wave stored.
- * @param {Settings|null|undefined} settings
+ * @param {MapSettings|null|undefined} settings
  * @returns {MapMode}
  */
 export function mapModeFromSettings(settings) {
@@ -150,7 +157,7 @@ let localModeArmed = false;
  * `corner → full` writes `minimap: true`, the settings-derived mode does not change, and the local
  * `full` survives. See ARCHITECTURE.md §4.6 / the contract note in this wave's report.
  *
- * @param {Settings|null|undefined} settings
+ * @param {MapSettings|null|undefined} settings
  * @returns {MapMode}
  */
 export function readMapMode(settings) {
@@ -186,7 +193,7 @@ export function setMapMode(mode) {
  * Advance the cycle. The caller (main.js / the options screen) should then persist it with
  * `setSetting('mapMode', mode)` **and** `setSetting('minimap', mode !== 'off')`, so the preference
  * survives whichever shape `src/state` stores.
- * @param {Settings|null|undefined} settings
+ * @param {MapSettings|null|undefined} settings
  * @returns {MapMode} the new mode
  */
 export function cycleMapMode(settings) {
@@ -235,7 +242,17 @@ export const MAP = Object.freeze({
    * scan. Covers the map being switched off for a while, a tab switch, or a teleport.
    */
   STALE_AFTER: 0.4,
+  /**
+   * Side margin of the full map, in **device** pixels. The full map is fitted on the device grid
+   * (see `drawFull`), so its margin is too. Paid in UI pixels it cost `3u × m.px` a side — 30 device
+   * pixels on a 412×915 phone at dpr 2.625, which was the difference between 3 and 4 device pixels
+   * per tile across the 257-tile cap (771 vs 1 028 px, 71 % vs 95 % of the screen width).
+   */
+  MARGIN_DEV: 6,
 });
+
+/** Shorthand for `MAP.MARGIN_DEV`, used on the full map's hot path. */
+const MAP_MARGIN_DEV = MAP.MARGIN_DEV;
 
 // ─── Raster colours ──────────────────────────────────────────────────────────────────────────
 
@@ -406,21 +423,49 @@ export function countExplored(explored, limit) {
  * @param {number} boxW available width, in the units the caller draws in (the full map passes
  *   **device** pixels — see `drawFull`)
  * @param {number} boxH available height, same units
- * @returns {{res:'tile'|'cell', scale:number, w:number, h:number}} `scale` is target pixels per
- *   raster pixel (an integer ≥ 1); `w`/`h` are the drawn size in the same units as `boxW`/`boxH`
+ * @param {FullFit} [out] filled in place and returned when given — the full map compares two
+ *   candidate layouts every frame and must not allocate to do it
+ * @returns {FullFit} `scale` is target pixels per raster pixel (an integer ≥ 1); `w`/`h` are the
+ *   drawn size in the same units as `boxW`/`boxH`
  */
-export function chooseFullScale(cols, rows, boxW, boxH) {
+export function chooseFullScale(cols, rows, boxW, boxH, out) {
+  const fit = out === undefined ? { res: /** @type {'tile'|'cell'} */ ('tile'), scale: 0, w: 0, h: 0 } : out;
   const c = Math.max(1, Math.floor(cols));
   const r = Math.max(1, Math.floor(rows));
   const tw = c * 2 + 1;
   const th = r * 2 + 1;
   const tileScale = Math.min(Math.floor(boxW / tw), Math.floor(boxH / th));
   if (tileScale >= 1) {
-    return { res: 'tile', scale: tileScale, w: tw * tileScale, h: th * tileScale };
+    fit.res = 'tile';
+    fit.scale = tileScale;
+    fit.w = tw * tileScale;
+    fit.h = th * tileScale;
+    return fit;
   }
   const cellScale = Math.max(1, Math.min(Math.floor(boxW / c), Math.floor(boxH / r)));
-  return { res: 'cell', scale: cellScale, w: c * cellScale, h: r * cellScale };
+  fit.res = 'cell';
+  fit.scale = cellScale;
+  fit.w = c * cellScale;
+  fit.h = r * cellScale;
+  return fit;
 }
+
+/**
+ * Does fit `a` draw a better full map than fit `b`? Tile resolution beats cell resolution (walls
+ * are the point of the map), then the larger drawn area wins, and a tie goes to `a`.
+ * @param {FullFit} a
+ * @param {FullFit} b
+ * @returns {boolean}
+ */
+export function fitBeats(a, b) {
+  if (a.res !== b.res) return a.res === 'tile';
+  return a.w * a.h >= b.w * b.h;
+}
+
+/**
+ * One way of fitting the maze into a box.
+ * @typedef {{res:'tile'|'cell', scale:number, w:number, h:number}} FullFit
+ */
 
 /**
  * The tile window the corner map shows, clamped so it never scrolls past the edges of a small
@@ -466,8 +511,9 @@ export function cornerWindow(px, py, span, mw, mh, out) {
  *   frame while the map is visible, before drawing
  * @property {(ctx:CanvasRenderingContext2D, m:any, state:GameState, clock:number, reduced:boolean) => number}
  *   drawCorner  draw the corner window; returns its height in UI pixels (0 if it drew nothing)
- * @property {(ctx:CanvasRenderingContext2D, m:any, state:GameState, clock:number, reduced:boolean) => void}
- *   drawFull  draw the full-screen labyrinth map
+ * @property {(ctx:CanvasRenderingContext2D, m:any, state:GameState, clock:number, reduced:boolean, gaugeRight?:number, gaugeBottom?:number) => void}
+ *   drawFull  draw the full-screen labyrinth map, laying its text out clear of the fuel gauge box
+ *   the HUD keeps on screen over it (right and bottom edges, UI pixels)
  * @property {() => number} exploredCount  explored tiles, maintained incrementally
  * @property {() => MapStats} stats  live, reused object — never retain a copy
  * @property {() => void} reset
@@ -972,24 +1018,46 @@ export function createMapView(options) {
     );
   }
 
+  /** Fit scratch for the full map's two candidate layouts ({@link chooseFullScale} fills them). */
+  /** @type {FullFit} */
+  const stackFit = { res: 'tile', scale: 0, w: 0, h: 0 };
+  /** @type {FullFit} */
+  const railFit = { res: 'tile', scale: 0, w: 0, h: 0 };
+
+  // ── Full-map label text, rebuilt only when the numbers behind it change ──
+  const headMemo = createTextMemo((lv, c, r) => 'DEPTH ' + lv + '  ·  ' + formatLabyrinth(c, r));
+  const depthMemo = createTextMemo((lv) => 'DEPTH ' + lv);
+  const sizeMemo = createTextMemo((c, r) => formatLabyrinth(c, r));
+  const mappedMemo = createTextMemo((pct) => 'MAPPED ' + formatPercent(pct / 100));
+  const gemsMemo = createTextMemo((g, t) => formatCount(g, t));
+  const exitMemo = createTextMemo((d) => 'EXIT ' + formatDistance(d));
+  const distMemo = createTextMemo((d) => formatDistance(d));
+
   /**
-   * The full-screen labyrinth map: header, fitted map, legend.
+   * The full-screen labyrinth map: the fitted map, what it is (depth, size, how much is mapped) and
+   * a legend.
    *
-   * The layout is measured rather than assumed, because the two targets are wildly different
-   * boxes: 640×360 UI pixels on a desktop (where a 257-pixel map and a three-item legend sit side
-   * by side comfortably) and 234×506 on a phone at dpr 3, where the same text at the same scale
-   * is twice the width of the screen. Every string here is fitted with {@link fitScale} and the
-   * map is centred in whatever is left.
+   * **Two layouts, and whichever draws the bigger map wins** — measured every frame from the real
+   * text widths, because the targets are wildly different boxes:
+   * - **Strips** (a phone, and the fallback): a header strip on top, the legend strip underneath and
+   *   the map centred between them. A phone at dpr 3 is 234×506 UI pixels; it has no side room.
+   * - **Rails** (a wide screen): the header stacks down the left gutter under the fuel gauge, the
+   *   legend down the right gutter, and the map gets the whole height. On 16:9 the strips spent
+   *   ~24 % of the height on two lines of text while the left and right thirds of the screen sat
+   *   empty; at 1920×1080 the rails draw the 257-tile cap at 4 device pixels per tile (1 028 px)
+   *   where the strips managed 3 (771 px).
+   * A tie goes to the rails: the same map, with the text moved out of the way of it.
    * @param {CanvasRenderingContext2D} ctx
    * @param {any} m surface metrics
    * @param {GameState} state
    * @param {number} clock
    * @param {boolean} reduced
-   * @param {number} [headerLeft] left edge for the header line, so it clears the fuel gauge
-   * @param {number} [topInset] vertical space already taken at the top (the gauge, on a phone)
+   * @param {number} [gaugeRight] right edge of the fuel gauge the HUD keeps on screen over the map,
+   *   in UI pixels (0 when there is none)
+   * @param {number} [gaugeBottom] bottom edge of that gauge, in UI pixels
    * @returns {void}
    */
-  function drawFull(ctx, m, state, clock, reduced, headerLeft, topInset) {
+  function drawFull(ctx, m, state, clock, reduced, gaugeRight, gaugeBottom) {
     const level = /** @type {any} */ (state.levelData);
     if (tileCanvas === null || level === null || level !== levelRef) return;
     const t0 = now();
@@ -1003,45 +1071,35 @@ export function createMapView(options) {
 
     const margin = 3 * u;
     const frame = Math.max(1, u);
-    const inset = topInset === undefined ? 0 : topInset;
-    const hx = headerLeft === undefined || headerLeft <= 0 ? margin : headerLeft;
-
-    // ── Header: depth, size, how much of it you have seen ──
+    const dev = Math.max(1, m.px);
+    const gR = typeof gaugeRight === 'number' && gaugeRight > 0 ? gaugeRight : 0;
+    const gB = typeof gaugeBottom === 'number' && gaugeBottom > 0 ? gaugeBottom : 0;
     const total = mw * mh;
-    const pct = total > 0 ? explored / total : 0;
-    const head = `DEPTH ${state.level}  ·  ${formatLabyrinth(maze.cols, maze.rows)}`;
-    const mapped = `MAPPED ${formatPercent(pct)}`;
-    const headRoom = m.w - hx - margin;
-    // One scale for both halves of the header, shrunk until they fit side by side.
-    let headSize = Math.max(1, u);
-    for (;;) {
-      const hw = measureLine(head, { font: 'hud', size: headSize });
-      const mwid = measureLine(mapped, { font: 'hud', size: headSize });
-      if (hw + mwid + 4 * u <= headRoom || headSize <= 1) break;
-      headSize--;
-    }
-    const headH = textHeight({ font: 'hud', size: headSize });
-    const headY = margin + inset;
-    drawText(ctx, head, hx, headY, { font: 'hud', size: headSize, color: 'hudGold' });
-    drawText(ctx, mapped, m.w - margin, headY, {
-      font: 'hud',
-      size: headSize,
-      color: 'hudDim',
-      align: 'right',
-    });
+    const mapped = mappedMemo(total > 0 ? Math.round(clamp01(explored / total) * 100) : 0);
 
-    // ── Box: everything between the header and the legend, with the map centred in it ──
+    // ── Candidate 1: strips ──
+    const head = headMemo(state.level, maze.cols, maze.rows);
+    // Beside the gauge on a wide screen, under it on a phone — and under it on a wide screen too
+    // when beside it the header would have to shrink (a 4:3 window): a header at half the size of
+    // the legend under the map reads as an afterthought, and the row under the gauge is free.
+    const under =
+      m.narrow || headerScale(head, mapped, m.w - Math.max(margin, gR + 3 * u) - margin, u) < Math.max(1, u);
+    const hx = under ? margin : Math.max(margin, gR + 3 * u);
+    const headY = under ? Math.max(margin, gB + 2 * u) : margin;
+    const headSize = headerScale(head, mapped, m.w - hx - margin, u);
+    const headH = textHeight({ font: 'hud', size: headSize });
     const legendSize = legendScale(m, state, u);
     const legendH = textHeight({ font: 'hud', size: legendSize });
     const legendY = m.h - margin - legendH;
     const boxTop = headY + headH + 3 * u;
-    const boxBottom = legendY - 3 * u;
-    const boxW = m.w - margin * 2 - frame * 2;
-    const boxH = boxBottom - boxTop - frame * 2;
-    if (boxW < 16 || boxH < 16) {
-      stats.drawMs = now() - t0;
-      return;
-    }
+    const boxH = legendY - 3 * u - boxTop - frame * 2;
+    // The side margin is paid in **device** pixels, not in UI pixels. A 3-UI-pixel margin costs
+    // `3u × m.px` device pixels a side, and the fit below is quantised to whole device pixels per
+    // tile, so a margin paid on the chunky grid can cost a whole pixel per tile across a 257-tile
+    // map (see `MAP.MARGIN_DEV` for the phone where it did). The map is a diagram measured on the device grid (see the note
+    // under this one); its margin has to be measured there too.
+    const boxWDev = (m.w - frame * 2) * dev - 2 * MAP_MARGIN_DEV;
+    const stripsOk = boxWDev >= 16 * dev && boxH >= 16;
 
     // The map is fitted in **device** pixels rather than in UI pixels.
     //
@@ -1054,16 +1112,67 @@ export function createMapView(options) {
     // is still an integer number of device pixels per raster pixel; the grid is simply finer than
     // the font's. On a desktop (`m.px` = 2) this changes nothing — the arithmetic gives the same
     // answer it did in UI pixels.
-    const dev = Math.max(1, m.px);
-    const fit = chooseFullScale(maze.cols, maze.rows, boxW * dev, boxH * dev);
+    if (stripsOk) chooseFullScale(maze.cols, maze.rows, boxWDev, boxH * dev, stackFit);
+
+    // ── Candidate 2: rails (a wide screen only) ──
+    const railSize = Math.max(1, u);
+    const railLineH = textHeight({ font: 'hud', size: railSize });
+    let rail = false;
+    let railLeft = 0;
+    let railRight = 0;
+    if (!m.narrow) {
+      // The left rail is already as wide as the gauge above it, so the close hint lives at its foot
+      // rather than widening the legend rail on the other side of the map.
+      const textW = Math.max(
+        measureLine(depthMemo(state.level), { font: 'hud', size: railSize }),
+        measureLine(sizeMemo(maze.cols, maze.rows), { font: 'hud', size: railSize }),
+        measureLine(mapped, { font: 'hud', size: railSize }),
+        measureLine(closeHint(), { font: 'hud', size: railSize }),
+      );
+      railLeft = Math.max(gR, margin + textW) + 4 * u;
+      railRight = legendColumnWidth(state, railSize, u) + margin + 4 * u;
+      const railWDev = (m.w - railLeft - railRight - frame * 2) * dev;
+      const railHDev = (m.h - margin * 2 - frame * 2) * dev;
+      // Both rails must actually hold their text: three lines under the gauge plus the close hint
+      // at the foot on the left, three legend rows plus the distance line on the right.
+      const leftFits = gB + 4 * u + 3 * (railLineH + 2 * u) + 2 * u + railLineH <= m.h - margin;
+      const rightFits = margin + u + 3 * legendRowPitch(railSize, u) + railLineH <= m.h - margin;
+      if (railWDev >= 16 * dev && railHDev >= 16 * dev && leftFits && rightFits) {
+        chooseFullScale(maze.cols, maze.rows, railWDev, railHDev, railFit);
+        rail = !stripsOk || fitBeats(railFit, stackFit);
+      }
+    }
+    if (!rail && !stripsOk) {
+      stats.drawMs = now() - t0;
+      return;
+    }
+
+    const fit = rail ? railFit : stackFit;
     const drawW = fit.w;
     const drawH = fit.h;
     // The frame is drawn on the UI grid around the device-space raster, so it is the enclosing
     // whole number of UI pixels; the raster is then centred inside it.
     const panelW = Math.ceil(drawW / dev) + frame * 2;
     const panelH = Math.ceil(drawH / dev) + frame * 2;
-    const px = Math.round((m.w - panelW) / 2);
-    const py = Math.round(boxTop + (boxH + frame * 2 - panelH) / 2);
+    let px = 0;
+    let py = 0;
+    if (rail) {
+      // Centred on the screen when the rails leave room for that — the world behind is centred —
+      // and nudged clear of the wider rail when they do not.
+      px = clamp(Math.round((m.w - panelW) / 2), railLeft, Math.max(railLeft, m.w - railRight - panelW));
+      py = Math.round((m.h - panelH) / 2);
+      drawRailHeader(ctx, m, state, maze, margin, gB + 4 * u, railSize, railLineH + 2 * u, mapped);
+    } else {
+      px = Math.round((m.w - panelW) / 2);
+      py = Math.round(boxTop + (boxH + frame * 2 - panelH) / 2);
+      drawText(ctx, head, hx, headY, { font: 'hud', size: headSize, color: 'hudGold' });
+      drawText(ctx, mapped, m.w - margin, headY, {
+        font: 'hud',
+        size: headSize,
+        color: 'hudDim',
+        align: 'right',
+      });
+    }
 
     // ── The map ──
     drawPanel(ctx, px, py, panelW, panelH, u, {
@@ -1156,8 +1265,49 @@ export function createMapView(options) {
     ctx.restore();
 
     // ── Legend ──
-    drawLegend(ctx, m, state, margin, legendY, legendSize);
+    if (rail) drawLegendColumn(ctx, m, state, m.w - railRight + 4 * u, margin, railSize);
+    else drawLegend(ctx, m, state, margin, legendY, legendSize);
     stats.drawMs = now() - t0;
+  }
+
+  /**
+   * One text scale for both halves of the strips header (`DEPTH n · size` on the left, `MAPPED n%`
+   * on the right): the largest, up to `u`, at which the two fit side by side in `room`.
+   * @param {string} head
+   * @param {string} mapped
+   * @param {number} room UI pixels
+   * @param {number} u
+   * @returns {number}
+   */
+  function headerScale(head, mapped, room, u) {
+    let size = Math.max(1, u);
+    for (;;) {
+      const hw = measureLine(head, { font: 'hud', size });
+      const mwid = measureLine(mapped, { font: 'hud', size });
+      if (hw + mwid + 4 * u <= room || size <= 1) return size;
+      size--;
+    }
+  }
+
+  /**
+   * The left rail of the wide full map: depth, labyrinth size, mapped share — one fact a line,
+   * under the fuel gauge — and how to close the map, at its foot.
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {any} m
+   * @param {GameState} state
+   * @param {{cols:number, rows:number}} maze
+   * @param {number} x
+   * @param {number} y top of the first line
+   * @param {number} size text scale
+   * @param {number} pitch line pitch
+   * @param {string} mapped the `MAPPED n%` line
+   * @returns {void}
+   */
+  function drawRailHeader(ctx, m, state, maze, x, y, size, pitch, mapped) {
+    drawText(ctx, depthMemo(state.level), x, y, { font: 'hud', size, color: 'hudGold' });
+    drawText(ctx, sizeMemo(maze.cols, maze.rows), x, y + pitch, { font: 'hud', size, color: 'hudBright' });
+    drawText(ctx, mapped, x, y + pitch * 2, { font: 'hud', size, color: 'hudDim' });
+    drawText(ctx, closeHint(), x, m.h - x, { font: 'hud', size, color: 'hudDim', baseline: 'bottom' });
   }
 
   /**
@@ -1170,12 +1320,43 @@ export function createMapView(options) {
     return state.explored !== null && exitIdx >= 0 && state.explored[exitIdx] !== 0;
   }
 
+  /** Cached close hint; the device question is asked once. */
+  let closeHintText = '';
+
+  /**
+   * How to close the map, in the terms of the device in hand: the M key on a keyboard, the MAP
+   * button of the touch overlay on a phone (a phone has no M key to press).
+   * @returns {string}
+   */
+  function closeHint() {
+    if (closeHintText === '') {
+      let coarse = false;
+      try {
+        const mm = /** @type {any} */ (globalThis).matchMedia;
+        coarse = typeof mm === 'function' && mm.call(globalThis, '(pointer: coarse)').matches === true;
+      } catch (err) {
+        coarse = false;
+      }
+      closeHintText = coarse ? 'MAP TO CLOSE' : 'M TO CLOSE';
+    }
+    return closeHintText;
+  }
+
+  /**
+   * The exit readout of the legend, keyed on the whole metres `formatDistance` prints.
+   * @param {GameState} state
+   * @returns {string}
+   */
+  function exitText(state) {
+    const d = state.derived !== undefined ? state.derived.exitDist : Infinity;
+    return exitMemo(Math.round(d));
+  }
+
   /**
    * The text scale the legend strip can afford.
    *
    * Measured, not guessed: at u = 3 on a phone the full strip is nearly twice the width of the
-   * screen, and a legend that overlaps itself is worse than no legend. Measuring at scale 1 and
-   * dividing is exact, because every width in the strip is linear in the scale.
+   * screen, and a legend that overlaps itself is worse than no legend.
    * @param {any} m
    * @param {GameState} state
    * @param {number} u
@@ -1186,28 +1367,27 @@ export function createMapView(options) {
     // not), so the fit is solved by trying the sizes — `u` is at most 6, so this is at most six
     // measurements of four short strings.
     for (let size = Math.max(1, u); size > 1; size--) {
-      if (legendWidth(m, state, size, u) <= m.w - 6 * u) return size;
+      if (legendWidth(state, size, u) <= m.w - 6 * u) return size;
     }
     return 1;
   }
 
   /**
    * Width of the legend strip at a given text scale.
-   * @param {any} m
    * @param {GameState} state
    * @param {number} size
    * @param {number} u
    * @returns {number} UI pixels
    */
-  function legendWidth(m, state, size, u) {
+  function legendWidth(state, size, u) {
     const run = state.run;
     const seen = exitSeen(state);
-    let w = ICON_SIZE.gem * size + 2 * u + measureLine(formatCount(run.gems, run.gemsTotal), { font: 'hud', size }) + 5 * u;
+    let w = ICON_SIZE.gem * size + 2 * u + measureLine(gemsMemo(run.gems, run.gemsTotal), { font: 'hud', size }) + 5 * u;
     w += ICON_SIZE.oilW * size + 2 * u + measureLine('OIL', { font: 'hud', size }) + 5 * u;
     if (!seen) {
       w += ICON_SIZE.portal * size + 2 * u + measureLine('EXIT', { font: 'hud', size }) + 5 * u;
     }
-    w += measureLine(seen ? `EXIT ${formatDistance(state.derived.exitDist)}` : 'M TO CLOSE', { font: 'hud', size });
+    w += measureLine(seen ? exitText(state) : closeHint(), { font: 'hud', size });
     return w;
   }
 
@@ -1235,7 +1415,7 @@ export function createMapView(options) {
     // Gems, then flasks, then the exit — the order they matter in.
     drawGemIcon(ctx, cx, y, iconScale);
     cx += ICON_SIZE.gem * iconScale + 2 * u;
-    const gemText = formatCount(run.gems, run.gemsTotal);
+    const gemText = gemsMemo(run.gems, run.gemsTotal);
     drawText(ctx, gemText, cx, y, { font: 'hud', size, color: 'hudGem' });
     cx += measureLine(gemText, { font: 'hud', size }) + 5 * u;
 
@@ -1250,12 +1430,91 @@ export function createMapView(options) {
       drawText(ctx, 'EXIT', cx, y, { font: 'hud', size, color: 'hudBright' });
     }
 
-    drawText(ctx, seen ? `EXIT ${formatDistance(state.derived.exitDist)}` : 'M TO CLOSE', m.w - x, y, {
+    drawText(ctx, seen ? exitText(state) : closeHint(), m.w - x, y, {
       font: 'hud',
       size,
       color: seen ? 'hudBright' : 'hudDim',
       align: 'right',
     });
+  }
+
+  /**
+   * Row pitch of the legend column: the tallest icon (the 9-row flask) plus a gap.
+   * @param {number} size
+   * @param {number} u
+   * @returns {number}
+   */
+  function legendRowPitch(size, u) {
+    return ICON_SIZE.oilH * Math.max(1, size) + 3 * u;
+  }
+
+  /**
+   * Width of the legend column (the right rail of the wide layout) at a given text scale.
+   * @param {GameState} state
+   * @param {number} size
+   * @param {number} u
+   * @returns {number} UI pixels
+   */
+  function legendColumnWidth(state, size, u) {
+    const run = state.run;
+    const icon = Math.max(ICON_SIZE.gem, ICON_SIZE.oilW, ICON_SIZE.portal) * Math.max(1, size) + 2 * u;
+    // Every label sits right of the icon column, the distance included, so the rail is exactly as
+    // wide as its longest label: "12/273" or "1,240m" — never "EXIT 1,240m" on one line.
+    let w = measureLine(gemsMemo(run.gems, run.gemsTotal), { font: 'hud', size });
+    w = Math.max(w, measureLine('EXIT', { font: 'hud', size }));
+    if (exitSeen(state)) w = Math.max(w, measureLine(distText(state), { font: 'hud', size }));
+    return icon + w;
+  }
+
+  /**
+   * The bare distance to the exit (`"1,240m"`), keyed on the whole metres it prints.
+   * @param {GameState} state
+   * @returns {string}
+   */
+  function distText(state) {
+    const d = state.derived !== undefined ? state.derived.exitDist : Infinity;
+    return distMemo(Math.round(d));
+  }
+
+  /**
+   * The legend as a column down the right rail: gems, flasks and the exit swatch, with the distance
+   * to the exit under the swatch once the exit has been seen.
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {any} m
+   * @param {GameState} state
+   * @param {number} x left edge of the column
+   * @param {number} y top edge
+   * @param {number} size text scale
+   * @returns {void}
+   */
+  function drawLegendColumn(ctx, m, state, x, y, size) {
+    const u = m.u;
+    const iconScale = Math.max(1, size);
+    const run = state.run;
+    const seen = exitSeen(state);
+    const pitch = legendRowPitch(size, u);
+    // Icons share one column so the labels line up whatever each icon's own width is.
+    const textX = x + Math.max(ICON_SIZE.gem, ICON_SIZE.oilW, ICON_SIZE.portal) * iconScale + 2 * u;
+    let ry = y + u;
+
+    drawGemIcon(ctx, x, ry, iconScale);
+    drawText(ctx, gemsMemo(run.gems, run.gemsTotal), textX, ry, { font: 'hud', size, color: 'hudGem' });
+    ry += pitch;
+
+    drawOilIcon(ctx, x, ry - u, iconScale);
+    drawText(ctx, 'OIL', textX, ry, { font: 'hud', size, color: 'hudGold' });
+    ry += pitch;
+
+    drawPortalIcon(ctx, x, ry, iconScale);
+    drawText(ctx, 'EXIT', textX, ry, { font: 'hud', size, color: seen ? 'hudDim' : 'hudBright' });
+    if (seen) {
+      // Found: the number that matters, under its swatch and in the brightest style in the rail.
+      drawText(ctx, distText(state), textX, ry + textHeight({ font: 'hud', size }) + 2 * u, {
+        font: 'hud',
+        size,
+        color: 'hudBright',
+      });
+    }
   }
 
   /**

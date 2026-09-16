@@ -37,6 +37,7 @@ import { levelParams } from './state/balance.js';
 import { loadPersist, savePersist } from './state/save.js';
 
 import { createInput } from './input/input.js';
+import { CONTROL_HINTS } from './input/bindings.js';
 import { createMazeClient } from './maze/client.js';
 
 import { createRaycaster } from './renderer/raycaster.js';
@@ -126,6 +127,13 @@ function readParams() {
 const params = readParams();
 /** `?headless=1` exposes `window.__game` for `tools/verify.mjs` (ARCHITECTURE.md §4.7). */
 const HEADLESS = params.get('headless') !== null && params.get('headless') !== '0';
+/**
+ * Whether the tool surface is live at all. §4.7 says `?headless=1` **or** `?debug=1` exposes
+ * `window.__game`, so both flags must also arm everything behind it — most importantly the input
+ * injection merge in {@link pollFrame}. Gating the surface on one condition and the merge on
+ * another is how `inject()` becomes a function that exists, returns no error and does nothing.
+ */
+const EXPOSE = HEADLESS || isDebug();
 /** `?seed=N` pins the run seed so a headless run replays exactly. */
 const SEED_PARAM = Number(params.get('seed'));
 const FORCED_SEED = Number.isFinite(SEED_PARAM) && params.get('seed') !== null ? SEED_PARAM >>> 0 : null;
@@ -212,6 +220,31 @@ function boot() {
   const touchRoot = doc.getElementById('touch');
   if (!view || !overlay) throw new Error('index.html is missing #view or #overlay');
 
+  // ── Listener bookkeeping ────────────────────────────────────────────────────────────────────
+
+  /**
+   * Every listener this file registers, so {@link shutdown} can take them all off again. The page
+   * normally lives until the tab closes, but a module that can be torn down is also a module that
+   * can be re-created (bfcache eviction, a future embed that restarts the game in place), and the
+   * subsystems all publish `dispose`/`destroy` in their §4 contracts.
+   * @type {Array<{target:any, type:string, fn:any, opts:any}>}
+   */
+  const listeners = [];
+
+  /**
+   * `addEventListener` that remembers what it added.
+   * @param {any} target
+   * @param {string} type
+   * @param {any} fn
+   * @param {any} [opts]
+   * @returns {void}
+   */
+  function listen(target, type, fn, opts) {
+    if (!target || typeof target.addEventListener !== 'function') return;
+    target.addEventListener(type, fn, opts);
+    listeners.push({ target, type, fn, opts });
+  }
+
   // ── State ───────────────────────────────────────────────────────────────────────────────────
   const persisted = loadPersist();
   const store = createStore(createInitialState(persisted.settings, persisted.best), reducer);
@@ -243,6 +276,9 @@ function boot() {
       else if (type === 'uiConfirm') audio.playUi('confirm');
       else audio.playUi('back');
     },
+    // The Controls panel lists the real bindings table (§4.3); menus.js only keeps a fallback copy
+    // for harnesses that pass nothing.
+    controls: CONTROL_HINTS,
   });
 
   // ── Input ───────────────────────────────────────────────────────────────────────────────────
@@ -314,7 +350,8 @@ function boot() {
         if (token !== buildToken) return;
         log.error('level build failed', err);
         // `client.build` never rejects for infrastructure reasons, so this is a genuine failure.
-        // One retry with a different maze costs a few milliseconds and rescues the run.
+        // Two retries with a different maze cost a few milliseconds and rescue the run (§4.7 —
+        // the count below, the contract and this sentence must keep saying the same number).
         if (loadRetries < 2) {
           loadRetries++;
           requestLevel(0x9e3779b9 * loadRetries);
@@ -404,7 +441,9 @@ function boot() {
           postFlash.g = 20;
           postFlash.b = 16;
           postFlash.a = 0.42;
-          persist(state);
+          // No persist here: the same dispatch also emits a `phase` event, and `onPhaseChange`
+          // owns the write for both `gameOver` and `levelComplete`. Doing it in both places cost
+          // two identical synchronous localStorage writes for one death.
           break;
         case 'phase':
           onPhaseChange(ev.from, ev.to, state);
@@ -433,7 +472,7 @@ function boot() {
       // Give the cursor back the moment the player is not driving: pause, death, level complete.
       exitPointerLock();
     }
-    if (to === 'levelComplete' || to === 'gameOver') persist(state);
+    if (to === 'levelComplete' || to === 'gameOver') persistNow(state);
     if (from === 'loading' && to === 'playing') hud.reset();
   }
 
@@ -447,12 +486,41 @@ function boot() {
   }
 
   /**
-   * Write the best score and settings to `localStorage`.
+   * A settings change is waiting to be written to `localStorage`.
+   *
+   * `savePersist` is a synchronous `JSON.stringify` + storage write, and the options screen's
+   * volume / music / sensitivity sliders dispatch `setSetting` on **every pointermove** — so
+   * writing per dispatch means a storage write per pointer sample, inside the frame, on a phone or
+   * a quota-pressured profile. The value is in the store either way; only the durable copy waits.
+   */
+  let persistDue = false;
+  /** `state.time` of the last write, so the flush is rate-limited against the sim clock. */
+  let lastPersistAt = -Infinity;
+
+  /** How long a pending settings write may wait, in sim seconds. */
+  const PERSIST_INTERVAL_S = 0.5;
+
+  /**
+   * Write the best score and settings to `localStorage` now, cancelling any pending write.
+   * Used where the moment matters: a run ended, or the page is going away.
    * @param {GameState} state
    * @returns {void}
    */
-  function persist(state) {
+  function persistNow(state) {
+    persistDue = false;
+    lastPersistAt = state.time;
     savePersist({ best: state.best, settings: state.settings });
+  }
+
+  /**
+   * Write a pending settings change if one has been waiting long enough. Called once per step.
+   * @param {GameState} state
+   * @returns {void}
+   */
+  function flushPersist(state) {
+    if (!persistDue) return;
+    if (state.time - lastPersistAt < PERSIST_INTERVAL_S) return;
+    persistNow(state);
   }
 
   /**
@@ -480,7 +548,10 @@ function boot() {
     appliedSettings.minimap = settings.minimap;
     appliedSettings.mapMode = settings.mapMode;
     appliedSettings.reducedMotion = settings.reducedMotion;
-    persist(store.getState());
+    // Mark rather than write: `step()` flushes at most twice a second, which collapses a whole
+    // slider drag — and the map hotkey's two dispatches (`mapMode` + the legacy `minimap` mirror)
+    // — into one storage write.
+    persistDue = true;
   }
 
   store.subscribe(routeEvents);
@@ -509,7 +580,7 @@ function boot() {
    */
   function pollFrame() {
     const real = input.poll();
-    if (!HEADLESS) return real;
+    if (!EXPOSE) return real;
     mergedFrame.moveX = clamp(real.moveX + injected.moveX, -1, 1);
     mergedFrame.moveY = clamp(real.moveY + injected.moveY, -1, 1);
     mergedFrame.turn = clamp(real.turn + injected.turn, -1, 1);
@@ -555,11 +626,12 @@ function boot() {
   }
 
   // Pointer events reach the menus directly: they hit-test the layout recorded by the last render.
+  const onPointer = (/** @type {PointerEvent} */ ev) => {
+    const handled = menus.handlePointer(ev);
+    if (handled && ev.cancelable) ev.preventDefault();
+  };
   for (const type of ['pointermove', 'pointerdown', 'pointerup', 'pointerleave', 'pointercancel']) {
-    overlay.addEventListener(type, (ev) => {
-      const handled = menus.handlePointer(/** @type {PointerEvent} */ (ev));
-      if (handled && ev.cancelable) ev.preventDefault();
-    });
+    listen(overlay, type, onPointer);
   }
 
   // ─── Layout ───────────────────────────────────────────────────────────────────────────────
@@ -628,11 +700,9 @@ function boot() {
     requestAnimationFrame(layout);
   }
 
-  globalThis.addEventListener('resize', scheduleLayout, { passive: true });
-  globalThis.addEventListener('orientationchange', scheduleLayout, { passive: true });
-  if (globalThis.visualViewport) {
-    globalThis.visualViewport.addEventListener('resize', scheduleLayout, { passive: true });
-  }
+  listen(globalThis, 'resize', scheduleLayout, { passive: true });
+  listen(globalThis, 'orientationchange', scheduleLayout, { passive: true });
+  listen(globalThis.visualViewport, 'resize', scheduleLayout, { passive: true });
   layout();
 
   // ─── Focus / visibility ───────────────────────────────────────────────────────────────────
@@ -643,11 +713,11 @@ function boot() {
   const autoPause = () => {
     if (store.getState().phase === 'playing') store.dispatch({ type: 'pause' });
   };
-  globalThis.addEventListener('blur', autoPause);
-  doc.addEventListener('visibilitychange', () => {
+  listen(globalThis, 'blur', autoPause);
+  listen(doc, 'visibilitychange', () => {
     if (doc.hidden) autoPause();
   });
-  doc.addEventListener('pointerlockchange', () => {
+  listen(doc, 'pointerlockchange', () => {
     const locked = doc.pointerLockElement === overlay;
     // A hidden cursor is only right while the pointer is captured.
     doc.body.classList.toggle('locked', locked);
@@ -703,6 +773,10 @@ function boot() {
     tickAction.dt = dt;
     tickAction.input = frame;
     store.dispatch(tickAction);
+
+    // Settings written during this step (or the last few) go to storage here, off the pointer
+    // event that produced them.
+    flushPersist(store.getState());
 
     // Watchdog: a level that never arrives would strand the player on the loading screen, and the
     // phase machine has no exit from `loading` (documented in ARCHITECTURE.md §4.2).
@@ -807,10 +881,12 @@ function boot() {
 
   // ─── Headless surface (ARCHITECTURE.md §4.7) ──────────────────────────────────────────────
 
-  if (HEADLESS || isDebug()) {
+  if (EXPOSE) {
+    // Exactly the keys §4.7 enumerates, and nothing else: an extra handle here (the raw `loop`,
+    // with start/stop on it, used to be one) is something a tool comes to depend on and the
+    // contract never promised.
     /** @type {any} */ (globalThis).__game = {
       ready: false,
-      version: '0.1',
       state: () => store.getState(),
       dispatch: (/** @type {any} */ action) => store.dispatch(action),
       // Tools observe transitions through the same seam the game does, so a phase that lasts less
@@ -826,7 +902,6 @@ function boot() {
       screen: () => menus.screen(),
       mapMode: () => hud.mapMode(store.getState().settings),
       errors,
-      loop,
       input: {
         /**
          * Merge a partial frame into the injected input. Axes persist until changed; `lookDX` and
@@ -860,6 +935,65 @@ function boot() {
       },
     };
   }
+
+  // ─── Teardown ─────────────────────────────────────────────────────────────────────────────
+
+  /** Guards {@link shutdown} against a second `pagehide` (or a manual call). */
+  let shutDown = false;
+
+  /**
+   * Give everything back: stop the loop, dispose every subsystem that publishes a teardown in its
+   * §4 contract, and remove every listener this file registered.
+   *
+   * Only for a page that is genuinely going away. A `pagehide` with `persisted === true` means the
+   * page went into the back/forward cache and may be restored, so that path only writes a pending
+   * setting: the loop suspends itself on `document.hidden` and comes back on `pageshow` (§4.1).
+   * @returns {void}
+   */
+  function shutdown() {
+    if (shutDown) return;
+    shutDown = true;
+    try {
+      persistNow(store.getState());
+    } catch {
+      // Storage may be gone already; a lost preference must not take the teardown with it.
+    }
+    loop.stop();
+    for (const l of listeners) {
+      try {
+        l.target.removeEventListener(l.type, l.fn, l.opts);
+      } catch {
+        // A detached target is already as removed as it can be.
+      }
+    }
+    listeners.length = 0;
+    // Each of these is documented as idempotent and safe to call, but one throwing must not stop
+    // the rest from running — a half-disposed page is worse than an undisposed one.
+    for (const close of [
+      () => mazeClient.dispose(),
+      () => input.destroy(),
+      () => audio.dispose(),
+      () => raycaster.dispose(),
+      () => post.destroy(),
+      () => hud.dispose(),
+      () => menus.dispose(),
+    ]) {
+      try {
+        close();
+      } catch (err) {
+        log.error('shutdown step failed', err);
+      }
+    }
+  }
+
+  listen(globalThis, 'pagehide', (/** @type {PageTransitionEvent} */ ev) => {
+    if (ev && ev.persisted) {
+      // Bound for the bfcache: keep the machine intact, just make the durable copy current.
+      if (persistDue) persistNow(store.getState());
+      return;
+    }
+    shutdown();
+  });
 
   // ─── Go ───────────────────────────────────────────────────────────────────────────────────
 

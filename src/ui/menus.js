@@ -31,6 +31,7 @@ import { createLogger } from '../core/log.js';
 import { COLOR, drawText, lineHeight, measureLine, textHeight } from './font.js';
 import {
   createCounter,
+  createTextMemo,
   formatCount,
   formatDistance,
   formatInt,
@@ -129,6 +130,12 @@ const MAX_FRAME_DT = 0.25;
 /** Rows the tally has. */
 const TALLY_ROWS = 4;
 
+/** Rows a screen may lay out (the options screen, at nine, is the longest). */
+const MAX_ROWS = 16;
+
+/** Values one `choice` row may show as separately clickable words. */
+const MAX_CHOICE_VALUES = 4;
+
 // ─── Menu model ──────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -160,6 +167,7 @@ const TALLY_ROWS = 4;
 const TITLE_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
   { id: 'descend', label: 'Descend', kind: 'action' },
   { id: 'options', label: 'Options', kind: 'action' },
+  { id: 'controls', label: 'Controls', kind: 'action' },
   { id: 'credits', label: 'Credits', kind: 'action' },
 ]);
 
@@ -167,6 +175,7 @@ const TITLE_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
 const PAUSE_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
   { id: 'resume', label: 'Resume', kind: 'action' },
   { id: 'options', label: 'Options', kind: 'action' },
+  { id: 'controls', label: 'Controls', kind: 'action' },
   { id: 'quit', label: 'Quit to Title', kind: 'action' },
 ]);
 
@@ -207,6 +216,11 @@ const CREDITS_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
   { id: 'back', label: 'Back', kind: 'back' },
 ]);
 
+/** Controls screen — one row out, same shape as Credits. */
+const CONTROLS_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
+  { id: 'back', label: 'Back', kind: 'back' },
+]);
+
 /** Level-complete screen. */
 const COMPLETE_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
   { id: 'next', label: 'Descend', kind: 'action' },
@@ -219,6 +233,9 @@ const GAMEOVER_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
   { id: 'quit', label: 'Title', kind: 'action' },
 ]);
 
+/** The game-over record line. */
+const NEW_BEST_TEXT = 'NEW BEST!';
+
 /** Loading screen — nothing to select. */
 const NO_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([]);
 
@@ -228,6 +245,7 @@ const SCREENS = Object.freeze({
   pause: Object.freeze({ id: 'pause', items: PAUSE_ITEMS }),
   options: Object.freeze({ id: 'options', items: OPTION_ITEMS }),
   credits: Object.freeze({ id: 'credits', items: CREDITS_ITEMS }),
+  controls: Object.freeze({ id: 'controls', items: CONTROLS_ITEMS }),
   complete: Object.freeze({ id: 'complete', items: COMPLETE_ITEMS }),
   gameover: Object.freeze({ id: 'gameover', items: GAMEOVER_ITEMS }),
   loading: Object.freeze({ id: 'loading', items: NO_ITEMS }),
@@ -249,6 +267,115 @@ const CREDITS_LINES = Object.freeze([
   '',
   'Thank you for descending.',
 ]);
+
+/**
+ * One line of the Controls panel.
+ * @typedef {{label:string, keys:string, pad?:string}} ControlHint
+ */
+
+/** Most hint rows the Controls panel will draw. */
+const MAX_CONTROL_ROWS = 12;
+
+/**
+ * What the game is played with, in display order.
+ *
+ * This mirrors `CONTROL_HINTS` in `src/input/bindings.js`, which is the authority on the bindings
+ * themselves — `src/ui` may not import `src/input` (§2), so the composition root can hand the real
+ * table in through `createMenus(canvas, {controls})` and this table is the fallback for a harness,
+ * a preview or a host that passes nothing. A drift shows up as a wrong hint on one panel and
+ * nowhere else; the keys themselves are never read from here.
+ *
+ * Written in ASCII on purpose: the bitmap faces cover 0x20…0x7E plus `© × … ·` (§4.6), so the
+ * arrow glyphs the input module's own table uses would silently drop out. {@link sanitizeHints}
+ * translates them for an override that carries them.
+ * @type {ReadonlyArray<ControlHint>}
+ */
+const DEFAULT_CONTROL_HINTS = Object.freeze([
+  Object.freeze({ label: 'Move', keys: 'W S  ·  UP DOWN', pad: 'Left stick' }),
+  Object.freeze({ label: 'Strafe', keys: 'A D', pad: 'Left stick' }),
+  Object.freeze({ label: 'Turn', keys: 'Q E  ·  LEFT RIGHT', pad: 'Right stick' }),
+  Object.freeze({ label: 'Look', keys: 'MOUSE', pad: 'Right stick' }),
+  Object.freeze({ label: 'Sprint', keys: 'SHIFT', pad: 'Triggers' }),
+  Object.freeze({ label: 'Map', keys: 'M  ·  TAB', pad: 'View' }),
+  Object.freeze({ label: 'Pause', keys: 'ESC  ·  P', pad: 'Menu' }),
+  Object.freeze({ label: 'Mute', keys: 'N', pad: '—' }),
+  Object.freeze({ label: 'Confirm', keys: 'ENTER  ·  SPACE', pad: 'A' }),
+  Object.freeze({ label: 'Back', keys: 'ESC  ·  BACKSPACE', pad: 'B' }),
+]);
+
+/** The line under the keyboard table, for a player who will pick the game up on a phone later. */
+const TOUCH_HINT = 'Touch: left stick moves, drag the right half to look.';
+
+/**
+ * What a phone is played with (`src/input/touch-overlay.js` + the touch path of `input.js`).
+ *
+ * A player holding a phone has no W key, no Shift and no Tab, so the keyboard table told them
+ * nothing they could use — and its one touch line did not fit a phone's panel. On a device whose
+ * primary pointer is a finger the panel shows this table instead. Sprint is an outward *flick* of
+ * the stick, not a deflection (see `TOUCH_SPRINT_FLICK_RATIO` in `input.js`), and the two buttons
+ * carry the labels `MAP` and `PAUSE`.
+ * @type {ReadonlyArray<ControlHint>}
+ */
+const TOUCH_CONTROL_HINTS = Object.freeze([
+  Object.freeze({ label: 'Move', keys: 'LEFT STICK' }),
+  Object.freeze({ label: 'Sprint', keys: 'FLICK THE STICK' }),
+  Object.freeze({ label: 'Look', keys: 'DRAG RIGHT SIDE' }),
+  Object.freeze({ label: 'Map', keys: 'MAP BUTTON' }),
+  Object.freeze({ label: 'Pause', keys: 'PAUSE BUTTON' }),
+  Object.freeze({ label: 'Choose', keys: 'TAP' }),
+]);
+
+/** The footer under the touch table. */
+const KEYBOARD_HINT = 'A keyboard or gamepad works too.';
+
+/** Characters the bitmap faces cannot draw, and what to say instead. */
+const GLYPH_FALLBACK = Object.freeze({
+  '↑': 'UP',
+  '↓': 'DOWN',
+  '←': 'LEFT',
+  '→': 'RIGHT',
+  '—': '-',
+  '–': '-',
+});
+
+/**
+ * Make a caller-supplied hint table safe to draw: strings only, unrenderable glyphs translated,
+ * and a hard cap so a hostile table cannot make the panel taller than the screen.
+ *
+ * Runs **once**, when the menus are created — never per frame.
+ * @param {unknown} hints
+ * @returns {ReadonlyArray<ControlHint>}
+ */
+function sanitizeHints(hints) {
+  if (!Array.isArray(hints) || hints.length === 0) return DEFAULT_CONTROL_HINTS;
+  /** @type {ControlHint[]} */
+  const out = [];
+  for (let i = 0; i < hints.length && out.length < MAX_CONTROL_ROWS; i++) {
+    const h = hints[i];
+    if (h === null || typeof h !== 'object') continue;
+    const label = typeof h.label === 'string' ? h.label : '';
+    const keys = typeof h.keys === 'string' ? h.keys : '';
+    if (label === '' || keys === '') continue;
+    out.push({ label: translateGlyphs(label), keys: translateGlyphs(keys) });
+  }
+  return out.length === 0 ? DEFAULT_CONTROL_HINTS : out;
+}
+
+/**
+ * Replace the characters the faces have no glyph for (a missing glyph is dropped silently, which
+ * would turn `'W S / ↑ ↓'` into `'W S / '`).
+ * @param {string} text
+ * @returns {string}
+ */
+function translateGlyphs(text) {
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    const ch = text.charAt(i);
+    const sub = /** @type {any} */ (GLYPH_FALLBACK)[ch];
+    out += sub === undefined ? ch : sub;
+  }
+  return out;
+}
 
 // ─── Pure helpers (unit-tested) ──────────────────────────────────────────────────────────────
 
@@ -371,6 +498,9 @@ const PICK_PALETTE = Object.freeze([
  * @property {(key:keyof Settings, value:number|boolean) => void} [onSetting]
  * @property {() => void} [onNextLevel]  descend after a level-complete tally
  * @property {(type:'uiMove'|'uiConfirm'|'uiBack'|'uiDeny') => void} [onUiSound]
+ * @property {ReadonlyArray<ControlHint>} [controls] what the Controls panel lists. The composition
+ *   root passes `CONTROL_HINTS` from `src/input/bindings.js` — the module that owns the bindings —
+ *   because `src/ui` may not import `src/input` (§2). Omitted, the mirrored default is used.
  */
 
 /**
@@ -397,6 +527,13 @@ const PICK_PALETTE = Object.freeze([
 export function createMenus(overlayCanvas, callbacks) {
   const surface = createSurface(overlayCanvas);
   const cb = callbacks === undefined || callbacks === null ? {} : callbacks;
+  /**
+   * The Controls panel's contents, resolved once. `src/ui` may not import `src/input`, so the
+   * composition root passes `CONTROL_HINTS` in; anything missing or malformed falls back to the
+   * mirrored table above.
+   * @type {ReadonlyArray<ControlHint>}
+   */
+  const controlHints = sanitizeHints(/** @type {any} */ (cb).controls);
 
   /** Sub-screen open over the title or pause screen, or null. @type {string|null} */
   let sub = null;
@@ -424,19 +561,73 @@ export function createMenus(overlayCanvas, callbacks) {
 
   // ── Layout scratch (no per-frame allocation) ──
   /** Flat row rectangles from the last layout pass: [x,y,w,h] per row. */
-  const rowRects = new Float64Array(4 * 16);
+  const rowRects = new Float64Array(4 * MAX_ROWS);
   /** Flat slider-track rectangles, parallel to `rowRects`. */
-  const trackRects = new Float64Array(4 * 16);
+  const trackRects = new Float64Array(4 * MAX_ROWS);
+  /**
+   * Flat rectangles of the individual words of a `choice` row, keyed by
+   * `(row * MAX_CHOICE_VALUES + value) * 4` — the same trick as `trackRects`, one level deeper.
+   *
+   * WHY it exists: `drawOptions` paints Off/Corner/Full as three separately highlighted targets,
+   * so a pointer landing on one of them must write **that** value. Without these rectangles the
+   * click fell through to the keyboard path (`stepChoice`), which advances the cycle and therefore
+   * gave the wrong answer two times out of three — and on a touch device this row is the only way
+   * to change the setting at all.
+   */
+  const choiceRects = new Float64Array(4 * MAX_ROWS * MAX_CHOICE_VALUES);
+  /** How many of a row's words were laid out (0 for every row that is not a wide `choice`). */
+  const choiceCounts = new Int32Array(MAX_ROWS);
   /** Number of rows laid out last frame. */
   let rowCount = 0;
+
+  // ── Label text, rebuilt only when the numbers behind it change ──
+  // Every screen here re-renders every frame, and a template literal or `formatX()` call allocates
+  // a new string each time even when the text is identical to the last frame's. These memos key on
+  // the (already integer) inputs, so a screen that is standing still allocates no strings at all.
+  const bestMemo = createTextMemo((score, level) => 'BEST ' + formatInt(score) + '  ·  DEPTH ' + level);
+  const statusMemo = createTextMemo((level, score) => 'DEPTH ' + level + '  ·  ' + formatInt(score));
+  const bannerMemo = createTextMemo((level, side) => formatLevelBanner(level, side, side));
+  const cellsMemo = createTextMemo((cells) => formatInt(cells) + ' CELLS');
+  const gemsRowMemo = createTextMemo(
+    (gems, total, level) => 'GEMS ' + formatCount(gems, total) + ' × ' + SCORE_RULES.GEM_BASE * level,
+  );
+  const torchRowMemo = createTextMemo((sec) => 'TORCH LEFT ' + formatTime(sec));
+  const clearedMemo = createTextMemo((level) => 'Depth ' + level + ' Cleared');
+  const levelMemo = createTextMemo((level) => String(level));
+  /** One integer memo per tally row (final value) and per rolling counter (shown value). */
+  const tallyFinalMemos = [0, 1, 2, 3].map(() => createTextMemo((v) => formatInt(v)));
+  const tallyShownMemos = [0, 1, 2, 3].map(() => createTextMemo((v) => formatInt(v)));
+  const scoreMemo = createTextMemo((v) => formatInt(v));
+  const bestScoreMemo = createTextMemo((v) => formatInt(v));
+  const labyrinthMemo = createTextMemo((c, r) => formatLabyrinth(c, r));
+  const exploredMemo = createTextMemo((pct) => formatPercent(pct / 100));
+  const refuelsMemo = createTextMemo((n) => formatInt(n));
+  const walkedMemo = createTextMemo((d) => formatDistance(d));
+  /** Slider value text per options row, keyed on the value in thousandths (what `adjust` rounds to). */
+  const sliderMemos = Array.from({ length: MAX_ROWS }, () =>
+    createTextMemo((milli, mult, max) =>
+      mult === 1 ? (milli / 1000).toFixed(1) + '×' : formatPercent(max > 0 ? milli / 1000 / max : 0),
+    ),
+  );
   /** Enabled flags for the rows laid out last frame. @type {boolean[]} */
-  const rowEnabled = new Array(16).fill(true);
+  const rowEnabled = new Array(MAX_ROWS).fill(true);
   /** Pointer mapping scratch. */
   const ptr = new Float64Array(2);
   /** Row the pointer went down on, for click-release matching. */
   let pressedRow = -1;
   /** Row whose slider is being dragged, or −1. */
   let dragRow = -1;
+
+  /**
+   * The sub-screen open over the title or pause screen, or null.
+   * @returns {Screen|null}
+   */
+  function subScreen() {
+    if (sub === 'options') return SCREENS.options;
+    if (sub === 'credits') return SCREENS.credits;
+    if (sub === 'controls') return SCREENS.controls;
+    return null;
+  }
 
   /**
    * Which screen should be showing for this state.
@@ -446,9 +637,9 @@ export function createMenus(overlayCanvas, callbacks) {
   function screenFor(state) {
     switch (state.phase) {
       case 'title':
-        return sub === 'options' ? SCREENS.options : sub === 'credits' ? SCREENS.credits : SCREENS.title;
+        return subScreen() === null ? SCREENS.title : /** @type {Screen} */ (subScreen());
       case 'paused':
-        return sub === 'options' ? SCREENS.options : SCREENS.pause;
+        return subScreen() === null ? SCREENS.pause : /** @type {Screen} */ (subScreen());
       case 'loading':
         return SCREENS.loading;
       case 'levelComplete':
@@ -598,6 +789,10 @@ export function createMenus(overlayCanvas, callbacks) {
         sound('uiConfirm');
         openSub('credits');
         return true;
+      case 'controls':
+        sound('uiConfirm');
+        openSub('controls');
+        return true;
       case 'resume':
         sound('uiConfirm');
         invoke(cb.onResume, 'onResume');
@@ -692,6 +887,53 @@ export function createMenus(overlayCanvas, callbacks) {
       return false;
     }
     return true;
+  }
+
+  /**
+   * Write one `choice` value directly (the pointer path: the player clicked a word, so the answer
+   * is that word — not "the next one along", which is what the keyboard means by confirm).
+   * @param {MenuItem} item
+   * @param {string} value one of `item.values`
+   * @returns {boolean} true when the write ran
+   */
+  function writeChoice(item, value) {
+    const write = item.write;
+    if (write === undefined) {
+      sound('uiDeny');
+      return false;
+    }
+    sound('uiConfirm');
+    try {
+      write(value, (key, v) => invoke(cb.onSetting, 'onSetting', key, v));
+    } catch (err) {
+      log.error('choice write failed', err);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Which word of a `choice` row the pointer is over, or −1.
+   * @param {number} row
+   * @param {number} x UI pixels
+   * @param {number} y UI pixels
+   * @returns {number} index into the row's `values`, or −1
+   */
+  function choiceHit(row, x, y) {
+    if (row < 0 || row >= MAX_ROWS) return -1;
+    const n = choiceCounts[row];
+    if (n <= 0) return -1;
+    const base = row * MAX_CHOICE_VALUES * 4;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return -1;
+    for (let v = 0; v < n; v++) {
+      const o = base + v * 4;
+      const rx = choiceRects[o];
+      const ry = choiceRects[o + 1];
+      if (x < rx || y < ry) continue;
+      if (x >= rx + choiceRects[o + 2] || y >= ry + choiceRects[o + 3]) continue;
+      return v;
+    }
+    return -1;
   }
 
   /**
@@ -841,6 +1083,18 @@ export function createMenus(overlayCanvas, callbacks) {
           sound('uiConfirm');
           return true;
         }
+        // A `choice` row paints its values as separate words: a click on one of them means that
+        // value. Only a click on the row but off every word falls through to `activate`, which
+        // steps the cycle the way confirm does.
+        const item = screen.items[row];
+        if (item !== undefined && item.kind === 'choice') {
+          const word = choiceHit(row, ptr[0], ptr[1]);
+          const values = item.values;
+          if (word >= 0 && values !== undefined && word < values.length) {
+            writeChoice(item, values[word]);
+            return true;
+          }
+        }
         activate(screen, row, state);
         return true;
       }
@@ -953,6 +1207,12 @@ export function createMenus(overlayCanvas, callbacks) {
         tallyT = 0;
         tallyDone = false;
         for (let i = 0; i < tallyCounters.length; i++) tallyCounters[i].snap(0);
+        // Reduced motion means reduced motion: rows arriving one at a time over ~1.8 s with four
+        // counters rolling is exactly the effect the setting asks to turn off, and suppressing
+        // only the 160 ms row punch left the animation that matters running.
+        if (state.settings !== undefined && state.settings.reducedMotion === true) {
+          finishTally(state);
+        }
       } else {
         tallyT = -1;
       }
@@ -1008,6 +1268,9 @@ export function createMenus(overlayCanvas, callbacks) {
         break;
       case 'credits':
         drawCredits(ctx, m, state, screen, enter, reduced);
+        break;
+      case 'controls':
+        drawControls(ctx, m, state, screen, enter, reduced);
         break;
       case 'loading':
         drawLoading(ctx, m, state, reduced);
@@ -1067,7 +1330,9 @@ export function createMenus(overlayCanvas, callbacks) {
   /** Cached title-column gradient; rebuilt only when the surface size changes. */
   /** @type {CanvasGradient|null} */
   let columnGradient = null;
-  let columnKey = '';
+  let columnW = -1;
+  let columnH = -1;
+  let columnHalf = -1;
 
   /**
    * The soft vertical band of shade the title lettering sits on. A gradient rather than a
@@ -1080,15 +1345,16 @@ export function createMenus(overlayCanvas, callbacks) {
    */
   function drawColumnShade(ctx, m, halfW) {
     const cx = Math.round(m.w / 2);
-    const key = `${m.w}x${m.h}x${halfW}`;
-    if (columnGradient === null || columnKey !== key) {
+    if (columnGradient === null || columnW !== m.w || columnH !== m.h || columnHalf !== halfW) {
       const g = ctx.createLinearGradient(cx - halfW, 0, cx + halfW, 0);
       g.addColorStop(0, withAlpha(COLOR.void, 0));
       g.addColorStop(0.22, withAlpha(COLOR.void, 0.55));
       g.addColorStop(0.78, withAlpha(COLOR.void, 0.55));
       g.addColorStop(1, withAlpha(COLOR.void, 0));
       columnGradient = g;
-      columnKey = key;
+      columnW = m.w;
+      columnH = m.h;
+      columnHalf = halfW;
     }
     ctx.fillStyle = columnGradient;
     ctx.fillRect(cx - halfW, 0, halfW * 2, m.h);
@@ -1189,6 +1455,29 @@ export function createMenus(overlayCanvas, callbacks) {
     trackRects[o + 1] = 0;
     trackRects[o + 2] = 0;
     trackRects[o + 3] = 0;
+    // Likewise the per-word targets: a row that is not a wide `choice` has none, so a stale
+    // layout can never hand a click to a word that is no longer on screen.
+    choiceCounts[i] = 0;
+  }
+
+  /**
+   * Record one word of a `choice` row as its own pointer target.
+   * @param {number} i row index
+   * @param {number} v value index
+   * @param {number} x
+   * @param {number} y
+   * @param {number} w
+   * @param {number} h
+   * @returns {void}
+   */
+  function recordChoiceWord(i, v, x, y, w, h) {
+    if (i < 0 || i >= MAX_ROWS || v < 0 || v >= MAX_CHOICE_VALUES) return;
+    const o = (i * MAX_CHOICE_VALUES + v) * 4;
+    choiceRects[o] = x;
+    choiceRects[o + 1] = y;
+    choiceRects[o + 2] = w;
+    choiceRects[o + 3] = h;
+    if (v + 1 > choiceCounts[i]) choiceCounts[i] = v + 1;
   }
 
   /**
@@ -1309,11 +1598,14 @@ export function createMenus(overlayCanvas, callbacks) {
     const rows = screen.items.length;
     const availH = m.h - listTop - 26 * u;
     const heightCap = Math.max(1, Math.floor((availH / Math.max(1, rows) - 6 * u) / 12));
+    // The menu never outranks the wordmark. On a phone the logo is width-bound (62 % of 234 UI
+    // pixels) while the height cap still allowed scale 4 rows, so the four menu words came out
+    // bigger than "A-MAZE" itself — the title screen's hierarchy upside down.
     const itemScale = fitScale(
       'Descend',
       colW * 0.7,
       { font: 'display' },
-      Math.min(scaleCap(m, 110), heightCap),
+      Math.max(1, Math.min(scaleCap(m, 110), heightCap, logoScale - 1)),
       1,
     );
     const rowH = textHeight({ font: 'display', size: itemScale }) + 6 * u;
@@ -1343,7 +1635,7 @@ export function createMenus(overlayCanvas, callbacks) {
     // Best score sits on its own line above the footer, never across it.
     const best = state.best;
     if (best !== undefined && best.score > 0) {
-      const bestText = `BEST ${formatInt(best.score)}  ·  DEPTH ${best.level}`;
+      const bestText = bestMemo(best.score, best.level);
       drawText(ctx, bestText, cx, footY - footH - 3 * u, {
         font: 'hud',
         size: fitScale(bestText, m.w - 8 * u, { font: 'hud' }, u),
@@ -1389,7 +1681,7 @@ export function createMenus(overlayCanvas, callbacks) {
     });
     drawRule(ctx, cx, py + 5 * u + headH + 3 * u, Math.round(panelW * 0.32), u);
     drawItemList(ctx, m, state, screen, py + headH + 13 * u, itemScale, rowH, reduced);
-    const status = `DEPTH ${state.level}  ·  ${formatInt(state.run.score)}`;
+    const status = statusMemo(state.level, Math.floor(state.run.score));
     drawText(ctx, status, cx, py + panelH - 3 * u, {
       font: 'hud',
       size: fitScale(status, panelW - 8 * u, { font: 'hud' }, u),
@@ -1425,14 +1717,22 @@ export function createMenus(overlayCanvas, callbacks) {
     // Three columns: label, control, value. The value column has to hold "100%" at full size, and
     // a toggle's ON/OFF word shares it so sliders and switches line up down the panel.
     const valueW = measureLine('100%', { font: 'hud', size: u });
-    const switchW = Math.min(18 * u, Math.round(inner * 0.3));
+    // A phone keeps the ON/OFF word (an unlabelled switch on a narrow panel is genuinely
+    // ambiguous), and pays for it out of the switch's width rather than the label's: the whole row
+    // is the tap target, so a narrower switch costs nothing to hit and the word costs nothing to
+    // read. `wordSize`/`wordW` are the column that word needs.
+    const wordSize = stacked ? Math.max(1, u - 1) : u;
+    const wordW = stacked ? measureLine('OFF', { font: 'hud', size: wordSize }) : valueW;
+    const switchW = stacked
+      ? Math.min(8 * u, Math.round(inner * 0.18))
+      : Math.min(18 * u, Math.round(inner * 0.3));
     const trackW = stacked
       ? inner - valueW - 3 * u
       : Math.max(10 * u, Math.round(inner * 0.34));
 
     // One scale for every label, so the list reads as a column rather than as a ransom note.
     const controlW = stacked
-      ? switchW
+      ? switchW + wordW + 3 * u
       : Math.max(switchW + valueW + 3 * u, trackW + valueW + 3 * u);
     const labelColW = inner - controlW - 3 * u;
     let labelScale = Math.max(1, u);
@@ -1539,25 +1839,27 @@ export function createMenus(overlayCanvas, callbacks) {
         const on = state.settings[key] === true;
         const bw = switchW;
         const bh = 7 * u;
-        // Wide screens put the word in the same value column the sliders use, so the three columns
-        // line up down the panel; a phone drops the word and keeps the switch.
-        const bx = stacked ? right - bw : right - valueW - 3 * u - bw;
+        // The word sits in the value column the sliders use, so the three columns line up down the
+        // panel. A phone shrinks it (and the switch) rather than dropping it.
+        const bx = right - wordW - 3 * u - bw;
         const by = rowY + Math.round(labelH / 2) - Math.round(bh / 2);
         const half = Math.round(bw / 2);
-        drawWell(ctx, bx, by, bw, bh, u, on ? COLOR.goldMid : COLOR.stoneShadow, COLOR.ironDark);
+        // BOTH states get a track the eye can see. An OFF switch drawn in stone-shadow on a
+        // near-black panel had no track at all, so the knob was a grey blob with nothing to judge
+        // its position against — iron against a dark border reads as an empty channel, and the
+        // gold of the ON state then reads as "filled".
+        drawWell(ctx, bx, by, bw, bh, u, on ? COLOR.goldMid : COLOR.ironBase, COLOR.stoneDark);
         // The knob slides to the side the state is on, so the switch reads from its shape and
         // colour before any word is parsed — the convention every touch UI already taught.
-        ctx.fillStyle = on ? COLOR.goldPale : COLOR.stoneDark;
+        ctx.fillStyle = on ? COLOR.goldPale : COLOR.stoneBright;
         ctx.fillRect(on ? bx + half : bx + u, by + u, half - u, bh - 2 * u);
-        if (!stacked) {
-          drawText(ctx, on ? 'ON' : 'OFF', right, by + Math.round(bh / 2), {
-            font: 'hud',
-            size: u,
-            color: on ? (selected ? 'hud' : 'hudGold') : 'hudDim',
-            align: 'right',
-            baseline: 'middle',
-          });
-        }
+        drawText(ctx, on ? 'ON' : 'OFF', right, by + Math.round(bh / 2), {
+          font: 'hud',
+          size: wordSize,
+          color: on ? (selected ? 'hud' : 'hudGold') : 'hudDim',
+          align: 'right',
+          baseline: 'middle',
+        });
         y += rowH;
         continue;
       }
@@ -1593,7 +1895,14 @@ export function createMenus(overlayCanvas, callbacks) {
           continue;
         }
         // Right-aligned, laid out back to front so the live word always ends at the value column.
+        // Each word is also recorded as its own pointer target: they are drawn as three separate
+        // choices, so clicking one has to mean that one (see `choiceRects`).
         let cxw = right;
+        // Each word's *target* runs from its own left padding to the next word's, so the gaps
+        // between them and the trailing margin belong to a word rather than being dead slivers
+        // that fall through to the cycle. The painted highlight is unchanged; only the hit box
+        // grows, which is what a thumb needs.
+        let wordEdge = right + 3 * u;
         for (let v = values.length - 1; v >= 0; v--) {
           const word = labelOf === undefined ? values[v] : labelOf(values[v]);
           const wOfWord = measureLine(word, { font: 'hud', size: u });
@@ -1609,6 +1918,10 @@ export function createMenus(overlayCanvas, callbacks) {
             align: 'right',
             baseline: 'middle',
           });
+          // Full row height, so a thumb aiming at a word does not have to find the text's own box.
+          const wordX = cxw - wOfWord - 2 * u;
+          recordChoiceWord(i, v, wordX, rowY - 2 * u, wordEdge - wordX, rowH - u);
+          wordEdge = wordX;
           cxw -= wOfWord + 5 * u;
         }
         y += rowH;
@@ -1645,8 +1958,7 @@ export function createMenus(overlayCanvas, callbacks) {
         trackH + 2 * u - Math.max(1, u >> 1) * 2,
       );
 
-      const valueText =
-        item.format === 'mult' ? raw.toFixed(1) + '×' : formatPercent(max > 0 ? raw / max : 0);
+      const valueText = sliderMemos[i](Math.round(raw * 1000), item.format === 'mult' ? 1 : 0, max);
       drawText(ctx, valueText, right, ty + Math.round(trackH / 2), {
         font: 'hud',
         size: u,
@@ -1665,15 +1977,21 @@ export function createMenus(overlayCanvas, callbacks) {
     }
     rowCount = count;
 
-    // The hint lives under the panel, or tucked against the bottom edge when there is no room.
+    // The hint lives under the panel. When the panel has taken the whole height (a phone held
+    // sideways) the hint is left out rather than drawn across the panel's bottom frame, which is
+    // what tucking it against the screen edge used to do: the rows are the content, and the hint
+    // only names the controls the rows already respond to.
     const promptH = textHeight({ font: 'hud', size: u });
-    drawPrompt(
-      ctx,
-      m,
-      'ARROWS ADJUST  ·  ESC BACK',
-      Math.min(py + panelH + 5 * u, m.h - promptH - 2 * u),
-      reduced,
-    );
+    const promptY = py + panelH + 4 * u;
+    if (promptY + promptH <= m.h - u) {
+      drawPrompt(
+        ctx,
+        m,
+        primaryPointerIsCoarse() ? 'TAP OR DRAG TO ADJUST' : 'ARROWS ADJUST  ·  ESC BACK',
+        promptY,
+        reduced,
+      );
+    }
   }
 
   // ── Credits ──
@@ -1727,6 +2045,101 @@ export function createMenus(overlayCanvas, callbacks) {
       y += lineH;
     }
     drawItemList(ctx, m, state, screen, Math.round(y + 3 * u), itemScale, rowH, reduced);
+  }
+
+  // ── Controls ──
+
+  /**
+   * What the game is played with. `src/input/bindings.js` owns the bindings and exports the table
+   * (`CONTROL_HINTS`); it is drawn here in the same panel style as Credits, because a first-person
+   * maze whose player never learns about sprint, the map key or mouse look is a harder game than
+   * it was designed to be.
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {SurfaceMetrics} m
+   * @param {GameState} state
+   * @param {Screen} screen
+   * @param {number} enter
+   * @param {boolean} reduced
+   * @returns {void}
+   */
+  function drawControls(ctx, m, state, screen, enter, reduced) {
+    const u = m.u;
+    const cx = Math.round(m.w / 2);
+    drawScrim(ctx, m, state.phase === 'paused' ? 0.76 : 0.7);
+
+    const touch = primaryPointerIsCoarse();
+    const hints = touch ? TOUCH_CONTROL_HINTS : controlHints;
+    const footer = touch ? KEYBOARD_HINT : TOUCH_HINT;
+    const panelW = Math.min(m.w - 4 * u, Math.max(110 * u, m.w * 0.74));
+    const colW = panelW - 14 * u;
+    const headScale = fitScale('Controls', panelW * 0.6, { font: 'display' }, Math.max(2, u * 2), 1);
+    const headH = textHeight({ font: 'display', size: headScale });
+    const itemScale = Math.max(1, u);
+    const rowH = textHeight({ font: 'display', size: itemScale }) + 4 * u;
+
+    // One scale for every key/action pair, then the whole panel is shrunk until it fits the
+    // surface — ten rows is taller than the options screen, so a short window is the normal case
+    // rather than the exception.
+    let size = fitHintScale(hints, colW, Math.max(1, u));
+    let lineH = 0;
+    let footH = 0;
+    let panelH = 0;
+    for (;;) {
+      lineH = textHeight({ font: 'hud', size }) + 2 * u;
+      footH = textHeight({ font: 'hud', size: Math.max(1, size - 1) }) + 3 * u;
+      panelH = headH + 11 * u + hints.length * lineH + footH + rowH + 7 * u;
+      if (panelH <= m.h - 4 * u || size <= 1) break;
+      size--;
+    }
+    const px = Math.round(cx - panelW / 2);
+    const py = Math.max(2 * u, Math.round((m.h - panelH) / 2)) + panelSlide(enter, u, reduced);
+
+    drawPanel(ctx, px, py, panelW, panelH, u, { frame: 'wood', alpha: 0.9 });
+    drawText(ctx, 'Controls', cx, py + 4 * u, {
+      font: 'display',
+      size: headScale,
+      color: 'gothic',
+      align: 'center',
+    });
+    drawRule(ctx, cx, py + 4 * u + headH + 2 * u, Math.round(panelW * 0.3), u);
+
+    const left = px + 7 * u;
+    const right = px + panelW - 7 * u;
+    let y = py + headH + 11 * u;
+    for (let i = 0; i < hints.length; i++) {
+      drawRow(ctx, hints[i].label, hints[i].keys, left, right, Math.round(y), size, 'hudGold', 'hud');
+      y += lineH;
+    }
+    // One line for the other kind of device, at the smallest size on the panel — and only if it
+    // fits: at one font pixel per UI pixel a 53-character sentence is twice the width of a phone's
+    // panel, and a footer running off both edges of the screen is worse than no footer.
+    const footSize = fitScale(footer, colW, { font: 'hud' }, Math.max(1, size - 1), 1);
+    if (measureLine(footer, { font: 'hud', size: footSize }) <= colW) {
+      drawText(ctx, footer, cx, Math.round(y + u), {
+        font: 'hud',
+        size: footSize,
+        color: 'hudDim',
+        align: 'center',
+      });
+    }
+    y += footH;
+    drawItemList(ctx, m, state, screen, Math.round(y + 2 * u), itemScale, rowH, reduced);
+  }
+
+  /**
+   * The largest scale at which every hint's `label + gap + keys` fits the column.
+   * @param {ReadonlyArray<ControlHint>} hints
+   * @param {number} width
+   * @param {number} maxScale
+   * @returns {number}
+   */
+  function fitHintScale(hints, width, maxScale) {
+    let scale = maxScale;
+    for (let i = 0; i < hints.length; i++) {
+      const fit = fitOneRowScale(hints[i].label, hints[i].keys, width, scale);
+      if (fit < scale) scale = fit;
+    }
+    return Math.max(1, scale);
   }
 
   // ── Loading ──
@@ -1795,7 +2208,7 @@ export function createMenus(overlayCanvas, callbacks) {
     // has just taken the stairs down into a 96×96 labyrinth should learn that here and not by
     // walking for ten minutes.
     const side = cellsForLevel(state.level);
-    const banner = formatLevelBanner(state.level, side, side);
+    const banner = bannerMemo(state.level, side);
     const bannerSize = fitScale(banner, m.w * 0.9, { font: 'hud' }, Math.max(1, u), 1);
     drawText(ctx, banner, cx, y + 8 * u, {
       font: 'hud',
@@ -1804,7 +2217,7 @@ export function createMenus(overlayCanvas, callbacks) {
       align: 'center',
     });
     const cells = side * side;
-    drawText(ctx, `${formatInt(cells)} CELLS`, cx, y + 8 * u + textHeight({ font: 'hud', size: bannerSize }) + 2 * u, {
+    drawText(ctx, cellsMemo(cells), cx, y + 8 * u + textHeight({ font: 'hud', size: bannerSize }) + 2 * u, {
       font: 'hud',
       size: bannerSize,
       color: 'hudDim',
@@ -1825,6 +2238,7 @@ export function createMenus(overlayCanvas, callbacks) {
   const statValues = ['', '', '', ''];
   let statCount = 0;
   /** Cache key for the explored count: the level object identity it was measured on. */
+  /** @type {object|null} */
   let statLevelRef = null;
   let statExplored = 0;
 
@@ -1850,7 +2264,7 @@ export function createMenus(overlayCanvas, callbacks) {
     if (level !== null && level !== undefined && level.maze !== undefined) {
       const maze = level.maze;
       statLabels[statCount] = 'LABYRINTH';
-      statValues[statCount] = formatLabyrinth(maze.cols, maze.rows);
+      statValues[statCount] = labyrinthMemo(maze.cols, maze.rows);
       statCount++;
 
       const total = maze.width * maze.height;
@@ -1860,18 +2274,18 @@ export function createMenus(overlayCanvas, callbacks) {
           statLevelRef = level;
         }
         statLabels[statCount] = 'EXPLORED';
-        statValues[statCount] = formatPercent(statExplored / total);
+        statValues[statCount] = exploredMemo(Math.round(clamp01(statExplored / total) * 100));
         statCount++;
       }
     }
     if (typeof run.refuels === 'number' && Number.isFinite(run.refuels) && statCount < statLabels.length) {
       statLabels[statCount] = 'REFUELS';
-      statValues[statCount] = formatInt(run.refuels);
+      statValues[statCount] = refuelsMemo(Math.floor(run.refuels));
       statCount++;
     }
     if (typeof run.distance === 'number' && Number.isFinite(run.distance) && statCount < statLabels.length) {
       statLabels[statCount] = 'WALKED';
-      statValues[statCount] = formatDistance(run.distance);
+      statValues[statCount] = walkedMemo(Math.round(run.distance));
       statCount++;
     }
     return statCount;
@@ -1892,6 +2306,7 @@ export function createMenus(overlayCanvas, callbacks) {
   function drawStatStrip(ctx, left, right, y, u, size, alpha) {
     if (statCount === 0) return 0;
     const lineH = textHeight({ font: 'hud', size });
+    const pitch = statRowPitch(u, size);
     const perRow = statCount >= 3 ? 2 : statCount;
     const colW = Math.floor((right - left) / perRow);
     const rows = Math.ceil(statCount / perRow);
@@ -1899,14 +2314,78 @@ export function createMenus(overlayCanvas, callbacks) {
       const col = i % perRow;
       const row = (i / perRow) | 0;
       const x = left + col * colW;
-      const ry = y + row * (lineH * 2 + 2 * u);
+      const ry = y + row * pitch;
       drawText(ctx, statLabels[i], x, ry, { font: 'hud', size, color: 'hudDim', alpha });
-      drawText(ctx, statValues[i], x, ry + lineH + u, { font: 'hud', size, color: 'hudBright', alpha });
+      // The value sits a clear 2u under its label: at u = 2 the old single unit made
+      // LABYRINTH/16×16 read as one cramped block rather than as a label and a number.
+      drawText(ctx, statValues[i], x, ry + lineH + 2 * u, {
+        font: 'hud',
+        size,
+        color: 'hudBright',
+        alpha,
+      });
     }
-    return rows * (lineH * 2 + 4 * u);
+    return rows * pitch;
+  }
+
+  /**
+   * Vertical pitch of one stat row. **One** definition, used by the draw loop, by its return value
+   * and by both callers' panel measurements — they disagreed by 2u before, which left the second
+   * row sitting above its reserved slot and a stray gap under the strip.
+   * @param {number} u
+   * @param {number} size text scale
+   * @returns {number}
+   */
+  function statRowPitch(u, size) {
+    return textHeight({ font: 'hud', size }) * 2 + 4 * u;
+  }
+
+  /**
+   * Height the expedition strip will occupy, including the rule above it.
+   * @param {number} rows how many stat rows were filled
+   * @param {number} u
+   * @param {number} size text scale
+   * @returns {number}
+   */
+  function statStripHeight(rows, u, size) {
+    if (rows === 0) return 0;
+    return (rows >= 3 ? 2 : 1) * statRowPitch(u, size) + 4 * u;
   }
 
   // ── Level complete ──
+
+  /**
+   * Tally scratch. Hoisted for the same reason `statLabels` is: these screens re-render every
+   * frame, and the file's own rule (see "Layout scratch") is that a frame allocates nothing.
+   * @type {number[]}
+   */
+  const tallyTargets = [0, 0, 0, 0];
+  /** @type {string[]} */
+  const tallyLabels = ['', '', '', ''];
+  /** @type {string[]} */
+  const tallyFinals = ['', '', '', ''];
+  /** @type {string[]} */
+  const endLabels = ['', '', ''];
+  /** @type {string[]} */
+  const endValues = ['', '', ''];
+  /** One-element scratch for the single-row `fitRowScale` calls. @type {string[]} */
+  const oneLabel = [''];
+  /** @type {string[]} */
+  const oneValue = [''];
+
+  /**
+   * The largest scale at which one label/value pair fits, without allocating a pair of arrays.
+   * @param {string} label
+   * @param {string} value
+   * @param {number} width
+   * @param {number} maxScale
+   * @returns {number}
+   */
+  function fitOneRowScale(label, value, width, maxScale) {
+    oneLabel[0] = label;
+    oneValue[0] = value;
+    return fitRowScale(oneLabel, oneValue, width, maxScale);
+  }
 
   /**
    * @param {CanvasRenderingContext2D} ctx
@@ -1924,12 +2403,11 @@ export function createMenus(overlayCanvas, callbacks) {
 
     const run = state.run;
     const level = state.level;
-    const targets = [
-      run.gems * SCORE_RULES.GEM_BASE * level,
-      fuelBonusOf(state),
-      SCORE_RULES.CLEAR_BASE * level,
-      run.score,
-    ];
+    const targets = tallyTargets;
+    targets[0] = run.gems * SCORE_RULES.GEM_BASE * level;
+    targets[1] = fuelBonusOf(state);
+    targets[2] = SCORE_RULES.CLEAR_BASE * level;
+    targets[3] = run.score;
     // Rows arrive one at a time; each starts rolling `TALLY_STAGGER` after the one before it.
     let allDone = true;
     for (let i = 0; i < TALLY_ROWS; i++) {
@@ -1943,36 +2421,58 @@ export function createMenus(overlayCanvas, callbacks) {
     }
     if (allDone) tallyDone = true;
 
-    const labels = [
-      `GEMS ${formatCount(run.gems, run.gemsTotal)} × ${SCORE_RULES.GEM_BASE * level}`,
-      `TORCH LEFT ${formatTime(run.fuel)}`,
-      'DEPTH BONUS',
-      'TOTAL',
-    ];
+    const labels = tallyLabels;
+    labels[0] = gemsRowMemo(run.gems, run.gemsTotal, level);
+    labels[1] = torchRowMemo(Math.floor(run.fuel));
+    labels[2] = 'DEPTH BONUS';
+    labels[3] = 'TOTAL';
     // Measure against the *final* values so the column does not shift while the counters roll.
-    const finals = [
-      formatInt(targets[0]),
-      formatInt(targets[1]),
-      formatInt(targets[2]),
-      formatInt(targets[3]),
-    ];
+    const finals = tallyFinals;
+    for (let i = 0; i < TALLY_ROWS; i++) finals[i] = tallyFinalMemos[i](Math.floor(targets[i]));
 
     const panelW = Math.min(m.w - 4 * u, Math.max(100 * u, m.w * 0.68));
-    const headText = `Depth ${level} Cleared`;
+    const headText = clearedMemo(level);
     const headScale = fitScale(headText, panelW * 0.86, { font: 'display' }, Math.max(2, u * 2), 1);
     const headH = textHeight({ font: 'display', size: headScale });
     const colW = panelW - 14 * u;
-    const rowScale = fitRowScale(labels, finals, colW, u);
-    const totalScale = Math.min(rowScale + 1, fitRowScale([labels[3]], [finals[3]], colW, u + 1));
-    const lineH = textHeight({ font: 'hud', size: totalScale }) + 4 * u;
-    const itemScale = fitScale('Quit to Title', panelW * 0.7, { font: 'display' }, scaleCap(m, 150), 1);
-    const rowH = textHeight({ font: 'display', size: itemScale }) + 4 * u;
     // The expedition summary sits between the tally and the buttons: it is the record of the maze
     // you just walked, which at these sizes is a bigger story than the score.
     const statRows = buildRunStats(state);
-    const statH = statRows === 0 ? 0 : (statRows >= 3 ? 2 : 1) * (textHeight({ font: 'hud', size: rowScale }) * 2 + 4 * u) + 4 * u;
-    const panelH =
-      headH + 13 * u + lineH * TALLY_ROWS + 4 * u + statH + rowH * screen.items.length + 6 * u;
+    // The panel is *fitted*, exactly as the options panel is (see `drawOptions`): computing a
+    // height once and centring it lets an oversized panel run off the bottom of the surface, which
+    // is what cut this frame off at 1280×720 (m.h = 360 against a 362-pixel panel). Shrink the
+    // rows first, then give up the expedition strip, then the buttons — in that order, because
+    // that is the order of what the screen is for.
+    let rowScale = fitRowScale(labels, finals, colW, u);
+    let itemScale = fitScale('Quit to Title', panelW * 0.7, { font: 'display' }, scaleCap(m, 150), 1);
+    let statsShown = statRows > 0;
+    let totalScale = 0;
+    let lineH = 0;
+    let rowH = 0;
+    let statH = 0;
+    let panelH = 0;
+    for (;;) {
+      totalScale = Math.min(rowScale + 1, fitOneRowScale(labels[3], finals[3], colW, u + 1));
+      lineH = textHeight({ font: 'hud', size: totalScale }) + 4 * u;
+      rowH = textHeight({ font: 'display', size: itemScale }) + 4 * u;
+      statH = statsShown ? statStripHeight(statRows, u, rowScale) : 0;
+      panelH =
+        headH + 13 * u + lineH * TALLY_ROWS + 4 * u + statH + rowH * screen.items.length + 6 * u;
+      if (panelH <= m.h - 4 * u) break;
+      if (rowScale > 1) {
+        rowScale--;
+        continue;
+      }
+      if (statsShown) {
+        statsShown = false;
+        continue;
+      }
+      if (itemScale > 1) {
+        itemScale--;
+        continue;
+      }
+      break;
+    }
     const px = Math.round(cx - panelW / 2);
     const py = Math.max(2 * u, Math.round((m.h - panelH) / 2)) + panelSlide(enter, u, reduced);
 
@@ -2005,7 +2505,7 @@ export function createMenus(overlayCanvas, callbacks) {
       drawRow(
         ctx,
         labels[i],
-        formatInt(tallyCounters[i].value),
+        tallyShownMemos[i](tallyCounters[i].value),
         left,
         right,
         Math.round(y) - punch,
@@ -2018,19 +2518,66 @@ export function createMenus(overlayCanvas, callbacks) {
 
     y += 4 * u;
     if (statH > 0) {
-      ctx.fillStyle = withAlpha(COLOR.stoneDark, 0.5);
-      ctx.fillRect(left, Math.round(y) - 2 * u, right - left, Math.max(1, u >> 1));
       // The strip fades in with the last tally row rather than arriving with the panel, so the
-      // eye finishes the score before it is offered the expedition numbers.
+      // eye finishes the score before it is offered the expedition numbers — and its divider fades
+      // with it, instead of hanging across an empty panel while the first rows are still due.
       const statAlpha = tallyDone ? 1 : clamp01((tallyT - TALLY_DELAY - TALLY_ROWS * TALLY_STAGGER) * 2);
-      if (statAlpha > 0) drawStatStrip(ctx, left, right, Math.round(y + 2 * u), u, rowScale, statAlpha);
+      if (statAlpha > 0) {
+        ctx.fillStyle = withAlpha(COLOR.stoneDark, 0.5 * statAlpha);
+        ctx.fillRect(left, Math.round(y) - 2 * u, right - left, Math.max(1, u >> 1));
+        drawStatStrip(ctx, left, right, Math.round(y + 2 * u), u, rowScale, statAlpha);
+      }
       y += statH;
     }
     if (tallyDone) {
       drawItemList(ctx, m, state, screen, Math.round(y), itemScale, rowH, reduced);
     } else {
-      rowCount = 0;
-      drawPrompt(ctx, m, 'PRESS ENTER TO SKIP', Math.round(y + rowH / 2), reduced);
+      // The whole panel is one hit target while the tally runs, so a click or a tap skips it —
+      // `handlePointer` bails out early when no row was laid out, which used to make its own skip
+      // branch unreachable and left a phone player being told to press a key it does not have.
+      recordRow(0, px, py, panelW, panelH);
+      rowEnabled[0] = true;
+      rowCount = 1;
+      drawPrompt(ctx, m, skipPrompt(), Math.round(y + rowH / 2), reduced);
+    }
+  }
+
+  /**
+   * What to tell the player to do to skip the tally, in the terms of the device they are holding:
+   * the old copy named the Enter key to a phone, which has none.
+   * @returns {string}
+   */
+  function skipPrompt() {
+    return primaryPointerIsCoarse() ? 'TAP TO SKIP' : 'CLICK OR PRESS ENTER TO SKIP';
+  }
+
+  /**
+   * Is the device's **primary** pointer a finger?
+   *
+   * WHY the media query and not `maxTouchPoints` / `'ontouchstart' in window`: those report touch
+   * *capability*, which every touchscreen laptop — and headless desktop Chrome — has, so a player
+   * sitting at a keyboard was told to tap. `(pointer: coarse)` describes the input the device is
+   * actually driven with. Anything unavailable (Node, an old browser) reads as a desktop.
+   * @returns {boolean}
+   */
+  function primaryPointerIsCoarse() {
+    if (coarsePointer === -1) coarsePointer = queryCoarsePointer() ? 1 : 0;
+    return coarsePointer === 1;
+  }
+
+  /** Cached answer of {@link queryCoarsePointer}: −1 not asked yet, 0 no, 1 yes. */
+  let coarsePointer = -1;
+
+  /**
+   * The media query behind {@link primaryPointerIsCoarse}, asked once.
+   * @returns {boolean}
+   */
+  function queryCoarsePointer() {
+    try {
+      const mm = /** @type {any} */ (globalThis).matchMedia;
+      return typeof mm === 'function' && mm.call(globalThis, '(pointer: coarse)').matches === true;
+    } catch (err) {
+      return false;
     }
   }
 
@@ -2059,10 +2606,16 @@ export function createMenus(overlayCanvas, callbacks) {
     const newBest = run.score > 0 && run.score >= best.score;
 
     const headText = 'Your torch has gone out';
-    const scoreText = formatInt(run.score);
-    const bestText = formatInt(best.score);
-    const labels = ['SCORE', 'DEPTH REACHED', newBest ? 'NEW BEST' : 'BEST'];
-    const values = [scoreText, String(state.level), bestText];
+    const labels = endLabels;
+    labels[0] = 'SCORE';
+    labels[1] = 'DEPTH REACHED';
+    labels[2] = newBest ? NEW_BEST_TEXT : 'BEST';
+    const values = endValues;
+    values[0] = scoreMemo(Math.floor(run.score));
+    values[1] = levelMemo(state.level);
+    // A new record *is* the score printed directly above it, so the row carries no number: it is
+    // one centred line of celebration rather than the same six digits twice.
+    values[2] = newBest ? '' : bestScoreMemo(Math.floor(best.score));
 
     const panelW = Math.min(m.w - 4 * u, Math.max(100 * u, m.w * 0.7));
     const headScale = fitScale(
@@ -2074,14 +2627,48 @@ export function createMenus(overlayCanvas, callbacks) {
     );
     const headH = textHeight({ font: 'display', size: headScale });
     const colW = panelW - 14 * u;
-    const rowScale = fitRowScale(labels, values, colW, u);
-    const scoreScale = Math.min(rowScale + 1, fitRowScale([labels[0]], [values[0]], colW, u + 1));
-    const lineH = textHeight({ font: 'hud', size: scoreScale }) + 4 * u;
-    const itemScale = fitScale('Try Again', panelW * 0.6, { font: 'display' }, scaleCap(m, 150), 1);
-    const rowH = textHeight({ font: 'display', size: itemScale }) + 4 * u;
     const statRows = buildRunStats(state);
-    const statH = statRows === 0 ? 0 : (statRows >= 3 ? 2 : 1) * (textHeight({ font: 'hud', size: rowScale }) * 2 + 4 * u) + 4 * u;
-    const panelH = headH + 14 * u + lineH * 3 + statH + rowH * screen.items.length + 6 * u;
+    // Fitted, for the reason spelled out in `drawComplete`: a panel measured once and centred runs
+    // off a short surface instead of shrinking to it.
+    let rowScale = fitRowScale(labels, values, colW, u);
+    let itemScale = fitScale('Try Again', panelW * 0.6, { font: 'display' }, scaleCap(m, 150), 1);
+    let statsShown = statRows > 0;
+    let scoreScale = 0;
+    let bestScale = 0;
+    let scoreH = 0;
+    let depthH = 0;
+    let bestH = 0;
+    let rowH = 0;
+    let statH = 0;
+    let panelH = 0;
+    for (;;) {
+      scoreScale = Math.min(rowScale + 1, fitOneRowScale(labels[0], values[0], colW, u + 1));
+      // The record line is drawn at the score's size whenever it fits the column there — on a
+      // phone as well, now that it no longer has to share the line with a number.
+      bestScale = newBest ? fitScale(NEW_BEST_TEXT, colW, { font: 'hud' }, scoreScale, 1) : rowScale;
+      // Each row is spaced for its own size: one pitch for all three left a small DEPTH REACHED
+      // floating in a gap measured for the score's double-height digits.
+      scoreH = textHeight({ font: 'hud', size: scoreScale }) + 4 * u;
+      depthH = textHeight({ font: 'hud', size: rowScale }) + 4 * u;
+      bestH = textHeight({ font: 'hud', size: bestScale }) + 4 * u;
+      rowH = textHeight({ font: 'display', size: itemScale }) + 4 * u;
+      statH = statsShown ? statStripHeight(statRows, u, rowScale) : 0;
+      panelH = headH + 14 * u + scoreH + depthH + bestH + 2 * u + statH + rowH * screen.items.length + 6 * u;
+      if (panelH <= m.h - 4 * u) break;
+      if (rowScale > 1) {
+        rowScale--;
+        continue;
+      }
+      if (statsShown) {
+        statsShown = false;
+        continue;
+      }
+      if (itemScale > 1) {
+        itemScale--;
+        continue;
+      }
+      break;
+    }
     const px = Math.round(cx - panelW / 2);
     const py = Math.max(2 * u, Math.round((m.h - panelH) / 2)) + panelSlide(enter, u, reduced);
 
@@ -2099,24 +2686,26 @@ export function createMenus(overlayCanvas, callbacks) {
     const right = px + panelW - 7 * u;
     let y = py + headH + 14 * u;
     drawRow(ctx, labels[0], values[0], left, right, Math.round(y), scoreScale, 'hud', 'hudBright');
-    y += lineH;
+    y += scoreH;
     drawRow(ctx, labels[1], values[1], left, right, Math.round(y), rowScale, 'hudDim', 'hudGold');
-    y += lineH;
-    // A new record flashes; an old one is stated quietly.
-    const flash = newBest ? (reduced ? 1 : 0.4 + 0.6 * (0.5 + 0.5 * Math.sin(clock * 7))) : 1;
-    drawRow(
-      ctx,
-      labels[2],
-      values[2],
-      left,
-      right,
-      Math.round(y),
-      rowScale,
-      newBest ? 'hudBright' : 'hudDim',
-      newBest ? 'hudBright' : 'hudGold',
-      flash,
-    );
-    y += lineH + 2 * u;
+    y += depthH;
+    if (newBest) {
+      // A new record is celebrated; an old one is stated quietly. The celebration is carried by
+      // **weight** — the score's size, gold, centred on the panel — and the pulse only breathes
+      // across the top fifth of the alpha range: dropping to 40 % made the one line the screen
+      // exists to celebrate read as a *disabled* row next to a fully opaque "DEPTH REACHED".
+      const flash = reduced ? 1 : 0.82 + 0.18 * (0.5 + 0.5 * Math.sin(clock * 7));
+      drawText(ctx, NEW_BEST_TEXT, cx, Math.round(y), {
+        font: 'hud',
+        size: bestScale,
+        color: 'hudGold',
+        align: 'center',
+        alpha: flash,
+      });
+    } else {
+      drawRow(ctx, labels[2], values[2], left, right, Math.round(y), bestScale, 'hudDim', 'hudGold');
+    }
+    y += bestH + 2 * u;
 
     // Where the torch went out: how big the labyrinth was and how much of it was ever seen. On a
     // 128×128 level "explored 31 %" is the whole story of the run in one number.

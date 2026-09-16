@@ -89,7 +89,7 @@ function isFloor(x, y) {
  * faces must be floor, or the torch would be buried inside the masonry.
  * @type {import('../core/types.js').Torch[]}
  */
-const torches = [
+const torches = /** @type {import('../core/types.js').Torch[]} */ ([
   { x: 4, y: 0, face: 1 },
   { x: 10, y: 0, face: 1 },
   { x: 0, y: 7, face: 0 },
@@ -107,7 +107,7 @@ const torches = [
   { x: 12, y: 11, face: 2 },
   { x: 4, y: 12, face: 1 },
   { x: 10, y: 12, face: 1 },
-].filter(
+]).filter(
   // A sconce must be bolted to a wall tile and face an open one, or it would be buried inside the
   // masonry. `Torch.face` uses the maze module's direction numbering, so its tables apply directly.
   (t) => !isFloor(t.x, t.y) && isFloor(t.x + DIR_DX[t.face], t.y + DIR_DY[t.face]),

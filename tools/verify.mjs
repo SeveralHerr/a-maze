@@ -57,6 +57,44 @@ const MAX_BUILD_RAF_GAP_MS = 50;
 /** Minimum times the autopilot's torch must visibly refill for the economy to count as working. */
 const MIN_REFUELS = 2;
 
+// ── The mid-tier device phase ─────────────────────────────────────────────────────────────────
+// Every number above is measured on a developer machine with the GPU frame limiter disabled, which
+// reads as enormous margin (600+ fps, render ~1.2 ms against an 8 ms gate) and says nothing about
+// the hardware the game ships to. This phase re-runs the same sampling with the renderer's CPU
+// slowed by `THROTTLE_RATE`, so the budgets carry evidence for a phone or a five-year-old laptop.
+// Measured at rate 4 on the cap level in an otherwise idle browser: render ~8.8 ms avg, ~84 fps
+// loop, longest frame gap ~30 ms, 0 steps discarded (rate 1: 2.4 ms; rate 2: 3.8-4.9 ms). The
+// budgets below sit ~35 % above that and well below "a player would notice", so a regression that
+// eats the real margin fails here long before it fails the unthrottled gates.
+//
+// CPU throttling multiplies whatever else the host is doing, so the phase also samples the same
+// scene unthrottled immediately before it (`throttled.baseline`). A failure whose control is itself
+// far above the cap soak's numbers is a loaded machine, not a regression — the report says which.
+/** CDP CPU throttling factor for the throttled phase (1 = no throttling). */
+const THROTTLE_RATE = 4;
+/** Seconds sampled while throttled. */
+const THROTTLE_SOAK_S = 10;
+const THROTTLED_MIN_FPS = 50;
+const THROTTLED_MAX_RENDER_MS_AVG = 12;
+/** Longest tolerated gap between animation frames while throttled, ms (≈6 dropped frames). */
+const THROTTLED_MAX_GAP_MS = 100;
+/**
+ * Steps the catch-up clamp may discard while throttled. Non-zero is legitimate here — a frame over
+ * ~83 ms owes more than `maxCatchUp` steps and the clamp *should* drop the overflow rather than
+ * queue it — but a growing count means the sim is losing ground, which is the death-spiral
+ * regression `skippedSteps` exists to catch. Unthrottled phases are gated at exactly zero.
+ */
+const THROTTLED_MAX_SKIPPED_STEPS = 5;
+/** Seconds of unthrottled sampling taken just before throttling, as the phase's control. */
+const THROTTLE_BASELINE_S = 3;
+/**
+ * Steps an *unthrottled* soak may discard. A death spiral — the regression `skippedSteps` exists to
+ * catch — discards steps every frame, hundreds per second. A single stall of the whole process (an
+ * OS preemption, a major GC, another Chrome on the same cores) discards one to four and is not a
+ * property of the game. Five separates the two without ever excusing the first.
+ */
+const MAX_STALL_SKIPPED_STEPS = 5;
+
 fs.mkdirSync(OUT, { recursive: true });
 
 function findChrome() {
@@ -97,6 +135,8 @@ const report = {
   buildGap: null,
   /** Oil flasks burned and fuel-seconds recovered across the whole run. */
   fuelEconomy: null,
+  /** The cap level re-sampled with the CPU throttled to `THROTTLE_RATE` (the real margin). */
+  throttled: null,
   fps: null,
   fpsUncapped: null,
   loopStats: null,
@@ -783,6 +823,8 @@ try {
         const g = window.__game;
         const samples = [];
         const t0 = performance.now();
+        // Cumulative since start(), so the phase's own figure is the difference.
+        const skipped0 = g.stats().skippedSteps;
         let frames = 0;
         const f = () => {
           frames++;
@@ -808,6 +850,7 @@ try {
                 renderMsAvg: +ls.renderMsAvg.toFixed(3),
                 droppedFrames: ls.droppedFrames,
                 skippedSteps: ls.skippedSteps,
+                skippedStepsDuringSoak: ls.skippedSteps - skipped0,
               },
             });
           }
@@ -910,6 +953,7 @@ try {
             const g = window.__game;
             const render = [];
             const t0 = performance.now();
+            const skipped0 = g.stats().skippedSteps;
             let frames = 0;
             let fuelRises = 0;
             let lastFuel = g.state().run.fuel;
@@ -936,6 +980,7 @@ try {
                   worldMsAvg: +(render.reduce((a, b) => a + b, 0) / render.length).toFixed(3),
                   worldMsP99: +render[Math.min(render.length - 1, Math.ceil(render.length * 0.99) - 1)].toFixed(3),
                   droppedFrames: ls.droppedFrames,
+                  skippedSteps: ls.skippedSteps - skipped0,
                   phase: s.phase,
                   level: s.level,
                   items: s.levelData ? s.levelData.items.length : 0,
@@ -971,6 +1016,75 @@ try {
       };
       await clearView(page, 5000);
       await shot(page, 'cap-play');
+
+      // ── The same level, on a mid-tier device ──
+      // Slow the renderer's CPU by THROTTLE_RATE and sample it again. This is the only phase that
+      // says anything about the margin a player actually has: the unthrottled numbers are measured
+      // with the frame limiter off on a developer machine.
+      let throttled = null;
+      try {
+        /** @param {number} seconds */
+        const sampleFrames = (seconds) =>
+          page.evaluate(
+            (seconds) =>
+              new Promise((resolve) => {
+                const g = window.__game;
+                const render = [];
+                const t0 = performance.now();
+                const skipped0 = g.stats().skippedSteps;
+                let frames = 0;
+                let last = t0;
+                let gapMax = 0;
+                let longGaps = 0;
+                const f = () => {
+                  const now = performance.now();
+                  const gap = now - last;
+                  last = now;
+                  if (frames > 0) {
+                    if (gap > gapMax) gapMax = gap;
+                    if (gap > 33) longGaps++;
+                  }
+                  frames++;
+                  render.push(g.renderStats().ms);
+                  if (now - t0 < seconds * 1000) requestAnimationFrame(f);
+                  else {
+                    render.sort((a, b) => a - b);
+                    const ls = g.stats();
+                    const s = g.state();
+                    resolve({
+                      seconds: +((performance.now() - t0) / 1000).toFixed(2),
+                      frames,
+                      rafFps: +((frames * 1000) / (performance.now() - t0)).toFixed(1),
+                      loopFps: +ls.fps.toFixed(1),
+                      stepMsAvg: +ls.stepMsAvg.toFixed(4),
+                      frameMsP99: +ls.frameMsP99.toFixed(2),
+                      renderMsAvg: +ls.renderMsAvg.toFixed(3),
+                      worldMsAvg: +(render.reduce((a, b) => a + b, 0) / render.length).toFixed(3),
+                      worldMsP99: +render[Math.min(render.length - 1, Math.ceil(render.length * 0.99) - 1)].toFixed(3),
+                      gapMaxMs: +gapMax.toFixed(1),
+                      gapsOver33Ms: longGaps,
+                      droppedFrames: ls.droppedFrames,
+                      skippedSteps: ls.skippedSteps - skipped0,
+                      phase: s.phase,
+                      level: s.level,
+                    });
+                  }
+                };
+                requestAnimationFrame(f);
+              }),
+            seconds,
+          );
+        // Control first: the same scene at rate 1, seconds before, on the same host load.
+        const baseline = await sampleFrames(THROTTLE_BASELINE_S);
+        await client.send('Emulation.setCPUThrottlingRate', { rate: THROTTLE_RATE });
+        await sleep(1500); // the loop's 120-frame window has to refill at the new speed
+        throttled = { ...(await sampleFrames(THROTTLE_SOAK_S)), baseline };
+      } finally {
+        // Never leave the page throttled: every measurement after this one would be wrong.
+        await client.send('Emulation.setCPUThrottlingRate', { rate: 1 }).catch(() => {});
+      }
+      report.throttled = throttled === null ? null : { rate: THROTTLE_RATE, ...throttled };
+      await sleep(600); // let the window refill at full speed before anything else is measured
 
       // (c) Both map states on the biggest maze in the game, shot AFTER the soak so there is
       // something on them — a minute of walking is the "just arrived" state a player sees.
@@ -1168,6 +1282,12 @@ if (report.capLevel) {
     fail(`cap-level heap grew ${c.heap.growthMB}MB over ${c.seconds}s > ${MAX_HEAP_GROWTH_MB}MB`);
   }
   if (c.walkedDuringSoak < 20) fail(`autopilot barely moved on the cap level (${c.walkedDuringSoak} tiles)`);
+  // The catch-up clamp discarding steps steadily on an unthrottled machine means the sim cannot keep
+  // up with a 60 Hz budget it has 500× the headroom for — the death-spiral regression this counter
+  // exists to catch. A one-off process stall is allowed for (MAX_STALL_SKIPPED_STEPS).
+  if (c.skippedSteps > MAX_STALL_SKIPPED_STEPS) {
+    fail(`cap-level soak discarded ${c.skippedSteps} sim steps (> ${MAX_STALL_SKIPPED_STEPS}: the sim is losing ground)`);
+  }
 } else if (report.level2 && report.level2.done) {
   fail('the maximum-size level was never reached, so nothing proved the massive-maze load');
 }
@@ -1201,6 +1321,33 @@ if (report.render) {
 }
 if (report.heap && report.heap.growthMB !== null && report.heap.growthMB > MAX_HEAP_GROWTH_MB) {
   fail(`heap grew ${report.heap.growthMB}MB over ${report.heap.soakSeconds}s > ${MAX_HEAP_GROWTH_MB}MB`);
+}
+if (report.loopStats && report.loopStats.skippedStepsDuringSoak > MAX_STALL_SKIPPED_STEPS) {
+  fail(
+    `the ${SOAK_S}s soak discarded ${report.loopStats.skippedStepsDuringSoak} sim steps ` +
+      `(> ${MAX_STALL_SKIPPED_STEPS}: the sim is losing ground)`,
+  );
+}
+
+// The mid-tier device: the same level, the same code, a CPU THROTTLE_RATE× slower.
+if (report.throttled) {
+  const t = report.throttled;
+  const b = t.baseline;
+  // Printed beside every throttled failure: the same scene, seconds earlier, at rate 1.
+  const ctl = b ? ` (unthrottled control: render ${b.renderMsAvg}ms, ${b.loopFps}fps, gap max ${b.gapMaxMs}ms)` : '';
+  if (t.phase !== 'playing') fail(`throttled phase ended in phase ${t.phase}`);
+  if (t.loopFps < THROTTLED_MIN_FPS) fail(`throttled (${t.rate}×) fps ${t.loopFps} < ${THROTTLED_MIN_FPS}${ctl}`);
+  if (t.renderMsAvg > THROTTLED_MAX_RENDER_MS_AVG) {
+    fail(`throttled (${t.rate}×) render avg ${t.renderMsAvg}ms > ${THROTTLED_MAX_RENDER_MS_AVG}ms${ctl}`);
+  }
+  if (t.gapMaxMs > THROTTLED_MAX_GAP_MS) {
+    fail(`throttled (${t.rate}×) longest frame gap ${t.gapMaxMs}ms > ${THROTTLED_MAX_GAP_MS}ms${ctl}`);
+  }
+  if (t.skippedSteps > THROTTLED_MAX_SKIPPED_STEPS) {
+    fail(`throttled (${t.rate}×) discarded ${t.skippedSteps} sim steps > ${THROTTLED_MAX_SKIPPED_STEPS}${ctl}`);
+  }
+} else if (report.capLevel) {
+  fail('the cap level was never sampled under CPU throttling, so no gate covers a mid-tier device');
 }
 // The options screen's Map row is a three-state choice now, and cycling it must move BOTH the
 // `mapMode` enum and the legacy `minimap` mirror, or the preference desynchronises on reload.
@@ -1259,6 +1406,16 @@ console.log(
       ? `soak ${cap.seconds}s @ ${cap.loopFps}fps, step ${cap.stepMsAvg}ms, render ${cap.renderMsAvg}ms avg / world p99 ${cap.worldMsP99}ms, heap +${cap.heap.growthMB}MB, walked ${cap.walkedDuringSoak} tiles, ${cap.refuelsDuringSoak} refuels · `
       : 'no cap soak · ') +
     `refuels ${report.fuelEconomy ? report.fuelEconomy.refuels : '?'} (+${report.fuelEconomy ? Math.round(report.fuelEconomy.gained) : '?'}s)`,
+);
+const thr = report.throttled;
+console.log(
+  `[verify] mid-tier: ` +
+    (thr
+      ? `CPU ${thr.rate}× · ${thr.loopFps}fps loop / ${thr.rafFps} wall · render ${thr.renderMsAvg}ms avg, ` +
+        `world p99 ${thr.worldMsP99}ms · frame p99 ${thr.frameMsP99}ms · gap max ${thr.gapMaxMs}ms ` +
+        `(${thr.gapsOver33Ms} over 33ms) · skipped steps ${thr.skippedSteps}` +
+        (thr.baseline ? ` · control at 1×: render ${thr.baseline.renderMsAvg}ms, ${thr.baseline.loopFps}fps` : '')
+      : 'not sampled'),
 );
 if (!report.pass) for (const r of report.failReasons) console.log(`[verify]   ✗ ${r}`);
 console.log(`[verify] ${report.screenshots.length} screenshots · wrote ${path.relative(ROOT, outFile)}`);

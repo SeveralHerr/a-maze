@@ -120,8 +120,9 @@ const _cand = new Int32Array(8);
 const _candW = new Int32Array(4);
 
 /**
- * Minimum fuel-seconds an oil flask must actually restore before it is consumed. Below this the
- * flask is left where it is, so a near-full tank never swallows a pickup for nothing.
+ * Absolute floor, in fuel-seconds, on the useful gain that makes an oil flask worth consuming. The
+ * real threshold is `FUEL.OIL_MIN_USEFUL_FRACTION` of the flask's value; this only stops a
+ * degenerate level (a zero-second flask) from making the test vacuous.
  */
 const OIL_MIN_GAIN = 1;
 
@@ -700,7 +701,11 @@ function collectAround(state) {
       for (let k = start[b]; k < to; k++) {
         const it = items[order[k]];
         if (it === undefined || it.taken) continue;
-        if (dist2(p.x, p.y, it.x, it.y) > pr2) continue;
+        // Written as "not inside" rather than "outside" so a NaN distance REJECTS. An item with
+        // non-finite coordinates is filed into bucket 0 by `bucketOf` — tiles 0…3 × 0…3, which is
+        // where the player spawns — and `NaN > pr2` is false, so the old form auto-collected it on
+        // the first frame of the level. Same comparison count, opposite answer for garbage.
+        if (!(dist2(p.x, p.y, it.x, it.y) <= pr2)) continue;
         takeItem(state, it);
       }
     }
@@ -728,14 +733,19 @@ function takeItem(state, it) {
     state.events.push({ type: 'pickup', kind: 'gem', x: it.x, y: it.y, value });
     return;
   }
-  // Walking over a flask with a full tank would burn it for nothing, which reads as a bug to the
-  // player. Leave it on the floor instead — it is still there on the way back. With the small
-  // tank of the new economy this happens often, and it is the difference between a generous
-  // world and a world that punishes you for topping up early.
-  if (run.fuelMax - run.fuel < OIL_MIN_GAIN) return;
+  // An unknown kind is data corruption, not an oil flask. Defaulting to oil here would hand a free
+  // refuel to any malformed item that reached the level (`{}` used to be treated as a flask).
+  if (it.kind !== 'oil') return;
+  // Walking over a flask with a near-full tank would burn most of it for nothing, which reads as a
+  // bug to the player: a flask is 38–53 s and the tank is 110–150 s, so a 1 s top-up destroys ~97 %
+  // of the pickup. Leave it on the floor until at least half of it would land — it is still there
+  // on the way back, and that is the rule `feasibility.test.mjs` proves the level curve against.
+  const gain = oilFuel(run.fuelMax);
+  const useful = Math.max(OIL_MIN_GAIN, gain * FUEL.OIL_MIN_USEFUL_FRACTION);
+  if (run.fuelMax - run.fuel < useful) return;
   it.taken = true;
   const before = run.fuel;
-  run.fuel = Math.min(run.fuelMax, run.fuel + oilFuel(run.fuelMax));
+  run.fuel = Math.min(run.fuelMax, run.fuel + gain);
   // The refuel tally is a per-level statistic (§3 RunStats): on a labyrinth that takes 7–22 flasks
   // to cross, "how many times did I refill" is the number that describes the level.
   run.refuels++;
@@ -914,7 +924,8 @@ export function stepPlaying(state, dt, input) {
   // ── Aim ──────────────────────────────────────────────────────────────────────────────────
   // Mouse yaw is applied raw: smoothing a pointer delta is indistinguishable from input lag.
   // The keyboard/stick turn gets a short ease so tapping a turn key does not snap.
-  sim.turnVel = damp(sim.turnVel, input.turn * PLAYER.TURN_SPEED, PLAYER.TURN_EASE_RATE, dt);
+  const turnTop = PLAYER.TURN_SPEED * (input.sprint ? PLAYER.SPRINT_TURN_MULT : 1);
+  sim.turnVel = damp(sim.turnVel, input.turn * turnTop, PLAYER.TURN_EASE_RATE, dt);
   p.angle = wrapAngle(p.angle + input.lookDX + sim.turnVel * dt);
 
   // ── Velocity ─────────────────────────────────────────────────────────────────────────────
@@ -1148,8 +1159,13 @@ export function stepAttract(state, dt) {
   sim.atSway += dt;
   const sway = Math.sin(sim.atSway * TAU * ATTRACT.SWAY_HZ) * ATTRACT.SWAY_AMP;
   const err = angleDiff(p.angle, Math.atan2(ty - p.y, tx - p.x) + sway);
+  // The proportional term is a RATE (rad/s), so it must be integrated over dt exactly like the cap
+  // it is clamped against. Comparing a raw `err × GAIN` (radians) with a per-frame step
+  // (`TURN_RATE × dt` ≈ 0.037 rad at 60 Hz) made the saturation band 60× too narrow *and*
+  // framerate-dependent, which turned the documented easing controller into a bang-bang one: the
+  // camera sat pinned at the rate cap and flipped sign every frame, a visible ±2°/frame buzz.
   const maxTurn = ATTRACT.TURN_RATE * dt;
-  p.angle = wrapAngle(p.angle + clamp(err * ATTRACT.TURN_GAIN, -maxTurn, maxTurn));
+  p.angle = wrapAngle(p.angle + clamp(err * ATTRACT.TURN_GAIN * dt, -maxTurn, maxTurn));
 
   const align = Math.cos(err);
   const speed = align > 0 ? ATTRACT.SPEED * Math.pow(align, ATTRACT.SPEED_FALLOFF) : 0;

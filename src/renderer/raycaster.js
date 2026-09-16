@@ -89,8 +89,9 @@ const MAX_SPRITES = 384;
 /**
  * Radius in tiles inside which a billboard can still change a pixel.
  *
- * Derived, not guessed: a sprite's shade level is `illum × fog(d) × 63` truncated (sprites carry no
- * dither), the brightest thing any sprite is given is `illum = 1.25` (a gem), and level 0 of the
+ * Derived, not guessed: a sprite's shade level is `illum × fog(d) × 63` truncated (sprites below one
+ * whole level skip the ordered dither — see `BAYER_NONE`), the brightest thing any sprite is given
+ * is `illum = 1.25` (a gem), and level 0 of the
  * colormap *is* the fog colour — which is exactly what the frame was cleared to and what every
  * surface at that distance already shades to. So once `fog(d) × 1.3 × 63 < 1` a sprite can only
  * paint fog onto fog. Solving `exp(-(d/9)^1.9) < 1/(1.3×63)` gives ≈19.6 tiles; the margin below
@@ -152,12 +153,18 @@ const TORCH_MAX_R = 7;
 /**
  * Ceiling on what the player's own torch alone can light a surface to.
  *
- * WHY it is below 1: the colormap's warm tint is concentrated in its top few levels, so whatever
- * reaches level 63 is what reads as "standing in firelight". Reserving that top fifth for the
- * *wall* torches is what gives them visible warm pools instead of being washed flat by the torch
- * the player is carrying — the reference's defining lighting cue.
+ * WHY it is below 1: a wall sconce must still be able to add something on top of the light the
+ * player carries, or its pool would be invisible — the reference's defining lighting cue.
+ *
+ * WHY it is no longer 0.78: that ceiling meant the player's own torch could never light anything
+ * past colormap level 49 of 63, where the old `t²` warm tint was still neutral (see
+ * `buildColormap`). Measured, a wall less than a tile from the eye came out at r−b = −24.5 —
+ * identical to one four tiles away — so the player walked around inside a uniformly cool frame
+ * with no warm pool anywhere. The ceiling now reaches the warm end of the ramp; the fog LUT and
+ * the attenuation LUT keep that from washing out the distance, and a sconce still has the last 5 %
+ * plus the whole of the dim mid-range beyond the player's pool to itself.
  */
-const PLAYER_TORCH_CEILING = 0.78;
+const PLAYER_TORCH_CEILING = 0.95;
 
 /** Ceilings receive less bounce light than floors — torches are mounted below them. */
 const CEIL_DIM = 0.72;
@@ -174,6 +181,31 @@ const SHAKE_PIXELS = 7;
 /** Shake also jitters yaw slightly, radians at `shake` 1. */
 const SHAKE_YAW = 0.02;
 
+/**
+ * Shade level (as a fraction of the ramp) at which the colormap's warm tint is fully applied.
+ * See `buildColormap` for the measurements behind 0.7.
+ */
+const WARM_FULL = 0.7;
+
+/**
+ * Exponent of a wall sconce's falloff `(1 − d/r)^k`. 1.7 made each sconce a pinpoint whose pool
+ * died a tile from the flame; 1.4 keeps the same radius (the light still reaches exactly zero at
+ * `TORCH_RADIUS`, so culling is untouched) and lets the pool read on the floor around it.
+ */
+const ATT_EXPONENT = 1.4;
+
+/**
+ * Fraction of the player's torch radius lit at full strength before the falloff begins.
+ *
+ * The torch the player carries does not use the sconces' power curve. A power curve starts falling
+ * the moment it leaves its core, so the floor three tiles ahead already sat below colormap level 25,
+ * where the blue-drifting channel gammas take over: the warm pool ended ~1.5 tiles out and the
+ * corridor read uniformly cool. A lantern's pool is a plateau with a soft edge — `1 − smoothstep`
+ * from this core out to the radius — which carries the warm light to ~3 tiles at a full tank and
+ * still shrinks with `view.light`, so the fuel gauge stays readable in the world itself.
+ */
+const PLAYER_TORCH_CORE = 0.1;
+
 /** Fog LUT resolution over [0, FAR] tiles. */
 const FOG_LUT_N = 512;
 const FOG_SCALE = FOG_LUT_N / FAR;
@@ -184,6 +216,18 @@ const ATT_LUT_N = 256;
 
 /** Torch sprite stands this far in front of the wall face it is mounted on (ARCHITECTURE §4.5). */
 const TORCH_OFFSET = 0.02;
+
+/** World height (and width) of a wall-torch billboard, in tiles. */
+const TORCH_SPRITE_SCALE = 0.5;
+
+/**
+ * Slack, in tiles, on a wall sprite's per-column mounting-plane depth (see `renderSprites`). The
+ * plane depth and the wall pass's DDA distance describe the *same* ray/plane intersection, so they
+ * differ only by float32 rounding in the z-buffer (≈1e-6 at 30 tiles); a hundredth of a tile
+ * absorbs that with four orders of magnitude to spare and is still far too thin for any real
+ * occluder — the nearest other geometry is a whole tile face — to slip through.
+ */
+const SPRITE_WALL_EPS = 0.01;
 
 /** Ambient embers emitted per second per visible torch. */
 const EMBER_RATE = 2.6;
@@ -216,6 +260,15 @@ const BAYER16 = Int32Array.from([0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 
   Math.round(((v + 0.5) / 16) * FX_ONE),
 );
 
+/**
+ * All-zero stand-in for `BAYER16`, used by a sprite whose shade level is below one whole level.
+ * Such a sprite truncates to level 0 — exactly the fog colour — on every pixel, which is the premise
+ * `SPRITE_FAR` is derived from; dithering it would lift scattered pixels to level 1 and make the
+ * fog cull visible (by one RGB step, but no longer byte-exact). Swapping tables keeps the pixel
+ * loop branch-free.
+ */
+const BAYER_NONE = new Int32Array(16);
+
 /** Channel shifts inside a packed pixel, for the flash pass. */
 const SH_R = LITTLE_ENDIAN ? 0 : 24;
 const SH_G = LITTLE_ENDIAN ? 8 : 16;
@@ -231,6 +284,18 @@ const INV_U32 = 2.3283064365386963e-10;
  * greenery reads as decoration only while it stays the exception, exactly as in the reference.
  */
 const WALL_VARIANT = Uint8Array.of(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 3);
+
+/**
+ * Per-variant mask on the per-tile **vertical** texture offset (see the wall pass).
+ *
+ * The plain and cracked stones are pure masonry, so sliding them up or down by whole 8-texel steps
+ * only breaks up the course joints, which is the point. The mossy and vined variants are not: their
+ * growth is painted with a top bias, hanging from the head of the tile the way damp creeps down a
+ * wall, so offsetting them vertically would leave a green band floating across the middle of the
+ * stone. Mask 0 pins those two; their own course phase (`COURSE_SETS` in `textures.js`) still keeps
+ * them out of step with their neighbours.
+ */
+const WALL_VOFF_MASK = Uint8Array.of(7, 7, 0, 0);
 
 /** Stand-ins for a view with no items/torches, so the index never sees `null` or a fresh `[]`. */
 const EMPTY_ITEMS = /** @type {import('../core/types.js').Item[]} */ ([]);
@@ -260,13 +325,28 @@ function buildColormap(out) {
     const gG = Math.pow(t, 1.35);
     const gB = Math.pow(t, 1.1);
     // Tint: what is bright in this game is bright because a *flame* is lighting it, so the top of
-    // the ramp warms and the bottom cools. The `t²` curve concentrates the warmth in the last few
-    // levels — right next to a torch — instead of bleaching the blue out of the stone everywhere,
-    // which is what keeps lit walls reading as the reference's blue-grey masonry.
-    const t2 = t * t;
-    const tintR = 0.84 + 0.26 * t2;
-    const tintG = 0.86 + 0.13 * t2;
-    const tintB = 1.06 - 0.17 * t2;
+    // the ramp warms and the bottom cools.
+    //
+    // WHERE on the ramp the warmth lives is the whole look. The first version used `t²`, which parks
+    // it in the last few levels that only a wall sconce at point-blank range reaches; measured, the
+    // player's own torchlight came out colour-neutral (`tintR/tintB` = 1.04 at the level its ceiling
+    // allowed), a wall one tile away was the same blue as one four tiles away (r−b −24.5 vs −34.8)
+    // and the floor's warmth was gone 2 tiles out. The near field — side walls at a grazing Lambert
+    // angle, the floor 1–3 tiles ahead — actually lives at levels ~25–50, so the warmth is a
+    // smoothstep that is already ~⅔ spent at mid-ramp and saturates by 70 %. Below that the
+    // per-channel gammas above still pull everything to blue, so the frame reads as a warm pool
+    // around the player falling off into cool blue shadow down the corridor.
+    //
+    // Measured over the six preview poses at `light` 0.9, together with the player-torch plateau
+    // (`PLAYER_TORCH_CORE`): near walls r−b −31.6 → −2.8, mid walls −31.0 → −7.9, far walls
+    // −24.3 → −20.4 (still cool), and the floor 2.5–3.5 tiles ahead −5.5 → +27.8. With no sconce in
+    // range at all the floor 1.5–2.5 tiles ahead goes −12.9 → +28.1. Warmer than this and the
+    // blue-grey masonry of the reference turns into neutral grey concrete — tried and rejected.
+    const wu = t >= WARM_FULL ? 1 : t / WARM_FULL;
+    const warm = wu * wu * (3 - 2 * wu);
+    const tintR = 0.8 + 0.44 * warm;
+    const tintG = 0.85 + 0.14 * warm;
+    const tintB = 1.12 - 0.4 * warm;
     const base = l * CM_STRIDE;
     for (let i = 0; i < PALETTE_SIZE; i++) {
       const r = PALETTE_RGB[i * 3] * tintR * gR + fogR * (1 - gR);
@@ -294,9 +374,9 @@ function buildFogLut(out) {
 }
 
 /**
- * Normalised distance → attenuation for a point light, `(1-t)^1.7` with a small unattenuated
- * core. Reaches exactly 0 at the radius, so a light can be culled by distance with no visible
- * edge.
+ * Normalised distance → attenuation for a point light, `(1-t)^ATT_EXPONENT` with a small
+ * unattenuated core. Reaches exactly 0 at the radius, so a light can be culled by distance with no
+ * visible edge.
  * @param {Float32Array} out length `ATT_LUT_N + 1`
  * @returns {void}
  */
@@ -304,7 +384,21 @@ function buildAttLut(out) {
   for (let i = 0; i <= ATT_LUT_N; i++) {
     const t = i / ATT_LUT_N;
     const k = t < 0.12 ? 1 : 1 - (t - 0.12) / 0.88;
-    out[i] = Math.pow(k < 0 ? 0 : k, 1.7);
+    out[i] = Math.pow(k < 0 ? 0 : k, ATT_EXPONENT);
+  }
+}
+
+/**
+ * Normalised distance → attenuation for the player's own torch: a lit plateau with a smooth
+ * shoulder, `1 − smoothstep(PLAYER_TORCH_CORE, 1, t)`. Exactly 0 at the radius, like `buildAttLut`.
+ * @param {Float32Array} out length `ATT_LUT_N + 1`
+ * @returns {void}
+ */
+function buildPlayerAttLut(out) {
+  for (let i = 0; i <= ATT_LUT_N; i++) {
+    let u = (i / ATT_LUT_N - PLAYER_TORCH_CORE) / (1 - PLAYER_TORCH_CORE);
+    u = u < 0 ? 0 : u > 1 ? 1 : u;
+    out[i] = 1 - u * u * (3 - 2 * u);
   }
 }
 
@@ -405,6 +499,8 @@ export function createRaycaster(canvas, options) {
   buildFogLut(fogLut);
   const attLut = new Float32Array(ATT_LUT_N + 1);
   buildAttLut(attLut);
+  const playerAttLut = new Float32Array(ATT_LUT_N + 1);
+  buildPlayerAttLut(playerAttLut);
   const fogPacked = colormap[C.fog]; // level 0 of any index is exactly the fog colour
 
   // ── Framebuffer state ──
@@ -446,6 +542,15 @@ export function createRaycaster(canvas, options) {
   const sprVOff = new Float32Array(MAX_SPRITES);
   const sprDist = new Float32Array(MAX_SPRITES);
   const sprLevel = new Int32Array(MAX_SPRITES);
+  /**
+   * Mounting-wall plane of a wall sprite, in the form the sprite pass needs per column: a ray with
+   * camera-plane coordinate `cx` meets the plane at depth `sprWallK / (sprWallA + sprWallB·cx)`.
+   * `sprWallK < 0` marks a wall sprite; free-standing sprites carry 0 and z-test honestly. Float64
+   * because a grazing ray divides by a small denominator. See `renderSprites` for why.
+   */
+  const sprWallK = new Float64Array(MAX_SPRITES);
+  const sprWallA = new Float64Array(MAX_SPRITES);
+  const sprWallB = new Float64Array(MAX_SPRITES);
   const sprOrder = new Int32Array(MAX_SPRITES);
   /** @type {Texture[]} reused slots; assignment only, never a fresh array */
   const sprTex = new Array(MAX_SPRITES);
@@ -813,7 +918,7 @@ export function createRaycaster(canvas, options) {
     const d = Math.sqrt(dx * dx + dy * dy);
     let t = d * torchInvR;
     if (t > 1) t = 1;
-    let illum = AMBIENT + attLut[(t * ATT_LUT_N) | 0] * torchPower;
+    let illum = AMBIENT + playerAttLut[(t * ATT_LUT_N) | 0] * torchPower;
     for (let k = 0; k < n; k++) {
       const i = list[k];
       const lx = lightX[i] - wx;
@@ -880,7 +985,7 @@ export function createRaycaster(canvas, options) {
     if (lam < 0) lam = 0;
     let t = d * torchInvR;
     if (t > 1) t = 1;
-    let illum = AMBIENT + attLut[(t * ATT_LUT_N) | 0] * torchPower * lam;
+    let illum = AMBIENT + playerAttLut[(t * ATT_LUT_N) | 0] * torchPower * lam;
     for (let i = 0; i < lightN; i++) {
       const lx = lightX[i] - wx;
       const ly = lightY[i] - wy;
@@ -1031,7 +1136,8 @@ export function createRaycaster(canvas, options) {
       // per-tile horizontal texture offset. The offset is what stops a corridor looking like the
       // same photograph repeated — the block courses still line up, but the joints no longer do.
       const hv = hash2(mapX, mapY, variantSeed);
-      const tIdx = wallTex[WALL_VARIANT[hv & 15]].indices;
+      const variant = WALL_VARIANT[hv & 15];
+      const tIdx = wallTex[variant].indices;
       // A third use of the same hash: mirror the course horizontally on half the tiles. Four wall
       // paintings across 64 offsets already gave plenty of variety in a 13-tile corridor; at 257
       // tiles the eye starts to recognise individual blocks, and mirroring doubles the vocabulary
@@ -1039,6 +1145,14 @@ export function createRaycaster(canvas, options) {
       // break the tiling, because the offset above has already displaced every joint anyway.
       if (hv & 0x100000) texX = TEX - 1 - texX;
       texX = (texX + ((hv >>> 8) & (TEX - 1))) & (TEX - 1);
+      // …and a fourth: a per-tile VERTICAL offset, in whole 8-texel steps. Without it the course
+      // joints of every tile sat at identical texel rows, and down a 257-tile corridor they fused —
+      // each carrying `paintBlock`'s lit top bevel — into unbroken bright rails, the single loudest
+      // reason the masonry read as flat panels with ledges. Eight steps break the rails while
+      // keeping the wall on a masonry grid rather than jittering it into noise; the wall texture
+      // wraps in both axes (`textures.test.mjs`, "organic surfaces wrap smoothly"), so the offset
+      // folds into the fixed-point start below and costs nothing per pixel.
+      const vOffFx = ((hv >>> 14) & WALL_VOFF_MASK[variant]) << 19; // (offset × 8 texels) in 16.16
 
       const lineH = h / dist;
       const topF = horizon - lineH * 0.5;
@@ -1065,7 +1179,7 @@ export function createRaycaster(canvas, options) {
         const from = run === 0 ? y0 : horizon > y0 ? horizon : y0;
         const to = run === 0 ? (horizon < y1 ? horizon : y1) : y1;
         if (to <= from) continue;
-        let texPos = ((from - topF) * stepTex * FX_ONE) | 0;
+        let texPos = (((from - topF) * stepTex * FX_ONE) | 0) + vOffFx;
         const rampStep = run === 0 ? rampUp : rampDown;
         // Start at the level this row has, then walk toward (run 0) or away from (run 1) the peak.
         let cur = lvl - (run === 0 ? horizon - from : from - horizon) * rampStep;
@@ -1233,9 +1347,12 @@ export function createRaycaster(canvas, options) {
    * @param {number} vOff world-space vertical offset; positive moves the sprite *down*
    * @param {number} level 16.16 shade level
    * @param {number} dist2 squared distance from the camera, for sorting
+   * @param {number} face mounting wall's outward-normal direction (0=E 1=S 2=W 3=N, as `Torch.face`),
+   *   or -1 for a free-standing sprite
+   * @param {number} off tiles the sprite stands in front of its mounting face (ignored when `face` is -1)
    * @returns {void}
    */
-  function addSprite(x, y, tex, scale, vOff, level, dist2) {
+  function addSprite(x, y, tex, scale, vOff, level, dist2, face, off) {
     let i;
     if (sprN < MAX_SPRITES) {
       i = sprN++;
@@ -1252,6 +1369,20 @@ export function createRaycaster(canvas, options) {
     sprVOff[i] = vOff;
     sprLevel[i] = level;
     sprDist[i] = dist2;
+    sprWallK[i] = 0;
+    if (face >= 0) {
+      const nx = DIR_DX[face & 3];
+      const ny = DIR_DY[face & 3];
+      // Signed distance from the eye to the mounting face along its outward normal. Only an eye in
+      // front of the wall can see the sconce at all; from behind, the wall itself hides it and the
+      // honest z-test is already right.
+      const eyeToWall = (camX - x) * nx + (camY - y) * ny + off;
+      if (eyeToWall > 0) {
+        sprWallK[i] = -eyeToWall;
+        sprWallA[i] = dirX * nx + dirY * ny;
+        sprWallB[i] = planeX * nx + planeY * ny;
+      }
+    }
     sprOrder[i] = i;
   }
 
@@ -1328,8 +1459,20 @@ export function createRaycaster(canvas, options) {
           // Emissive: the flame is a light source, so only distance fog dims it.
           const flick = 0.88 + 0.12 * tnoise(time * 9 + phase, 0x2c1a);
           // Scale 0.5 makes the sconce about half a tile tall; the offset lifts the flame to head
-          // height, where a real wall bracket sits.
-          addSprite(x, y, textures.torch[frame], 0.5, -0.17, levelFx(flick, Math.sqrt(d2), 1), d2);
+          // height, where a real wall bracket sits. Passing the mounting face is what stops the
+          // billboard being sliced by the wall it is bolted to at a grazing angle (see
+          // `renderSprites`).
+          addSprite(
+            x,
+            y,
+            textures.torch[frame],
+            TORCH_SPRITE_SCALE,
+            -0.17,
+            levelFx(flick, Math.sqrt(d2), 1),
+            d2,
+            face,
+            TORCH_OFFSET,
+          );
         }
       }
     }
@@ -1385,7 +1528,19 @@ export function createRaycaster(canvas, options) {
           const lvl = levelFx(illumFlat(it.x, it.y, allLights, lightN) * (isGem ? 1.25 : 1.1), d, 1);
           // Gems hover at knee height and bob; flasks stand on the floor. `vOff` is `0.5 - z`,
           // the world height of the sprite's centre below the eye.
-          addSprite(it.x, it.y, frames[spin], isGem ? 0.34 : 0.42, (isGem ? 0.2 : 0.375) - bobZ, lvl, d2);
+          // Face -1: a gem or a flask stands free in the middle of a tile, so there is no mounting
+          // surface to see past — it must z-test honestly.
+          addSprite(
+            it.x,
+            it.y,
+            frames[spin],
+            isGem ? 0.34 : 0.42,
+            (isGem ? 0.2 : 0.375) - bobZ,
+            lvl,
+            d2,
+            -1,
+            0,
+          );
         }
       }
     }
@@ -1408,6 +1563,8 @@ export function createRaycaster(canvas, options) {
           0.02,
           levelFx(open ? 1 : 0.45, Math.sqrt(d2), 1),
           d2,
+          -1, // free-standing in the exit tile: no mounting surface
+          0,
         );
       }
     }
@@ -1428,11 +1585,29 @@ export function createRaycaster(canvas, options) {
 
   /**
    * Draw the queued billboards, far to near, z-tested per column and alpha-keyed per texel.
+   *
+   * ── Wall sprites and the z-test ──
+   * A billboard carries one depth, `tY`, across its whole width, because it always turns to face
+   * the eye. The wall a sconce is bolted to does not turn: at anything but a head-on view the half
+   * of the billboard on the far side of the flame swings *behind* the wall plane, so an honest
+   * `tY >= zbuf[x]` test rejects those columns against the very wall the torch hangs on and the
+   * flame is cut off along a hard vertical line. Measured before this existed: a torch 1.1 tiles
+   * away at a grazing heading lost 50 of its 109 columns and read as an orange rectangle, at exactly
+   * the range a player reads a corridor torch.
+   *
+   * A constant depth bias would hide that, but it also lets real occluders within the bias through,
+   * and the bias a grazing view needs grows with distance. The fix here is exact instead: for a wall
+   * sprite each column tests `min(tY, depth at which this column's ray meets the mounting plane)`.
+   * A billboard texel behind the wall plane is thereby drawn as if projected onto the wall (a decal,
+   * which is what a flush-mounted flame looks like), and only geometry *in front of that plane* can
+   * hide it. The mounting wall itself — and nothing else — stops counting as an occluder. It costs
+   * one division per on-screen column of a wall sprite.
    * @returns {number} sprites that put at least one column on screen
    */
   function renderSprites() {
     const w = width;
     const h = height;
+    const invW = 1 / w;
     const halfW = w * 0.5;
     const invDet = 1 / (planeX * dirY - dirX * planeY);
     let drawn = 0;
@@ -1467,7 +1642,15 @@ export function createRaycaster(canvas, options) {
       const tex = sprTex[i];
       const ind = tex.indices;
       const stip = tex.stipple;
-      const levBase = (sprLevel[i] >> 16) << 8;
+      // 16.16 shade level carried into the pixel loop so it can be ordered-dithered exactly like
+      // the wall and flat passes. Quantising it once per sprite made a gem walked toward step
+      // visibly between shade bands — the banding the 4×4 Bayer matrix exists everywhere else to
+      // prevent. The cost is one table read and an add per sprite texel.
+      const lvFx = sprLevel[i];
+      const dither = lvFx >= FX_ONE ? BAYER16 : BAYER_NONE;
+      const wallK = sprWallK[i];
+      const wallA = sprWallA[i];
+      const wallB = sprWallB[i];
       const stepFx = ((TEX / size) * FX_ONE) | 0;
       let texFx = ((x0 - leftF) * (TEX / size) * FX_ONE) | 0;
       const texYStart = ((y0 - topF) * (TEX / size) * FX_ONE) | 0;
@@ -1477,8 +1660,19 @@ export function createRaycaster(canvas, options) {
         const tx = texFx >> 16;
         texFx += stepFx;
         if (tx < 0 || tx >= TEX) continue;
-        if (tY >= zbuf[x]) continue; // hidden behind a wall
+        let depthTest = tY;
+        if (wallK < 0) {
+          // Where this column's ray meets the mounting plane (same `cameraX` as the wall pass). A
+          // ray running parallel to or away from the wall never meets it and keeps plain `tY`.
+          const den = wallA + wallB * (2 * x * invW - 1);
+          if (den < 0) {
+            const onWall = wallK / den - SPRITE_WALL_EPS;
+            if (onWall < depthTest) depthTest = onWall;
+          }
+        }
+        if (depthTest >= zbuf[x]) continue; // hidden behind nearer geometry
         any = true;
+        const bayerCol = x & 3;
         let tp = texYStart;
         let pi = y0 * w + x;
         for (let y = y0; y < y1; y++) {
@@ -1492,7 +1686,10 @@ export function createRaycaster(canvas, options) {
           const idx = ind[ti];
           // Index 0 is the transparency key; stippled texels drop every other screen pixel.
           if (idx !== 0 && !(stip !== null && stip[ti] === 1 && ((x + y) & 1) === 0)) {
-            buf[pi] = colormap[levBase | idx];
+            let level = (lvFx + dither[((y & 3) << 2) | bayerCol]) >> 16;
+            if (level < 0) level = 0;
+            else if (level > LEVEL_MAX) level = LEVEL_MAX;
+            buf[pi] = colormap[(level << 8) | idx];
           }
           pi += w;
         }

@@ -230,6 +230,8 @@ const state = {
     sensitivity: 1,
     scanlines: true,
     minimap: mapParam !== 'off',
+    // The three-state preference (ARCHITECTURE.md §3). `?map=` forces the HUD's mode as well.
+    mapMode: mapParam === 'off' || mapParam === 'full' ? mapParam : 'corner',
     reducedMotion,
     invertLook: false,
   },
@@ -327,11 +329,12 @@ function setScreen(name) {
       state.best.score = 13100;
       break;
     case 'options':
+    case 'controls':
     case 'credits': {
       // The sub-screens are internal to `menus`; reach them the way a player does — by pressing
-      // Down to the row and confirming.
+      // Down to the row and confirming. Title rows: Descend, Options, Controls, Credits.
       state.phase = 'title';
-      const steps = name === 'options' ? 1 : 2;
+      const steps = name === 'options' ? 1 : name === 'controls' ? 2 : 3;
       for (let i = 0; i < steps; i++) menus.handleInput(frameWith('down'), state);
       menus.handleInput(frameWith('confirm'), state);
       break;
@@ -718,7 +721,7 @@ if (frozen) {
   /** Map cost accounting, for the screenshot driver's performance assertions. */
   mapStats: () => hud.mapStats(),
   /** Force a map state without walking the options screen. */
-  setMap: (mode) => {
+  setMap: (/** @type {string} */ mode) => {
     let now = hud.mapMode(state.settings);
     for (let i = 0; i < 3 && now !== mode; i++) now = hud.cycleMap(state.settings);
     return now;

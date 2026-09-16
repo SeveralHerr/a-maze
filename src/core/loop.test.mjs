@@ -30,6 +30,8 @@ import { clearErrors, errors } from './log.js';
  * @property {{hidden:boolean, fire:() => void, listenerCount:number}} doc
  * @property {(stepMs:number, renderMs:number) => void} setWorkCost
  * @property {number} cafCount
+ * @property {() => boolean} runTimers  fire the pending visibility poll, if any; false when none
+ * @property {() => number} timerCount  pending visibility polls (0 or 1)
  */
 
 /**
@@ -53,6 +55,10 @@ function harness(options = {}) {
   const renders = [];
   /** @type {Array<Function>} */
   const visibilityListeners = [];
+  /** Pending visibility-poll callback (the loop only ever schedules one at a time). */
+  /** @type {(() => void)|null} */
+  let timerCb = null;
+  let timerId = 0;
 
   const doc = {
     hidden: false,
@@ -93,6 +99,15 @@ function harness(options = {}) {
       cafCount++;
       scheduled = null;
     },
+    // Fake timers for the suspended-state visibility poll, so the test drives it deterministically
+    // instead of waiting 250 ms of wall clock (and never leaves a live timer behind).
+    setTimer: (/** @type {() => void} */ fn) => {
+      timerCb = fn;
+      return ++timerId;
+    },
+    clearTimer: () => {
+      timerCb = null;
+    },
     doc,
     ...options,
   });
@@ -116,6 +131,14 @@ function harness(options = {}) {
     get cafCount() {
       return cafCount;
     },
+    runTimers() {
+      const cb = timerCb;
+      timerCb = null;
+      if (!cb) return false;
+      cb();
+      return true;
+    },
+    timerCount: () => (timerCb === null ? 0 : 1),
   };
 }
 
@@ -289,6 +312,72 @@ test('starting while already hidden waits for visibility instead of burning fram
   assert.equal(h.pending(), true);
 });
 
+test('the loop resumes when doc.hidden clears WITHOUT a visibilitychange event', () => {
+  // The failure this pins: itch.io's iframe (the comment in tick() names it) can drop the event on
+  // the way back. Suspension cancels the frame, so without an independent re-check nothing is left
+  // to notice the page is visible again and the sim is frozen until a reload.
+  const h = harness();
+  h.loop.start();
+  h.frame(0);
+  h.frame(STEP_MS);
+  assert.equal(h.stepDts.length, 1);
+
+  h.doc.hidden = true;
+  h.doc.fire();
+  assert.equal(h.loop.suspended, true);
+  assert.equal(h.pending(), false, 'no frame is scheduled while hidden');
+  assert.equal(h.timerCount(), 1, 'a visibility poll is armed while suspended');
+
+  // Still hidden: the poll re-arms itself and nothing resumes.
+  assert.equal(h.runTimers(), true);
+  assert.equal(h.loop.suspended, true);
+  assert.equal(h.timerCount(), 1, 'the poll re-arms while the document stays hidden');
+
+  // Visible again, but the embedder never fires the event.
+  h.doc.hidden = false;
+  assert.equal(h.runTimers(), true);
+  assert.equal(h.loop.suspended, false, 'the poll noticed the document is visible again');
+  assert.equal(h.timerCount(), 0, 'the poll is disarmed once running');
+  assert.equal(h.pending(), true, 'a frame is scheduled again');
+
+  h.frame(10); // re-primes the clock
+  h.frame(STEP_MS);
+  assert.equal(h.stepDts.length, 2, 'the sim runs again');
+});
+
+test('the visibility poll is disarmed by a real visibilitychange and by stop()', () => {
+  const h = harness();
+  h.loop.start();
+  h.frame(0);
+  h.doc.hidden = true;
+  h.doc.fire();
+  assert.equal(h.timerCount(), 1);
+  h.doc.hidden = false;
+  h.doc.fire(); // the event did arrive this time
+  assert.equal(h.loop.suspended, false);
+  assert.equal(h.timerCount(), 0, 'no orphan timer survives a normal resume');
+
+  h.doc.hidden = true;
+  h.doc.fire();
+  assert.equal(h.timerCount(), 1);
+  h.loop.stop();
+  assert.equal(h.timerCount(), 0, 'stop() leaves nothing pending');
+  assert.equal(h.runTimers(), false);
+});
+
+test('starting hidden arms the poll, so a missed event still cannot strand the loop', () => {
+  const h = harness();
+  h.doc.hidden = true;
+  h.loop.start();
+  assert.equal(h.loop.suspended, true);
+  assert.equal(h.timerCount(), 1);
+  h.doc.hidden = false;
+  h.runTimers();
+  assert.equal(h.loop.suspended, false);
+  assert.equal(h.pending(), true);
+  h.loop.stop();
+});
+
 test('doc: null disables visibility handling entirely (workers, headless tools)', () => {
   const h = harness({ doc: null });
   h.loop.start();
@@ -352,6 +441,32 @@ test('stats() reports fps, averages, p99 and dropped frames over a 120-frame win
   assert.equal(s3.frameMsAvg, 0);
   assert.equal(s3.frameMsP99, 0);
   assert.equal(s3.skippedSteps, 0);
+});
+
+test('frameMsP99 matches a full sort at every window size, on unsorted data', () => {
+  // The p99 is a top-K selection over the raw ring rather than a sort, so it is checked against
+  // the obvious-but-slow implementation at every fill level, with deliberately jumbled intervals.
+  const h = harness();
+  h.loop.start();
+  h.frame(0);
+  /** @type {number[]} */
+  const seen = [];
+  let x = 12345;
+  for (let i = 0; i < 130; i++) {
+    x = (x * 1103515245 + 12345) & 0x7fffffff;
+    const ms = 4 + (x % 97); // 4…100 ms, no order at all
+    h.frame(ms);
+    seen.push(ms);
+    const window = seen.slice(-120);
+    const sorted = window.slice().sort((a, b) => a - b);
+    const idx = Math.min(window.length - 1, Math.max(0, Math.ceil(0.99 * window.length) - 1));
+    const s = h.loop.stats();
+    assert.equal(s.frameMsP99, sorted[idx], `p99 at ${window.length} samples`);
+    // Reading the statistics must not disturb the window it measures.
+    const avg = window.reduce((a, b) => a + b, 0) / window.length;
+    assert.ok(Math.abs(s.frameMsAvg - avg) < 1e-9, 'stats() must not reorder the ring buffer');
+  }
+  h.loop.stop();
 });
 
 test('stats() on a fresh loop is all zeros rather than NaN', () => {

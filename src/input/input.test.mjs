@@ -205,7 +205,6 @@ test('preventDefault is scoped: only bound scrolling keys, never while typing', 
   };
   assert.equal(wasPrevented('ArrowUp'), true, 'arrows would scroll the page');
   assert.equal(wasPrevented('Space'), true);
-  assert.equal(wasPrevented('Tab'), true, 'Tab would move focus off the canvas');
   assert.equal(wasPrevented('KeyW'), false, 'letters never scroll');
   assert.equal(wasPrevented('F5'), false, 'unbound keys are untouched');
 
@@ -214,6 +213,26 @@ test('preventDefault is scoped: only bound scrolling keys, never while typing', 
   t.env.document.activeElement = field;
   assert.equal(wasPrevented('Space'), false);
   t.env.document.activeElement = null;
+  t.input.destroy();
+});
+
+test('Tab never traps keyboard focus: swallowed only during play, never with Shift', () => {
+  const t = setup({ playing: false });
+  /** @param {string} code @param {any} [extra] @returns {boolean} */
+  const wasPrevented = (code, extra) => {
+    /** @type {any} */
+    const ev = Object.assign({ type: 'keydown', code, repeat: false, cancelable: true }, extra);
+    t.env.window.dispatchEvent(ev);
+    t.env.window.dispatchEvent({ type: 'keyup', code });
+    return ev.defaultPrevented === true;
+  };
+  // On the title/options screens the map binding is worth nothing and the focus ring is worth
+  // everything: a keyboard-only player must be able to tab out of the canvas (WCAG 2.1.2).
+  assert.equal(wasPrevented('Tab'), false, 'menus must not eat Tab');
+  t.setPlaying(true);
+  assert.equal(wasPrevented('Tab'), true, 'during play Tab is the second map key');
+  assert.equal(wasPrevented('Tab', { shiftKey: true }), false, 'Shift+Tab always walks focus back');
+  assert.equal(wasPrevented('ArrowUp'), true, 'the other suppressed keys are unaffected');
   t.input.destroy();
 });
 
@@ -382,6 +401,9 @@ test('requestPointerLock is safe when unsupported or rejected', () => {
 
 test('drag-look works as a pointer-lock fallback, but only while playing', () => {
   const t = setup({ playing: false });
+  // The fallback is for engines that cannot lock the pointer at all; take the API away so the
+  // automatic re-lock below cannot grab it out from under the drag.
+  delete t.env.canvas.requestPointerLock;
   t.env.canvas.dispatchEvent({ type: 'mousedown', button: 0 });
   mouseMove(t, 100);
   assert.equal(t.input.poll().lookDX, 0, 'dragging in a menu must not turn the camera');
@@ -393,6 +415,74 @@ test('drag-look works as a pointer-lock fallback, but only while playing', () =>
   t.env.document.dispatchEvent({ type: 'mouseup' });
   mouseMove(t, 100);
   assert.equal(t.input.poll().lookDX, 0, 'drag ended');
+  t.input.destroy();
+});
+
+test('pointer lock is re-acquired on the next poll after a keyboard resume', () => {
+  const t = setup({ playing: false });
+
+  // Paused, with the pointer released exactly as main.js does on leaving `playing`.
+  t.env.canvas.dispatchEvent({ type: 'click' });
+  assert.equal(t.env.document.pointerLockElement, null, 'menus keep the cursor');
+
+  // The player presses Enter on the pause menu; main.js flips the phase for the next step.
+  t.keyDown('Enter');
+  t.setPlaying(true);
+  t.input.poll();
+  assert.equal(t.env.document.pointerLockElement, t.env.canvas, 'the mouse is live without a click');
+
+  // And mouse look actually works now, which is the point of the whole exercise.
+  mouseMove(t, 100);
+  assert.ok(Math.abs(t.input.poll().lookDX - 100 * 0.0024) < 1e-12);
+  t.input.destroy();
+});
+
+test('automatic pointer lock is gated by gesture, phase, cooldown and refusals', () => {
+  const t = setup({ playing: true });
+  let requests = 0;
+  t.env.canvas.requestPointerLock = () => {
+    requests++;
+    // A browser that refuses: the lock never lands and `pointerlockerror` is delivered.
+    t.env.document.dispatchEvent({ type: 'pointerlockerror' });
+  };
+
+  // No gesture yet in this session → nothing is asked for.
+  t.env.advance(9000);
+  t.input.poll();
+  assert.equal(requests, 0, 'a request without a user gesture would only be refused');
+
+  t.keyDown('KeyW');
+  t.input.poll();
+  assert.equal(requests, 1, 'a keypress authorises the request');
+  t.input.poll();
+  t.input.poll();
+  assert.equal(requests, 1, 'and the cooldown stops a request storm');
+
+  t.env.advance(1300);
+  t.input.poll();
+  assert.equal(requests, 2);
+  t.env.advance(1300);
+  t.input.poll();
+  assert.equal(requests, 3);
+  t.env.advance(1300);
+  t.input.poll();
+  assert.equal(requests, 3, 'three refusals and the module stops asking');
+
+  // A deliberate click is the player saying "try again".
+  t.env.canvas.dispatchEvent({ type: 'click' });
+  assert.equal(requests, 4);
+
+  // Touch devices never want the pointer at all.
+  const m = setup({ coarsePointer: true, playing: true });
+  let touchRequests = 0;
+  m.env.canvas.requestPointerLock = () => {
+    touchRequests++;
+  };
+  m.keyDown('KeyW');
+  m.env.advance(10);
+  m.input.poll();
+  assert.equal(touchRequests, 0);
+  m.input.destroy();
   t.input.destroy();
 });
 
@@ -473,15 +563,138 @@ test('gamepad: buttons are edge-triggered and d-pad moves', () => {
   t.input.destroy();
 });
 
+/**
+ * Poll often enough that the "no pad has ever been seen" probe throttle cannot hide the pad under
+ * test. While nothing is connected the module samples `getGamepads()` twice a second, not 60 times.
+ * @param {any} t
+ * @returns {any} the last frame
+ */
+function pollPastProbe(t) {
+  let f = t.input.poll();
+  for (let i = 0; i < 40; i++) f = t.input.poll();
+  return f;
+}
+
 test('gamepad: triggers sprint, and a disconnected pad is ignored', () => {
   const t = setup();
   t.env.setGamepads([fakePad({ pressed: [7] })]);
   assert.equal(t.input.poll().sprint, true);
   t.env.setGamepads([null, undefined]);
   assert.equal(t.input.poll().sprint, false);
-  t.env.setGamepads([{ connected: false, axes: [1, 1], buttons: [] }]);
-  const f = t.input.poll();
+  t.env.setGamepads([{ connected: false, mapping: 'standard', axes: [1, 1], buttons: [] }]);
+  const f = pollPastProbe(t);
   assert.equal(f.moveX, 0, 'a disconnected pad contributes nothing');
+  t.input.destroy();
+});
+
+test('gamepad: a non-standard pad cannot spin the camera (its axis 2 often rests at -1)', () => {
+  const t = setup();
+  // Chrome reports mapping:'' for any HID pad it does not recognise. On a great many of those,
+  // axis 2 is a trigger sitting at -1 — under the standard-mapping assumption that is a right
+  // stick held hard over, and the player spins at full rate without touching anything.
+  t.env.setGamepads([fakePad({ mapping: '', axes: [0, 0, -1, 0] })]);
+  for (let i = 0; i < 60; i++) {
+    const f = t.input.poll();
+    assert.equal(f.turn, 0, 'an unmapped axis 2 is never read as yaw');
+    assert.equal(f.moveX, 0);
+    assert.equal(f.moveY, 0);
+  }
+
+  t.input.destroy();
+
+  // The left stick still works on such a pad, but only once an axis has proven it is a control by
+  // moving away from the value it was resting at when the pad was adopted.
+  const u = setup();
+  u.env.setGamepads([fakePad({ mapping: '', axes: [-1, 0, -1, 0] })]);
+  for (let i = 0; i < 10; i++) {
+    assert.equal(u.input.poll().moveX, 0, 'an axis resting at -1 is not a stick held left');
+  }
+  u.env.setGamepads([fakePad({ mapping: '', axes: [0.59, 0, -1, 0] })]);
+  const f = u.input.poll();
+  assert.ok(Math.abs(f.moveX - 0.5) < 1e-9, `a deliberate deflection is honoured, got ${f.moveX}`);
+  assert.equal(f.turn, 0, 'and axis 2 stays ignored');
+  u.input.destroy();
+});
+
+test('gamepad: a non-standard pad holding a button at rest cannot sprint or act forever', () => {
+  const t = setup();
+  t.env.setGamepads([fakePad({ mapping: '', pressed: [7, 9] })]);
+  for (let i = 0; i < 30; i++) {
+    const f = t.input.poll();
+    assert.equal(f.sprint, false, 'a resting trigger reported as a pressed button is not sprint');
+    assert.equal(f.pressed.size, 0);
+  }
+  // Once the same control has been seen released it is a real button and behaves normally.
+  t.env.setGamepads([fakePad({ mapping: '', pressed: [] })]);
+  t.input.poll();
+  t.env.setGamepads([fakePad({ mapping: '', pressed: [7] })]);
+  assert.equal(t.input.poll().sprint, true);
+  t.input.destroy();
+});
+
+test('gamepad: a standard pad wins over a non-standard one at a lower index', () => {
+  const t = setup();
+  t.env.setGamepads([
+    fakePad({ mapping: '', index: 0, axes: [0, 0, -1, 0] }),
+    fakePad({ mapping: 'standard', index: 1, axes: [0, 0, 1, 0] }),
+  ]);
+  assert.equal(t.input.poll().turn, 1, 'the real controller is the one that drives');
+  // And the buttons of the adopted pad are the ones that count.
+  t.env.setGamepads([
+    fakePad({ mapping: '', index: 0, axes: [0, 0, -1, 0] }),
+    fakePad({ mapping: 'standard', index: 1, axes: [0, 0, 1, 0], pressed: [9] }),
+  ]);
+  assert.ok(t.input.poll().pressed.has('pause'));
+  t.input.destroy();
+});
+
+test('gamepad: look sensitivity bends the stick curve without moving the rate ceiling', () => {
+  for (const s of [0.2, 1, 3]) {
+    const t = setup({ sensitivity: s });
+    t.env.setGamepads([fakePad({ axes: [0, 0, 1, 0] })]);
+    assert.equal(t.input.poll().turn, 1, `full deflection is full rate at sensitivity ${s}`);
+    t.env.setGamepads([fakePad({ axes: [0, 0, -1, 0] })]);
+    assert.equal(t.input.poll().turn, -1, `and symmetric at sensitivity ${s}`);
+    t.input.destroy();
+  }
+
+  // The slider still does something: the middle of the travel is quicker at 3 than at 0.2.
+  /** @param {number} s @returns {number} */
+  const midRate = (s) => {
+    const t = setup({ sensitivity: s });
+    t.env.setGamepads([fakePad({ axes: [0, 0, 0.7, 0] })]);
+    const turn = t.input.poll().turn;
+    t.input.destroy();
+    return turn;
+  };
+  const slow = midRate(0.2);
+  const mid = midRate(1);
+  const fast = midRate(3);
+  assert.ok(slow < mid && mid < fast, `expected a monotone slider, got ${slow} < ${mid} < ${fast}`);
+  assert.ok(fast < 1, 'and no part of the travel saturates early');
+});
+
+test('gamepad: getGamepads is not called every frame while nothing is plugged in', () => {
+  const t = setup();
+  let calls = 0;
+  t.env.navigator.getGamepads = () => {
+    calls++;
+    return [];
+  };
+  for (let i = 0; i < 120; i++) t.input.poll();
+  assert.ok(calls <= 8, `expected a throttled probe, got ${calls} calls in 120 polls`);
+  assert.ok(calls >= 1, 'but it must still find a pad that appears without an event');
+
+  // A connect event promotes the poll to sampling every frame immediately.
+  t.env.navigator.getGamepads = () => {
+    calls++;
+    return [fakePad({ axes: [0, -1, 0, 0] })];
+  };
+  const before = calls;
+  t.env.window.dispatchEvent({ type: 'gamepadconnected' });
+  for (let i = 0; i < 10; i++) t.input.poll();
+  assert.equal(calls - before, 10, 'a connected pad is sampled on every poll');
+  assert.equal(t.input.poll().moveY, 1);
   t.input.destroy();
 });
 
@@ -505,11 +718,13 @@ test('gamepad: a hostile getGamepads implementation cannot break the poll', () =
   t.env.navigator.getGamepads = () => {
     throw new Error('permission denied');
   };
-  assert.equal(t.input.poll().moveX, 0);
+  assert.equal(pollPastProbe(t).moveX, 0);
   t.env.navigator.getGamepads = () => null;
-  assert.equal(t.input.poll().moveX, 0);
-  t.env.navigator.getGamepads = () => [{ axes: [NaN, NaN, NaN], buttons: [null, 1, {}] }];
-  const f = t.input.poll();
+  assert.equal(pollPastProbe(t).moveX, 0);
+  t.env.navigator.getGamepads = () => [
+    { connected: true, mapping: 'standard', axes: [NaN, NaN, NaN], buttons: [null, 1, {}] },
+  ];
+  const f = pollPastProbe(t);
   assert.equal(f.moveX, 0);
   assert.equal(Number.isFinite(f.turn), true);
   t.input.destroy();
@@ -538,7 +753,7 @@ test('touch: the left 40% is a dynamic-origin virtual stick', () => {
   t.env.canvas.dispatchEvent(touchEvent('touchmove', [{ id: 1, x: 100, y: 440 }]));
   f = t.input.poll();
   assert.equal(f.moveY, 1, 'a full-radius push forward is full speed');
-  assert.equal(f.sprint, true, 'pinning the stick sprints');
+  assert.equal(f.sprint, false, 'full speed is not sprinting');
 
   // Beyond the ring the origin follows, so the thumb can always come back.
   t.env.canvas.dispatchEvent(touchEvent('touchmove', [{ id: 1, x: 100, y: 200 }]));
@@ -551,6 +766,50 @@ test('touch: the left 40% is a dynamic-origin virtual stick', () => {
   f = t.input.poll();
   assert.equal(f.moveY, 0);
   assert.equal(f.sprint, false);
+  t.input.destroy();
+});
+
+test('touch: sprint is an outward flick, not "the thumb left the ring"', () => {
+  const t = setup();
+
+  // A slow, ordinary drag across the glass — the stick's origin slides with it and the magnitude
+  // pins to 1, but the player did not ask to sprint and must not burn fuel 1.5x for walking.
+  t.env.canvas.dispatchEvent(touchEvent('touchstart', [{ id: 1, x: 100, y: 500 }]));
+  for (let y = 480; y >= 260; y -= 20) {
+    t.env.advance(120); // 20 px per 120 ms: nothing like a shove
+    t.env.canvas.dispatchEvent(touchEvent('touchmove', [{ id: 1, x: 100, y }]));
+    const f = t.input.poll();
+    assert.equal(f.sprint, false, `dragging must not sprint (y=${y})`);
+  }
+  assert.equal(t.input.poll().moveY, 1, 'but it is still full-speed walking');
+  t.env.canvas.dispatchEvent(touchEvent('touchend', [{ id: 1, x: 100, y: 260 }]));
+  t.input.poll();
+
+  // A deliberate flick: past 1.4 ring radii from where the thumb landed, inside the window.
+  t.env.canvas.dispatchEvent(touchEvent('touchstart', [{ id: 2, x: 100, y: 500 }]));
+  t.env.advance(80);
+  t.env.canvas.dispatchEvent(touchEvent('touchmove', [{ id: 2, x: 100, y: 400 }]));
+  let f = t.input.poll();
+  assert.equal(f.sprint, true, '100 px in 80 ms is a shove');
+  assert.equal(f.moveY, 1);
+
+  // It stays latched while the thumb stays out there…
+  t.env.advance(400);
+  t.env.canvas.dispatchEvent(touchEvent('touchmove', [{ id: 2, x: 100, y: 380 }]));
+  assert.equal(t.input.poll().sprint, true);
+
+  // …and drops the moment the thumb eases back off the rim.
+  t.env.canvas.dispatchEvent(touchEvent('touchmove', [{ id: 2, x: 100, y: 450 }]));
+  f = t.input.poll();
+  assert.equal(f.sprint, false, 'easing back off the rim is how you stop sprinting');
+  assert.ok(Math.abs(f.moveY) < 1, 'and the stick is no longer pinned');
+
+  // The same travel taken slowly never latches.
+  t.env.canvas.dispatchEvent(touchEvent('touchend', [{ id: 2, x: 100, y: 470 }]));
+  t.env.canvas.dispatchEvent(touchEvent('touchstart', [{ id: 3, x: 100, y: 500 }]));
+  t.env.advance(900);
+  t.env.canvas.dispatchEvent(touchEvent('touchmove', [{ id: 3, x: 100, y: 380 }]));
+  assert.equal(t.input.poll().sprint, false, 'slow travel is walking, however far it goes');
   t.input.destroy();
 });
 

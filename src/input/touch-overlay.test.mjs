@@ -158,6 +158,30 @@ test('update() binds visibility to the phase and hides the stick with it', () =>
   m.overlay.destroy();
 });
 
+test('the button bar steps out of the full map’s header', () => {
+  const m = mount();
+  const bar = m.layer.childNodes[2];
+  assert.equal(bar.style.transform, undefined, 'nothing is written before the first update');
+
+  m.overlay.update({ phase: 'playing', settings: { mapMode: 'corner' } });
+  assert.equal(bar.style.transform, undefined, 'the common case writes nothing at all');
+
+  m.overlay.update({ phase: 'playing', settings: { mapMode: 'full' } });
+  assert.equal(bar.attributes['data-map'], 'full', 'the hook styles.css can key off');
+  assert.match(bar.style.transform, /translateY\(\d+px\)/, 'and a shift that works without it');
+
+  m.overlay.update({ phase: 'playing', settings: { mapMode: 'off' } });
+  assert.equal(bar.attributes['data-map'], 'default');
+  assert.equal(bar.style.transform, '', 'the page stylesheet keeps its say in every other mode');
+
+  // A state without settings (or without a map mode at all) must not move anything.
+  m.overlay.update({ phase: 'playing' });
+  assert.equal(bar.style.transform, '');
+  m.overlay.update({ phase: 'playing', settings: { mapMode: /** @type {any} */ (7) } });
+  assert.equal(bar.style.transform, '');
+  m.overlay.destroy();
+});
+
 test('destroy() unmounts the layer, removes every listener and is idempotent', () => {
   const m = mount();
   assert.ok(m.env.totalListeners() > 0);

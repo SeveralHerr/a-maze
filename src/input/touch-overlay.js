@@ -22,9 +22,10 @@
 /**
  * The handle returned by {@link createTouchOverlay}.
  * @typedef {Object} TouchOverlay
- * @property {(state: {phase?: string}|null|undefined) => void} update
- *   Bind visibility to the game phase. Controls show only while `phase === 'playing'` (a pause or
- *   title menu draws its own buttons). Safe to call every frame: it costs one string compare.
+ * @property {(state: {phase?: string, settings?: {mapMode?: string}}|null|undefined) => void} update
+ *   Bind visibility to the game phase, and the button bar's position to the map mode. Controls
+ *   show only while `phase === 'playing'` (a pause or title menu draws its own buttons). Safe to
+ *   call every frame: it costs two compares.
  * @property {(active: boolean, originX: number, originY: number, knobX: number, knobY: number) => void} setStick
  *   Move/show/hide the virtual stick. Coordinates are **CSS pixels in viewport space** (i.e. raw
  *   `Touch.clientX/clientY`), matching what `input.js` already tracks.
@@ -45,6 +46,18 @@ const KNOB_RADIUS = 26;
  * compatibility `click` ~300 ms after `touchend`; without this guard every tap fires twice.
  */
 const CLICK_SUPPRESS_MS = 700;
+
+/**
+ * How far down the button bar slides while the **full** map is open, in CSS px.
+ *
+ * `styles.css` already pushes the bar clear of the HUD's top-right panel, but the full-screen map
+ * draws its own header (`DEPTH n · 128×128` on the left, `MAPPED %` on the right) at that same
+ * vertical inset on a phone, so PAUSE landed on top of the percentage. One button height plus the
+ * gap moves the bar off the header line and onto the map's top-right margin, where it covers a
+ * corner of a picture instead of a number. A `transform` (rather than a margin or a `top`) so the
+ * shift composes with wherever the page stylesheet has put the bar, without knowing that value.
+ */
+const FULL_MAP_DROP_PX = 64;
 
 /**
  * Create the on-screen touch controls inside `root`.
@@ -243,6 +256,7 @@ export function createTouchOverlay(root, opts) {
 
   // ── Mutable view state (cached so we only touch the DOM on a real change) ─────────────────
   let visible = true; // visible until the first update() binds us to a phase
+  let barLowered = false; // true while the full-screen map is open
   let stickShown = false;
   let ringX = NaN;
   let ringY = NaN;
@@ -264,6 +278,18 @@ export function createTouchOverlay(root, opts) {
   return {
     update(state) {
       if (destroyed) return;
+
+      // The full map covers the screen with its own header; the bar steps out of its way. The
+      // `data-map` attribute is the hook `styles.css` (integrator territory) can use to place the
+      // bar itself — the inline transform below is what makes the fix stand up without it.
+      const settings = state ? /** @type {any} */ (state).settings : null;
+      const lower = !!settings && settings.mapMode === 'full';
+      if (lower !== barLowered) {
+        barLowered = lower;
+        bar.setAttribute('data-map', lower ? 'full' : 'default');
+        bar.style.transform = lower ? `translateY(${FULL_MAP_DROP_PX}px)` : '';
+      }
+
       // Anything that is not the playing phase is a menu, and menus own the screen: hiding the
       // buttons there prevents a stray tap from re-pausing an already paused game.
       const show = !state || typeof state.phase !== 'string' ? true : state.phase === 'playing';

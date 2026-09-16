@@ -11,8 +11,11 @@
  * 1. **`poll()` allocates nothing.** One `InputFrame` object and one `Set` are created at
  *    construction and reused forever; actions travel as a 9-bit integer mask until the moment they
  *    are written into that `Set`. The only allocation left in the poll path is the array
- *    `navigator.getGamepads()` builds, which is the browser's, not ours, and only exists while a
- *    pad is plugged in. Consumers must therefore **not retain the frame** across steps.
+ *    `navigator.getGamepads()` builds, which is the browser's, not ours: Chrome returns a fresh
+ *    4-element array on **every** call, plugged in or not, so while no pad has been seen the poll
+ *    probes only once every `PAD_PROBE_POLLS + 1` polls (≈ twice a second) instead of 60 times a
+ *    second, and a `gamepadconnected` event promotes it to per-poll sampling immediately.
+ *    Consumers must **not retain the frame** across steps.
  * 2. **No stuck keys.** `blur`, `visibilitychange`, pointer-lock loss and `touchcancel` all clear
  *    every held state. A key released while the tab was hidden can never leave the player walking
  *    into a wall forever.
@@ -94,8 +97,30 @@ const STICK_ZONE_FRACTION = 0.4;
 /** Deadzone for the virtual stick. Smaller than a gamepad's: a thumb has no spring return. */
 const TOUCH_DEADZONE = 0.12;
 
-/** Stick deflection at which touch counts as sprinting (push the thumb to the rim). */
-const TOUCH_SPRINT_AT = 0.92;
+/**
+ * Sprint on touch is an **outward flick**, not a deflection threshold.
+ *
+ * The stick's origin slides (see {@link updateStick}), so *any* drag past the ring pins the
+ * magnitude at exactly 1 — a thumb dragged naturally across the glass would otherwise sprint
+ * permanently and burn fuel 1.5× with no way to walk except holding inside a moving 60 px window.
+ * Instead: travel this multiple of the ring radius away from the point the thumb **landed**,
+ * within {@link TOUCH_SPRINT_FLICK_MS}, and sprint latches; bring the thumb back inside the ring
+ * (relative to that same landing point) and it unlatches. Sprint becomes a decision again.
+ */
+const TOUCH_SPRINT_FLICK_RATIO = 1.4;
+
+/**
+ * Milliseconds the flick above must complete in. Long enough for a deliberate shove (a thumb
+ * covers ~85 px in well under a fifth of a second), short enough that slowly dragging the stick
+ * around while exploring never trips it.
+ */
+const TOUCH_SPRINT_FLICK_MS = 260;
+
+/**
+ * Deflection the thumb must keep to stay sprinting once the flick has latched it. Easing back off
+ * the rim drops to a walk, which is the same gesture a stick-and-trigger player would make.
+ */
+const TOUCH_SPRINT_HOLD = 0.9;
 
 /** Seconds a menu direction must be held before it starts repeating. */
 const NAV_REPEAT_DELAY_S = 0.42;
@@ -119,6 +144,37 @@ const SENS_MAX = 3;
  * (where a player aims) while keeping full rate at the rim (where they spin).
  */
 const STICK_CURVE_MIX = 0.7;
+
+/**
+ * Number of polls skipped between `getGamepads()` probes while no pad has ever been seen.
+ * 30 ⇒ one probe every ~0.5 s at 60 Hz, which is far below the time it takes a human to plug a
+ * controller in and reach for it, and 97 % fewer throwaway arrays than probing every frame.
+ */
+const PAD_PROBE_POLLS = 30;
+
+/**
+ * Axes tracked for the non-standard-mapping baseline guard. Standard mapping defines 4; 8 covers
+ * the wheels/flight sticks that report a hat or a clutch as extra axes without growing the arrays.
+ */
+const PAD_AXIS_MAX = 8;
+
+/**
+ * Longest a user gesture is assumed to still authorise a pointer-lock request, in ms. Chrome's
+ * transient activation window is 5 s; asking at 4 s leaves margin for a slow frame and means a
+ * keyboard resume (Enter on the pause menu) can re-lock on the following step rather than leaving
+ * the mouse silently dead until the player thinks to click.
+ */
+const GESTURE_GRACE_MS = 4000;
+
+/** Minimum gap between two *automatic* pointer-lock requests, in ms (a click always goes now). */
+const AUTO_LOCK_COOLDOWN_MS = 1200;
+
+/**
+ * Consecutive refusals after which the automatic request gives up until the next successful lock.
+ * Some environments (iframes without `allow="pointer-lock"`, Chrome's post-Escape cooldown) refuse
+ * every time, and retrying twice a second forever would be a noise generator, not a feature.
+ */
+const AUTO_LOCK_MAX_FAILS = 3;
 
 // ─── Public types ────────────────────────────────────────────────────────────────────────────
 
@@ -150,8 +206,9 @@ const STICK_CURVE_MIX = 0.7;
  * @property {() => InputFrame} poll                one reused frame; never retain it
  * @property {(o: InputOptions) => void} setOptions partial update; unknown keys ignored
  * @property {() => void} requestPointerLock        safe to call any time; no-ops when unsupported
- * @property {(state: {phase?: string}|null|undefined) => void} updateOverlay
- *   Forwards the phase to the touch overlay (no-op without one). Call it once per frame.
+ * @property {(state: {phase?: string, settings?: {mapMode?: string}}|null|undefined) => void} updateOverlay
+ *   Forwards the phase — and the map mode, which decides where the button bar sits — to the touch
+ *   overlay (no-op without one). Pass the whole `GameState`; call it once per frame.
  * @property {() => void} destroy                   removes every listener and DOM node
  * @property {boolean} isTouch                      true once the device has proven it is touch
  * @property {boolean} pointerLocked                true while the canvas owns the pointer
@@ -225,7 +282,12 @@ export function createInput(canvasEl, opts) {
   let stickOriginY = 0;
   let stickX = 0; // normalised -1..1, right positive
   let stickY = 0; // normalised -1..1, forward positive
-  let stickMag = 0;
+  /** Where the thumb first landed (the sliding origin moves; this does not) and when. */
+  let stickDownX = 0;
+  let stickDownY = 0;
+  let stickDownMs = 0;
+  /** Latched by an outward flick; see {@link TOUCH_SPRINT_FLICK_RATIO}. */
+  let stickSprint = false;
   let lookId = -1;
   let lookLastX = 0;
   let touchDetected = false;
@@ -236,6 +298,18 @@ export function createInput(canvasEl, opts) {
   let padIndex = -1;
   /** Set after any discontinuity (blur, (re)connect): the next poll re-baselines without edges. */
   let padResync = true;
+  /** True when the adopted pad reports W3C `mapping: 'standard'` — i.e. its indices mean anything. */
+  let padStandard = true;
+  /** Resting axis values captured on the resync poll, for the non-standard baseline guard. */
+  const padAxisBase = new Float64Array(PAD_AXIS_MAX);
+  /** 1 once a non-standard axis has moved away from its baseline and may be trusted. */
+  const padAxisLive = new Uint8Array(PAD_AXIS_MAX);
+  /** 1 once a non-standard button has been observed *released* and may be trusted. */
+  const padBtnLive = new Uint8Array(32);
+  /** True once a pad has been seen connected; gates the per-poll `getGamepads()` allocation. */
+  let padSeen = false;
+  /** Polls left to skip before the next probe while `padSeen` is false. */
+  let padProbeSkips = 0;
   /** Directions currently held on d-pad/stick, for software auto-repeat. */
   let navHoldMask = 0;
   let navRepeatTimer = 0;
@@ -250,6 +324,16 @@ export function createInput(canvasEl, opts) {
 
   let lastPollMs = now();
   let destroyed = false;
+
+  // Pointer-lock re-acquisition state (see maybeAutoLock).
+  /** Timestamp of the last user gesture, which is what authorises a pointer-lock request. */
+  let lastGestureMs = -1e9;
+  /** Timestamp of the last *automatic* request, for the cooldown. */
+  let lastAutoLockMs = -1e9;
+  /** True between an automatic request and its verdict, so only its failures are counted. */
+  let autoLockPending = false;
+  /** Consecutive automatic refusals; at AUTO_LOCK_MAX_FAILS the module stops asking. */
+  let autoLockFails = 0;
 
   // ── Listener bookkeeping (invariant 3) ────────────────────────────────────────────────────
   /** @type {{t:any, type:string, fn:Function, opt:any}[]} */
@@ -337,6 +421,14 @@ export function createInput(canvasEl, opts) {
       if (e.metaKey) clearHeld();
       return;
     }
+    // An unmodified keypress is a user gesture, and a gesture is what a pointer-lock request
+    // needs. Recorded for every key (bound or not) so resuming a paused game from the keyboard can
+    // take the pointer back on the next step — see maybeAutoLock. Deliberately *only* the
+    // keyboard: a mouse player's click already locks directly in `onClick`, and treating clicks as
+    // standing authorisation would have the module asking for the pointer behind gestures the
+    // player aimed at something else.
+    lastGestureMs = now();
+
     const code = e.code || codeFromKey(e.key);
     if (!code) return;
 
@@ -355,7 +447,12 @@ export function createInput(canvasEl, opts) {
       pendingMask |= first && !e.repeat ? mask : mask & NAV_MASK;
     }
     if (PREVENT_DEFAULT_CODES.has(code) && !textFieldFocused() && e.cancelable !== false) {
-      if (typeof e.preventDefault === 'function') e.preventDefault();
+      // `Tab` is the one entry in that set whose default is a keyboard user's ONLY way to move
+      // focus off the canvas (WCAG 2.1.2, "No Keyboard Trap"). Swallow it just where the binding
+      // earns it — during actual play, where it is a second name for the map — and never for
+      // Shift+Tab, so focus can always walk back out. `M` covers the map everywhere else.
+      const focusEscape = code === 'Tab' && (e.shiftKey === true || !shouldLockPointer());
+      if (!focusEscape && typeof e.preventDefault === 'function') e.preventDefault();
     }
   }
 
@@ -430,13 +527,22 @@ export function createInput(canvasEl, opts) {
   };
 
   /**
-   * Pointer lock may only be requested from a user gesture, so the click handler is the one place
-   * that can ask for it — and it asks only while the predicate says the player is playing.
+   * Pointer lock may only be requested from a user gesture. A click is the most direct one, and it
+   * asks only while the predicate says the player is playing.
    */
   const onClick = () => {
+    // A deliberate click is also the player telling us to try again after we gave up.
+    autoLockFails = 0;
     if (touchDetected || isLocked() || !shouldLockPointer()) return;
     requestPointerLock();
   };
+
+  /** Record that an automatic request was refused, and stop asking once it is clearly hopeless. */
+  function noteLockRefused() {
+    if (!autoLockPending) return;
+    autoLockPending = false;
+    autoLockFails++;
+  }
 
   const onPointerLockChange = () => {
     // Either direction is a discontinuity: releasing the pointer (Esc) abandons a half-gesture the
@@ -444,11 +550,42 @@ export function createInput(canvasEl, opts) {
     // bogus jumbo delta. Drop whatever has accumulated and start the next poll clean.
     dragging = false;
     lookAccum = 0;
+    if (isLocked()) {
+      autoLockPending = false;
+      autoLockFails = 0;
+    }
   };
 
   const onPointerLockError = () => {
+    noteLockRefused();
     log.debug('pointer lock refused');
   };
+
+  /**
+   * Take the pointer back when the game is being played without it.
+   *
+   * Pointer lock is released on every exit from `playing` (main.js does that so a menu gets its
+   * cursor back), and it is only ever *re-*acquired by a canvas click. A player who resumes the
+   * pause menu with Enter — or starts a game from the title screen with the keyboard — therefore
+   * lands back in the dungeon with a mouse that silently does nothing, with no prompt to click.
+   * (A player who resumes by *clicking* the menu row is already fine: the phase has flipped by the
+   * time `click` fires, so `onClick` locks.) Asking here, once per step, fixes the keyboard case:
+   * a keydown grants transient activation that is still valid on the following frame, so the
+   * request succeeds — the gesture is real, just one frame old. Guarded three ways so it can never turn
+   * into a request storm: only with a recent gesture, at most once per {@link AUTO_LOCK_COOLDOWN_MS},
+   * and never again after {@link AUTO_LOCK_MAX_FAILS} refusals until a lock actually lands.
+   */
+  function maybeAutoLock() {
+    if (destroyed || touchDetected || autoLockFails >= AUTO_LOCK_MAX_FAILS) return;
+    if (!target || typeof target.requestPointerLock !== 'function') return;
+    if (isLocked() || !shouldLockPointer()) return;
+    const t = now();
+    if (t - lastGestureMs > GESTURE_GRACE_MS) return;
+    if (t - lastAutoLockMs < AUTO_LOCK_COOLDOWN_MS) return;
+    lastAutoLockMs = t;
+    autoLockPending = true;
+    requestPointerLock();
+  }
 
   // ── Touch ─────────────────────────────────────────────────────────────────────────────────
 
@@ -457,7 +594,7 @@ export function createInput(canvasEl, opts) {
     stickId = -1;
     stickX = 0;
     stickY = 0;
-    stickMag = 0;
+    stickSprint = false;
     if (overlay) overlay.setStick(false, 0, 0, 0, 0);
   }
 
@@ -482,7 +619,28 @@ export function createInput(canvasEl, opts) {
     }
     const nx = dx / STICK_RADIUS_PX;
     const ny = dy / STICK_RADIUS_PX;
-    stickMag = radialDeadzone(nx, ny, TOUCH_DEADZONE, stickScratch);
+    const deflection = radialDeadzone(nx, ny, TOUCH_DEADZONE, stickScratch);
+
+    // Sprint latches on a shove and holds while the thumb stays out at the rim.
+    //
+    // It is judged against the point the thumb LANDED on, which the sliding origin above has by
+    // then left behind — that displacement is the only part of the gesture the rim clamp does not
+    // throw away, so it is the only place "the player shoved forward" can honestly be read from.
+    // Deflection alone cannot say it: past the ring the deflection is *always* exactly 1.
+    if (stickSprint) {
+      if (deflection < TOUCH_SPRINT_HOLD) stickSprint = false;
+    } else {
+      const tdx = x - stickDownX;
+      const tdy = y - stickDownY;
+      const travel = Math.sqrt(tdx * tdx + tdy * tdy);
+      if (
+        travel >= STICK_RADIUS_PX * TOUCH_SPRINT_FLICK_RATIO &&
+        now() - stickDownMs <= TOUCH_SPRINT_FLICK_MS
+      ) {
+        stickSprint = true;
+      }
+    }
+
     stickX = stickScratch[0];
     // Screen Y grows downward; forward is up the screen.
     stickY = -stickScratch[1];
@@ -513,6 +671,10 @@ export function createInput(canvasEl, opts) {
         stickId = t.identifier;
         stickOriginX = t.clientX;
         stickOriginY = t.clientY;
+        stickDownX = t.clientX;
+        stickDownY = t.clientY;
+        stickDownMs = now();
+        stickSprint = false;
         updateStick(t.clientX, t.clientY);
       } else {
         if (lookId !== -1) continue;
@@ -561,12 +723,18 @@ export function createInput(canvasEl, opts) {
 
   const onGamepadConnected = () => {
     padResync = true;
+    padSeen = true; // promote the poll from probing to sampling immediately
+    padProbeSkips = 0;
     log.debug('gamepad connected');
   };
   const onGamepadDisconnected = () => {
     padIndex = -1;
     padPrev.fill(0);
     padResync = true;
+    // Fall back to probing. A reconnect fires `gamepadconnected` again in every engine, and the
+    // probe would find the pad within half a second even if one did not.
+    padSeen = false;
+    padProbeSkips = 0;
   };
 
   /**
@@ -641,6 +809,78 @@ export function createInput(canvasEl, opts) {
   }
 
   /**
+   * Yaw rate for a right-stick deflection, shaped by the response curve and then by the look
+   * sensitivity — **without moving the ceiling**.
+   *
+   * A pad stick is a *rate* (`frame.turn` is clamped to ±1 and the sim multiplies it by
+   * `TURN_SPEED`), where the mouse's `lookDX` is a *displacement*. Multiplying a rate by the mouse
+   * slider is therefore wrong in both directions: at 3× the rate saturated at ~0.66 deflection and
+   * the outer third of the stick's travel did nothing, and at 0.2× a full-stick 180° turn took
+   * 4.4 s. Sensitivity bends the curve instead — the exponent `1/√s` makes the middle of the
+   * travel quicker or gentler while `|x| = 1` always maps to exactly 1, so full deflection is full
+   * rate at every setting and s = 1 is bit-identical to the plain cubic blend.
+   *
+   * @param {number} rx deadzoned axis value, -1..1
+   * @returns {number} turn rate, -1..1
+   */
+  function padTurnResponse(rx) {
+    const shaped = STICK_CURVE_MIX * rx * rx * rx + (1 - STICK_CURVE_MIX) * rx;
+    let m = shaped < 0 ? -shaped : shaped;
+    if (m === 0) return 0;
+    if (m > 1) m = 1;
+    const out = sensitivity === 1 ? m : Math.pow(m, 1 / Math.sqrt(sensitivity));
+    return shaped < 0 ? -out : out;
+  }
+
+  /**
+   * Value of a pad axis, guarded for pads the browser could not map.
+   *
+   * Chrome reports `mapping: ''` for any HID device it does not recognise — generic USB pads,
+   * arcade sticks, wheels, flight sticks — and on those the axis order is whatever the device says
+   * it is. Axis 2 is very often a trigger that **rests at -1**, which under the standard-mapping
+   * assumption is a right stick held hard left: the camera spins at the full turn rate forever and
+   * the game is unplayable for a keyboard player who merely has a cheap pad plugged in. So a
+   * non-standard axis stays at 0 until it has moved more than a deadzone away from the value it
+   * was resting at when the pad was adopted, at which point it has proven it is a real control.
+   *
+   * @param {any} axes
+   * @param {number} i
+   * @returns {number}
+   */
+  function padAxis(axes, i) {
+    const raw = axes[i];
+    const v = typeof raw === 'number' && Number.isFinite(raw) ? raw : 0;
+    if (padStandard) return v;
+    if (i >= PAD_AXIS_MAX) return 0;
+    if (padAxisLive[i]) return v;
+    const d = v - padAxisBase[i];
+    if ((d < 0 ? -d : d) > DEADZONE) {
+      padAxisLive[i] = 1;
+      return v;
+    }
+    return 0;
+  }
+
+  /**
+   * Adopt `pads[i]` as the active pad, resetting every piece of per-pad state.
+   * @param {any} pad
+   * @param {number} i
+   */
+  function adoptPad(pad, i) {
+    if (padIndex === i) {
+      padStandard = pad.mapping === 'standard';
+      return;
+    }
+    padIndex = i;
+    padStandard = pad.mapping === 'standard';
+    padPrev.fill(0);
+    padBtnLive.fill(0);
+    padAxisLive.fill(0);
+    padResync = true;
+    log.debug('gamepad adopted', i, padStandard ? 'standard' : 'non-standard');
+  }
+
+  /**
    * Sample the active gamepad. Called once per poll; writes into the `pad*` scratch variables.
    * @param {number} dt seconds since the previous poll
    */
@@ -653,6 +893,16 @@ export function createInput(canvasEl, opts) {
     if (!nav || typeof nav.getGamepads !== 'function') {
       updateNavRepeat(0, dt);
       return;
+    }
+    // Every `getGamepads()` call allocates a fresh array in Chrome whether or not anything is
+    // plugged in, so while nothing has been seen we look twice a second instead of sixty times.
+    if (!padSeen) {
+      if (padProbeSkips > 0) {
+        padProbeSkips--;
+        updateNavRepeat(0, dt);
+        return;
+      }
+      padProbeSkips = PAD_PROBE_POLLS;
     }
     /** @type {any} */
     let pads = null;
@@ -667,26 +917,37 @@ export function createInput(canvasEl, opts) {
       return;
     }
 
-    // Stay on the pad we were already using (a second controller must not hijack the game), and
-    // otherwise adopt the lowest connected index.
+    // Selection, in priority order: the pad we are already on if it is standard (a second
+    // controller must not hijack the game mid-run), else the lowest-index **standard** pad, else
+    // the one we are already on, else the lowest connected index at all. A standard pad therefore
+    // always wins over a non-standard one, whatever order the browser lists them in — otherwise an
+    // arcade stick at index 0 would lock out the Xbox pad at index 1.
     /** @type {any} */
     let pad = null;
-    if (padIndex >= 0 && padIndex < pads.length) {
-      const p = pads[padIndex];
-      if (p && p.connected !== false) pad = p;
-    }
-    if (!pad) {
+    /** @type {any} */
+    const current = padIndex >= 0 && padIndex < pads.length ? pads[padIndex] : null;
+    const currentOk = !!current && current.connected !== false;
+    if (currentOk && current.mapping === 'standard') {
+      pad = current;
+      adoptPad(pad, padIndex);
+    } else {
+      let fallback = -1;
       for (let i = 0; i < pads.length; i++) {
         const p = pads[i];
-        if (p && p.connected !== false) {
+        if (!p || p.connected === false) continue;
+        if (p.mapping === 'standard') {
           pad = p;
-          if (padIndex !== i) {
-            padIndex = i;
-            padPrev.fill(0);
-            padResync = true;
-          }
+          adoptPad(p, i);
           break;
         }
+        if (fallback < 0) fallback = i;
+      }
+      if (!pad && currentOk) {
+        pad = current;
+        adoptPad(pad, padIndex);
+      } else if (!pad && fallback >= 0) {
+        pad = pads[fallback];
+        adoptPad(pad, fallback);
       }
     }
     if (!pad) {
@@ -695,22 +956,38 @@ export function createInput(canvasEl, opts) {
         padPrev.fill(0);
         padResync = true;
       }
+      padSeen = false;
+      padProbeSkips = PAD_PROBE_POLLS;
       updateNavRepeat(0, dt);
       return;
     }
+    padSeen = true;
 
     const axes = pad.axes;
     let navMask = 0;
 
-    if (axes && axes.length >= 2) {
-      radialDeadzone(axes[0], axes[1], DEADZONE, stickScratch);
-      padMoveX += stickScratch[0];
-      padMoveY -= stickScratch[1]; // pads report "up" as -1
-    }
-    if (axes && axes.length >= 3) {
-      const rx = axisDeadzone(axes[2], DEADZONE);
-      // Cubic-blended response, then the look sensitivity so one slider tunes every device.
-      padTurn += (STICK_CURVE_MIX * rx * rx * rx + (1 - STICK_CURVE_MIX) * rx) * sensitivity;
+    if (axes && typeof axes.length === 'number') {
+      if (padResync && !padStandard) {
+        // Baseline for the guard in `padAxis`: whatever the device is reporting at rest, now.
+        const n = axes.length < PAD_AXIS_MAX ? axes.length : PAD_AXIS_MAX;
+        padAxisBase.fill(0);
+        padAxisLive.fill(0);
+        for (let i = 0; i < n; i++) {
+          const raw = axes[i];
+          padAxisBase[i] = typeof raw === 'number' && Number.isFinite(raw) ? raw : 0;
+        }
+      }
+      if (axes.length >= 2) {
+        radialDeadzone(padAxis(axes, 0), padAxis(axes, 1), DEADZONE, stickScratch);
+        padMoveX += stickScratch[0];
+        padMoveY -= stickScratch[1]; // pads report "up" as -1
+      }
+      // The right stick is read from axis 2 **only under standard mapping**. On an unmapped device
+      // that index is as likely to be a trigger, a hat or a rudder, and a wrong guess here spins
+      // the camera rather than merely doing nothing.
+      if (padStandard && axes.length >= 3) {
+        padTurn += padTurnResponse(axisDeadzone(axes[2], DEADZONE));
+      }
     }
 
     const buttons = pad.buttons;
@@ -729,7 +1006,12 @@ export function createInput(canvasEl, opts) {
               : b.pressed === true || (typeof b.value === 'number' && b.value > 0.5)
                 ? 1
                 : 0;
-        if (down) {
+        // Same guard as the axes, for the same reason: an unmapped pad whose resting trigger reads
+        // as "button 6 pressed" would otherwise sprint forever. A button counts only once it has
+        // been observed released at least once.
+        if (!down) padBtnLive[i] = 1;
+        const trusted = padStandard || padBtnLive[i] === 1;
+        if (down && trusted) {
           const am = GAMEPAD_BUTTON_ACTION[i] | 0;
           if (am !== 0) {
             navMask |= am & NAV_MASK;
@@ -747,6 +1029,9 @@ export function createInput(canvasEl, opts) {
 
     padMoveX = clamp(padMoveX, -1, 1);
     padMoveY = clamp(padMoveY, -1, 1);
+    // Clamped BEFORE it meets the keyboard's contribution, so a stick and a d-pad pushing the same
+    // way cannot make the sum saturate earlier than full deflection does on its own.
+    padTurn = clamp(padTurn, -1, 1);
     navMask |= navBitsFromAxes(padMoveX, padMoveY);
     updateNavRepeat(navMask, dt);
     padResync = false;
@@ -768,6 +1053,7 @@ export function createInput(canvasEl, opts) {
     else if (dt > MAX_POLL_DT_S) dt = MAX_POLL_DT_S;
 
     pollGamepad(dt);
+    maybeAutoLock();
 
     // Keyboard contributions are booleans per slot, so two keys on one slot still mean "1".
     const kx = (hold[HOLD.STRAFE_R] > 0 ? 1 : 0) - (hold[HOLD.STRAFE_L] > 0 ? 1 : 0);
@@ -777,7 +1063,7 @@ export function createInput(canvasEl, opts) {
     frame.moveX = clamp(kx + padMoveX + stickX, -1, 1);
     frame.moveY = clamp(ky + padMoveY + stickY, -1, 1);
     frame.turn = clamp(kt + padTurn, -1, 1);
-    frame.sprint = hold[HOLD.SPRINT] > 0 || padSprint || stickMag >= TOUCH_SPRINT_AT;
+    frame.sprint = hold[HOLD.SPRINT] > 0 || padSprint || stickSprint;
 
     frame.lookDX = clamp(lookAccum, -MAX_LOOK_PER_POLL, MAX_LOOK_PER_POLL);
     lookAccum = 0;
@@ -811,18 +1097,20 @@ export function createInput(canvasEl, opts) {
           if (destroyed || isLocked()) return;
           try {
             const q = target.requestPointerLock();
-            if (q && typeof q.catch === 'function') q.catch(() => {});
+            if (q && typeof q.catch === 'function') q.catch(noteLockRefused);
           } catch {
             /* refused twice: keyboard turning remains */
+            noteLockRefused();
           }
         });
       }
     } catch {
       try {
         const q = target.requestPointerLock();
-        if (q && typeof q.catch === 'function') q.catch(() => {});
+        if (q && typeof q.catch === 'function') q.catch(noteLockRefused);
       } catch {
         /* nothing else to try */
+        noteLockRefused();
       }
     }
   }

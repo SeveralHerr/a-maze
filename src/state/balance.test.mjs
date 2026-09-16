@@ -144,9 +144,20 @@ test('tankSeconds / drainRate / travelTiles / estimatedPathTiles: the derived cu
   assert.equal(tankSeconds(CAP_LEVEL), FUEL.TANK_END);
   assert.equal(tankSeconds(1e6), FUEL.TANK_END);
   assert.equal(tankSeconds(NaN), FUEL.TANK_START, 'garbage degrades to level 1');
-  assert.equal(drainRate(CAP_LEVEL), 1);
-  assert.equal(drainRate(CAP_LEVEL + 5), 1 + 5 * FUEL.DRAIN_PER_LEVEL_PAST_CAP);
+  assert.equal(drainRate(1), 1, 'level 1 burns at exactly 1×');
+  assert.equal(drainRate(LEVEL.DRAIN_RAMP_START), 1, 'the generous half of the curve is flat');
+  assert.equal(
+    drainRate(LEVEL.DRAIN_RAMP_START + 5),
+    1 + 5 * FUEL.DRAIN_PER_LEVEL,
+    'the ramp starts inside the playable curve, not at the size cap',
+  );
+  assert.ok(drainRate(CAP_LEVEL) > 1.1, `drain at the cap is ${drainRate(CAP_LEVEL)}, not flat`);
   assert.equal(drainRate(1e6), FUEL.DRAIN_MAX);
+  // The whole point of the ramp: depth must actually cost more torch, not just more walking.
+  for (let lv = 2; lv <= 40; lv++) {
+    assert.ok(drainRate(lv) >= drainRate(lv - 1), `drain is non-decreasing at level ${lv}`);
+  }
+  assert.ok(drainRate(12) > drainRate(3), 'a level-12 route costs more torch than a level-3 one');
   // 110 s of fuel at 3.2 tiles/s with 18 % overhead ≈ 298 tiles of walking.
   assert.ok(Math.abs(travelTiles(110, 1) - 298) < 1, `${travelTiles(110, 1).toFixed(1)} tiles`);
   assert.equal(travelTiles(110, 2), travelTiles(110, 1) / 2, 'drain halves the reach');

@@ -152,10 +152,17 @@ export function createPost(rootEl) {
     }
     // One dark line per internal row, a third of the pitch thick: visible texture, still legible.
     const thick = pitch >= 6 ? 2 : 1;
+    // Strength scales with the pitch. At a wide pitch the dark line is one row in six and reads as
+    // CRT character; at the shipped 3 px pitch (1280×720 over a 240-row buffer) it is one row in
+    // THREE, and at 0.42 that cost ~14 % of the mean luminance plus hard banding straight across
+    // every wall face — measurably more wall detail than the effect was buying. The gap's lift is
+    // scaled the same way so the two stay in proportion.
+    const dark = pitch >= 6 ? 0.42 : pitch >= 5 ? 0.34 : pitch >= 4 ? 0.28 : 0.22;
+    const lift = pitch >= 6 ? 0.04 : pitch >= 5 ? 0.034 : pitch >= 4 ? 0.028 : 0.022;
     scanEl.style.backgroundImage =
       `repeating-linear-gradient(to bottom,` +
-      `rgba(0,0,0,0.42) 0px, rgba(0,0,0,0.42) ${thick}px,` +
-      `rgba(255,255,255,0.04) ${thick}px, rgba(255,255,255,0.04) ${pitch}px)`;
+      `rgba(0,0,0,${dark}) 0px, rgba(0,0,0,${dark}) ${thick}px,` +
+      `rgba(255,255,255,${lift}) ${thick}px, rgba(255,255,255,${lift}) ${pitch}px)`;
   }
 
   /**

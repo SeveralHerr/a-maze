@@ -598,6 +598,85 @@ test('attract: turning is rate-limited, so the shot never snaps', () => {
   }
 });
 
+test('attract: the steering is an easing controller, not a bang-bang one', () => {
+  // Regression. The proportional term used to be compared against a PER-FRAME cap without being
+  // multiplied by dt, which made the saturation band 60× too narrow: the camera sat pinned at
+  // ±TURN_RATE and reversed sign almost every frame — a permanent ~±2°/frame buzz on the first
+  // screen the player ever sees — and the band moved with the framerate on top of that.
+  //
+  // The property under test is the documented one (balance.js ATTRACT.TURN_GAIN): below
+  // `TURN_RATE / TURN_GAIN` radians of heading error the turn eases off instead of saturating.
+  /**
+   * @param {number} dt
+   * @returns {{pinned:number, flipsPerSecond:number, meanRate:number}}
+   */
+  function measure(dt) {
+    const s = createInitialState();
+    reducer(s, { type: 'levelReady', data: levelDataFor(mazeFrom(TWISTY)) });
+    const steps = Math.round(60 / dt); // 60 seconds of attract, whatever the step size
+    let pinned = 0;
+    let flips = 0;
+    let prev = 0;
+    let sum = 0;
+    for (let i = 0; i < steps; i++) {
+      const before = s.player.angle;
+      stepAttract(s, dt);
+      let d = s.player.angle - before;
+      while (d > Math.PI) d -= TAU;
+      while (d < -Math.PI) d += TAU;
+      const rate = d / dt;
+      sum += Math.abs(rate);
+      if (Math.abs(rate) >= ATTRACT.TURN_RATE * 0.95) pinned++;
+      if (rate !== 0) {
+        if (prev !== 0 && Math.sign(rate) !== Math.sign(prev)) flips++;
+        prev = rate;
+      }
+    }
+    return { pinned: pinned / steps, flipsPerSecond: flips / 60, meanRate: sum / steps };
+  }
+
+  const a = measure(1 / 60);
+  // TWISTY turns a corner every few tiles, so honest corner-turning pins the cap ~25 % of the time;
+  // the bang-bang bug measured 88 %. (A real 16×16 demo maze measures ~19 % at 60 and 30 Hz, 1.2 flips/s.)
+  assert.ok(a.pinned < 0.3, `${(a.pinned * 100).toFixed(1)}% of frames pinned at the rate cap`);
+  assert.ok(a.flipsPerSecond < 5, `yaw reversed ${a.flipsPerSecond.toFixed(1)} times per second`);
+  assert.ok(a.meanRate < ATTRACT.TURN_RATE * 0.75, `mean |yaw| ${a.meanRate.toFixed(2)} rad/s`);
+
+  // Framerate independence: the turn is a rate, so halving the step rate must not widen the band.
+  const b = measure(1 / 30);
+  assert.ok(
+    Math.abs(a.pinned - b.pinned) < 0.1,
+    `saturation is dt-dependent: ${a.pinned.toFixed(3)} at 60 Hz vs ${b.pinned.toFixed(3)} at 30 Hz`,
+  );
+  assert.ok(
+    Math.abs(a.meanRate - b.meanRate) < ATTRACT.TURN_RATE * 0.1,
+    `mean yaw rate is dt-dependent: ${a.meanRate.toFixed(3)} vs ${b.meanRate.toFixed(3)}`,
+  );
+});
+
+test('attract: a small heading error eases, it does not saturate', () => {
+  // The direct form of the same property: point the camera almost at its target and check that the
+  // commanded step is the proportional one (err × GAIN × dt) rather than the rate cap.
+  const maze = mazeFrom(['#####', '#S..#', '#####']);
+  maze.exit = { x: 3, y: 1 };
+  const s = createInitialState();
+  reducer(s, { type: 'levelReady', data: levelDataFor(maze) });
+  const dt = 1 / 60;
+  // The attract target is east of the start, so a near-zero angle is a near-zero heading error.
+  s.player.angle = 0.02;
+  const before = s.player.angle;
+  stepAttract(s, dt);
+  let d = s.player.angle - before;
+  while (d > Math.PI) d -= TAU;
+  while (d < -Math.PI) d += TAU;
+  // The sway makes the exact error unpredictable, but it is bounded by SWAY_AMP + 0.02, so the
+  // step must stay far below the cap — an order of magnitude below, not a hair under it.
+  assert.ok(
+    Math.abs(d) < ATTRACT.TURN_RATE * dt * 0.5,
+    `a ${(ATTRACT.SWAY_AMP + 0.02).toFixed(3)} rad error produced ${Math.abs(d).toFixed(5)} rad of turn, cap ${(ATTRACT.TURN_RATE * dt).toFixed(5)}`,
+  );
+});
+
 test('attract: deterministic for a given maze seed', () => {
   const a = createInitialState();
   const b = createInitialState();

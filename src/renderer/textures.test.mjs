@@ -284,6 +284,78 @@ test('emissive art is flagged, and only glow art carries a stipple mask', () => 
   }
 });
 
+/**
+ * Rows of a wall texture that are course joints: most of the row is dark mortar.
+ * @param {Uint8Array} indices
+ * @returns {number[]} joint row indices
+ */
+function mortarRows(indices) {
+  /** @type {number[]} */
+  const rows = [];
+  for (let y = 0; y < SIZE; y++) {
+    let dark = 0;
+    for (let x = 0; x < SIZE; x++) if (lum(indices, x, y) < 45) dark++;
+    if (dark > SIZE * 0.6) rows.push(y);
+  }
+  return rows;
+}
+
+test('wall variants put their course joints on different rows, so no rail runs down a corridor', () => {
+  // With one shared course table every wall tile in the game had its joints on the same texel
+  // rows; down a 257-tile corridor those fused (each with a lit bevel on top) into bright unbroken
+  // rails. Each variant now has its own phase, and the raycaster slides plain/cracked tiles
+  // vertically — which is only legal because the texture wraps on a joint.
+  const phases = set.wall.map((t) => mortarRows(t.indices).join(','));
+  for (let i = 0; i < phases.length; i++) {
+    assert.ok(phases[i].length > 0, `wall[${i}] has no detectable course joints`);
+    for (let j = i + 1; j < phases.length; j++) {
+      assert.notEqual(phases[i], phases[j], `wall[${i}] and wall[${j}] share every course joint`);
+    }
+  }
+  for (const i of [0, 1]) {
+    const rows = mortarRows(set.wall[i].indices);
+    assert.ok(rows.includes(SIZE - 1), `wall[${i}] must end on a mortar joint to wrap vertically`);
+    assert.ok(!rows.includes(0), `wall[${i}] must start on a block's lit top edge, not in mortar`);
+  }
+});
+
+test('wall blocks are landscape, not square', () => {
+  // A tile's 64 texels of width compress to 10-25 screen pixels on a grazing corridor wall while its
+  // 64 texels of height stay 60-240, so a square block lands on screen as a thin portrait sliver.
+  // The reference's blocks are ~1.6:1 or wider; measure face runs along the middle of each course.
+  const indices = set.wall[0].indices;
+  const joints = mortarRows(indices);
+  /** @type {number[]} */
+  const courseHeights = [];
+  /** @type {number[]} */
+  const runs = [];
+  for (let k = 0; k < joints.length; k++) {
+    const next = joints[(k + 1) % joints.length] + (k + 1 === joints.length ? SIZE : 0);
+    const gap = next - joints[k] - 1;
+    if (gap < 5) continue; // adjacent mortar rows of the same joint
+    courseHeights.push(gap);
+    const mid = (joints[k] + 1 + (gap >> 1)) & (SIZE - 1);
+    let run = 0;
+    // Walk twice around the row so a run crossing the wrap is counted whole.
+    for (let x = 0; x < SIZE * 2; x++) {
+      const face = lum(indices, x & (SIZE - 1), mid) >= 45;
+      if (face) run++;
+      else {
+        if (run > 0 && x - run >= SIZE >> 1 && x - run < SIZE + (SIZE >> 1)) runs.push(run);
+        run = 0;
+      }
+    }
+  }
+  assert.ok(courseHeights.length >= 3, `expected at least 3 courses, found ${courseHeights.length}`);
+  runs.sort((a, b) => a - b);
+  const medianRun = runs[runs.length >> 1];
+  const meanHeight = courseHeights.reduce((a, b) => a + b, 0) / courseHeights.length;
+  assert.ok(
+    medianRun >= meanHeight * 1.6,
+    `blocks are ${medianRun}×${meanHeight.toFixed(1)} texels — not landscape enough to survive foreshortening`,
+  );
+});
+
 test('walls use the whole stone ramp (blocks, mortar and bevels are all present)', () => {
   // A wall that came out flat would still pass every structural test above, so assert the tonal
   // spread the art direction calls for: dark mortar, mid faces and light bevels.

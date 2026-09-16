@@ -287,8 +287,14 @@ export function axisDeadzone(v, deadzone) {
 // ─── Human-readable summary (for the options/credits screens) ────────────────────────────────
 
 /**
- * Player-facing description of the default scheme, in display order. `src/ui` can render this
- * verbatim on a "Controls" panel instead of duplicating the binding knowledge.
+ * Player-facing description of the default scheme, in display order. `src/ui` renders this
+ * verbatim on the Options screen's Controls panel instead of duplicating the binding knowledge.
+ *
+ * **Wiring (the seam, because `src/ui` may not import `src/input` — §2):** the composition root
+ * passes it across — `createMenus(overlay, { …, controls: CONTROL_HINTS })`. `src/ui/menus.js`
+ * carries an ASCII fallback for a preview/harness that passes nothing, so a missing wire shows up
+ * as a stale hint row rather than an empty panel; this table stays the authority on the bindings
+ * themselves, and any rebinding UI would write back through here.
  * @type {readonly {label:string, keys:string, pad:string}[]}
  */
 export const CONTROL_HINTS = Object.freeze([

@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 
 import {
   ICON_SIZE,
+  compassGems,
   compileArt,
   createHud,
   createSurface,
@@ -384,7 +385,7 @@ test('map statistics are exposed and start empty', () => {
 });
 
 test('every map mode renders without throwing at both layouts', () => {
-  for (const mode of ['off', 'corner', 'full']) {
+  for (const mode of /** @type {const} */ (['off', 'corner', 'full'])) {
     for (const [w, h, dpr] of [[1280, 720, 1], [390, 844, 3]]) {
       const canvas = drawableCanvas(w, h);
       const hud = createHud(canvas, { map: mode });
@@ -395,6 +396,54 @@ test('every map mode renders without throwing at both layouts', () => {
       assert.doesNotThrow(() => hud.render(state, null, 0), `${mode} paused @ ${w}x${h}`);
     }
   }
+});
+
+test('the compass gate is an absolute gem count, not a fraction of a 273-gem level', () => {
+  // 15 % capped at 8: reachable in a couple of minutes at every size on the shipped curve
+  // (6 gems on depth 1 → 273 at the 128×128 cap).
+  assert.equal(compassGems(6), 1);
+  assert.equal(compassGems(12), 2);
+  assert.equal(compassGems(29), 5, 'depth 3');
+  assert.equal(compassGems(120), 8, 'the cap bites well before the biggest levels');
+  assert.equal(compassGems(273), 8, 'depth 15');
+  assert.equal(compassGems(0), 0);
+  assert.equal(compassGems(NaN), 0);
+  for (const total of [6, 12, 29, 57, 120, 273]) {
+    assert.ok(compassGems(total) <= total, `${total} gems: the gate is reachable`);
+    assert.ok(compassGems(total) >= 1, `${total} gems: the gate is not free`);
+  }
+});
+
+test('the compass appears once those gems are collected, at any maze size', () => {
+  /**
+   * Fills in the bottom-centre dial area — where `drawCompass` puts its ring, ticks and needle.
+   * @param {any} run
+   * @returns {number}
+   */
+  const dialFills = (run) => {
+    const canvas = drawableCanvas(1280, 720);
+    const hud = createHud(canvas, { map: 'off' });
+    hud.resize(1280, 720, 1);
+    const state = playingState(run);
+    state.level = 9;
+    hud.render(state, null, 0);
+    const m = hud.surface.metrics;
+    let n = 0;
+    for (const [x, y, w] of canvas.__ctx.calls.rects) {
+      if (y < m.h * 0.6) continue;
+      if (Math.abs(x + w / 2 - m.w / 2) > 14 * m.u) continue;
+      n++;
+    }
+    return n;
+  };
+
+  // Depth 9 carries 120-odd gems. Under the old "half the gems" rule this instrument — and the
+  // distance readout under it — could never appear at all.
+  const none = dialFills({ gems: 0, gemsTotal: 120 });
+  const earned = dialFills({ gems: 8, gemsTotal: 120 });
+  assert.ok(earned > none + 10, `the dial is drawn once earned (${none} → ${earned} fills)`);
+  const almost = dialFills({ gems: 7, gemsTotal: 120 });
+  assert.equal(almost, none, 'and not before');
 });
 
 test('the HUD survives a level with no data and a low tank', () => {

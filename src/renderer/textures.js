@@ -7,9 +7,10 @@
  * seed. Painting the whole set costs roughly 10–20 ms once at load.
  *
  * ART DIRECTION (docs/art-reference.png):
- * - **Walls** — big blue-grey stone blocks in a running bond, chunky 2 px noise clusters, dark
- *   navy mortar grooves, a light bevel on the top/left edge of every block, hairline cracks, and
- *   variants where moss creeps out of the mortar and vines hang down the face.
+ * - **Walls** — big landscape blue-grey stone blocks (~2:1) in a running bond, each face a few flat
+ *   hard-edged tonal patches rather than a dithered gradient, dark navy mortar grooves, a light
+ *   bevel on the top/left edge of every block, hairline cracks, and variants where moss creeps out
+ *   of the mortar and vines hang down the face. Every variant has its own course phase.
  * - **Floor** — irregular rounded cobbles (a jittered Voronoi) in warm grey-brown with near-black
  *   gaps, moss tufts in the gaps, plus an occasional iron grate tile.
  * - **Ceiling** — dark brown planks with grain, nails and knots, and a heavier cross beam every
@@ -22,9 +23,11 @@
  * - `indices[i]` is a palette index; `pixels[i]` is the same texel already packed for the
  *   framebuffer. Index 0 is the transparency key and is never drawn.
  * - World-surface textures (wall/floor/ceiling) must be **seamless**: floor and ceiling tile on
- *   both axes (a tile repeats in x and y), walls tile horizontally (one wall face is exactly one
- *   texture tall, so there is no vertical seam to hide). Every noise function here is toroidal on
- *   a 64 px period, and block layouts wrap in x, which is what makes that true.
+ *   both axes (a tile repeats in x and y), and walls tile horizontally. The plain and cracked wall
+ *   variants must *also* wrap vertically on a course joint, because the raycaster slides them up
+ *   or down per tile to break the joints of neighbouring tiles apart (every course table ends at
+ *   64, asserted in `textures.test.mjs`). Every noise function here is toroidal on a 64 px period,
+ *   and block layouts wrap in x, which is what makes that true.
  * - `stipple[i] === 1` marks a texel the renderer draws only on odd screen-space `(x+y)` parity —
  *   a 1-bit "half transparent" used for flame and portal glow. It is screen-space on purpose, so
  *   the dissolve stays a fixed checker no matter how large the sprite is drawn.
@@ -155,6 +158,28 @@ function rampPickChunky(ramp, t, x, y) {
 }
 
 /**
+ * Nearest ramp step, **no dither at all**.
+ *
+ * WHY a third variant: an ordered dither turns a smooth tone gradient into two alternating ramp
+ * steps, and on a wall one tile from the eye a texel is six screen pixels, so those two steps read
+ * as a checkerboard painted across the stone. The reference's masonry has no gradients in it — a
+ * block face is a handful of *flat* irregular patches of a few greys with hard edges between them,
+ * which is exactly what quantising the face's noise without a dither produces. Used for wall block
+ * faces and their weathering; the mortar bed, the moss and every other surface keep their dither,
+ * where the magnification is lower or the gradient is the point.
+ * @param {Uint8Array} ramp dark → light palette indices
+ * @param {number} t 0..1 position along the ramp (clamped)
+ * @returns {number} palette index
+ */
+function rampPickFlat(ramp, t) {
+  const last = ramp.length - 1;
+  const f = (t <= 0 ? 0 : t >= 1 ? 1 : t) * last;
+  let i = (f + 0.5) | 0;
+  if (i > last) i = last;
+  return ramp[i];
+}
+
+/**
  * Hash-derived float in [0,1) for a lattice point.
  * @param {number} x
  * @param {number} y
@@ -233,11 +258,44 @@ function fillRect(buf, x0, y0, w, h, c) {
 
 // ─── Walls ─────────────────────────────────────────────────────────────────────────────────────
 
-/** Course (block row) boundaries. Three chunky courses per world unit, as in the reference. */
-const COURSES = Int32Array.of(0, 22, 43, 64);
+/**
+ * Course (block row) boundaries, **one row per wall variant**.
+ *
+ * WHY a table and not one constant: a single shared course set put the three block joints at the
+ * same texel rows in *every* wall tile in the game, and the raycaster's per-tile hash only shifted
+ * a tile horizontally. Down a 257-tile corridor those identical joints fused — with `paintBlock`'s
+ * lit top bevel riding on each of them — into three bright unbroken rails running the length of
+ * the level, which is what made the masonry read as tall flat panels with ledges rather than as
+ * courses of stone. Giving each variant its own phase (and offsetting the whole texture vertically
+ * per tile in `raycaster.js`) means neighbouring tiles put their joints at different heights and
+ * no rail can form.
+ *
+ * Each row is **four courses of ≈16 texels**, not three of ≈21: with `MORTAR` taken off, a face is
+ * then ~13 texels tall against ~29 wide — the reference's landscape proportion (~2:1), where three
+ * courses gave a 1.05:1 square that foreshortened into a portrait sliver on a grazing wall.
+ * Every row must start at 0 and end at `SIZE` so the texture still wraps vertically.
+ * @type {ReadonlyArray<Int32Array>}
+ */
+const COURSE_SETS = [
+  Int32Array.of(0, 16, 32, 48, 64),
+  Int32Array.of(0, 14, 30, 47, 64),
+  Int32Array.of(0, 18, 33, 49, 64),
+  Int32Array.of(0, 15, 29, 46, 64),
+];
 
 /** Mortar groove width in texels — the dark navy line between blocks. */
 const MORTAR = 3;
+
+/**
+ * Block cell width in texels, including the mortar groove: `BLOCK_W_MIN … +BLOCK_W_SPREAD-1`.
+ *
+ * Two blocks across a 64-texel tile face, so a face is ~29 × 13 texels (≈2.2:1 landscape). On a
+ * grazing corridor wall a tile's 64 texels of width compress to 10–25 screen pixels while its 64
+ * texels of height occupy 60–240, so a *square* texel block lands on screen as a 1:5 portrait
+ * sliver; starting from 2.2:1 is what keeps it reading as a block after that foreshortening.
+ */
+const BLOCK_W_MIN = 28;
+const BLOCK_W_SPREAD = 12;
 
 /**
  * Paint one stone block face, its bevel, cracks and speckle.
@@ -257,39 +315,46 @@ function paintBlock(buf, mask, bx, by, bw, bh, seed, rng) {
   if (fw < 5 || fh < 5) return;
 
   // Per-block base tone: real masonry is not one colour, and this variation is most of what makes
-  // the wall read as blocks rather than as noise.
-  const baseT = 0.5 + rng.range(-0.13, 0.15);
+  // the wall read as blocks rather than as noise. The spread is wide (±0.2 of the ramp) because a
+  // narrower one measured only ~60 % of the reference's p95−p5 luminance range over a matched wall
+  // region — the difference between chiselled stone and a flat fill.
+  const baseT = 0.5 + rng.range(-0.24, 0.26);
 
   for (let y = 0; y < fh; y++) {
     for (let x = 0; x < fw; x++) {
       const gx = bx + x;
       const gy = by + y;
-      let t = baseT + (fbmChunky(gx, gy, seed) - 0.5) * 0.2;
+      let t = baseT + (fbmChunky(gx, gy, seed) - 0.5) * 0.3;
       // Bevel: light catches the top and left edges, the bottom and right fall into shadow. Two
       // steps, so the block still reads as chiselled at the 1–3 px sizes the raycaster shows.
-      if (y === 0 || x === 0) t += 0.24;
-      else if (y === 1 || x === 1) t += 0.11;
-      if (y >= fh - 2 || x >= fw - 2) t -= 0.16;
-      if (y === fh - 1 || x === fw - 1) t -= 0.1;
-      put(buf, gx, gy, rampPickChunky(RAMPS.stone, t, gx, gy));
+      if (y === 0 || x === 0) t += 0.28;
+      else if (y === 1 || x === 1) t += 0.13;
+      if (y >= fh - 2 || x >= fw - 2) t -= 0.19;
+      if (y === fh - 1 || x === fw - 1) t -= 0.12;
+      put(buf, gx, gy, rampPickFlat(RAMPS.stone, t));
       mask[((gy & MASK) << 6) | (gx & MASK)] = 0;
     }
   }
 
-  // Speckle: a few 2×2/3×2 clusters of slightly off-tone stone — weathering, not noise.
-  const clusters = 2 + rng.int(4);
+  // Weathering: chunky 4–7 × 3–5 patches of off-tone stone. They are deliberately larger than the
+  // 2×2 speckle they replace — at corridor distance a 2×2 patch dissolves into the Bayer dither and
+  // reads as mush, where a 4–7 texel patch survives both the colormap crush and the 3× upscale and
+  // still reads as a weathered face, exactly as in the reference.
+  const clusters = 3 + rng.int(3);
   for (let i = 0; i < clusters; i++) {
     const cx = 1 + rng.int(fw - 3);
     const cy = 1 + rng.int(fh - 3);
-    const cw = 2 + rng.int(2);
-    const ch = 2;
-    const dt = rng.chance(0.5) ? 0.15 : -0.16;
+    const cw = 4 + rng.int(3);
+    const ch = 3 + rng.int(2);
+    // One whole ramp step either way (the stone ramp has nine): a flat patch of the neighbouring
+    // grey, not a dithered blend that would read as a checkerboard once magnified.
+    const dt = rng.chance(0.5) ? 0.125 : -0.125;
     for (let y = 0; y < ch; y++) {
       for (let x = 0; x < cw; x++) {
         const gx = bx + cx + x;
         const gy = by + cy + y;
         if (cx + x >= fw - 1 || cy + y >= fh - 1) continue;
-        put(buf, gx, gy, rampPickChunky(RAMPS.stone, baseT + dt, gx, gy));
+        put(buf, gx, gy, rampPickFlat(RAMPS.stone, baseT + dt));
       }
     }
   }
@@ -328,9 +393,11 @@ function paintCrack(buf, bx, by, fw, fh, rng) {
  * @param {number} seed
  * @param {{moss:number, vines:number, cracks:number}} opts
  *   `moss` 0..1 coverage, `vines` strand count, `cracks` 0..1 chance per block
+ * @param {Int32Array} courses course boundaries for this variant (see {@link COURSE_SETS});
+ *   must start at 0 and end at `SIZE` or the texture stops wrapping vertically
  * @returns {Uint8Array} index buffer
  */
-function paintWall(seed, opts) {
+function paintWall(seed, opts, courses) {
   const buf = new Uint8Array(AREA);
   const mask = scratchMask;
   const rng = createRng(seed);
@@ -344,17 +411,20 @@ function paintWall(seed, opts) {
     }
   }
 
-  // 2. Three courses of blocks in a running bond (each course offset, so no seam runs top to
-  //    bottom). Widths are drawn to sum to exactly 64 so the row wraps seamlessly.
-  for (let r = 0; r < 3; r++) {
-    const y0 = COURSES[r];
-    const bh = COURSES[r + 1] - y0;
+  // 2. Courses of blocks in a running bond (each course starts at its own offset, so no seam runs
+  //    top to bottom). Widths are drawn to sum to exactly 64 so the row wraps seamlessly, and they
+  //    are wide — two landscape blocks across a tile face, as the reference's masonry is — rather
+  //    than three squares that foreshorten into portrait slivers on a grazing corridor wall.
+  const rows = courses.length - 1;
+  for (let r = 0; r < rows; r++) {
+    const y0 = courses[r];
+    const bh = courses[r + 1] - y0;
     let x = rng.int(SIZE);
     let remaining = SIZE;
     while (remaining > 0) {
-      let bw = remaining <= 34 ? remaining : 18 + rng.int(13);
+      let bw = remaining <= 50 ? remaining : BLOCK_W_MIN + rng.int(BLOCK_W_SPREAD);
       // Never leave a sliver: if the remainder would be unusably thin, take it now.
-      if (remaining - bw > 0 && remaining - bw < 18) bw = remaining - 18;
+      if (remaining - bw > 0 && remaining - bw < BLOCK_W_MIN) bw = remaining - BLOCK_W_MIN;
       paintBlock(buf, mask, x, y0, bw, bh, seed, rng);
       if (opts.cracks > 0 && rng.chance(opts.cracks)) {
         paintCrack(buf, x, y0, bw - MORTAR, bh - MORTAR, rng);
@@ -983,12 +1053,14 @@ export function createTextures(seed = 0xa11a2e) {
   const root = createRng(usedSeed);
   const s = (/** @type {string} */ name) => root.fork(name).u32();
 
+  // Each variant gets its own course phase from `COURSE_SETS`, so the block joints of neighbouring
+  // wall tiles land on different texel rows and cannot fuse into a rail down a long corridor.
   /** @type {Texture[]} */
   const wall = [
-    finish(paintWall(s('wall0'), { moss: 0, vines: 0, cracks: 0.22 }), null, false),
-    finish(paintWall(s('wall1'), { moss: 0.12, vines: 0, cracks: 0.7 }), null, false),
-    finish(paintWall(s('wall2'), { moss: 0.42, vines: 0, cracks: 0.35 }), null, false),
-    finish(paintWall(s('wall3'), { moss: 0.34, vines: 2, cracks: 0.3 }), null, false),
+    finish(paintWall(s('wall0'), { moss: 0, vines: 0, cracks: 0.22 }, COURSE_SETS[0]), null, false),
+    finish(paintWall(s('wall1'), { moss: 0.12, vines: 0, cracks: 0.7 }, COURSE_SETS[1]), null, false),
+    finish(paintWall(s('wall2'), { moss: 0.42, vines: 0, cracks: 0.35 }, COURSE_SETS[2]), null, false),
+    finish(paintWall(s('wall3'), { moss: 0.34, vines: 2, cracks: 0.3 }, COURSE_SETS[3]), null, false),
   ];
 
   /** @type {Texture[]} */

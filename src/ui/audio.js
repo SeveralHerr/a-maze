@@ -28,10 +28,13 @@
  *   Constructing one earlier makes Chrome print an autoplay warning — console noise we refuse.
  * - **Bounded.** At most `maxVoices` one-shot voices exist at once (default 24). Voices are a
  *   pre-allocated pool; a new sound that cannot find a free slot steals the voice that is closest
- *   to finishing, and only from an equal-or-lower priority.
+ *   to finishing, and only from a lower priority — or from an equal one that would have finished
+ *   first. A stolen voice is faded over ~6 ms rather than cut, so stealing cannot click.
  * - **Leak-free.** Every voice disconnects all of its nodes on `ended`, and a per-frame reap
  *   releases any voice whose scheduled end time has passed (belt and braces: `onended` does not
- *   fire while a context is suspended).
+ *   fire while a context is suspended) and disposes the short-lived tails of stolen voices.
+ * - **One sound per action.** Several paths can answer the same input (the menus blip *and* the
+ *   resulting phase change), so the phase handler defers to a menu blip it can see (`uiAnswered`).
  * - **Allocation-free per frame.** `update()` touches only numbers and pre-allocated objects; it
  *   allocates nothing unless it actually schedules a new sound (music pluck / heartbeat), which
  *   happens at most a few times per second.
@@ -136,30 +139,73 @@ export const AUDIO = Object.freeze({
   COMBO_WINDOW: 1.6,
   /** Highest combo step that still raises the arpeggio pitch. */
   COMBO_MAX: 7,
-  /** Heartbeat period (seconds) at the low-fuel threshold and at empty. */
-  HEART: Object.freeze({ slow: 1.15, fast: 0.44, split: 0.26 }),
+  /**
+   * Heartbeat period (seconds) at the low-fuel threshold and at empty, plus the fuel fraction the
+   * urgency curve is measured against.
+   * `lowFraction` **mirrors `balance.js` FUEL.LOW_FRACTION** (§2 forbids `src/ui` importing
+   * `src/state`) — retune both together, or the beat reaches maximum urgency at the wrong moment.
+   */
+  HEART: Object.freeze({ slow: 1.15, fast: 0.44, split: 0.26, lowFraction: 0.25 }),
   /** Portal hum: gain and filter cutoff at `nearExit` 0 → 1, and how far it pans off-centre. */
   PORTAL: Object.freeze({ gain: 0.21, cutMin: 170, cutMax: 1500, pan: 0.8 }),
   /** Torch fire bed: constant hiss level and the gap between crackle pops, seconds. */
   TORCH: Object.freeze({ bed: 0.016, gapMin: 0.07, gapMax: 0.5 }),
-  /** Generative music: seconds between plucks, and the pentatonic degrees in semitones over A3. */
-  MUSIC: Object.freeze({ gapMin: 1.5, gapMax: 4.4, root: 220, droneHz: 55 }),
+  /**
+   * Generative music. `root`/`droneHz` are the level-1 key (A); deeper levels transpose both by
+   * `MUSIC_KEYS` and thin the gaps toward `gapFloor`, reaching the floor at `depthSpan`.
+   * `depthSpan` is approximately the level the maze stops growing — being a level out changes
+   * nothing audible, so it is deliberately NOT a mirror of a gameplay constant.
+   */
+  MUSIC: Object.freeze({
+    gapMin: 1.5,
+    gapMax: 4.4,
+    root: 220,
+    droneHz: 55,
+    depthSpan: 15,
+    gapFloor: 0.55,
+    droneCut: 320,
+    droneCutFloor: 0.65,
+  }),
+  /** How far a stolen voice is faded before it is cut, seconds (see `fadeSteal`). */
+  STEAL_FADE: 0.008,
+  /**
+   * A UI blip inside this window counts as "the menus already answered that action", so the phase
+   * handler stays quiet instead of flamming a second identical square figure on top of it.
+   */
+  UI_ECHO: 0.25,
   /** Smoothing time constants for the continuously-driven parameters. */
-  TC: Object.freeze({ mix: 0.05, portal: 0.14, music: 0.6 }),
+  TC: Object.freeze({ mix: 0.05, portal: 0.14, music: 0.6, key: 0.45 }),
 });
 
 /** A minor pentatonic over the root, in semitones (plus two upper-octave degrees). */
 const PENTATONIC = Object.freeze([0, 3, 5, 7, 10, 12, 15, 17, 19, 24]);
 
-/** Level-start bell, Hz: A5 · E5 · C5 · A4 — an A-minor triad falling into the dark. */
+/**
+ * The key each depth is played in, semitones from the level-1 root (A). One 10-note bag in one
+ * register for the ~13 minutes a deep level runs is the length at which any generative line starts
+ * to sound like a loop, so the whole ambience — drone, portal, plucks and the descent bell —
+ * transposes every level: A → G → C → E → A… Level 1 keeps the shipped A so the game still opens
+ * on the sound it was tuned with, and the rotation is bounded (never a running descent) so the
+ * drone cannot walk off the bottom of the spectrum over a 30-level run.
+ */
+const MUSIC_KEYS = Object.freeze([0, -2, 3, -5]);
+
+/** Level-start bell, Hz: A5 · E5 · C5 · A4 — a minor triad falling into the dark (key at level 1). */
 const BELL_NOTES = Object.freeze([880, 659.25, 523.25, 440]);
 /** Level-complete run-up, Hz: C5 · E5 · G5 · C6. */
 const FANFARE_ARP = Object.freeze([523.25, 659.25, 783.99, 1046.5]);
 /** …resolving onto a held C-major triad. */
 const FANFARE_CHORD = Object.freeze([523.25, 659.25, 783.99]);
+/** The "you beat your own record" chord that follows the game-over snuff: C5 · E5 · G5, rising. */
+const NEW_BEST_TRIAD = Object.freeze([523.25, 659.25, 783.99]);
 
-/** Voice priorities. A new sound may only steal a voice of equal or lower priority. */
-const PRI = Object.freeze({ MUSIC: 0, STEP: 1, UI: 2, CUE: 3, STING: 4 });
+/**
+ * Voice priorities. A new sound may only steal a voice of equal or lower priority, and at *equal*
+ * priority only one that finishes sooner than the newcomer (see `acquireVoice`).
+ * `AMBIENT` exists so the torch crackle — scheduled several times a second by `update()` — sits
+ * below the music plucks it used to share a rank with and can never truncate a 2.6 s note.
+ */
+const PRI = Object.freeze({ AMBIENT: 0, MUSIC: 1, STEP: 2, UI: 3, CUE: 4, STING: 5 });
 
 /** Max WebAudio nodes a single voice may own. Keeps the pool's backing arrays fixed-size. */
 const MAX_NODES = 8;
@@ -241,7 +287,17 @@ export function createAudio(options) {
   /** @type {AnyNode} */ let portalFilter = null;
   /** @type {AnyNode} */ let portalPan = null;
   /** @type {AnyNode} */ let droneGain = null;
+  /** @type {AnyNode} */ let droneTone = null;
   /** @type {AnyNode} */ let torchGain = null;
+  /**
+   * Frequency params that follow the level key, and their level-1 frequency in Hz (two parallel
+   * flat arrays so `setDepth` retunes them without walking objects). The portal is in here too:
+   * its fundamental is locked to the drone, so the two sustained lows can never drift into a beat.
+   * @type {AnyParam[]}
+   */
+  const keyedParams = [];
+  /** @type {number[]} */
+  const keyedHz = [];
   /**
    * Always-on nodes (buses, hum, drone, fire bed). They live outside the voice pool, so teardown
    * has to disconnect them explicitly.
@@ -270,6 +326,10 @@ export function createAudio(options) {
   let comboUntil = 0; //  ctx time at which the gem combo lapses
   let lastStepAt = -1; //  rate limit so a stuck footstep event storm cannot machine-gun
   let lastUpdateT = -1; // ctx time of the previous update(), -1 = never
+  let lastUiSoundAt = -1; // ctx time of the last UI blip, whatever path played it
+  let depthLevel = 0; //   level the ambience is currently keyed to (0 = never set)
+  let musicKey = 1; //     frequency multiplier for that level's key
+  let gapScale = 1; //     pluck-gap multiplier: deeper levels are denser
 
   // ── Voice pool ──────────────────────────────────────────────────────────────────────────────
   /**
@@ -299,6 +359,14 @@ export function createAudio(options) {
   let liveVoices = 0;
   let stolen = 0;
   let dropped = 0;
+  /**
+   * Nodes of stolen voices, still connected while their few-millisecond fade plays out, with the
+   * ctx time each batch may be disposed. Two parallel arrays, drained by `reap`.
+   * @type {AnyNode[][]}
+   */
+  const retiring = [];
+  /** @type {number[]} */
+  const retireAt = [];
 
   /** Reused stats object — §4.1 house style: never allocate for telemetry. */
   const statsOut = {
@@ -476,6 +544,11 @@ export function createAudio(options) {
    * one whose truncation is least audible, so the engine degrades gracefully under load instead
    * of chopping the sound the player is currently listening to.
    *
+   * WHY the equal-priority guard: "soonest end" alone compares the candidates with each other but
+   * never with the newcomer, so a 0.03 s torch crackle could evict a 2.6 s music pluck of the same
+   * rank and cut two seconds of tail. At equal priority a sound may only displace one that would
+   * have finished *before it does*; anything longer is left alone and the request is dropped.
+   *
    * @param {number} pri PRI.*
    * @param {number} end ctx time the sound is done
    * @returns {Voice|null} null when the request must be dropped
@@ -490,6 +563,7 @@ export function createAudio(options) {
     for (let i = 0; i < maxVoices; i++) {
       const v = voices[i];
       if (v.pri > pri) continue;
+      if (v.pri === pri && v.end > end) continue; // never trade a long note for a short one
       if (victim === null || v.end < victim.end) victim = v;
     }
     if (victim === null) {
@@ -497,7 +571,7 @@ export function createAudio(options) {
       return null;
     }
     stolen++;
-    releaseVoice(victim);
+    releaseVoice(victim, now());
     return startVoice(victim, pri, end);
   }
 
@@ -513,13 +587,23 @@ export function createAudio(options) {
 
   /**
    * Hand a node to the voice so it is stopped and disconnected on release.
+   *
+   * `nodes[0]` is by convention the voice's **head gain** — the one node every cue owns and the one
+   * `fadeSteal` ramps. Both primitives create it first; a future cue must do the same.
    * @template T
    * @param {Voice} v
    * @param {T} node
    * @returns {T} the same node, for chaining
    */
   function own(v, node) {
-    if (v.n < MAX_NODES) v.nodes[v.n++] = node;
+    if (v.n < MAX_NODES) {
+      v.nodes[v.n++] = node;
+    } else {
+      // A dropped node is never stopped or disconnected — i.e. exactly the leak this module
+      // promises not to have. Unreachable with the shipped cues (the widest uses 6 of 8); it is
+      // recorded loudly so that *adding* a partial or a panner cannot leak silently.
+      log.error('voice node overflow: a cue needs more than MAX_NODES nodes');
+    }
     return node;
   }
 
@@ -527,17 +611,40 @@ export function createAudio(options) {
    * Stop and disconnect everything the voice owns. Idempotent: `onended` and the per-frame reap
    * both call it, and a stolen voice is released before it is reused.
    * @param {Voice} v
+   * @param {number} [fadeAt] set only when the voice is being **stolen**: instead of cutting the
+   *   waveform dead (a click, because the sample jumps to 0 from wherever the envelope was), the
+   *   head gain is ramped to silence over ~6 ms and the nodes are handed to `retiring` for the
+   *   reap a few milliseconds later.
    */
-  function releaseVoice(v) {
+  function releaseVoice(v, fadeAt) {
     if (!v.active) return;
     v.active = false;
     liveVoices--;
-    for (let i = 0; i < v.n; i++) {
-      const node = v.nodes[i];
-      v.nodes[i] = null;
+    if (fadeAt !== undefined && v.n > 0 && fadeSteal(v, fadeAt)) {
+      v.n = 0;
+      return;
+    }
+    disposeNodes(v.nodes, v.n);
+    v.n = 0;
+  }
+
+  /**
+   * Stop, unhook and disconnect a run of nodes. The array slots are nulled so a pooled voice never
+   * keeps a WebAudio node alive after it is done with it.
+   * @param {AnyNode[]} nodes
+   * @param {number} n how many entries are in use
+   * @param {number} [stopAt] explicit stop time; omitted = stop immediately
+   */
+  function disposeNodes(nodes, n, stopAt) {
+    for (let i = 0; i < n; i++) {
+      const node = nodes[i];
+      nodes[i] = null;
       if (!node) continue;
       try {
-        if (typeof node.stop === 'function') node.stop();
+        if (typeof node.stop === 'function') {
+          if (stopAt === undefined) node.stop();
+          else node.stop(stopAt);
+        }
       } catch {
         /* already stopped, or never started — both are fine */
       }
@@ -552,7 +659,62 @@ export function createAudio(options) {
         /* already disconnected */
       }
     }
-    v.n = 0;
+  }
+
+  /**
+   * Fade a stolen voice out instead of cutting it. The nodes must stay connected for the length of
+   * the ramp, so they cannot be disconnected here — they move to `retiring` and the next `reap`
+   * (or teardown) disposes them once their stop time has passed.
+   * @param {Voice} v
+   * @param {number} t ctx time the steal happens
+   * @returns {boolean} false when the voice has no head gain to ramp (caller cuts it instead)
+   */
+  function fadeSteal(v, t) {
+    const head = v.nodes[0];
+    const g = head ? head.gain : null;
+    if (!g) return false;
+    const stopAt = t + AUDIO.STEAL_FADE;
+    try {
+      // Hold whatever the envelope had reached, then slide to silence. `cancelAndHold` is the
+      // exact tool; older implementations get cancel + an explicit anchor at the current value.
+      if (typeof g.cancelAndHoldAtTime === 'function') g.cancelAndHoldAtTime(t);
+      else {
+        if (typeof g.cancelScheduledValues === 'function') g.cancelScheduledValues(t);
+        pSet(g, typeof g.value === 'number' && g.value > 1e-4 ? g.value : 1e-4, t);
+      }
+      pExp(g, 1e-4, t + AUDIO.STEAL_FADE * 0.75);
+    } catch {
+      return false; // a param that refuses ramps: the hard cut is still correct, just clickier
+    }
+    /** @type {AnyNode[]} */
+    const nodes = new Array(v.n);
+    for (let i = 0; i < v.n; i++) {
+      nodes[i] = v.nodes[i];
+      v.nodes[i] = null;
+      try {
+        if (nodes[i]) nodes[i].onended = null; // the voice is about to be reused: no late release
+      } catch {
+        /* read-only onended */
+      }
+      try {
+        if (nodes[i] && typeof nodes[i].stop === 'function') nodes[i].stop(stopAt);
+      } catch {
+        /* never started */
+      }
+    }
+    retiring.push(nodes);
+    retireAt.push(stopAt);
+    // Bounded by construction: a steal storm cannot grow this past one pool's worth of tails.
+    if (retiring.length > maxVoices) retireOne(0);
+    return true;
+  }
+
+  /** @param {number} i index into `retiring` */
+  function retireOne(i) {
+    const nodes = retiring[i];
+    retiring.splice(i, 1);
+    retireAt.splice(i, 1);
+    if (nodes) disposeNodes(nodes, nodes.length);
   }
 
   /**
@@ -561,6 +723,9 @@ export function createAudio(options) {
    * @param {number} t ctx time
    */
   function reap(t) {
+    for (let i = retiring.length - 1; i >= 0; i--) {
+      if (retireAt[i] <= t) retireOne(i);
+    }
     if (liveVoices === 0) return;
     for (let i = 0; i < maxVoices; i++) {
       const v = voices[i];
@@ -708,6 +873,14 @@ export function createAudio(options) {
    * The exit portal hum: two detuned saws plus an octave, through a low-pass that opens as the
    * player approaches. Always running (three oscillators cost ~nothing) with the gain parked at 0,
    * because starting/stopping it would click and would need its own state machine.
+   *
+   * WHY the fundamental is an octave above the music drone: the hum and the drone are the only two
+   * *sustained* lows in the mix and they overlap at the loudest moment of the game (`nearExit` 1).
+   * Anything but a simple ratio between them beats — the shipped 61.7 Hz sat 6.7 Hz above the
+   * 55 Hz drone, which is not the "tritone-ish" unease its comment claimed but a slow throb inside
+   * one critical band, i.e. mud. At 2:1 the hum fuses with the drone instead, and the unease is
+   * carried by what it is actually made of: a detuned saw pair beating against *itself* at 0.66 Hz,
+   * a filter that only opens as you close in, and the slow LFO wobble below.
    */
   function buildPortal() {
     portalGain = keep(newGain(0));
@@ -726,9 +899,10 @@ export function createAudio(options) {
     connect(mix, portalFilter);
 
     const t = now();
-    const a = keep(newOsc('sawtooth', 61.7)); // B1 — a tritone-ish drone against the A music root
-    const b = keep(newOsc('sawtooth', 61.7 * 1.006)); // beating at ~0.37 Hz
-    const c = keep(newOsc('triangle', 123.4));
+    const base = AUDIO.MUSIC.droneHz * 2; // 110 Hz (A2) at level 1, and it follows the level key
+    const a = keyed(keep(newOsc('sawtooth', base)), base);
+    const b = keyed(keep(newOsc('sawtooth', base * 1.006)), base * 1.006); // beats at ~0.66 Hz
+    const c = keyed(keep(newOsc('triangle', base * 2)), base * 2);
     connect(a, mix);
     connect(b, mix);
     connect(c, mix);
@@ -784,18 +958,67 @@ export function createAudio(options) {
     return node;
   }
 
+  /**
+   * Register an always-on oscillator whose pitch follows the level key.
+   * @template T
+   * @param {T} node an oscillator
+   * @param {number} hz its frequency in the level-1 key
+   * @returns {T}
+   */
+  function keyed(node, hz) {
+    keyedParams.push(/** @type {any} */ (node).frequency);
+    keyedHz.push(hz);
+    return node;
+  }
+
+  /**
+   * Key the ambience to a depth: transpose the sustained layers, tighten the pluck gaps and darken
+   * the drone's filter. Called from the `levelStart` event and from `update()` (whichever notices
+   * the new level first); a repeat call for the same level does nothing.
+   *
+   * Everything glides over `TC.key` rather than jumping, so the key change lands under the descent
+   * bell as "the dungeon shifting" instead of as an edit.
+   * @param {number} level 1-based
+   */
+  function setDepth(level) {
+    const lv = Number.isFinite(level) && level >= 1 ? Math.floor(level) : 1;
+    if (lv === depthLevel) return;
+    depthLevel = lv;
+    musicKey = semitone(MUSIC_KEYS[(lv - 1) % MUSIC_KEYS.length]);
+    const depth01 = clamp01((lv - 1) / Math.max(1, AUDIO.MUSIC.depthSpan - 1));
+    // Deeper levels run longer, so the line has to arrive more often to cover the same minutes.
+    gapScale = lerp(1, AUDIO.MUSIC.gapFloor, depth01);
+    if (!live()) return;
+    const t = now();
+    for (let i = 0; i < keyedParams.length; i++) {
+      pTarget(keyedParams[i], keyedHz[i] * musicKey, t, AUDIO.TC.key);
+    }
+    if (droneTone) {
+      pTarget(
+        droneTone.frequency,
+        AUDIO.MUSIC.droneCut * lerp(1, AUDIO.MUSIC.droneCutFloor, depth01),
+        t,
+        AUDIO.TC.key,
+      );
+    }
+  }
+
   /** Low sustained drone under the generative plucks. */
   function buildDrone() {
     droneGain = keep(newGain(0.11));
-    const tone = keep(newFilter('lowpass', 320, 0.8));
+    const tone = keep(newFilter('lowpass', AUDIO.MUSIC.droneCut, 0.8));
+    droneTone = tone;
     connect(tone, droneGain);
     connect(droneGain, musicBus);
 
     const t = now();
     const root = AUDIO.MUSIC.droneHz;
-    const a = keep(newOsc('sawtooth', root));
-    const b = keep(newOsc('sawtooth', root * 1.004));
-    const fifth = keep(newOsc('sine', root * 1.4983)); // just fifth: cleaner than equal temperament
+    const a = keyed(keep(newOsc('sawtooth', root)), root);
+    const b = keyed(keep(newOsc('sawtooth', root * 1.004)), root * 1.004);
+    // 3:2 exactly. The equal-tempered fifth (2^(7/12) = 1.498307) is what used to be here under a
+    // comment claiming just intonation; a drone is the one place the pure ratio is free, because
+    // nothing modulates and the fifth's own second harmonic then lands exactly on the saws' third.
+    const fifth = keyed(keep(newOsc('sine', root * 1.5)), root * 1.5);
     const mix = keep(newGain(0.3));
     connect(a, mix);
     connect(b, mix);
@@ -860,6 +1083,24 @@ export function createAudio(options) {
   // ════════════════════════════════════════════════════════════════════════════════════════════
 
   /**
+   * Insert a per-voice stereo panner in front of `bus`, or return the bus unchanged when the sound
+   * is centred (the overwhelming majority) or the context has no `createStereoPanner`. One node,
+   * owned by the voice, so it is disconnected with the rest of it.
+   * @param {Voice} v
+   * @param {AnyNode} bus
+   * @param {number} pan -1..1
+   * @param {number} t ctx time
+   * @returns {AnyNode} what the voice's head gain should connect to
+   */
+  function panned(v, bus, pan, t) {
+    if (!pan || !Number.isFinite(pan) || typeof ctx.createStereoPanner !== 'function') return bus;
+    const p = own(v, ctx.createStereoPanner());
+    pSet(p.pan, clamp(pan, -1, 1), t);
+    connect(p, bus);
+    return p;
+  }
+
+  /**
    * One synthesised tone with an attack/exponential-decay envelope and an optional pitch glide.
    * The workhorse behind bells, plucks, arpeggios and falling game-over tones.
    *
@@ -876,6 +1117,7 @@ export function createAudio(options) {
    * @param {number} pri PRI.*
    * @param {number} [partial] extra partial as a frequency ratio (0 = none), e.g. 2.76 for a bell
    * @param {number} [partialAmp] amplitude of that partial relative to `amp`
+   * @param {number} [pan] stereo position -1..1 (0 = centred, no panner node is created)
    * @returns {boolean} false when the sound was dropped (no voice available)
    */
   function tone(
@@ -892,11 +1134,12 @@ export function createAudio(options) {
     pri,
     partial = 0,
     partialAmp = 0.3,
+    pan = 0,
   ) {
     const v = acquireVoice(pri, t + dur + 0.02);
     if (!v) return false;
     const g = own(v, newGain(0));
-    connect(g, bus);
+    connect(g, panned(v, bus, pan, t));
     if (send && sendAmt > 0) {
       const s = own(v, newGain(sendAmt));
       connect(g, s);
@@ -941,13 +1184,14 @@ export function createAudio(options) {
    * @param {AnyNode|null} send
    * @param {number} sendAmt
    * @param {number} pri
+   * @param {number} [pan] stereo position -1..1 (0 = centred, no panner node is created)
    * @returns {boolean}
    */
-  function noiseBurst(filterType, f0, f1, q, t, attack, dur, amp, bus, send, sendAmt, pri) {
+  function noiseBurst(filterType, f0, f1, q, t, attack, dur, amp, bus, send, sendAmt, pri, pan = 0) {
     const v = acquireVoice(pri, t + dur + 0.02);
     if (!v) return false;
     const g = own(v, newGain(0));
-    connect(g, bus);
+    connect(g, panned(v, bus, pan, t));
     if (send && sendAmt > 0) {
       const s = own(v, newGain(sendAmt));
       connect(g, s);
@@ -981,23 +1225,37 @@ export function createAudio(options) {
    * @param {string} type @param {number} f0 @param {number} f1 @param {number} t
    * @param {number} attack @param {number} dur @param {number} amp @param {number} pri
    * @param {number} [send] 0..1 reverb send @param {number} [partial] @param {number} [partialAmp]
+   * @param {number} [pan] -1..1
    * @returns {boolean}
    */
-  function sfx(type, f0, f1, t, attack, dur, amp, pri, send = 0, partial = 0, partialAmp = 0.3) {
+  function sfx(
+    type,
+    f0,
+    f1,
+    t,
+    attack,
+    dur,
+    amp,
+    pri,
+    send = 0,
+    partial = 0,
+    partialAmp = 0.3,
+    pan = 0,
+  ) {
     const to = send > 0 ? sfxSend : null;
-    return tone(type, f0, f1, t, attack, dur, amp, sfxBus, to, send, pri, partial, partialAmp);
+    return tone(type, f0, f1, t, attack, dur, amp, sfxBus, to, send, pri, partial, partialAmp, pan);
   }
 
   /**
    * `noiseBurst()` on the SFX bus.
    * @param {string} filterType @param {number} f0 @param {number} f1 @param {number} q
    * @param {number} t @param {number} attack @param {number} dur @param {number} amp
-   * @param {number} pri @param {number} [send] 0..1 reverb send
+   * @param {number} pri @param {number} [send] 0..1 reverb send @param {number} [pan] -1..1
    * @returns {boolean}
    */
-  function sfxNoise(filterType, f0, f1, q, t, attack, dur, amp, pri, send = 0) {
+  function sfxNoise(filterType, f0, f1, q, t, attack, dur, amp, pri, send = 0, pan = 0) {
     const to = send > 0 ? sfxSend : null;
-    return noiseBurst(filterType, f0, f1, q, t, attack, dur, amp, sfxBus, to, send, pri);
+    return noiseBurst(filterType, f0, f1, q, t, attack, dur, amp, sfxBus, to, send, pri, pan);
   }
 
   /**
@@ -1037,25 +1295,29 @@ export function createAudio(options) {
    * Gem pickup: a bright major arpeggio with an octave shimmer and a sparkle hiss.
    * Rapid successive pickups raise the whole figure two semitones per combo step, so sweeping a
    * dead end rewards the player with a rising melody instead of the same chime nine times.
+   * @param {number} [pan] -1..1, where the gem was relative to the player's facing
    */
-  function playGem() {
+  function playGem(pan = 0) {
     const t = now();
     comboCount = t < comboUntil ? Math.min(comboCount + 1, AUDIO.COMBO_MAX) : 0;
     comboUntil = t + AUDIO.COMBO_WINDOW;
     const root = 659.25 * semitone(comboCount * 2); // E5 upward
     // Major triad: unambiguously "good", against the minor ambience underneath.
-    sfx('triangle', root, root, t, 0.004, 0.26, 0.17, PRI.CUE, 0.25, 2, 0.22);
-    sfx('triangle', root * 1.26, root * 1.26, t + 0.06, 0.004, 0.24, 0.15, PRI.CUE, 0.25, 2, 0.2);
-    sfx('triangle', root * 1.5, root * 1.5, t + 0.12, 0.004, 0.34, 0.15, PRI.CUE, 0.3, 2, 0.24);
-    sfxNoise('highpass', 5200, 9000, 0.7, t, 0.008, 0.22, 0.05, PRI.STEP, 0.2);
+    sfx('triangle', root, root, t, 0.004, 0.26, 0.17, PRI.CUE, 0.25, 2, 0.22, pan);
+    sfx('triangle', root * 1.26, root * 1.26, t + 0.06, 0.004, 0.24, 0.15, PRI.CUE, 0.25, 2, 0.2, pan);
+    sfx('triangle', root * 1.5, root * 1.5, t + 0.12, 0.004, 0.34, 0.15, PRI.CUE, 0.3, 2, 0.24, pan);
+    sfxNoise('highpass', 5200, 9000, 0.7, t, 0.008, 0.22, 0.05, PRI.STEP, 0.2, pan);
   }
 
-  /** Oil flask: an upward noise sweep (the whoosh) over a warm rising tone (the refill). */
-  function playOil() {
+  /**
+   * Oil flask: an upward noise sweep (the whoosh) over a warm rising tone (the refill).
+   * @param {number} [pan] -1..1, where the flask was relative to the player's facing
+   */
+  function playOil(pan = 0) {
     const t = now();
-    sfxNoise('bandpass', 320, 3600, 1.1, t, 0.09, 0.42, 0.2, PRI.CUE, 0.18);
-    sfx('triangle', 196, 294, t, 0.02, 0.5, 0.17, PRI.CUE, 0.22, 2, 0.18);
-    sfx('sine', 392, 587, t + 0.04, 0.03, 0.42, 0.08, PRI.CUE);
+    sfxNoise('bandpass', 320, 3600, 1.1, t, 0.09, 0.42, 0.2, PRI.CUE, 0.18, pan);
+    sfx('triangle', 196, 294, t, 0.02, 0.5, 0.17, PRI.CUE, 0.22, 2, 0.18, pan);
+    sfx('sine', 392, 587, t + 0.04, 0.03, 0.42, 0.08, PRI.CUE, 0, 0, 0.3, pan);
   }
 
   /** Low fuel: a detuned minor-second swell that arrives just before the first heartbeat. */
@@ -1066,15 +1328,20 @@ export function createAudio(options) {
     armHeartbeat(t + 0.35);
   }
 
-  /** Level start: a descending reverberant bell figure — "you are deeper now". */
+  /**
+   * Level start: a descending reverberant bell figure — "you are deeper now". Transposed into the
+   * level's key, so the bell is what *states* the new key before the first pluck arrives and level
+   * 15 no longer sounds identical to level 1.
+   */
   function playLevelStart() {
     const t = now();
     for (let i = 0; i < BELL_NOTES.length; i++) {
+      const f = BELL_NOTES[i] * musicKey;
       // 2.76 is the classic inharmonic bell partial; the long decay feeds the dungeon reverb.
       sfx(
         'sine',
-        BELL_NOTES[i],
-        BELL_NOTES[i],
+        f,
+        f,
         t + i * 0.17,
         0.005,
         1.5 + i * 0.25,
@@ -1087,28 +1354,42 @@ export function createAudio(options) {
     }
   }
 
-  /** Level complete: a fast ascending retro arpeggio capped with a held major chord. */
+  /**
+   * Level complete: a fast ascending retro arpeggio capped with a held major chord — transposed
+   * with everything else, so the cadence resolves in the key the level was actually played in.
+   */
   function playFanfare() {
     const t = now();
     for (let i = 0; i < FANFARE_ARP.length; i++) {
-      const f = FANFARE_ARP[i];
+      const f = FANFARE_ARP[i] * musicKey;
       sfx('square', f, f, t + i * 0.075, 0.004, 0.2, 0.1, PRI.STING, 0.25);
     }
     for (let i = 0; i < FANFARE_CHORD.length; i++) {
-      const f = FANFARE_CHORD[i];
+      const f = FANFARE_CHORD[i] * musicKey;
       sfx('triangle', f, f, t + 0.32, 0.01, 1.1, 0.11, PRI.STING, 0.45, 2, 0.25);
     }
     duck = 0.35; // let the fanfare own the mix; update() restores music over ~1 s
   }
 
-  /** Game over: two sagging detuned tones plus the torch being snuffed out. */
-  function playGameOver() {
+  /**
+   * Game over: two sagging detuned tones plus the torch being snuffed out.
+   * @param {boolean} [newBest] the run beat the stored record — the only moment in the game worth
+   *   a major chord, and until now a record run sounded exactly like a bad one.
+   */
+  function playGameOver(newBest) {
     const t = now();
     sfx('sawtooth', 330, 82.4, t, 0.03, 1.5, 0.12, PRI.STING, 0.5);
     sfx('sawtooth', 392, 98, t + 0.14, 0.03, 1.45, 0.1, PRI.STING, 0.5);
     sfx('sine', 165, 41, t + 0.05, 0.02, 1.7, 0.09, PRI.STING);
     // The snuff: broadband hiss collapsing to nothing, like a flame pinched out.
     sfxNoise('lowpass', 5200, 260, 0.8, t, 0.01, 0.55, 0.22, PRI.STING, 0.3);
+    if (newBest) {
+      // Placed after the snuff, not over it: the torch dies, *then* the score speaks.
+      for (let i = 0; i < NEW_BEST_TRIAD.length; i++) {
+        const f = NEW_BEST_TRIAD[i];
+        sfx('triangle', f, f, t + 1 + i * 0.1, 0.006, 0.8, 0.09, PRI.STING, 0.4, 2, 0.2);
+      }
+    }
     duck = 0.25;
   }
 
@@ -1119,6 +1400,10 @@ export function createAudio(options) {
    */
   function playUiSound(kind) {
     const t = now();
+    // Every path that blips — the menus through `playUi()`, a uiMove/uiConfirm event, or the phase
+    // handler itself — records it here, which is what lets `onPhase` tell "nobody has answered
+    // this action yet" from "the menus already did" (see `handle`).
+    lastUiSoundAt = t;
     if (kind === 'confirm') {
       sfx('square', 659.25, 659.25, t, 0.003, 0.07, 0.11, PRI.UI);
       sfx('square', 987.77, 987.77, t + 0.06, 0.003, 0.12, 0.12, PRI.UI, 0.2);
@@ -1164,7 +1449,7 @@ export function createAudio(options) {
   function scheduleCrackle(t, fuelFrac) {
     const f = rng.range(1400, 4200) * lerp(0.6, 1, fuelFrac);
     const amp = rng.range(0.02, 0.07) * lerp(0.5, 1, fuelFrac);
-    sfxNoise('bandpass', f, f * 0.6, 2.6, t, 0.002, rng.range(0.02, 0.06), amp, PRI.MUSIC);
+    sfxNoise('bandpass', f, f * 0.6, 2.6, t, 0.002, rng.range(0.02, 0.06), amp, PRI.AMBIENT);
   }
 
   // ── Generative music ────────────────────────────────────────────────────────────────────────
@@ -1176,7 +1461,7 @@ export function createAudio(options) {
    */
   function schedulePluck(t) {
     const st = PENTATONIC[rng.int(PENTATONIC.length)];
-    const f = AUDIO.MUSIC.root * semitone(st) * (rng.chance(0.25) ? 0.5 : 1);
+    const f = AUDIO.MUSIC.root * musicKey * semitone(st) * (rng.chance(0.25) ? 0.5 : 1);
     const dur = rng.range(1.6, 2.6);
     tone('triangle', f, f, t, 0.012, dur, 0.085, musicBus, musicSend, 0.75, PRI.MUSIC, 2, 0.14);
     if (rng.chance(0.3)) {
@@ -1273,6 +1558,19 @@ export function createAudio(options) {
     if (!live() || !events || typeof events.length !== 'number') return;
     try {
       const muted = silent();
+      // WHY this pre-scan: *unpausing from the menu answers one action twice*. menus.js plays a
+      // confirm blip through main.js -> playUi('confirm'), and the same key press dispatches
+      // `resume`, whose phase event reaches `onPhase` below. Two identical square figures one
+      // frame apart sum phase-coherently — about +6 dB with a comb notch — which is an audible
+      // flam on the most common interaction in the game. `uiAnswered` says "a menu already spoke
+      // for this input", either just now (any blip within AUDIO.UI_ECHO, which covers the direct
+      // `playUi` path main.js uses) or somewhere in *this* batch (the event path), and `onPhase`
+      // then stays quiet. A programmatic resume with no UI sound anywhere still gets its blip.
+      let uiAnswered = now() - lastUiSoundAt < AUDIO.UI_ECHO;
+      for (let i = 0; i < events.length && !uiAnswered; i++) {
+        const e = events[i];
+        if (e && (e.type === 'uiConfirm' || e.type === 'uiMove')) uiAnswered = true;
+      }
       for (let i = 0; i < events.length; i++) {
         const e = events[i];
         if (!e || typeof e.type !== 'string') continue;
@@ -1283,12 +1581,16 @@ export function createAudio(options) {
           case 'bump':
             if (!muted) playBump(numberOr(e.strength, 0.5));
             break;
-          case 'pickup':
+          case 'pickup': {
             if (!muted) {
-              if (e.kind === 'oil') playOil();
-              else playGem();
+              // The event carries the item's world position, so a gem on your left can sound as
+              // if it were on your left. Same bearing maths as the portal hum.
+              const pan = pickupPan(e.x, e.y, state);
+              if (e.kind === 'oil') playOil(pan);
+              else playGem(pan);
             }
             break;
+          }
           case 'lowFuel':
             if (!muted) playLowFuel();
             else armHeartbeat(now() + 0.35);
@@ -1297,6 +1599,8 @@ export function createAudio(options) {
             comboCount = 0;
             comboUntil = 0;
             disarmHeartbeat();
+            // Key the ambience to the new depth BEFORE the bell, so the bell states the new key.
+            setDepth(numberOr(e.level, depthLevel || 1));
             if (!muted) playLevelStart();
             break;
           case 'levelComplete':
@@ -1305,10 +1609,10 @@ export function createAudio(options) {
             break;
           case 'gameOver':
             disarmHeartbeat();
-            if (!muted) playGameOver();
+            if (!muted) playGameOver(e.newBest === true);
             break;
           case 'phase':
-            onPhase(e.from, e.to, muted);
+            onPhase(e.from, e.to, muted, uiAnswered);
             break;
           case 'uiMove':
             if (!muted) playUiSound('move');
@@ -1332,13 +1636,16 @@ export function createAudio(options) {
    * @param {Phase} from
    * @param {Phase} to
    * @param {boolean} muted
+   * @param {boolean} uiAnswered a menu already blipped for this input (see `handle`) — the phase
+   *   blips exist for *programmatic* transitions (a pointer-lock loss, a lost window focus, a
+   *   headless `dispatch`), never to double up on one the player heard already.
    */
-  function onPhase(from, to, muted) {
+  function onPhase(from, to, muted, uiAnswered) {
     if (to === 'paused') {
       disarmHeartbeat();
-      if (!muted) playUiSound('back');
+      if (!muted && !uiAnswered) playUiSound('back');
     } else if (to === 'playing' && from === 'paused') {
-      if (!muted) playUiSound('confirm');
+      if (!muted && !uiAnswered) playUiSound('confirm');
     } else if (to === 'title' || to === 'loading') {
       disarmHeartbeat();
       comboCount = 0;
@@ -1360,6 +1667,13 @@ export function createAudio(options) {
 
       const s = state && typeof state === 'object' ? state : null;
       const phase = /** @type {Phase|''} */ (s && typeof s.phase === 'string' ? s.phase : '');
+
+      // Depth keys the ambience (§ setDepth). Read from the state as well as from the levelStart
+      // event because `state.level` already holds the new depth during `loading`, so the drone
+      // glides into the new key while the labyrinth is being carved — and because it is the one
+      // reading that cannot be missed by an event that arrived before the first gesture unlocked
+      // the context. A repeat for the same level costs one number comparison.
+      if (s && typeof s.level === 'number' && s.level !== depthLevel) setDepth(s.level);
 
       // Settings are the source of truth; reading them here means main.js cannot forget to call
       // setVolume() after an options change. Only *changes* are adopted (see seenVolumeSetting).
@@ -1452,7 +1766,10 @@ export function createAudio(options) {
           // urgency 0 at the low-fuel threshold, 1 at an empty tank.
           const max = run && run.fuelMax > 0 ? run.fuelMax : 0;
           const frac = max > 0 ? clamp01(run.fuel / max) : 0;
-          const urgency = 1 - clamp01(frac / 0.2);
+          // AUDIO.HEART.lowFraction mirrors balance.js FUEL.LOW_FRACTION — the fraction the sim
+          // sets `derived.lowFuel` at. If the two drift, the beat either starts at full urgency or
+          // never reaches it, which is the whole point of the cue.
+          const urgency = 1 - clamp01(frac / AUDIO.HEART.lowFraction);
           const period = lerp(AUDIO.HEART.slow, AUDIO.HEART.fast, urgency);
           while (heartNext < t + AUDIO.LOOKAHEAD) {
             scheduleHeartbeat(heartNext, period, urgency);
@@ -1473,11 +1790,28 @@ export function createAudio(options) {
       if (pluckNext < t) pluckNext = t + rng.range(0.2, 0.9);
       while (pluckNext < t + AUDIO.LOOKAHEAD) {
         if (musicOn) schedulePluck(pluckNext);
-        pluckNext += rng.range(AUDIO.MUSIC.gapMin, AUDIO.MUSIC.gapMax);
+        pluckNext += rng.range(AUDIO.MUSIC.gapMin, AUDIO.MUSIC.gapMax) * gapScale;
       }
     } catch (err) {
       fail(err);
     }
+  }
+
+  /**
+   * Where a picked-up item was, as a stereo position. `sin(bearing)` is 0 dead ahead and behind and
+   * ±1 abeam — the same cue as the portal hum, at 0.6 so a pickup never jumps fully into one ear.
+   * @param {number} x item world x @param {number} y item world y
+   * @param {GameState|null|undefined} state
+   * @returns {number} -1..1, 0 when the position or the player is unusable
+   */
+  function pickupPan(x, y, state) {
+    const p = state && typeof state === 'object' ? state.player : null;
+    if (!p || !Number.isFinite(x) || !Number.isFinite(y)) return 0;
+    if (!Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.angle)) return 0;
+    const dx = x - p.x;
+    const dy = y - p.y;
+    if (dx === 0 && dy === 0) return 0; // standing exactly on it: no bearing to speak of
+    return clamp(Math.sin(Math.atan2(dy, dx) - p.angle) * 0.6, -1, 1);
   }
 
   /**
@@ -1560,6 +1894,9 @@ export function createAudio(options) {
   function teardown() {
     try {
       for (let i = 0; i < maxVoices; i++) releaseVoice(voices[i]);
+      while (retiring.length) retireOne(retiring.length - 1);
+      keyedParams.length = 0;
+      keyedHz.length = 0;
       for (let i = 0; i < persistent.length; i++) {
         const node = persistent[i];
         if (!node) continue;

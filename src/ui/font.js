@@ -956,7 +956,7 @@ function buildAtlas(face, style) {
     for (let y = 0; y < g.h; y++) {
       for (let x = 0; x < g.w; x++) {
         if (g.mask[y * g.w + x] === 0) continue;
-        const top = style.highlight !== null && !inkAt(g, x, y - 1);
+        const top = style.highlight !== null && catchesLight(g, x, y);
         putPixel(px, total, penX + padX + x, padY + y, top ? _rgbaHighlight : _rgbaFill);
       }
     }
@@ -969,8 +969,38 @@ function buildAtlas(face, style) {
 }
 
 /**
+ * Does the inked cell (x,y) catch the overhead light — i.e. is it drawn in the style's highlight
+ * tone rather than its fill?
+ *
+ * The highlight is light landing on the **top surface of a stroke that has body under it**, so a
+ * cell qualifies only when all three hold:
+ * - the cell above is empty (it is a top edge at all);
+ * - the cell below is inked (there is a stroke under the rim — a one-pixel horizontal bar, the
+ *   crossbar of an `A` or the base of a `Z`, is *all* edge, and lighting it turned the whole bar
+ *   parchment; the bottom of a bowl or a foot serif has empty space above it too, and lit, it read
+ *   as light coming from underneath);
+ * - a horizontal neighbour is inked (without it every cell of a one-pixel diagonal qualifies).
+ *
+ * Measured on the display face: the `A-MAZE` wordmark went from ~60 % highlight (original rule)
+ * to 34 % (horizontal-neighbour test only) to 21 % with all three, and the lowercase headings from
+ * 35 % to 16 % — gold dominant under a thin top rim, which is what `docs/art-reference.png` does.
+ * @param {{w:number, h:number, mask:Uint8Array}} g
+ * @param {number} x
+ * @param {number} y
+ * @returns {boolean}
+ */
+export function catchesLight(g, x, y) {
+  return (
+    inkAt(g, x, y) &&
+    !inkAt(g, x, y - 1) &&
+    inkAt(g, x, y + 1) &&
+    (inkAt(g, x - 1, y) || inkAt(g, x + 1, y))
+  );
+}
+
+/**
  * Is (x,y) inside the glyph and inked?
- * @param {Glyph} g
+ * @param {{w:number, h:number, mask:Uint8Array}} g a {@link Glyph} or a {@link glyphMask} result
  * @param {number} x
  * @param {number} y
  * @returns {boolean}
@@ -982,7 +1012,7 @@ function inkAt(g, x, y) {
 
 /**
  * Does (x,y) touch ink in any of the 8 surrounding cells?
- * @param {Glyph} g
+ * @param {{w:number, h:number, mask:Uint8Array}} g
  * @param {number} x
  * @param {number} y
  * @returns {boolean}

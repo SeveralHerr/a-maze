@@ -43,6 +43,19 @@ const DEFAULT_SNAP_MS = 0.4;
 const MAX_MANUAL_STEPS = 100000;
 
 /**
+ * How often a suspended loop re-reads `document.hidden`, in milliseconds.
+ *
+ * The way *into* suspension is defended twice — the `visibilitychange` listener *and* a per-frame
+ * re-check in `tick()` — precisely because some embedders (itch.io's iframe, older Safari) fire
+ * that event unreliably. The way *out* must be defended the same way, or an embedder that drops
+ * the event on the way back leaves the loop suspended with no frame pending and nothing left to
+ * re-check it: a permanent freeze that only a reload clears. 250 ms is four checks a second, far
+ * below anything a player perceives as a stall, at a cost of one boolean read per tick while
+ * suspended (and nothing at all while running).
+ */
+const VISIBILITY_POLL_MS = 250;
+
+/**
  * Rolling frame statistics over the last `samples` frames (≤ 120). The object returned by
  * `stats()` is **reused** — copy the fields you need to keep.
  * @typedef {Object} FrameStats
@@ -76,6 +89,10 @@ const MAX_MANUAL_STEPS = 100000;
  * @property {(cb:(ts:number)=>void) => number} [raf]
  * @property {(id:number) => void} [caf]
  * @property {{hidden:boolean, addEventListener:Function, removeEventListener:Function}|null} [doc]
+ * @property {(fn:() => void, ms:number) => any} [setTimer]
+ *   schedules the visibility re-check while suspended; defaults to `setTimeout`. `null`/absent
+ *   host timers simply disable the poll (the `visibilitychange` listener still works).
+ * @property {(id:any) => void} [clearTimer]  counterpart of `setTimer`; defaults to `clearTimeout`
  */
 
 /**
@@ -125,12 +142,16 @@ export function createLoop(options) {
       : typeof document !== 'undefined'
         ? /** @type {any} */ (document)
         : null;
+  const setTimer = typeof opts.setTimer === 'function' ? opts.setTimer : defaultSetTimer();
+  const clearTimer = typeof opts.clearTimer === 'function' ? opts.clearTimer : defaultClearTimer();
 
   // ── Loop state ───────────────────────────────────────────────────────────────────────────────
   let running = false;
   let suspended = false;
   /** Scheduler handle of the pending frame, or 0 when none is pending. */
   let frameHandle = 0;
+  /** Timer handle of the visibility poll that runs while suspended, or `null` when none. */
+  let pollHandle = /** @type {any} */ (null);
   /** Timestamp of the previous frame, ms. NaN means "next frame only primes the clock". */
   let lastTs = NaN;
   /** Unconsumed simulation time, seconds. */
@@ -142,7 +163,6 @@ export function createLoop(options) {
   const stepMsRing = new Float64Array(WINDOW); // total step() time in that frame
   const stepCountRing = new Float64Array(WINDOW); // steps executed in that frame
   const renderMsRing = new Float64Array(WINDOW);
-  const scratch = new Float64Array(WINDOW); // sorted copy for the p99 percentile
   let ringHead = 0;
   let ringCount = 0;
 
@@ -302,12 +322,16 @@ export function createLoop(options) {
     // Forget the clock and the pending sim time: the wall time spent hidden is not game time.
     lastTs = NaN;
     acc = 0;
+    // No frame is pending now, so `tick()`'s per-frame visibility re-check is gone with it. The
+    // poll is what replaces it until the document is visible again (see VISIBILITY_POLL_MS).
+    startVisibilityPoll();
   }
 
   /** Resume after the document became visible again. @returns {void} */
   function resume() {
     if (!running || !suspended) return;
     suspended = false;
+    stopVisibilityPoll();
     lastTs = NaN; // next frame re-primes the clock instead of catching up on the hidden period
     requestFrame();
   }
@@ -317,6 +341,34 @@ export function createLoop(options) {
     if (!running) return;
     if (doc && doc.hidden) suspend();
     else resume();
+  }
+
+  /**
+   * Schedule the next visibility re-check. Idempotent, and a no-op where the host has no timers.
+   * @returns {void}
+   */
+  function startVisibilityPoll() {
+    if (pollHandle !== null || setTimer === null || !doc) return;
+    pollHandle = setTimer(pollVisible, VISIBILITY_POLL_MS);
+  }
+
+  /** @returns {void} */
+  function stopVisibilityPoll() {
+    if (pollHandle === null) return;
+    if (clearTimer !== null) clearTimer(pollHandle);
+    pollHandle = null;
+  }
+
+  /**
+   * Re-read `doc.hidden` while suspended and resume the moment it is false, whether or not the
+   * embedder ever delivered the `visibilitychange` event that would have said so.
+   * @returns {void}
+   */
+  function pollVisible() {
+    pollHandle = null;
+    if (!running || !suspended) return;
+    if (doc && !doc.hidden) resume();
+    else startVisibilityPoll();
   }
 
   /** @returns {void} */
@@ -342,8 +394,20 @@ export function createLoop(options) {
     if (doc && typeof doc.addEventListener === 'function') {
       doc.addEventListener('visibilitychange', onVisibilityChange, false);
     }
-    if (doc && doc.hidden) suspended = true;
-    else requestFrame();
+    // A window that is focused or restored from the back/forward cache is visible, whatever the
+    // document last said. Cheap, symmetrical belt and braces alongside the poll; absent in Node
+    // and in the tests' fake documents, which have no `defaultView`.
+    const win = viewOf(doc);
+    if (win) {
+      win.addEventListener('pageshow', onVisibilityChange, false);
+      win.addEventListener('focus', onVisibilityChange, false);
+    }
+    if (doc && doc.hidden) {
+      suspended = true;
+      startVisibilityPoll();
+    } else {
+      requestFrame();
+    }
   }
 
   /** @returns {void} */
@@ -352,10 +416,16 @@ export function createLoop(options) {
     running = false;
     suspended = false;
     cancelFrame();
+    stopVisibilityPoll();
     lastTs = NaN;
     acc = 0;
     if (doc && typeof doc.removeEventListener === 'function') {
       doc.removeEventListener('visibilitychange', onVisibilityChange, false);
+    }
+    const win = viewOf(doc);
+    if (win) {
+      win.removeEventListener('pageshow', onVisibilityChange, false);
+      win.removeEventListener('focus', onVisibilityChange, false);
     }
   }
 
@@ -391,7 +461,6 @@ export function createLoop(options) {
       // A frame that took ~k step periods missed about k-1 refreshes at the target rate.
       const k = Math.round(f / stepMs) - 1;
       if (k > 0) dropped += k;
-      scratch[i] = f;
     }
     const avg = frameSum / n;
     statsOut.frameMsAvg = avg;
@@ -399,9 +468,7 @@ export function createLoop(options) {
     statsOut.stepMsAvg = stepCount > 0 ? stepSum / stepCount : 0;
     statsOut.renderMsAvg = renderSum / n;
     statsOut.droppedFrames = dropped;
-    // Sorting a subarray view would allocate; sort the whole scratch buffer only when the window
-    // is full, otherwise sort the filled prefix via a manual insertion sort (n < 120, rare).
-    statsOut.frameMsP99 = percentile99(scratch, n);
+    statsOut.frameMsP99 = percentile99(frameMsRing, n);
     return statsOut;
   }
 
@@ -458,25 +525,98 @@ export function createLoop(options) {
 }
 
 /**
- * 99th percentile of the first `n` entries of `buf` (which is reordered in place).
- * Insertion sort: n ≤ 120 and the data is nearly sorted in practice, so this beats the allocation
- * a `subarray().sort()` would cost.
+ * Largest values tracked by {@link percentile99}. The wanted rank counted from the top is
+ * `n - (ceil(0.99n) - 1) ≤ 0.01n + 1`, which is 2 for a full 120-frame window and never more than
+ * 3 for any `n ≤ WINDOW`; 4 leaves a slot of headroom and the function falls back to a sort if a
+ * future, much larger window ever needed more.
+ */
+const TOP_K = 4;
+
+/**
+ * Scratch for the top-K selection. Module-level and shared by every loop on the page, which is
+ * safe because `percentile99` is synchronous, non-reentrant and leaves nothing behind between
+ * calls — and it keeps `stats()` allocation-free, which is a contract promise (§4.1).
+ */
+const topScratch = new Float64Array(TOP_K);
+
+/**
+ * 99th percentile of the first `n` entries of `buf`, read-only.
+ *
+ * A full sort is the obvious implementation and the wrong one. `stats()` is called every frame
+ * (main.js hands it to `hud.render`), the ring is refilled from arbitrary frame intervals — *not*
+ * nearly sorted, whatever an earlier comment here claimed — and only the top handful of entries
+ * can ever be the answer. So this keeps the K largest values in a fixed 4-slot buffer in one
+ * linear pass: O(n·K) with K ≤ 4 instead of O(n²), no allocation, and the buffer it reads is left
+ * untouched.
  * @param {Float64Array} buf
  * @param {number} n
  * @returns {number} ms
  */
 function percentile99(buf, n) {
-  for (let i = 1; i < n; i++) {
+  if (n <= 0) return 0;
+  const idx = Math.min(n - 1, Math.max(0, Math.ceil(0.99 * n) - 1));
+  const k = n - idx; // rank from the top: 1 = the maximum
+  if (k > TOP_K) return percentileBySort(buf, n, idx);
+  // topScratch[0..k-1] holds the k largest seen so far, descending.
+  let held = 0;
+  for (let i = 0; i < n; i++) {
     const v = buf[i];
-    let j = i - 1;
-    while (j >= 0 && buf[j] > v) {
-      buf[j + 1] = buf[j];
+    if (held === k && v <= topScratch[k - 1]) continue;
+    let j = held < k ? held : k - 1;
+    while (j > 0 && topScratch[j - 1] < v) {
+      topScratch[j] = topScratch[j - 1];
       j--;
     }
-    buf[j + 1] = v;
+    topScratch[j] = v;
+    if (held < k) held++;
   }
-  const idx = Math.min(n - 1, Math.max(0, Math.ceil(0.99 * n) - 1));
-  return buf[idx];
+  return topScratch[k - 1];
+}
+
+/**
+ * Fallback for a window large enough that the wanted rank is deeper than {@link TOP_K}.
+ * Unreachable at `WINDOW` = 120 and kept only so a future window size cannot silently return a
+ * wrong number; it copies into a fresh array, which is why the top-K path exists at all.
+ * @param {Float64Array} buf
+ * @param {number} n
+ * @param {number} idx ascending index of the wanted value
+ * @returns {number} ms
+ */
+function percentileBySort(buf, n, idx) {
+  const copy = Array.prototype.slice.call(buf, 0, n);
+  copy.sort((a, b) => a - b);
+  return copy[idx];
+}
+
+/**
+ * The window a document belongs to, when it has one (`defaultView` is absent in Node and in the
+ * unit tests' fake documents).
+ * @param {any} d
+ * @returns {{addEventListener:Function, removeEventListener:Function}|null}
+ */
+function viewOf(d) {
+  const win = d && d.defaultView;
+  return win && typeof win.addEventListener === 'function' && typeof win.removeEventListener === 'function'
+    ? win
+    : null;
+}
+
+/**
+ * `setTimeout` when the host has one, else `null` (the visibility poll is simply disabled).
+ * @returns {((fn:() => void, ms:number) => any)|null}
+ */
+function defaultSetTimer() {
+  const g = /** @type {any} */ (globalThis);
+  return typeof g.setTimeout === 'function' ? (fn, ms) => g.setTimeout(fn, ms) : null;
+}
+
+/**
+ * Counterpart of {@link defaultSetTimer}.
+ * @returns {((id:any) => void)|null}
+ */
+function defaultClearTimer() {
+  const g = /** @type {any} */ (globalThis);
+  return typeof g.clearTimeout === 'function' ? (id) => g.clearTimeout(id) : null;
 }
 
 /**

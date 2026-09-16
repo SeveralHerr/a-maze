@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import {
   COLOR,
   FONT_STYLES,
+  catchesLight,
   clearFontCache,
   drawText,
   drawTextBlock,
@@ -216,4 +217,46 @@ test('styles and colours are complete and well-formed', () => {
   assert.equal(COLOR.gold, '#d9a441');
   assert.equal(COLOR.goldDeep, '#7a4a1a');
   assert.equal(COLOR.parchment, '#e8d3a0');
+});
+
+test('the display face catches light on stroke tops only, so gold dominates the wordmark', () => {
+  /**
+   * Share of inked cells drawn in the highlight tone.
+   * @param {string} text
+   * @returns {number}
+   */
+  const share = (text) => {
+    let lit = 0;
+    let ink = 0;
+    for (const ch of text) {
+      const g = glyphMask('display', ch);
+      if (g === null) continue;
+      for (let y = 0; y < g.h; y++) {
+        for (let x = 0; x < g.w; x++) {
+          if (g.mask[y * g.w + x] === 0) continue;
+          ink++;
+          if (catchesLight(g, x, y)) lit++;
+        }
+      }
+    }
+    return ink === 0 ? 0 : lit / ink;
+  };
+  // docs/art-reference.png: gold letters under a thin top rim. The first rule lit ~60 % of the
+  // wordmark, which read as parchment blocks outlined in brown.
+  assert.ok(share('A-MAZE') < 0.25, `wordmark highlight share ${share('A-MAZE').toFixed(2)}`);
+  assert.ok(share('Depth 3 Cleared') < 0.25);
+  assert.ok(share('A-MAZE') > 0.05, 'but there is still a rim to read the carving by');
+
+  const a = /** @type {{w:number, h:number, mask:Uint8Array}} */ (glyphMask('display', 'A'));
+  const z = /** @type {{w:number, h:number, mask:Uint8Array}} */ (glyphMask('display', 'Z'));
+  // Nothing on the bottom row of a glyph is ever lit: that would be light from underneath.
+  for (const g of [a, z]) {
+    let bottom = -1;
+    for (let y = 0; y < g.h; y++) for (let x = 0; x < g.w; x++) if (g.mask[y * g.w + x] !== 0) bottom = y;
+    for (let x = 0; x < g.w; x++) assert.equal(catchesLight(g, x, bottom), false, `bottom row x=${x}`);
+  }
+  // Empty cells and out-of-range probes are never lit.
+  assert.equal(catchesLight(a, -1, 0), false);
+  assert.equal(catchesLight(a, 0, 0), false);
+  assert.equal(catchesLight(a, a.w, a.h), false);
 });

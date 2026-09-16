@@ -332,6 +332,13 @@ function applyNewGame(state, rawSeed) {
 // ─── levelReady ──────────────────────────────────────────────────────────────────────────────
 
 /**
+ * Cap on how many `items`/`torches` entries `isLevelData` will inspect. A real level carries ~820
+ * items and ~1 300 torches at the 128×128 cap (ARCHITECTURE.md §4.2); 8 192 is an order of
+ * magnitude of headroom, and anything past it is not a level this build produced.
+ */
+const MAX_VALIDATED_ENTRIES = 8192;
+
+/**
  * Cheap structural check on level data arriving from the maze worker. A malformed payload is
  * dropped rather than installed, because a maze with a mis-sized tile array would corrupt every
  * downstream index.
@@ -355,6 +362,22 @@ function isLevelData(data) {
   // downstream — the one malformed field that cannot be allowed through.
   if (!isTileCoord(m.start, w, h) || !isTileCoord(m.exit, w, h)) return false;
   if (!Array.isArray(d.items) || !Array.isArray(d.torches)) return false;
+  // Element-level validation, not just "is an array". `buildItemGrid` dereferences `items[i].x` and
+  // `applyLevelReady` writes `items[i].taken`, so a null or a number in there throws *after* the
+  // state has been half-installed — which breaks the "never throws for any input" contract in this
+  // file's header and in ARCHITECTURE.md §4.2. The scan is capped so a hostile payload cannot cost
+  // a frame; past the cap the payload is rejected outright rather than partially trusted.
+  if (d.items.length > MAX_VALIDATED_ENTRIES || d.torches.length > MAX_VALIDATED_ENTRIES) return false;
+  for (let i = 0; i < d.items.length; i++) {
+    const it = d.items[i];
+    if (it === null || typeof it !== 'object') return false;
+    if (!Number.isFinite(it.x) || !Number.isFinite(it.y)) return false;
+    if (it.kind !== 'gem' && it.kind !== 'oil') return false;
+  }
+  for (let i = 0; i < d.torches.length; i++) {
+    const t = d.torches[i];
+    if (t === null || typeof t !== 'object') return false;
+  }
   return true;
 }
 

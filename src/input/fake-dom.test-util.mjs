@@ -266,6 +266,9 @@ export function createFakeEnv(opts) {
  * @param {number[]} [spec.axes]
  * @param {number[]} [spec.pressed]  indices of pressed buttons
  * @param {number} [spec.buttonCount]
+ * @param {string} [spec.mapping]  W3C mapping; `''` is what Chrome reports for any HID pad it
+ *   does not recognise (generic USB pads, arcade sticks, wheels), where no index means anything
+ * @param {number} [spec.index]
  * @returns {any}
  */
 export function fakePad(spec) {
@@ -274,7 +277,13 @@ export function fakePad(spec) {
   const pressed = new Set(s.pressed || []);
   const buttons = [];
   for (let i = 0; i < count; i++) buttons.push({ pressed: pressed.has(i), value: pressed.has(i) ? 1 : 0 });
-  return { connected: true, index: 0, mapping: 'standard', axes: s.axes || [0, 0, 0, 0], buttons };
+  return {
+    connected: true,
+    index: s.index === undefined ? 0 : s.index,
+    mapping: s.mapping === undefined ? 'standard' : s.mapping,
+    axes: s.axes || [0, 0, 0, 0],
+    buttons,
+  };
 }
 
 /**

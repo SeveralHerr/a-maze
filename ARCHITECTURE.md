@@ -42,8 +42,9 @@ tree is served locally (`npm run serve`) and uploaded to itch.io by CI.
   reached at level 15. `LEVEL.MAX_CELLS` in `balance.js` is the **single documented size knob** and
   the cap level is *derived* from it (`CAP_LEVEL`), never typed twice. Past the cap, levels get
   **harder, not bigger**: braid keeps rising (0→0.6 over 17 levels, square-root shaped, 0.6 from
-  level 18), the torch drains 2 % faster per level to a 1.35× ceiling, and oil thins from one flask
-  per 20 cells to one per 30. Levels run ~3.5 minutes at level 1 to ~13 minutes at the deepest.
+  level 18), the torch drains 1.5 % faster per level from `LEVEL.DRAIN_RAMP_START` (level 5, so the
+  ramp is felt inside the size curve) to a 1.35× ceiling, and oil thins from one flask per 20 cells
+  to one per 30. Levels run ~3.5 minutes at level 1 to ~13 minutes at the deepest.
 - **Torch economy _(a tank you keep refilling, not a budget)_:** `fuelMax` is a **tank** of
   110 s (level 1) → 150 s (the cap), **independent of maze area** — 64× the area buys 1.36× the
   tank. Oil flasks are the economy: their **count scales with area** so density is roughly constant
@@ -51,6 +52,9 @@ tree is served locally (`npm run serve`) and uploaded to itch.io by CI.
   tank** (clamped 25–60 s ⇒ 38–53 s in practice). A level takes **7–22 refuels** to cross and the
   player is never more than ~60–90 s from darkness, whatever the depth. Gems scale with area too
   (≈ one per 50–60 cells), still favouring dead ends, and remain the score currency.
+  A flask is only consumed when at least `FUEL.OIL_MIN_USEFUL_FRACTION` (0.5) of its value would
+  land in the tank — otherwise it stays on the floor — and the low-fuel alarm fires at
+  `FUEL.LOW_FRACTION` (0.25) of the tank.
   **Placement guarantee:** walking the solution path, the gap between consecutive *reachable* oil
   flasks (on the path or within `LEVEL.OIL_REACH_TILES` = 3 tiles of it) never exceeds
   `levelParams().oilTargetGap` — the path distance one flask pays for at a 2.0× wander factor with
@@ -250,13 +254,16 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
 - `types.js` — the typedefs above, plus named aliases for the inline shapes (`RunStats`,
   `BestScore`, `Derived`) and mirrors of `Action`, `RenderView` and `Flash`, because those cross
   module seams and `src/core` is the only module everyone may import. JSDoc only; `export {}`.
-- `loop.js` — `createLoop({ step:(dt)=>void, render:(alpha, frameDt)=>void, hz?:60, maxCatchUp?:5, vsyncSnapMs?:0.4, onError?, now?, raf?, caf?, doc? }) → { start(), stop(), running, suspended, hz, stepDt, stats():FrameStats, resetStats(), stepOnce(n?:number):number }`.
+- `loop.js` — `createLoop({ step:(dt)=>void, render:(alpha, frameDt)=>void, hz?:60, maxCatchUp?:5, vsyncSnapMs?:0.4, onError?, now?, raf?, caf?, doc?, setTimer?, clearTimer? }) → { start(), stop(), running, suspended, hz, stepDt, stats():FrameStats, resetStats(), stepOnce(n?:number):number }`.
   Fixed-timestep accumulator, clamps huge gaps (tab switch) to `maxCatchUp` steps and **discards**
   the overflow (no death spiral), auto-pauses when `document.hidden` and resumes without replaying
   the hidden time. `FrameStats = {fps, frameMsAvg, frameMsP99, stepMsAvg, renderMsAvg, droppedFrames, samples, skippedSteps}`
   over a rolling 120-frame window, **reused object**, zero allocations per frame.
-  `now/raf/caf/doc` are injectable so the loop is testable in Node; `doc: null` disables the
-  visibility pause. `vsyncSnapMs` snaps frame intervals within 0.4 ms of a whole step to that step,
+  `now/raf/caf/doc/setTimer/clearTimer` are injectable so the loop is testable in Node (`setTimer`/
+  `clearTimer` default to `setTimeout`/`clearTimeout`); `doc: null` disables the visibility pause.
+  A suspended loop does not trust `visibilitychange` alone: it **polls `document.hidden` every
+  250 ms** and also resumes on `pageshow` (back/forward cache restore) and window `focus`, so a
+  missed event can never freeze the game until a reload. `vsyncSnapMs` snaps frame intervals within 0.4 ms of a whole step to that step,
   which removes 1-step/2-step stutter on a display running at the sim rate.
 - `events.js` — `createEmitter({onError?}) → { on(type, fn):()=>void, once, off, emit, clear, count }`.
   Duplicate `(type, fn)` registration is idempotent; a throwing listener is caught and reported and
@@ -333,7 +340,10 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   Also `gemScore`, `levelBonus`, `oilFuel`, `coerceSetting`, `defaultSettings`, `sanitizeSettings`,
   `sanitizeBest`, `MAP_MODES`, and the new derived helpers `CAP_LEVEL`, `tankSeconds(level)`,
   `drainRate(level)`, `travelTiles(seconds, drain)`, `estimatedPathTiles(level)` and
-  `resolveTank(level, offered)`. Frozen tables `PLAYER / BUMP / BOB / WORLD / SIM / FUEL / SCORE /
+  `resolveTank(level, offered)`. `FUEL.LOW_FRACTION` (0.25) is the `lowFuel` threshold;
+  `FUEL.OIL_MIN_USEFUL_FRACTION` (0.5) is how much of a flask must be usable before the sim consumes
+  it (the same rule `feasibility.test.mjs` models); `LEVEL.DRAIN_RAMP_START` (5) is the last level
+  that burns at 1× before `drainRate` climbs by `FUEL.DRAIN_PER_LEVEL`. Frozen tables `PLAYER / BUMP / BOB / WORLD / SIM / FUEL / SCORE /
   ATTRACT / LEVEL`. Removed with the old economy (nothing referenced them): `FUEL.BASE_SECONDS`,
   `PER_CELL_START/END`, `DECAY_LEVELS`, `PER_PATH_TILE_START/END`, `PAR_FRACTION`,
   `LEVEL.GEM_PER_DEAD_END`, `LEVEL.OIL_PER_DEAD_END`.
@@ -563,7 +573,8 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   digit width) for titles and a clean 5×7 HUD face in an 8-row cell (one descender row) — both
   covering 0x20…0x7E plus `© × … ·`. `drawText(ctx, text, x, y, {font, size, color, shadow, align,
   baseline, tracking, lineHeight, alpha})`, `drawTextBlock`, `measureLine`, `measureText`,
-  `wrapText`, `fontMetrics`, `lineHeight`, `textHeight`, plus `COLOR` and `FONT_STYLES`.
+  `wrapText`, `fontMetrics`, `lineHeight`, `textHeight`, `catchesLight(glyph, x, y)` (the rim-light
+  rule for the gothic face, exported for its test), plus `COLOR` and `FONT_STYLES`.
   **`size` is an integer pixel scale** (1 = one font pixel per surface pixel), not a point size;
   `measureText` returns `{width, height, lines}`. Glyphs are blitted from per-(face,style) atlases
   built on first use. The overlay canvas is sized at the renderer's internal resolution ×2, so
@@ -578,12 +589,16 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
 - `map.js` — the **three-state map** (the massive-maze replacement for the minimap). Exports `MAP`,
   `MAP_MODES`, `MAP_MODE_LABEL`, `MapMode`, `normalizeMapMode`, `nextMapMode`, `mapModeFromSettings`,
   `readMapMode`, `setMapMode`, `cycleMapMode`, `resetMapMode`, `createMapView`, `paintTiles`,
-  `countExplored`, `chooseFullScale`, `cornerWindow`.
+  `countExplored`, `chooseFullScale(cols, rows, boxW, boxH, out?)`, `fitBeats(a, b)`, `cornerWindow`.
   - **OFF → CORNER → FULL**, cycled by the existing `map` action. CORNER is a 25-tile (19 on a phone)
     window centred on the player, zoomed 2–6×. FULL is a full-screen labyrinth map: header
     (`DEPTH n · 128×128`, `MAPPED %`), the fitted map, and a legend (gems n/total, OIL, EXIT,
     distance to the exit once seen). The fuel gauge stays on screen in FULL, so the torch keeps
-    burning while you read it.
+    burning while you read it. The view's internal `drawFull(ctx, m, state, clock, reduced,
+    gaugeRight?, gaugeBottom?)` lays the page out two ways — **strips** (header above, legend below)
+    and, on a wide screen, **rails** (header and legend in the side gutters, the map gets the whole
+    height) — fits both with `chooseFullScale` (the optional `out` fills a reused fit, so comparing
+    them allocates nothing) and keeps whichever draws bigger by `fitBeats`; a tie goes to the rails.
   - **Resolution _(deviation from "one pixel per cell", deliberate and measured)_:** cell resolution
     loses the walls entirely — they are thinner than a pixel. `chooseFullScale()` takes **tile**
     resolution whenever a whole pixel per tile fits and falls back to cell resolution otherwise, and
@@ -615,7 +630,9 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
 - `hud.js` — `createHud(overlayCanvas, {map?:'off'|'corner'|'full', minimap?:boolean|MapMode}) → { render(state, frameStats?, alpha?), resize(cssW, cssH, dpr?), surface, pop(value, kind?), cycleMap(settings?), mapMode(settings?), mapStats(), reset(), dispose() }`
   (`minimap: true` still means `'corner'`, so an older call site keeps working):
   fuel gauge, score with rolling counter + pop-up deltas, gem count, depth, level timer, compass
-  needle toward the exit **plus a distance-to-exit readout in tiles**, the map (via `map.js`), FPS in
+  needle toward the exit **plus a distance-to-exit readout in tiles** — both free on depths 1–2 and
+  from depth 3 earned at `compassGems(gemsTotal)` = `min(8, ceil(15 % of gemsTotal))` gems, an
+  absolute count so the instrument stays reachable at the cap (exported and pinned by a test), the map (via `map.js`), FPS in
   `?debug=1`. `cycleMap` advances OFF → CORNER → FULL and returns the new mode; `mapMode` reports the
   one in force; `mapStats()` returns a reused
   `{updateMs, drawMs, painted, scanned, flushes, explored, tiles, rebuilds}` (**stale while the mode
@@ -638,12 +655,16 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   the HUD renders per frame while events are per dispatch, so events would be missed on a
   double-step frame and replayed on a double-render one. main.js must therefore **not** also pop
   on `pickup` events.
-- `menus.js` — `createMenus(overlayCanvas, callbacks:{onNewGame, onResume, onQuit, onNextLevel, onSetting, onUiSound}) → { render(state), handleInput(frame:InputFrame, state):boolean, handlePointer(ev):boolean, resize(cssW, cssH, dpr?), surface, screen(), dispose() }`:
-  title (logo "A-MAZE" in gold gothic lettering + "Descend", "Options", "Credits"),
-  pause, options (volume, music, sensitivity, scanlines, **Map** — a three-state `choice` row, not a
+- `menus.js` — `createMenus(overlayCanvas, callbacks:{onNewGame, onResume, onQuit, onNextLevel, onSetting, onUiSound, controls?}) → { render(state), handleInput(frame:InputFrame, state):boolean, handlePointer(ev):boolean, resize(cssW, cssH, dpr?), surface, screen(), dispose() }`:
+  title (logo "A-MAZE" in gold gothic lettering + "Descend", "Options", "Controls", "Credits"),
+  pause (which also gains a "Controls" row), a **Controls** sub-screen, options (volume, music, sensitivity, scanlines, **Map** — a three-state `choice` row, not a
   toggle — reduced motion, invert look), loading, level complete (staggered tally: gems, fuel bonus,
   depth bonus, total), game over (score, best, "Try again").
   Keyboard/gamepad navigable **and** mouse/touch clickable.
+  `controls` is the `ControlHint[]` the Controls screen lists; main.js passes `CONTROL_HINTS` from
+  `src/input/bindings.js` (the owner of the bindings — `src/ui` may not import `src/input`), and
+  menus.js spells the arrow glyphs out as words for the bitmap font. Omitted (a harness), a mirrored
+  fallback table is shown.
   Massive-maze additions: a new `MenuItem` kind **`'choice'`** (fields `values`, `labelOf`, `read`,
   `write`; `write` is handed the settings writer rather than calling `onSetting` itself, so one row
   can shadow both `mapMode` and the legacy `minimap`); the **loading screen** names what is being
@@ -672,16 +693,22 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
 - `format.js` — also gained `formatLabyrinth(cols, rows)` (`128×128` with a real multiplication
   sign), `formatLevelBanner(level, cols, rows)` and `formatUnits(n, unit)`; `formatDistance` now
   groups thousands (`1,240m`), because a walk across a 128-cell maze runs to four figures.
+  `createTextMemo(build)` returns an allocation-free memo keyed on up to three quantised numbers, so
+  the HUD re-formats a readout only when its text would change. The rolling score counter is a
+  **fixed-length ease-out** (`ROLL.DURATION` 0.55 s whatever the gap, never slower than
+  `ROLL.MIN_RATE` units/s).
 - **Mirrored constants:** `src/ui` may not import `src/state`, so `menus.js` mirrors the §1 score
   formulas, the slider ranges of `SETTING_SPEC`, and now **`LEVEL_RULES`** (`BASE_CELLS` 16,
-  `GROWTH` 8, `MAX_CELLS` 128, for the loading banner only); `hud.js` mirrors `FUEL.LOW_FRACTION`;
+  `GROWTH` 8, `MAX_CELLS` 128, for the loading banner only); `hud.js` (`LOW_FUEL_FRACTION`) and `audio.js`
+  (`AUDIO.HEART.lowFraction`) both mirror `FUEL.LOW_FRACTION`;
   `map.js` mirrors `WORLD.REVEAL_RADIUS`. All of them cross-check against state the sim computed
   (the tally is derived from `run.levelScore`, every other size reading uses the real
   `maze.cols`/`maze.rows`), so a drift shows up as a wrong split or a wrong loading banner, never as
   a wrong total — but they must be updated together with `balance.js`.
-  `FUEL.LOW_FRACTION` is deliberately still 0.2: on the new tank that is a 22 s (level 1) to 30 s
-  (cap) warning ≈ 70–96 tiles of walking, comfortably more than one `oilTargetGap`. Lengthening the
-  alarm means changing it **in both files together**.
+  `FUEL.LOW_FRACTION` is **0.25**: on the tank that is a 27.5 s (level 1) to 37.5 s (cap) warning,
+  comfortably more than one `oilTargetGap`, so the sim's `lowFuel` event, the red gauge and the
+  heartbeat ramp all start at the same quarter-tank mark. Retuning it means changing `balance.js`,
+  `hud.js` and `audio.js` **together**.
 - `styles.css` lives at `/styles.css` (integrator) — layout, pixelated scaling, safe areas.
 
 ### 4.7 `src/main.js` (Integrator)
@@ -712,7 +739,14 @@ the last fifth.
 `state.events` is cleared at the top of every dispatch (§4.2). It hands the whole array to
 `audio.handle`, bursts particles and sets the world flash on `pickup`, sets the page flash on
 `levelComplete`/`gameOver`, starts the level build and releases pointer lock on `phase`, and
-persists on `gameOver`/`levelComplete`/`setSetting`.
+persists immediately on `gameOver`/`levelComplete`. `setSetting` saves are **debounced**: a change
+only marks the settings dirty and `step()` flushes at most once every 0.5 s of sim time, so a slider
+drag or the map hotkey's two dispatches become one storage write.
+
+**Teardown:** `pagehide` with `persisted === true` (bfcache) only writes a pending setting — the loop
+suspends itself and resumes on `pageshow` (§4.1). A real `pagehide` runs `shutdown()` once: persist
+now, stop the loop, remove every listener main.js registered, and dispose the maze client, input,
+audio, raycaster, post, HUD and menus, each guarded so one throwing teardown cannot stop the rest.
 
 **Level requests:** every build carries a token; an answer whose token is stale, or that arrives in
 another phase, is dropped. A genuine build failure retries twice with a reseeded maze before the
@@ -759,7 +793,7 @@ during boot on purpose, so the failure screen — the one path playing the game 
 looked at.
 
 ## 5. Quality gates (automated)
-- `npm test` — every `src/*/*.test.mjs` (node:test) in its own process (**523 tests in 35 files**).
+- `npm test` — every `src/*/*.test.mjs` (node:test) in its own process (**578 tests in 35 files**).
   Two of those files, `src/state/perf.test.mjs` and `src/state/feasibility.test.mjs`, import
   `src/maze` as a **test-only** dependency: the §2 runtime rule is unchanged (`src/state` still
   imports only `src/maze/constants.js` at runtime), but a feasibility proof over fake mazes would
@@ -791,7 +825,13 @@ looked at.
   soak with a forced GC either side, no page overflow on desktop or mobile — plus the massive-maze
   gates: the descent reaching level 15 at **128 cells per side with ≥ 600 items**, the longest
   animation-frame gap across that level's generation *and* installation **< 50 ms**, the 60 s
-  cap-level soak holding fps/render/heap to the same budgets while the autopilot actually walks it,
+  cap-level soak holding fps/render/heap to the same budgets while the autopilot actually walks it
+  (and discarding **≤ 5** sim steps — `skippedSteps` — so a single process stall passes but a
+  death spiral cannot),
+  a **4× CPU-throttled cap-level phase** (CDP `Emulation.setCPUThrottlingRate`, 10 s, preceded by a
+  3 s unthrottled control sample printed beside every failure so a loaded host is distinguishable
+  from a regression) gated at fps ≥ 50, render avg ≤ 12 ms, longest frame gap ≤ 100 ms and
+  ≤ 5 discarded steps,
   and the **torch refilling at least twice** with a positive fuel gain (a torch that never refills
   is a countdown, not an economy).
   The wall-clock budgets for clearing a level are 400 s / 500 s: level 1 is now a ~290-tile maze
@@ -811,7 +851,7 @@ looked at.
   128×128 cells (257×257 tiles, 16 384 cells) at level 15; stress tests go to 2000×2000.
   `LEVEL.MAX_CELLS` is the single knob and `CAP_LEVEL` is derived from
   `BASE_CELLS`/`GROWTH`/`MAX_CELLS`. Past the cap the maze stops growing and difficulty comes from
-  braid (which keeps rising to 0.6), a drain rising 2 %/level to 1.35×, thinning oil and the score
+  braid (which keeps rising to 0.6), a drain rising 1.5 %/level from level 5 to 1.35×, thinning oil and the score
   multiplier — not from area. Size is purely a balance decision: generating **and** validating
   128×128 costs ~5 ms and a full `buildLevel` ~12–14 ms.
   _Measured caveat that shaped the braid ramp:_ the "~13 tiles per cell-side" path law only holds

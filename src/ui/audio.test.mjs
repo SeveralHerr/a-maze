@@ -1109,3 +1109,373 @@ test('stats() returns a reused object with live counters', () => {
   assert.equal(b.state, 'running');
   assert.equal(typeof b.time, 'number');
 });
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// One sound per action (the unpause flam)
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/** Square oscillators started in the given op slice — one confirm figure is exactly two. */
+function squareBlips(ctx, from) {
+  const ids = new Set(
+    ctx
+      .opsSince(from)
+      .filter((o) => o.node.kind === 'osc')
+      .map((o) => o.node.id),
+  );
+  return ctx.nodes.filter((n) => ids.has(n.id) && n.type === 'square').length;
+}
+
+test('unpausing from the menu plays the confirm blip exactly once', () => {
+  // The real path: menus.js -> main.js -> playUi('confirm'), and the same key press dispatches
+  // `resume`, whose phase event arrives here a moment later.
+  const { ctx, audio } = makeAudio();
+  audio.unlock();
+  const state = makeState();
+  const mark = ctx.ops.length;
+  audio.playUi('confirm');
+  audio.handle([{ type: 'phase', from: 'paused', to: 'playing' }], state);
+  assert.equal(squareBlips(ctx, mark), 2, 'one confirm figure is two square oscillators, not four');
+});
+
+test('a uiConfirm event in the same batch as the phase change also blips once', () => {
+  const { ctx, audio } = makeAudio();
+  audio.unlock();
+  const state = makeState();
+
+  const mark = ctx.ops.length;
+  audio.handle([{ type: 'uiConfirm' }, { type: 'phase', from: 'paused', to: 'playing' }], state);
+  assert.equal(squareBlips(ctx, mark), 2, 'uiConfirm before the phase event');
+
+  // …and in the other order, because nothing guarantees the reducer's emission order.
+  ctx.advance(AUDIO.UI_ECHO + 0.1);
+  const mark2 = ctx.ops.length;
+  audio.handle([{ type: 'phase', from: 'paused', to: 'playing' }, { type: 'uiConfirm' }], state);
+  assert.equal(squareBlips(ctx, mark2), 2, 'phase event before uiConfirm');
+});
+
+test('a programmatic resume with no menu blip still gets its confirm', () => {
+  const { ctx, audio } = makeAudio();
+  audio.unlock();
+  const mark = ctx.ops.length;
+  audio.handle([{ type: 'phase', from: 'paused', to: 'playing' }], makeState());
+  assert.equal(squareBlips(ctx, mark), 2, 'a bare resume is still audible');
+});
+
+test('pausing from a menu does not double the back blip either', () => {
+  const { ctx, audio } = makeAudio();
+  audio.unlock();
+  const state = makeState();
+  const mark = ctx.ops.length;
+  audio.playUi('back');
+  audio.handle([{ type: 'phase', from: 'playing', to: 'paused' }], state);
+  assert.equal(squareBlips(ctx, mark), 1, 'the back blip is one square oscillator');
+
+  // A pause the player did not press a menu key for (pointer-lock loss, lost focus) still speaks.
+  ctx.advance(AUDIO.UI_ECHO + 0.1);
+  const mark2 = ctx.ops.length;
+  audio.handle([{ type: 'phase', from: 'playing', to: 'paused' }], state);
+  assert.equal(squareBlips(ctx, mark2), 1);
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// Event coverage
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+test('every GameEvent type in the contract is audible', () => {
+  // The ten shapes of ARCHITECTURE.md §3's GameEvent union. A new type added to core/types.js
+  // without a case here would otherwise go silently inaudible.
+  const union = [
+    { type: 'footstep', foot: 0 },
+    { type: 'bump', strength: 0.7 },
+    { type: 'pickup', kind: 'gem', x: 1, y: 1, value: 100 },
+    { type: 'levelStart', level: 3 },
+    { type: 'levelComplete', level: 3, bonus: 900 },
+    { type: 'lowFuel' },
+    { type: 'gameOver', score: 1200, newBest: false },
+    { type: 'phase', from: 'playing', to: 'paused' },
+    { type: 'uiMove' },
+    { type: 'uiConfirm' },
+  ];
+  assert.equal(union.length, 10, 'the union has ten members');
+  for (const ev of union) {
+    const { ctx, audio } = makeAudio();
+    audio.unlock();
+    const before = ctx.nodes.length;
+    audio.handle([ev], makeState());
+    assert.ok(
+      ctx.nodes.length > before,
+      `'${ev.type}' scheduled nothing at all — it is inaudible in the shipped game`,
+    );
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// Voice stealing policy
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+test('a short sound never evicts a longer one at the same priority', () => {
+  const { audio } = makeAudio({ maxVoices: 4 });
+  audio.unlock();
+  const state = makeState();
+  // Three long CUE voices (the oil whoosh) plus the bump's own first voice fill the pool.
+  audio.handle([{ type: 'pickup', kind: 'oil', x: 1, y: 1, value: 12 }], state);
+  const before = { stolen: audio.stats().stolen, dropped: audio.stats().dropped };
+  // A bump is the same priority but much shorter: its second voice must be dropped, not granted
+  // by chopping half a second off something still ringing.
+  audio.handle([{ type: 'bump', strength: 1 }], state);
+  const after = audio.stats();
+  assert.equal(after.stolen, before.stolen, 'nothing was stolen for a shorter sound');
+  assert.ok(after.dropped > before.dropped, 'the shorter sound was dropped instead');
+});
+
+test('torch crackles never steal a voice, they are dropped', () => {
+  const { ctx, audio } = makeAudio({ maxVoices: 4 });
+  audio.unlock();
+  // Four bell voices (PRI.STING, 1.5 s+) fill the pool.
+  audio.handle([{ type: 'levelStart', level: 1 }], makeState());
+  assert.equal(audio.stats().voices, 4, 'the pool is full of stings');
+  const state = makeState({ run: { ...makeState().run, fuel: 100 } });
+  const before = audio.stats().dropped;
+  for (let i = 0; i < 10; i++) {
+    audio.update(state); // asks for crackles (PRI.AMBIENT) and plucks (PRI.MUSIC)
+    ctx.advance(0.05);
+  }
+  const s = audio.stats();
+  assert.equal(s.stolen, 0, 'ambience must never truncate a sting');
+  assert.ok(s.dropped > before, 'the ambient requests were dropped instead');
+});
+
+test('a stolen voice is faded out over a few milliseconds, not cut dead', () => {
+  const { ctx, audio } = makeAudio({ maxVoices: 4 });
+  audio.unlock();
+  const state = makeState();
+  // Fill the pool with CUE voices, then let a STING (higher priority) take one.
+  audio.handle([{ type: 'pickup', kind: 'oil', x: 1, y: 1, value: 12 }], state);
+  audio.handle([{ type: 'bump', strength: 1 }], state);
+  const mark = ctx.ops.length;
+  const t0 = ctx.currentTime;
+  audio.handle([{ type: 'levelStart', level: 1 }], state);
+  assert.ok(audio.stats().stolen > 0, 'the sting actually stole');
+
+  const fades = ctx.opsSince(mark).filter((o) => o.method === 'exp' && o.value === 1e-4);
+  assert.ok(fades.length > 0, 'the stolen voice was ramped to silence');
+  assert.ok(fades[0].time > t0 && fades[0].time <= t0 + 0.05, 'and the ramp is short');
+
+  // Nothing was stopped at the current instant, which is what the hard cut used to do.
+  const cut = ctx.nodes.filter((n) => n.stopped === t0 && n.started >= 0);
+  assert.equal(cut.length, 0, 'no source was stopped with no fade at all');
+});
+
+test('the tails of stolen voices are disconnected by the reap, never left connected', () => {
+  const { ctx, audio } = makeAudio({ maxVoices: 4 });
+  audio.unlock();
+  const state = makeState({ phase: 'title' });
+  for (let i = 0; i < 12; i++) {
+    audio.handle([{ type: 'bump', strength: 1 }], state);
+  }
+  assert.ok(audio.stats().stolen > 0);
+  ctx.currentTime += 5;
+  for (const n of ctx.nodes) n.onended = null; // the suspended-context case: no ended callbacks
+  audio.update(state);
+  assert.equal(audio.stats().voices, 0);
+  // Every source that was given a stop time belonged to a voice (the always-on portal/torch/drone
+  // generators never get one) and must have been disconnected with it.
+  const live = ctx.nodes.filter(
+    (n) => n instanceof FakeSource && n.started >= 0 && n.stopped < Infinity && n.disconnects === 0,
+  );
+  assert.equal(live.length, 0, `${live.length} stolen sources stayed connected`);
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// Tuning: the sustained lows, and depth
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+test('the portal fundamental is locked to the drone and the drone fifth is exactly 3:2', () => {
+  const { ctx, audio } = makeAudio();
+  audio.unlock();
+  const freqs = ctx.ops
+    .filter((o) => o.param === 'frequency' && o.node.kind === 'osc')
+    .map((o) => o.value);
+  const root = AUDIO.MUSIC.droneHz;
+  const has = (hz) => freqs.some((f) => Math.abs(f - hz) < 1e-6);
+  assert.ok(has(root), 'the drone root');
+  assert.ok(has(root * 1.5), 'a pure 3:2 fifth, not the equal-tempered 1.498307');
+  assert.ok(!has(root * 1.4983), 'the equal-tempered fifth is gone');
+  assert.ok(has(root * 2), 'the portal fundamental is an octave above the drone');
+  // Nothing sustained sits a few Hz from the drone, which is what produced the low-end mud. The
+  // one exception is the drone's own 0.4 % detuned twin, which is the slow shimmer it is made of.
+  for (const f of freqs) {
+    const gap = Math.abs(f - root);
+    assert.ok(
+      gap < root * 0.01 || gap > 12,
+      `a sustained ${f} Hz throbs against the ${root} Hz drone`,
+    );
+  }
+});
+
+test('the ambience is keyed to the depth: different levels, different notes', () => {
+  /** @returns {number[]} pluck fundamentals over `seconds` on the title screen */
+  function plucks(level, seconds) {
+    const { ctx, audio } = makeAudio({ seed: 99 });
+    audio.unlock();
+    const state = makeState({ phase: 'title', level });
+    const mark = ctx.ops.length;
+    const frames = Math.round(seconds / 0.05);
+    for (let i = 0; i < frames; i++) {
+      audio.update(state);
+      ctx.advance(0.05);
+    }
+    return ctx
+      .opsSince(mark)
+      .filter((o) => o.param === 'frequency' && o.node.kind === 'osc' && o.method === 'set')
+      .map((o) => o.value);
+  }
+
+  const l1 = plucks(1, 120);
+  const l2 = plucks(2, 120);
+  assert.ok(l1.length > 4 && l2.length > 4, 'both levels made music');
+  assert.notDeepEqual(l1, l2, 'level 2 must not replay level 1 note for note');
+  const ratio = Math.pow(2, -2 / 12); // MUSIC_KEYS[1]
+  for (let i = 0; i < Math.min(l1.length, l2.length); i++) {
+    assert.ok(
+      Math.abs(l2[i] / l1[i] - ratio) < 1e-6,
+      `pluck ${i} is not transposed by the level key (${l1[i]} -> ${l2[i]})`,
+    );
+  }
+
+  // …and the deepest levels are denser, because they take three times as long to walk.
+  const deep = plucks(AUDIO.MUSIC.depthSpan, 300);
+  const shallow = plucks(1, 300);
+  assert.ok(
+    deep.length > shallow.length,
+    `depth should thicken the line (${shallow.length} -> ${deep.length} notes in 300 s)`,
+  );
+});
+
+test('the descent bell states the level key, so level 1 and level 15 differ', () => {
+  /** @returns {number[]} bell fundamentals for one levelStart */
+  function bell(level) {
+    const { ctx, audio } = makeAudio();
+    audio.unlock();
+    const mark = ctx.ops.length;
+    audio.handle([{ type: 'levelStart', level }], makeState({ level }));
+    return ctx
+      .opsSince(mark)
+      .filter((o) => o.param === 'frequency' && o.node.kind === 'osc' && o.method === 'set')
+      .map((o) => o.value);
+  }
+  const first = bell(1);
+  const deep = bell(15);
+  assert.ok(first.length >= 4 && deep.length >= 4);
+  assert.notDeepEqual(first, deep, 'the same bell on the first and the deepest level');
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// Positional pickups and the record run
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+test('a pickup is panned toward where the item actually was', () => {
+  const { ctx, audio } = makeAudio();
+  audio.unlock();
+  const state = makeState();
+  state.player.x = 5;
+  state.player.y = 5;
+  state.player.angle = 0; // facing +x (east)
+
+  /** @returns {number} the pan written for a gem at (x, y) */
+  function panFor(x, y) {
+    const mark = ctx.ops.length;
+    audio.handle([{ type: 'pickup', kind: 'gem', x, y, value: 100 }], state);
+    ctx.advance(AUDIO.COMBO_WINDOW + 0.5); // let the combo lapse between measurements
+    const ops = ctx.opsSince(mark).filter((o) => o.param === 'pan');
+    assert.ok(ops.length > 0, 'a panner was inserted for an off-centre pickup');
+    return ops[0].value;
+  }
+
+  assert.ok(panFor(5, 4) < -0.4, 'a gem to the north is on your left when facing east');
+  assert.ok(panFor(5, 6) > 0.4, 'a gem to the south is on your right');
+
+  // Dead ahead needs no panner at all — the cheap path stays cheap.
+  const mark = ctx.ops.length;
+  audio.handle([{ type: 'pickup', kind: 'gem', x: 9, y: 5, value: 100 }], state);
+  assert.equal(
+    ctx.opsSince(mark).filter((o) => o.param === 'pan').length,
+    0,
+    'a centred pickup allocates no panner',
+  );
+});
+
+test('beating your own record sounds different from a bad run', () => {
+  function gameOver(newBest) {
+    const { ctx, audio } = makeAudio();
+    audio.unlock();
+    const mark = ctx.ops.length;
+    audio.handle([{ type: 'gameOver', score: 5000, newBest }], makeState());
+    return ctx
+      .opsSince(mark)
+      .filter((o) => o.param === 'frequency' && o.node.kind === 'osc' && o.method === 'set')
+      .map((o) => o.value);
+  }
+  const plain = gameOver(false);
+  const record = gameOver(true);
+  assert.ok(record.length > plain.length, 'a record run adds the payoff chord');
+  assert.ok(
+    record.some((f) => Math.abs(f - 523.25) < 1e-6),
+    'the rising triad is there',
+  );
+  assert.ok(
+    !plain.some((f) => Math.abs(f - 523.25) < 1e-6),
+    'a losing run must not get it',
+  );
+});
+
+test('the heartbeat urgency curve is measured against the mirrored low-fuel fraction', () => {
+  // AUDIO.HEART.lowFraction mirrors balance.js FUEL.LOW_FRACTION; if it is ever edited on its own
+  // the beat reaches maximum urgency at the wrong tank level.
+  assert.equal(AUDIO.HEART.lowFraction, 0.25);
+  const { ctx, audio } = makeAudio();
+  audio.unlock();
+  const state = makeState();
+  state.derived.lowFuel = true;
+  // Exactly at the threshold the beat must be at its slowest; half the threshold is measurably
+  // faster, which is the escalation the cue exists for.
+  state.run.fuel = state.run.fuelMax * AUDIO.HEART.lowFraction;
+  const atThreshold = countBeats(ctx, audio, state, 8);
+  state.run.fuel = state.run.fuelMax * AUDIO.HEART.lowFraction * 0.5;
+  const halfway = countBeats(ctx, audio, state, 8);
+  assert.ok(atThreshold > 0, 'the beat starts at the threshold');
+  assert.ok(halfway > atThreshold, `the curve escalates (${atThreshold} -> ${halfway})`);
+});
+
+test('the widest cues fit a voice: no node is ever dropped past MAX_NODES', async () => {
+  // `own()` logs instead of silently leaking when a cue needs more nodes than a voice can hold.
+  // Drive every cue with every optional node switched on (pan + send + partial) and assert the
+  // guard never fired, so adding a node to a cue fails here rather than leaking in the browser.
+  const { errors, clearErrors } = await import('../core/log.js');
+  clearErrors();
+  const { ctx, audio } = makeAudio();
+  audio.unlock();
+  const state = makeState({ derived: { exitDist: 2, nearExit: 1, lowFuel: true } });
+  state.run.fuel = 5;
+  const all = [
+    { type: 'footstep', foot: 1 },
+    { type: 'bump', strength: 1 },
+    { type: 'pickup', kind: 'gem', x: 1.5, y: 0.5, value: 100 },
+    { type: 'pickup', kind: 'oil', x: 1.5, y: 2.5, value: 12 },
+    { type: 'lowFuel' },
+    { type: 'levelStart', level: 7 },
+    { type: 'levelComplete', level: 7, bonus: 900 },
+    { type: 'gameOver', score: 9000, newBest: true },
+    { type: 'phase', from: 'playing', to: 'paused' },
+    { type: 'uiMove' },
+    { type: 'uiConfirm' },
+  ];
+  for (let i = 0; i < 20; i++) {
+    audio.handle(all, state);
+    audio.update(state);
+    ctx.advance(0.1);
+  }
+  const overflow = errors.filter((e) => JSON.stringify(e).includes('overflow'));
+  assert.equal(overflow.length, 0, 'a cue asked for more nodes than MAX_NODES');
+  assert.equal(audio.stats().failures, 0);
+});

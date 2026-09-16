@@ -337,14 +337,45 @@ test('phase machine: malformed levelReady payloads are dropped, not installed', 
     { maze: { ...mazeFrom(CORRIDOR), start: { x: NaN, y: 1 } }, items: [], torches: [] },
     { maze: { ...mazeFrom(CORRIDOR), exit: { x: 99, y: 1 } }, items: [], torches: [] },
     { maze: { ...mazeFrom(CORRIDOR), exit: { x: '3', y: 1 } }, items: [], torches: [] },
+    // An array of the wrong THINGS, not just the wrong type. `buildItemGrid` dereferences
+    // `items[i].x` and the install loop writes `items[i].taken`, so each of these used to throw
+    // out of the reducer *after* levelData/explored had already been swapped — leaving the state
+    // half-installed with the malformed payload live as the loading-screen backdrop.
+    { maze: mazeFrom(CORRIDOR), items: [null], torches: [] },
+    { maze: mazeFrom(CORRIDOR), items: [5], torches: [] },
+    { maze: mazeFrom(CORRIDOR), items: ['gem'], torches: [] },
+    { maze: mazeFrom(CORRIDOR), items: [{ kind: 'oil', x: NaN, y: NaN }], torches: [] },
+    { maze: mazeFrom(CORRIDOR), items: [{ kind: 'gem', x: 1.5, y: Infinity }], torches: [] },
+    // No kind at all: `takeItem` used to treat anything that was not a gem as a flask.
+    { maze: mazeFrom(CORRIDOR), items: [{ x: 1.5, y: 1.5 }], torches: [] },
+    { maze: mazeFrom(CORRIDOR), items: [{ kind: 'bomb', x: 1.5, y: 1.5 }], torches: [] },
+    { maze: mazeFrom(CORRIDOR), items: [], torches: [null] },
   ];
   for (const data of bad) {
     const s = createInitialState();
     reducer(s, { type: 'newGame', seed: 1 });
-    reducer(s, { type: 'levelReady', data });
+    // The contract is that the reducer is TOTAL: it must not throw, whatever it is handed.
+    assert.doesNotThrow(() => reducer(s, { type: 'levelReady', data }));
     assert.equal(s.phase, 'loading', `payload ${JSON.stringify(data)} must be ignored`);
-    assert.equal(s.levelData, null);
+    assert.equal(s.levelData, null, 'and nothing may be half-installed');
+    assert.equal(s.explored, null);
+    assert.equal(s.run.fuelMax, 0);
   }
+});
+
+test('phase machine: a malformed levelReady never disturbs an installed level', () => {
+  // The other half of totality: a bad payload arriving in `title` (the attract camera's demo maze)
+  // must leave whatever is already installed exactly as it was.
+  const s = createInitialState();
+  reducer(s, { type: 'levelReady', data: level([item(1, 'gem', 2.5, 1.5)]) });
+  const installed = s.levelData;
+  const explored = s.explored;
+  assert.notEqual(installed, null);
+  assert.doesNotThrow(() =>
+    reducer(s, { type: 'levelReady', data: { maze: mazeFrom(CORRIDOR), items: [null], torches: [] } }),
+  );
+  assert.equal(s.levelData, installed, 'the good level is still installed');
+  assert.equal(s.explored, explored, 'and its explored buffer was not swapped');
 });
 
 test('phase machine: newGame resets the run and re-arms the record check', () => {
@@ -505,6 +536,57 @@ test('pickups: a flask is left on the floor when the tank is already full', () =
   const events = collect(s, 2);
   assert.equal(count(events, 'pickup'), 1);
   assert.ok(s.run.fuel > 40);
+});
+
+test('pickups: a near-full tank leaves the flask on the floor, it does not squander it', () => {
+  // The economy's central number. A flask is 35 % of the tank (38–53 s in practice), so consuming
+  // one for a 1 s top-up destroys ~97 % of it — and the player cannot read the gauge finely enough
+  // to avoid that deliberately. The threshold is half a flask, which is the rule
+  // `feasibility.test.mjs` proves the whole massive-maze balance against.
+  const flask = oilFuel(100);
+  const s = started(level([item(1, 'oil', 1.5, 1.5)], 100));
+  s.run.fuel = s.run.fuelMax * 0.9; // 10 s of headroom against a ~35 s flask
+  ticks(s, 1);
+  assert.equal(countEvents(s, 'pickup'), 0, 'a 90 % tank does not swallow a flask for a sip');
+  assert.equal(/** @type {any} */ (s.levelData).items[0].taken, false, 'still on the floor');
+  assert.equal(s.run.refuels, 0);
+
+  // Just under half a flask of headroom: still not worth it.
+  s.run.fuel = s.run.fuelMax - flask * 0.5 + 0.5;
+  ticks(s, 1);
+  assert.equal(countEvents(s, 'pickup'), 0, 'just under half a flask of room is still a waste');
+
+  // Comfortably over half a flask of headroom: now it is taken, and at full face value.
+  s.run.fuel = s.run.fuelMax - flask;
+  const before = s.run.fuel;
+  const events = collect(s, 2);
+  assert.equal(count(events, 'pickup'), 1, 'a real deficit takes the flask');
+  assert.ok(
+    s.run.fuel - before > flask * FUEL.OIL_MIN_USEFUL_FRACTION,
+    `gained ${(s.run.fuel - before).toFixed(1)} s of a ${flask.toFixed(1)} s flask`,
+  );
+});
+
+test('pickups: an item with non-finite coordinates is never collected', () => {
+  // `bucketOf` files a NaN-positioned item into bucket 0 — tiles 0…3 × 0…3, which is exactly where
+  // the player spawns — and `NaN > pickupRadius²` is false, so the old "skip if outside" test
+  // handed out a free refuel on the first frame of the level. Regression for sim.js collectAround.
+  const s = started(level([item(1, 'gem', 2.5, 1.5)], 100));
+  const items = /** @type {any[]} */ (/** @type {any} */ (s.levelData).items);
+  items.push({ id: 2, kind: 'oil', x: NaN, y: NaN, taken: false });
+  items.push({ id: 3, kind: 'gem', x: Infinity, y: 1.5, taken: false });
+  // The reducer would now reject this payload outright (isLevelData validates elements), so the
+  // grid is invalidated directly to reproduce the *sim-side* failure the guard comment claims is
+  // impossible: a malformed item must cost one wasted comparison per step, nothing more.
+  /** @type {any} */ (s).sim.gridFor = null;
+  s.run.fuel = 10;
+  const score = s.run.score;
+  ticks(s, 60);
+  assert.ok(s.run.fuel < 10, 'the torch burned down; nothing refilled it');
+  assert.equal(s.run.refuels, 0, 'the NaN flask was not consumed');
+  assert.equal(s.run.score, score, 'the Infinity gem scored nothing');
+  assert.equal(items[1].taken, false);
+  assert.equal(items[2].taken, false);
 });
 
 test('levelReady: the tank is the state module’s number, never the maze’s', () => {

@@ -9,7 +9,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { cellsForLevel, createMenus, hitTest, menuStep, sliderValueAt } from './menus.js';
-import { resetMapMode } from './map.js';
+import { resetMapMode, setMapMode } from './map.js';
 
 // ─── Pure helpers ────────────────────────────────────────────────────────────────────────────
 
@@ -203,6 +203,8 @@ test('pause: back resumes, and the rows do what they say', () => {
   assert.ok(log.includes('resume'));
 
   log.length = 0;
+  // Rows: Resume, Options, Controls, Quit to Title.
+  menus.handleInput(press('down'), state);
   menus.handleInput(press('down'), state);
   menus.handleInput(press('down'), state); // Quit to Title
   menus.handleInput(press('confirm'), state);
@@ -395,6 +397,396 @@ test('left and right step the map row in both directions and wrap', () => {
   menus.handleInput(press('left'), state);
   assert.equal(settings.find(([k]) => k === 'mapMode')[1], 'full', 'and wraps past the start');
   resetMapMode();
+});
+
+// ─── Pointer interaction ─────────────────────────────────────────────────────────────────────
+//
+// These drive the real layout: a canvas with a 2-D context (so `render` lays rows out and records
+// their rectangles) plus a `getBoundingClientRect`, then genuine client coordinates through
+// `handlePointer`. Keyboard navigation was covered thoroughly and the pointer paths were not,
+// which is how a `choice` row that wrote the wrong value and a tally nobody could skip by touch
+// both shipped.
+
+/**
+ * A 2-D context that accepts every call the menus make and draws nothing. Node has no canvas, so
+ * the font atlas cannot be built and `drawText` no-ops — the *layout*, which is what the pointer
+ * hit-tests against, runs in full.
+ * @returns {any}
+ */
+function fakeCtx() {
+  return {
+    globalAlpha: 1,
+    fillStyle: '',
+    imageSmoothingEnabled: false,
+    setTransform() {},
+    clearRect() {},
+    fillRect() {},
+    drawImage() {},
+    save() {},
+    restore() {},
+    beginPath() {},
+    rect() {},
+    clip() {},
+    createLinearGradient: () => ({ addColorStop() {} }),
+    createImageData: (w, h) => ({ width: w, height: h, data: new Uint8ClampedArray(w * h * 4) }),
+    putImageData() {},
+  };
+}
+
+/**
+ * A canvas that lays out at `cssW × cssH` at the page origin and hands back {@link fakeCtx}.
+ * @param {number} cssW
+ * @param {number} cssH
+ * @returns {any}
+ */
+function liveCanvas(cssW, cssH) {
+  const ctx = fakeCtx();
+  return {
+    width: 0,
+    height: 0,
+    getContext: () => ctx,
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: cssW, height: cssH }),
+  };
+}
+
+/**
+ * Menus on a real-sized surface, sitting on the options screen.
+ * @param {number} cssW
+ * @param {number} cssH
+ * @param {number} dpr
+ * @returns {{menus:any, state:any, settings:Array<[string, any]>, log:string[], click:(x:number, y:number) => void, surface:any}}
+ */
+function optionsHarness(cssW, cssH, dpr) {
+  /** @type {string[]} */
+  const log = [];
+  /** @type {Array<[string, any]>} */
+  const settings = [];
+  const canvas = liveCanvas(cssW, cssH);
+  const menus = createMenus(canvas, {
+    onNewGame: () => log.push('newGame'),
+    onResume: () => log.push('resume'),
+    onQuit: () => log.push('quit'),
+    onNextLevel: () => log.push('nextLevel'),
+    onSetting: (k, v) => {
+      settings.push([String(k), v]);
+      // The reducer would write the value back into the state; do the same, so the next frame
+      // reads what the player just chose.
+      state.settings[String(k)] = v;
+    },
+    onUiSound: (t) => log.push(`sfx:${t}`),
+  });
+  menus.resize(cssW, cssH, dpr);
+  const state = makeState('title');
+  menus.render(state);
+  menus.handleInput(press('down'), state); // Descend → Options
+  menus.handleInput(press('confirm'), state);
+  menus.render(state);
+  /**
+   * One complete press at a point in **client** coordinates.
+   * @param {number} x
+   * @param {number} y
+   * @returns {void}
+   */
+  const click = (x, y) => {
+    menus.handlePointer({ type: 'pointerdown', clientX: x, clientY: y });
+    menus.handlePointer({ type: 'pointerup', clientX: x, clientY: y });
+    menus.render(state);
+  };
+  return { menus, state, settings, log, click, surface: menus.surface };
+}
+
+/**
+ * Put the map back to a known state before a probe, so a write is always observable.
+ * @param {ReturnType<typeof optionsHarness>} h
+ * @param {string} mode
+ * @returns {void}
+ */
+function armMap(h, mode) {
+  setMapMode(mode);
+  h.state.settings.mapMode = mode;
+  h.state.settings.minimap = mode !== 'off';
+  h.settings.length = 0;
+}
+
+/**
+ * Client y of a row, found by clicking down the panel until one writes `key`. The x fractions are
+ * tried right to left because that is where the controls live; nothing about the panel's measured
+ * geometry is assumed.
+ * @param {ReturnType<typeof optionsHarness>} h
+ * @param {string} key
+ * @returns {number} client y, or −1
+ */
+function findRowY(h, key) {
+  const m = h.surface.metrics;
+  const toClientY = (uiY) => ((uiY + 0.5) * m.px * m.cssH) / m.devH;
+  const toClientX = (uiX) => ((uiX + 0.5) * m.px * m.cssW) / m.devW;
+  for (let uiY = 0; uiY < m.h; uiY++) {
+    const clientY = toClientY(uiY);
+    for (const frac of [0.8, 0.72, 0.62, 0.5]) {
+      armMap(h, 'off');
+      h.click(toClientX(Math.round(m.w * frac)), clientY);
+      if (h.settings.some(([k]) => k === key)) return clientY;
+      if (h.menus.screen() !== 'options') return -1; // walked onto Back: gone too far
+    }
+  }
+  return -1;
+}
+
+test('options: clicking a word of the Map row writes THAT value, not the next one', () => {
+  resetMapMode();
+  const h = optionsHarness(1280, 720, 1);
+  assert.equal(h.menus.screen(), 'options');
+  const rowY = findRowY(h, 'mapMode');
+  assert.ok(rowY > 0, 'the Map row is reachable by pointer at all');
+
+  // Sweep the row and record what each x writes, always starting from 'off'. That is what makes
+  // the answers distinguishable: a blind step of the cycle writes 'corner' from 'off' wherever it
+  // is clicked, so a 'full' can only have come from hitting the word "Full".
+  /** @type {Array<{x:number, value:string}>} */
+  const hits = [];
+  for (let clientX = 0; clientX < 1280; clientX += 4) {
+    armMap(h, 'off');
+    h.click(clientX, rowY);
+    const wrote = h.settings.find(([k]) => k === 'mapMode');
+    if (wrote !== undefined) hits.push({ x: clientX, value: String(wrote[1]) });
+  }
+  const seen = [...new Set(hits.map((hit) => hit.value))].join(',');
+  assert.ok(hits.some((hit) => hit.value === 'off'), `some x writes 'off' (saw ${seen})`);
+  assert.ok(hits.some((hit) => hit.value === 'corner'), `some x writes 'corner' (saw ${seen})`);
+  assert.ok(hits.some((hit) => hit.value === 'full'), `some x writes 'full' (saw ${seen})`);
+
+  // The words read Off · Corner · Full left to right and end at the value column, so their bands
+  // end in that order. (The bare left of the row is the documented fallback — a click there means
+  // "step the cycle" and writes 'corner' from 'off', which is why the *last* x of each value is
+  // the one that identifies its word.)
+  const lastX = (v) => {
+    let x = -1;
+    for (const hit of hits) if (hit.value === v) x = hit.x;
+    return x;
+  };
+  assert.ok(lastX('off') < lastX('corner'), 'the Off word sits left of Corner');
+  assert.ok(lastX('corner') < lastX('full'), 'the Corner word sits left of Full');
+
+  // The two measured regressions, asserted directly: 'off' + click "Full" used to give 'corner',
+  // and 'corner' + click "Corner" used to give 'full'.
+  armMap(h, 'off');
+  h.click(lastX('full'), rowY);
+  assert.equal(h.settings.find(([k]) => k === 'mapMode')[1], 'full', "off + click Full → full");
+  assert.equal(h.settings.find(([k]) => k === 'minimap')[1], true, 'the legacy mirror follows');
+
+  armMap(h, 'corner');
+  h.click(lastX('corner'), rowY);
+  assert.equal(h.settings.find(([k]) => k === 'mapMode')[1], 'corner', 'corner + click Corner → corner');
+
+  armMap(h, 'full');
+  h.click(lastX('off'), rowY);
+  assert.equal(h.settings.find(([k]) => k === 'mapMode')[1], 'off', 'full + click Off → off');
+  assert.equal(h.settings.find(([k]) => k === 'minimap')[1], false);
+
+  // And the fallback still works: the bare part of the row steps the cycle.
+  armMap(h, 'off');
+  h.click(hits[0].x, rowY);
+  assert.equal(h.settings.find(([k]) => k === 'mapMode')[1], 'corner', 'a bare click steps the cycle');
+  resetMapMode();
+});
+
+test('options: dragging a slider track quantises and clamps', () => {
+  resetMapMode();
+  const h = optionsHarness(1280, 720, 1);
+  const m = h.surface.metrics;
+  const rowY = findRowY(h, 'volume');
+  assert.ok(rowY > 0, 'the Sound row is reachable by pointer');
+  const startX = ((Math.round(m.w * 0.72) + 0.5) * m.px * m.cssW) / m.devW;
+
+  // A press-drag-release across the whole width: every value quantised to the row's 0.1 step,
+  // inside the 0‥1 range, and following the pointer.
+  /** @type {number[]} */
+  const seen = [];
+  h.settings.length = 0;
+  h.state.settings.volume = 0.5;
+  assert.equal(
+    h.menus.handlePointer({ type: 'pointerdown', clientX: startX, clientY: rowY }),
+    true,
+    'the press lands on the slider row',
+  );
+  for (let x = 1280; x >= 0; x -= 16) {
+    h.menus.handlePointer({ type: 'pointermove', clientX: x, clientY: rowY });
+  }
+  for (let x = 0; x <= 1280; x += 16) {
+    h.menus.handlePointer({ type: 'pointermove', clientX: x, clientY: rowY });
+  }
+  h.menus.handlePointer({ type: 'pointerup', clientX: 1280, clientY: rowY });
+  for (const [key, value] of h.settings) {
+    if (key !== 'volume') continue;
+    assert.equal(typeof value, 'number');
+    assert.ok(value >= 0 && value <= 1, `volume ${value} inside range`);
+    assert.equal(Math.round(value * 10) / 10, value, `volume ${value} quantised`);
+    seen.push(value);
+  }
+  assert.ok(seen.length >= 4, `the drag produced several values (${seen.join(',')})`);
+  assert.equal(Math.min(...seen), 0, 'dragging off the left pins to the minimum');
+  assert.equal(seen[seen.length - 1], 1, 'dragging past the right pins to the maximum');
+  // A release outside the track must not leave the drag armed.
+  h.settings.length = 0;
+  h.menus.handlePointer({ type: 'pointermove', clientX: 40, clientY: rowY });
+  assert.equal(h.settings.length, 0, 'the pointer no longer owns the slider after release');
+  resetMapMode();
+});
+
+test('level complete: the tally can be skipped by pointer, not only by Enter', () => {
+  /** @type {string[]} */
+  const log = [];
+  const canvas = liveCanvas(1280, 720);
+  const menus = createMenus(canvas, {
+    onNextLevel: () => log.push('nextLevel'),
+    onQuit: () => log.push('quit'),
+    onUiSound: (t) => log.push(`sfx:${t}`),
+  });
+  menus.resize(1280, 720, 1);
+  const state = makeState('levelComplete');
+  menus.render(state);
+  assert.equal(menus.screen(), 'complete');
+  // A quarter of a second in: the tally is still rolling, which is exactly when a player reaches
+  // for the screen.
+  state.time = 0.25;
+  menus.render(state);
+
+  const down = menus.handlePointer({ type: 'pointerdown', clientX: 640, clientY: 360 });
+  const up = menus.handlePointer({ type: 'pointerup', clientX: 640, clientY: 360 });
+  assert.equal(down, true, 'the panel accepts the press');
+  assert.equal(up, true, 'and consumes the release');
+  menus.render(state);
+
+  // The tally is finished, so the NEXT confirm descends instead of skipping — the same two-step
+  // contract the keyboard has.
+  log.length = 0;
+  menus.handleInput(press('confirm'), state);
+  assert.deepEqual(
+    log.filter((e) => e === 'nextLevel'),
+    ['nextLevel'],
+    'the click finished the tally, so confirm descends',
+  );
+});
+
+test('the end panels fit inside the surface at every tested size', () => {
+  // The level-complete panel used to be measured once and centred, so at 1280×720 it computed 362
+  // UI pixels against a 360-pixel surface and its bottom frame fell off the screen. The fit is
+  // asserted through the public surface: the panel's own hit rectangle (recorded while the tally
+  // runs) must lie inside it.
+  const sizes = [
+    [1280, 720, 1],
+    [1280, 620, 1],
+    [1024, 768, 1],
+    [390, 844, 3],
+    [800, 480, 1],
+  ];
+  for (const [w, hgt, dpr] of sizes) {
+    const canvas = liveCanvas(w, hgt);
+    const menus = createMenus(canvas, {});
+    menus.resize(w, hgt, dpr);
+    const state = makeState('levelComplete');
+    // The tally has to still be running (that is when the whole panel is the hit target), but the
+    // entry slide has to be over, so the rectangle probed is the resting one.
+    menus.render(state);
+    state.time = 0.25;
+    menus.render(state);
+    state.time = 0.5;
+    menus.render(state);
+    const m = menus.surface.metrics;
+
+    /**
+     * @param {number} uiY
+     * @returns {boolean} is the panel under the middle of this row of the surface?
+     */
+    const hitAt = (uiY) =>
+      menus.handlePointer({
+        type: 'pointermove',
+        clientX: w / 2,
+        clientY: ((uiY + 0.5) * m.px * hgt) / m.devH,
+      });
+
+    let top = -1;
+    let bottom = -1;
+    for (let uiY = 0; uiY < m.h; uiY++) {
+      if (!hitAt(uiY)) continue;
+      if (top < 0) top = uiY;
+      bottom = uiY;
+    }
+    assert.ok(top >= 0, `${w}x${hgt}@${dpr}: the complete panel is on screen at all`);
+    // The real assertion: there is surface left under the panel. An overflowing panel is clamped
+    // to the top by `Math.max(2u, …)` and runs off the bottom, so its last hit row is the last row
+    // of the surface — which is exactly what 1280×720 did before the panel was fitted.
+    assert.ok(
+      bottom < m.h - 1,
+      `${w}x${hgt}@${dpr}: the panel's bottom (${bottom}) must sit inside the surface (${m.h})`,
+    );
+    assert.ok(top >= 1, `${w}x${hgt}@${dpr}: the panel's top (${top}) must sit inside the surface`);
+  }
+});
+
+test('the Controls panel is reachable from the title and from pause', () => {
+  const { menus, log } = harness();
+  const title = makeState('title');
+  menus.render(title);
+  // Title rows: Descend, Options, Controls, Credits.
+  menus.handleInput(press('down'), title);
+  menus.handleInput(press('down'), title);
+  menus.handleInput(press('confirm'), title);
+  menus.render(title);
+  assert.equal(menus.screen(), 'controls');
+  assert.doesNotThrow(() => menus.render(title), 'the panel draws with the built-in hints');
+  menus.handleInput(press('back'), title);
+  menus.render(title);
+  assert.equal(menus.screen(), 'title');
+
+  // Pause rows: Resume, Options, Controls, Quit to Title.
+  const paused = makeState('paused');
+  paused.time = 1;
+  menus.render(paused);
+  menus.handleInput(press('down'), paused);
+  menus.handleInput(press('down'), paused);
+  log.length = 0;
+  menus.handleInput(press('confirm'), paused);
+  menus.render(paused);
+  assert.equal(menus.screen(), 'controls');
+  assert.equal(log.includes('resume'), false, 'opening Controls does not resume the run');
+  menus.handleInput(press('back'), paused);
+  menus.render(paused);
+  assert.equal(menus.screen(), 'pause');
+});
+
+test('a caller-supplied control table is used, sanitised and never trusted blindly', () => {
+  const menus = createMenus(null, {
+    controls: /** @type {any} */ ([
+      { label: 'Move', keys: 'W S / ↑ ↓' },
+      { label: '', keys: 'dropped: no label' },
+      null,
+      { label: 'Junk', keys: 7 },
+      { label: 'Map', keys: 'M' },
+    ]),
+  });
+  const state = makeState('title');
+  menus.render(state);
+  menus.handleInput(press('down'), state);
+  menus.handleInput(press('down'), state);
+  menus.handleInput(press('confirm'), state);
+  assert.doesNotThrow(() => menus.render(state));
+  assert.equal(menus.screen(), 'controls');
+  // And a table that is entirely unusable falls back to the built-in one rather than drawing an
+  // empty panel.
+  const empty = createMenus(null, { controls: /** @type {any} */ ([null, 3, {}]) });
+  assert.doesNotThrow(() => empty.render(state));
+});
+
+test('reduced motion finishes the level-complete tally instead of rolling it', () => {
+  const { menus, log } = harness();
+  const state = makeState('levelComplete');
+  state.settings.reducedMotion = true;
+  menus.render(state);
+  assert.equal(menus.screen(), 'complete');
+  // No skip needed: the first confirm descends, because there is no animation to interrupt.
+  menus.handleInput(press('confirm'), state);
+  assert.deepEqual(log.filter((e) => e === 'nextLevel'), ['nextLevel']);
 });
 
 test('the loading screen size mirror matches the shipped curve', () => {

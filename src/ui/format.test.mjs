@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import {
   ROLL,
   createCounter,
+  createTextMemo,
   formatClock,
   formatCount,
   formatDepth,
@@ -202,4 +203,71 @@ test('formatUnits pluralises', () => {
   assert.equal(formatUnits(1, 'REFUEL'), '1 REFUEL');
   assert.equal(formatUnits(0, 'REFUEL'), '0 REFUELS');
   assert.equal(formatUnits(12, 'REFUEL'), '12 REFUELS');
+});
+
+test('createTextMemo rebuilds only when a key changes', () => {
+  let builds = 0;
+  const memo = createTextMemo((a, b) => {
+    builds++;
+    return formatCount(a, b);
+  });
+  assert.equal(memo(3, 12), '3/12');
+  const first = memo(3, 12);
+  assert.equal(builds, 1, 'the same keys hand back the cached string');
+  assert.equal(memo(3, 12), first);
+  assert.equal(memo(4, 12), '4/12');
+  assert.equal(builds, 2);
+  // NaN and Infinity are stable keys (an unloaded level's exit distance is Infinity).
+  const dist = createTextMemo((d) => {
+    builds++;
+    return formatDistance(d);
+  });
+  builds = 0;
+  assert.equal(dist(Infinity), '--');
+  assert.equal(dist(Infinity), '--');
+  assert.equal(dist(NaN), '--');
+  assert.equal(dist(NaN), '--');
+  assert.equal(builds, 2);
+  // Omitted keys default to 0, and a key of 0 after a primed call still counts as a change.
+  const one = createTextMemo((a) => String(a));
+  assert.equal(one(0), '0');
+  assert.equal(one(5), '5');
+  assert.equal(one(0), '0');
+  // Total: a throwing builder yields an empty string instead of an exception mid-render.
+  const bad = createTextMemo(() => {
+    throw new Error('boom');
+  });
+  assert.equal(bad(1), '');
+});
+
+test('a roll lands in one fixed beat whatever the gap, and small changes do not crawl', () => {
+  /**
+   * @param {number} to
+   * @returns {number} seconds to arrive at 60 Hz
+   */
+  const secondsTo = (to) => {
+    const c = createCounter(0);
+    c.set(to);
+    let t = 0;
+    let prev = 0;
+    while (!c.done && t < 10) {
+      c.update(1 / 60);
+      t += 1 / 60;
+      assert.ok(c.value >= prev, 'monotone: an upward roll never steps back');
+      prev = c.value;
+    }
+    return t;
+  };
+  // The exponential roll this replaced took ~2.8 s for a level total and ~1 s for a gem.
+  const big = secondsTo(8531);
+  const gem = secondsTo(300);
+  assert.ok(big <= ROLL.DURATION + 1 / 30, `a level total lands in one beat (${big.toFixed(2)} s)`);
+  assert.ok(Math.abs(big - gem) < 1 / 20, `and so does a gem (${gem.toFixed(2)} s vs ${big.toFixed(2)} s)`);
+  // A +10 is a quick tick, not a 0.55 s fade.
+  assert.ok(secondsTo(10) <= 10 / ROLL.MIN_RATE + 1 / 30);
+  // Most of the distance is covered early: ease-out, not linear.
+  const c = createCounter(0);
+  c.set(1000);
+  for (let i = 0; i < Math.round((ROLL.DURATION * 60) / 3); i++) c.update(1 / 60);
+  assert.ok(c.value > 550, `a third of the way in, well over half the distance (${c.value})`);
 });

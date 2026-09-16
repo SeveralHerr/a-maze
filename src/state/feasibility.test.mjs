@@ -192,8 +192,8 @@ function autopilot(data, level) {
         if (item.kind !== 'oil') continue;
         const deficit = fuelMax - fuel;
         // The sim itself refuses a flask that would overflow the tank; a competent player also does
-        // not walk three tiles off-route for a sip. Half a flask's worth of room is the threshold.
-        if (deficit < Math.max(1, flask * 0.5)) continue;
+        // not walk three tiles off-route for a sip. The threshold is the sim's own rule (sim.js takeItem).
+        if (deficit < Math.max(1, flask * FUEL.OIL_MIN_USEFUL_FRACTION)) continue;
         if (trip > wander) continue; // no budget left for the round trip
         wander -= trip;
         travelled += trip;

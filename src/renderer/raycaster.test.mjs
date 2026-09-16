@@ -79,7 +79,7 @@ function room() {
 /**
  * Build a render view over a maze.
  * @param {import('../core/types.js').Maze} maze
- * @param {Partial<import('../core/types.js').RenderView> & {player?:Partial<import('../core/types.js').RenderView['player']>}} [over]
+ * @param {Omit<Partial<import('../core/types.js').RenderView>, 'player'> & {player?:Partial<import('../core/types.js').RenderView['player']>}} [over]
  * @returns {import('../core/types.js').RenderView}
  */
 function makeView(maze, over = {}) {
@@ -293,6 +293,203 @@ test('wall torches light the wall they are mounted on and not the far side of it
   const lit = brightness(1.5);
   const dark = brightness(3.5);
   assert.ok(lit > dark * 1.5, `the torch's own corridor (${lit.toFixed(1)}) should be clearly brighter than the one behind its wall (${dark.toFixed(1)})`);
+});
+
+// ── Wall-mounted billboards ──────────────────────────────────────────────────────────────────────
+// A billboard carries one depth across its width, but a sconce's wall recedes across that width, so
+// an honest z-test used to slice every torch seen at a grazing angle along a hard vertical line (50
+// of 109 columns gone at 1.1 tiles). These tests measure a torch's on-screen footprint *exactly*:
+// the frame is rendered twice with identical lighting and particles, once with invisible torch art,
+// and the columns that differ are the ones the billboard painted.
+
+/** The same painted set with every torch frame blanked to the transparency key. */
+const noTorchArt = {
+  ...textures,
+  torch: textures.torch.map((t) => ({ ...t, indices: new Uint8Array(t.indices.length) })),
+};
+
+/**
+ * Columns the wall torches painted in a frame.
+ * @param {import('../core/types.js').Maze} maze
+ * @param {import('../core/types.js').Torch[]} torches
+ * @param {{x:number, y:number, angle:number}} player
+ * @returns {boolean[]} one flag per internal column
+ */
+function torchColumns(maze, torches, player) {
+  const view = () => makeView(maze, { torches, player, exit: { x: 1, y: 1 }, time: 2, light: 0.9 });
+  const lit = makeRenderer();
+  lit.rc.render(view());
+  const bare = fakeCanvas();
+  const rcBare = createRaycaster(bare.canvas, { textures: noTorchArt });
+  rcBare.resize(960, 540, 1);
+  rcBare.render(view());
+  const a = lit.read();
+  const b = bare.read();
+  const w = lit.rc.internalSize.w;
+  const h = lit.rc.internalSize.h;
+  /** @type {boolean[]} */
+  const cols = [];
+  for (let x = 0; x < w; x++) {
+    let hit = false;
+    for (let y = 0; y < h && !hit; y++) hit = a[y * w + x] !== b[y * w + x];
+    cols.push(hit);
+  }
+  return cols;
+}
+
+/**
+ * A 3-tile-wide open strip with a solid wall along row 0 and row 4, and optionally with the north
+ * wall row removed (the "no wall to slice against" reference footprint).
+ * @param {boolean} northWall
+ * @returns {import('../core/types.js').Maze}
+ */
+function strip(northWall) {
+  const width = 16;
+  const height = 7;
+  const tiles = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const border = x === 0 || x === width - 1 || y === 0 || y === height - 1;
+      tiles[y * width + x] = border || (y === 2 && northWall) ? 1 : 0;
+    }
+  }
+  return { width, height, cols: 7, rows: 3, tiles, start: { x: 1, y: 3 }, exit: { x: 1, y: 1 }, seed: 1 };
+}
+
+test('a wall torch seen at a grazing angle is not sliced by the wall it is mounted on', () => {
+  // Torch bolted to the south face of the wall row y=2, flame just in front of y=3. Every pose looks
+  // down the corridor at a grazing angle from 1.1-2.5 tiles, from both ends, so both halves of the
+  // billboard get their turn at swinging into the masonry.
+  const torches = [{ x: 7, y: 2, face: /** @type {1} */ (1) }];
+  const poses = [
+    { x: 6.3, y: 3.5, angle: -0.35 }, // 1.3 tiles, approaching from the west
+    { x: 5.9, y: 3.35, angle: -0.2 }, // closer to the wall: steeper grazing
+    { x: 5.2, y: 3.6, angle: -0.15 },
+    { x: 8.7, y: 3.5, angle: Math.PI + 0.35 }, // the mirrored facing, from the east
+    { x: 9.1, y: 3.35, angle: Math.PI + 0.2 },
+  ];
+  for (const player of poses) {
+    const walled = torchColumns(strip(true), torches, player);
+    // Without the wall row there is nothing that could occlude the flame at all, so this is the
+    // billboard's true silhouette on screen.
+    const open = torchColumns(strip(false), torches, player);
+    const want = open.filter(Boolean).length;
+    const got = walled.filter(Boolean).length;
+    assert.ok(want > 20, `pose ${JSON.stringify(player)} should put the torch well on screen (${want} cols)`);
+    let missing = 0;
+    for (let x = 0; x < open.length; x++) if (open[x] && !walled[x]) missing++;
+    assert.ok(
+      missing <= 1,
+      `torch sliced at ${JSON.stringify(player)}: ${missing} of its ${want} columns dropped (drew ${got})`,
+    );
+  }
+});
+
+test('a wall torch is still hidden by geometry genuinely in front of it', () => {
+  // The fix must defeat only the sconce's OWN wall. Here the flame is round a corner (hidden by the
+  // wall row between), and from the far side of its own wall (hidden by that wall's back).
+  const width = 12;
+  const height = 9;
+  const tiles = new Uint8Array(width * height).fill(1);
+  const open = (/** @type {number} */ x, /** @type {number} */ y) => {
+    tiles[y * width + x] = 0;
+  };
+  for (let x = 1; x <= 10; x++) open(x, 1); // corridor along row 1
+  for (let y = 1; y <= 7; y++) open(10, y); // turning south at x=10
+  for (let x = 1; x <= 9; x++) open(x, 5); // a parallel corridor behind the torch's wall row
+  /** @type {import('../core/types.js').Maze} */
+  const maze = { width, height, cols: 5, rows: 4, tiles, start: { x: 1, y: 1 }, exit: { x: 1, y: 1 }, seed: 1 };
+
+  // Sconce on the north face of the solid row 6 at x=5, lighting corridor row 5.
+  const torches = [{ x: 5, y: 6, face: /** @type {3} */ (3) }];
+  // From the row-1 corridor, looking straight at where the flame is: rows 2-4 are solid between.
+  const behindRows = torchColumns(maze, torches, { x: 3.5, y: 1.5, angle: Math.atan2(5.98 - 1.5, 5.5 - 3.5) });
+  assert.equal(behindRows.filter(Boolean).length, 0, 'a torch behind solid rows must not be drawn');
+
+  // Sconce on the WEST face of the east wall of the south-running corridor, seen from the row-1
+  // corridor around the corner at a grazing angle: the corner tile (9,2) is in front of it.
+  const corner = [{ x: 11, y: 5, face: /** @type {2} */ (2) }];
+  const aroundCorner = torchColumns(maze, corner, { x: 4.5, y: 1.3, angle: Math.atan2(5.5 - 1.3, 10.98 - 4.5) });
+  assert.equal(aroundCorner.filter(Boolean).length, 0, 'a torch round a corner must not be drawn');
+
+  // Sanity: from inside its own corridor the same torch IS drawn, so the zeros above are occlusion.
+  const inView = torchColumns(maze, corner, { x: 10.3, y: 2.2, angle: Math.PI / 2 - 0.25 });
+  assert.ok(inView.filter(Boolean).length > 10, 'the corner torch must be visible from its corridor');
+
+  // From BEHIND its own wall. Two parallel north-south corridors (x=1 and x=3) share the solid
+  // column x=2; the sconce hangs on that column's west face, lighting x=1, and the camera stands in
+  // x=3. A depth bias sized for grazing views gets this wrong — the eye is on the far side of the
+  // mounting plane, so any bias at all shows the flame straight through a whole tile of stone.
+  const twin = new Uint8Array(5 * 10).fill(1);
+  for (let y = 1; y <= 8; y++) {
+    twin[y * 5 + 1] = 0;
+    twin[y * 5 + 3] = 0;
+  }
+  /** @type {import('../core/types.js').Maze} */
+  const twinMaze = { width: 5, height: 10, cols: 2, rows: 4, tiles: twin, start: { x: 1, y: 1 }, exit: { x: 1, y: 1 }, seed: 1 };
+  const westFace = [{ x: 2, y: 4, face: /** @type {2} */ (2) }];
+  for (const angle of [-Math.PI / 2, -Math.PI / 2 - 0.35]) {
+    const through = torchColumns(twinMaze, westFace, { x: 3.5, y: 7.5, angle });
+    assert.equal(through.filter(Boolean).length, 0, `a torch must not show through the back of its wall (heading ${angle.toFixed(2)})`);
+  }
+  // …and from its own corridor it is on screen, so the zero is the wall doing its job.
+  const ownSide = torchColumns(twinMaze, westFace, { x: 1.4, y: 7.5, angle: -Math.PI / 2 + 0.12 });
+  assert.ok(ownSide.filter(Boolean).length > 10, 'the twin-corridor torch must be visible from its side');
+});
+
+test("the player's torch throws a warm pool that falls off into cool shadow", () => {
+  // The lighting's defining read. The first colormap parked all its warmth in the top few levels,
+  // which the player's own torch could never reach, so a wall a tile away was exactly as blue as
+  // one down the corridor and the floor's warmth was gone two tiles out. Measured on a straight
+  // corridor with no sconces, so only the player's torch and the fog are lighting it.
+  const width = 40;
+  const height = 3;
+  const tiles = new Uint8Array(width * height).fill(1);
+  for (let x = 1; x < width - 1; x++) tiles[width + x] = 0;
+  /** @type {import('../core/types.js').Maze} */
+  const maze = { width, height, cols: 19, rows: 1, tiles, start: { x: 1, y: 1 }, exit: { x: 1, y: 1 }, seed: 1 };
+  const { rc, read } = makeRenderer();
+  rc.render(makeView(maze, { player: { x: 1.5, y: 1.5, angle: 0 }, exit: { x: 38, y: 1 }, light: 0.9 }));
+  const buf = read();
+  const w = rc.internalSize.w;
+  const h = rc.internalSize.h;
+  const z = rc.depth();
+  /**
+   * Mean red-minus-blue over a set of pixels.
+   * @param {(x:number, y:number) => boolean} pick
+   * @returns {number}
+   */
+  const warmth = (pick) => {
+    let sum = 0;
+    let n = 0;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        if (!pick(x, y)) continue;
+        const c = buf[y * w + x];
+        sum += (c & 255) - ((c >>> 16) & 255);
+        n++;
+      }
+    }
+    assert.ok(n > 50, 'sampled region is empty');
+    return sum / n;
+  };
+  const half = h >> 1;
+  /** A floor row's distance ahead of the eye, in tiles. */
+  const rowDist = (/** @type {number} */ y) => half / (y - half + 0.5);
+  const isWall = (/** @type {number} */ x, /** @type {number} */ y) => Math.abs(y - half) < h / z[x] / 2;
+  const floorNear = warmth((x, y) => y > half && !isWall(x, y) && rowDist(y) >= 1 && rowDist(y) < 2.5);
+  const floorFar = warmth((x, y) => y > half && !isWall(x, y) && rowDist(y) >= 2.5 && rowDist(y) < 3.5);
+  const floorDark = warmth((x, y) => y > half && !isWall(x, y) && rowDist(y) >= 4.5 && rowDist(y) < 7);
+  const wallNear = warmth((x, y) => z[x] < 1.6 && isWall(x, y));
+  const wallMid = warmth((x, y) => z[x] >= 2.5 && z[x] < 4 && isWall(x, y));
+  const wallFar = warmth((x, y) => z[x] > 6 && z[x] < 12 && isWall(x, y));
+  // Before the fix these read -9.8 / -15.9 on the floor and -29.1 / -22.6 on the walls: the pool
+  // was colder than the dark beyond it, and the nearest wall was the bluest thing on screen.
+  assert.ok(floorNear > 20, `the floor 1-2.5 tiles ahead should read warm (r-b ${floorNear.toFixed(1)})`);
+  assert.ok(floorFar > floorDark + 12, `the pool should still be warming the floor at 3 tiles (${floorFar.toFixed(1)} vs ${floorDark.toFixed(1)})`);
+  assert.ok(floorNear > floorDark + 30, `the pool must fall off into cool shadow (${floorNear.toFixed(1)} → ${floorDark.toFixed(1)})`);
+  assert.ok(wallNear > wallMid + 5, `a wall beside the player (${wallNear.toFixed(1)}) must be warmer than one 3 tiles on (${wallMid.toFixed(1)})`);
+  assert.ok(wallFar < 0, `walls down the corridor stay cool (r-b ${wallFar.toFixed(1)})`);
 });
 
 test('reduced motion removes camera shake entirely', () => {

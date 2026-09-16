@@ -56,8 +56,20 @@ export const PLAYER = Object.freeze({
   ACCEL: 3.2 / 0.15,
   /** Deceleration in tiles/s² when there is no move input (friction stop ≈ 0.11 s). */
   FRICTION: 30,
-  /** Peak keyboard/stick turn rate in radians/second. */
-  TURN_SPEED: 2.8,
+  /**
+   * Peak keyboard/stick turn rate in radians/second. 4.0 rad/s ≈ 229 °/s, so a 90° corner takes
+   * ~0.39 s including the `TURN_EASE_RATE` ramp. At the old 2.8 (160 °/s) one corner cost 617 ms
+   * measured from a standstill — in a game built entirely out of 90° corners, with ~760 path tiles
+   * at the size cap, a keyboard player spent a large fraction of the level mid-turn while a mouse
+   * player (raw `lookDX`) paid none of it. The benchmark sits here too: Doom's fast keyboard turn
+   * is ~246 °/s. `TURN_EASE_RATE` is unchanged, so a tap still rounds instead of snapping.
+   */
+  TURN_SPEED: 4,
+  /**
+   * Multiplier on `TURN_SPEED` while sprinting. Holding sprint through a corner should not mean
+   * overshooting it; the turn scales with the speed it has to keep up with.
+   */
+  SPRINT_TURN_MULT: 1.25,
   /**
    * Smoothing rate (1/s) applied to the commanded keyboard turn rate. High enough to feel
    * immediate, low enough to round off the first and last frame of a tap — the "slight ease".
@@ -201,23 +213,36 @@ export const FUEL = Object.freeze({
   /** Drain multiplier while sprinting (ARCHITECTURE.md §1). */
   SPRINT_MULT: 1.5,
   /**
-   * Fraction of `fuelMax` at or below which `derived.lowFuel` is true (mirrored by `src/ui/hud.js`).
-   * On the new tank that is 22 s at level 1 and 30 s at the cap — ~70–96 tiles of walking, i.e.
+   * Fraction of `fuelMax` at or below which `derived.lowFuel` is true (mirrored by `src/ui/hud.js`
+   * as `LOW_FUEL_FRACTION` — §4.6; raise both together).
+   * On the tank that is 27 s at level 1 and 37 s at the cap — ~88–120 tiles of walking, i.e.
    * a warning long enough to reach the next flask but short enough to feel like an alarm.
+   * Raised from 0.20: measured on real levels the tank bottomed out at 24–41 % on a competent run,
+   * so at 0.20 the heartbeat, the red vignette, the HUD LOW chip and the torch-radius collapse were
+   * **never seen**. The alarm has to be reachable or the whole tension vocabulary is dead content.
    */
-  LOW_FRACTION: 0.2,
+  LOW_FRACTION: 0.25,
   /**
    * Fraction of `fuelMax` the player must climb back above before the one-shot `lowFuel` event
-   * re-arms. The gap (0.26 vs 0.20) is hysteresis: without it, hovering at exactly 20 % would
+   * re-arms. The gap (0.32 vs 0.25) is hysteresis: without it, hovering at exactly 25 % would
    * re-fire the heartbeat cue every few frames. One flask (35 % of the tank) always clears it,
    * so every refuel re-arms the alarm — that is the 60–90 s tension loop.
    */
-  REARM_FRACTION: 0.26,
+  REARM_FRACTION: 0.32,
   /**
    * Fuel-seconds an oil flask restores, as a fraction of the level's `fuelMax`. At 35 % of a
    * 110–150 s tank a flask is 38–53 s: a real reprieve, but never a whole level.
    */
   OIL_FRACTION: 0.35,
+  /**
+   * How much of a flask's face value must actually land in the tank before the flask is consumed,
+   * as a fraction of `oilFuel(fuelMax)`. A flask is 38–53 s; consuming one for a 1 s top-up is
+   * ~97 % of the central resource destroyed, and the player cannot see the tank well enough to
+   * avoid it deliberately. At 0.5 a flask is left on the floor until half of it would be useful —
+   * exactly the rule `feasibility.test.mjs` models (`deficit < max(1, flask × 0.5)`), so the
+   * shipped sim and the feasibility proof now agree instead of the sim being the wasteful one.
+   */
+  OIL_MIN_USEFUL_FRACTION: 0.5,
   /** Lower clamp on an oil flask's value, in fuel-seconds. */
   OIL_MIN: 25,
   /** Upper clamp on an oil flask's value, in fuel-seconds. */
@@ -227,11 +252,17 @@ export const FUEL = Object.freeze({
   /** Tank size once the maze stops growing (`CAP_LEVEL`), in fuel-seconds. */
   TANK_END: 150,
   /**
-   * Extra drain per level **past the size cap**. Beyond `CAP_LEVEL` a level cannot get bigger
-   * (`LEVEL.MAX_CELLS` is a single knob), so difficulty comes from the torch burning faster, the
-   * flasks thinning out and the braid rising.
+   * Extra drain per level once the ramp starts (`LEVEL.DRAIN_RAMP_START`).
+   *
+   * The ramp used to start at `CAP_LEVEL`, which meant drain was exactly 1 across the entire
+   * playable curve — and because the tank (110→150 s) and the flask (35 % of the tank) scale
+   * together while oil density only thins from 1/20 to 1/30 cells, the refuel loop was *identical*
+   * at every depth. Measured: the minimum tank fraction over levels 1…12 wandered 24–41 % with no
+   * trend, and the `lowFuel` cue fired **zero** times over a full 15-level descent. Starting the
+   * ramp mid-curve is what makes "L1 generous, L10 tense" true: the same route costs ~7.5 % more
+   * torch at level 10 and ~15 % more at the cap, and depth reads as tighter rather than just longer.
    */
-  DRAIN_PER_LEVEL_PAST_CAP: 0.02,
+  DRAIN_PER_LEVEL: 0.015,
   /** Hard ceiling on the drain multiplier — past this the game is unreadable, not hard. */
   DRAIN_MAX: 1.35,
   /**
@@ -387,6 +418,13 @@ export const LEVEL = Object.freeze({
    * a different expedition. The chainability guarantee is stated in terms of this radius.
    */
   OIL_REACH_TILES: 3,
+  /**
+   * First level at which the torch's drain multiplier starts climbing (`FUEL.DRAIN_PER_LEVEL`).
+   * Levels 1…`DRAIN_RAMP_START` burn at exactly 1×, which is the "generous" half of the curve;
+   * from here on the same route costs measurably more torch. Deliberately well before `CAP_LEVEL`
+   * so the ramp is felt inside the playable curve rather than only in the post-cap tail.
+   */
+  DRAIN_RAMP_START: 5,
   /** Cells per oil flask on level 1 (density ≈ one flask per 20 cells). */
   OIL_CELLS_START: 20,
   /** Cells per oil flask once the density ramp completes — the flasks thin out with depth. */
@@ -439,15 +477,23 @@ export function tankSeconds(level) {
 }
 
 /**
- * Drain multiplier for a level. 1 up to the size cap; past it the torch burns faster, because a
- * level that cannot get bigger has to get harder some other way.
+ * Drain multiplier for a level. 1 through `LEVEL.DRAIN_RAMP_START`; past it the torch burns faster
+ * every level, to a `FUEL.DRAIN_MAX` ceiling.
+ *
+ * The ramp starts **inside** the size curve rather than at `CAP_LEVEL`, because the tank and the
+ * flask scale together and the oil density barely thins, so without it the refuel loop is bit-for-bit
+ * the same at level 1 and level 12 (see `FUEL.DRAIN_PER_LEVEL`). `oilTargetGap` is derived from this
+ * number, so raising the ramp automatically tightens the placement guarantee that
+ * `tools/validate-mazes.mjs` and `feasibility.test.mjs` assert — a ramp that is too steep fails loudly.
+ *
+ * Non-decreasing in `level` (relied on by `levelParams`'s ordering guarantee).
  * @param {number} level 1-based
  * @returns {number} ≥ 1, at most `FUEL.DRAIN_MAX`
  */
 export function drainRate(level) {
   const lv = levelNumber(level);
-  const past = Math.max(0, lv - CAP_LEVEL);
-  return Math.min(FUEL.DRAIN_MAX, 1 + past * FUEL.DRAIN_PER_LEVEL_PAST_CAP);
+  const past = Math.max(0, lv - LEVEL.DRAIN_RAMP_START);
+  return Math.min(FUEL.DRAIN_MAX, 1 + past * FUEL.DRAIN_PER_LEVEL);
 }
 
 /**

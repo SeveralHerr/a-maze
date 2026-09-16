@@ -170,6 +170,31 @@ test('the scanline pitch is an integer number of CSS pixels and switches off whe
   assert.equal(scan.style.opacity, '0');
 });
 
+test('a tight scanline pitch draws a gentler line than a wide one', () => {
+  // At 3 CSS px per row one row in three is darkened; at the old fixed 0.42 that cost ~14 % of the
+  // mean luminance and banded every wall face. The line's strength must fall with the pitch.
+  const { root } = makeDom();
+  const post = createPost(root);
+  const scan = root.children[0];
+  post.set({ scanlines: true });
+  /** @returns {number} alpha of the dark scanline stop */
+  const darkAlpha = () => {
+    const m = /rgba\(0,0,0,([\d.]+)\)/.exec(scan.style.backgroundImage);
+    assert.ok(m, `no dark stop in ${scan.style.backgroundImage}`);
+    return Number(m[1]);
+  };
+  post.resize(1280, 720, 240); // pitch 3
+  const tight = darkAlpha();
+  post.resize(1600, 960, 240); // pitch 4
+  const mid = darkAlpha();
+  post.resize(1920, 1440, 240); // pitch 6
+  const wide = darkAlpha();
+  assert.ok(tight < mid && mid < wide, `line alpha must grow with pitch: ${tight}, ${mid}, ${wide}`);
+  assert.ok(tight <= 0.25, `the shipped 3 px pitch must stay gentle (got ${tight})`);
+  // Mean darkening at pitch 3 (one dark row in three) stays under ~8 %.
+  assert.ok(tight / 3 < 0.08);
+});
+
 test('the iris closes to a hole and hides itself when fully open', () => {
   const { root } = makeDom();
   const post = createPost(root);

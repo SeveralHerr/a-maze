@@ -16,6 +16,7 @@ import {
   countExplored,
   createMapView,
   cycleMapMode,
+  fitBeats,
   mapModeFromSettings,
   nextMapMode,
   normalizeMapMode,
@@ -453,4 +454,101 @@ test('update never throws on a half-built state', () => {
   assert.doesNotThrow(() =>
     view.update(/** @type {any} */ ({ levelData: { maze: null }, explored: new Uint8Array(4) }), 0),
   );
+});
+
+test('chooseFullScale fills a caller-owned result, and fitBeats ranks tile resolution first', () => {
+  const out = { res: /** @type {'tile'|'cell'} */ ('cell'), scale: 0, w: 0, h: 0 };
+  const same = chooseFullScale(128, 128, 1100, 1100, out);
+  assert.equal(same, out, 'the result object is the one passed in (no per-frame allocation)');
+  assert.deepEqual({ ...out }, { res: 'tile', scale: 4, w: 1028, h: 1028 });
+  const cell = chooseFullScale(128, 128, 200, 200);
+  assert.equal(cell.res, 'cell');
+  assert.equal(fitBeats(out, cell), true, 'tiles beat cells');
+  assert.equal(fitBeats(cell, out), false);
+  const smaller = chooseFullScale(128, 128, 800, 800);
+  assert.equal(fitBeats(out, smaller), true, 'the bigger map wins');
+  assert.equal(fitBeats(smaller, out), false);
+  assert.equal(fitBeats(out, { ...out }), true, 'a tie goes to the first candidate');
+});
+
+/**
+ * A 2-D context for `drawFull`: everything it calls, recording the map blit.
+ * @returns {any}
+ */
+function fullMapCtx() {
+  const calls = { blit: /** @type {number[]|null} */ (null), transforms: 0, restores: 0 };
+  return {
+    calls,
+    globalAlpha: 1,
+    fillStyle: '#000',
+    fillRect() {},
+    save() {},
+    restore() {
+      calls.restores++;
+    },
+    setTransform() {
+      calls.transforms++;
+    },
+    beginPath() {},
+    rect() {},
+    clip() {},
+    drawImage(...args) {
+      // The map blit is the only nine-argument draw from a raster canvas.
+      if (args.length === 9) calls.blit = args.slice(5);
+    },
+  };
+}
+
+test('the wide full map moves its text into side rails and gets the whole height', () => {
+  const state = makeState(128, 128);
+  reveal(state, 1, 1, 3);
+  state.level = 15;
+
+  /**
+   * Draw the full map at a surface size and return the blit rectangle in device pixels.
+   * @param {any} m
+   * @param {number} gaugeRight
+   * @param {number} gaugeBottom
+   * @returns {number[]}
+   */
+  const blitAt = (m, gaugeRight, gaugeBottom) => {
+    const { view } = makeView();
+    view.update(state, 0);
+    const ctx = fullMapCtx();
+    view.drawFull(ctx, m, state, 0, true, gaugeRight, gaugeBottom);
+    assert.ok(ctx.calls.blit !== null, 'the map was drawn');
+    assert.equal(ctx.calls.restores, 1, 'the UI transform is always put back');
+    return /** @type {number[]} */ (ctx.calls.blit);
+  };
+
+  // 1920×1080 at dpr 1: the surface is 960×540 UI px at 2 device px each. Strips on top and
+  // bottom left 3 device px per tile; the rails give the map the full height, and 4.
+  const hd = { w: 960, h: 540, px: 2, u: 3, narrow: false, originX: 0, originY: 0 };
+  const [hx, hy, hw, hh] = blitAt(hd, 237, 54);
+  assert.equal(hw, 1028, `257 tiles × 4 device px (got ${hw})`);
+  assert.equal(hh, 1028);
+  assert.ok(hx >= 237 * 2, 'the map sits clear of the fuel gauge column');
+  assert.ok(hx + hw <= hd.w * hd.px, 'and inside the screen on the right');
+  assert.ok(hy >= 0 && hy + hh <= hd.h * hd.px, 'and inside it vertically');
+
+  // 1280×720: the cap is height-bound either way (2 px per tile); the tie goes to the rails, so the
+  // text still leaves the strips and the map is centred on the whole height.
+  const wide = { w: 640, h: 360, px: 2, u: 2, narrow: false, originX: 0, originY: 0 };
+  const [wx, wy, ww, wh] = blitAt(wide, 158, 42);
+  assert.equal(ww, 514);
+  assert.ok(wx >= 158 * 2);
+  const frame = 2 * 2;
+  assert.ok(Math.abs(wy - frame - (720 - (wh + frame * 2)) / 2) <= 2, `centred vertically (y=${wy})`);
+
+  // A phone keeps the stacked strips: no room at the sides at all.
+  const phone = { w: 234, h: 506, px: 5, u: 3, narrow: true, originX: 0, originY: 0 };
+  const [px, , pw] = blitAt(phone, 120, 60);
+  assert.equal(pw, 1028, 'a 390×844 phone at dpr 3 still gets 4 device px per tile');
+  assert.ok(px >= 0 && px + pw <= phone.w * phone.px);
+
+  // 412×915 at dpr 2.625: the side margin is paid in device pixels, which is what buys the fourth
+  // device pixel per tile here (a UI-pixel margin cost 30 device px a side and left 3).
+  const pixel = { w: 216, h: 480, px: 5, u: 2, narrow: true, originX: 1, originY: 1 };
+  const [, , qw] = blitAt(pixel, 110, 50);
+  assert.equal(qw, 1028, `257 tiles × 4 device px on a 1 082-px-wide phone (got ${qw})`);
 });
