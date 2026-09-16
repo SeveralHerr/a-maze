@@ -44,6 +44,35 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
+    # ── Quality gate ──────────────────────────────────────────────────────────
+    # Everything below the gate is a deploy; nothing above it is. A build that
+    # cannot pass the unit tests, or whose maze generator can emit an unsolvable
+    # level, must never reach a player - an unwinnable maze is the one failure a
+    # player cannot tell from their own incompetence.
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22
+        cache: npm
+
+    # `npm ci` (not `install`): it installs exactly package-lock.json and fails
+    # loudly when the two disagree. The only dependency is puppeteer-core, which
+    # downloads no browser.
+    - name: Install dev dependencies
+      run: npm ci
+
+    - name: Unit tests
+      run: npm test
+
+    # 117k mazes across the seed/size matrix: every one must be solvable, fully
+    # connected and sealed (ARCHITECTURE.md §5). Runs in ~5 s.
+    - name: Maze solvability matrix
+      run: node tools/validate-mazes.mjs
+
+    # Extreme grid sizes: no throw, no stack overflow, bounded time and memory.
+    - name: Generator stress
+      run: node tools/stress.mjs
+
     # No build step: the game is plain ES modules loaded straight from index.html.
     # The upload is index.html at the root plus src/ beside it, which is exactly the
     # layout `node tools/serve.mjs` serves locally. Tests, tooling and node_modules
@@ -53,7 +82,9 @@ jobs:
         rm -rf "${BUILD_DIR}"
         mkdir -p "${BUILD_DIR}"
         cp index.html styles.css "${BUILD_DIR}/"
-        rsync -a --exclude='*.test.mjs' --exclude='README.md' src "${BUILD_DIR}/"
+        rsync -a --exclude='*.test.mjs' --exclude='*.test-util.mjs' \
+                 --exclude='preview.html' --exclude='preview.js' \
+                 --exclude='README.md' src "${BUILD_DIR}/"
 
     # A missing or empty index.html is the one failure that would still upload
     # successfully and leave a blank page on itch.io.

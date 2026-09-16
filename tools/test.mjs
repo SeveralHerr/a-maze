@@ -28,9 +28,11 @@ for (const file of files) {
   const ok = r.status === 0;
   if (!ok) failed++;
   const out = (r.stdout || '') + (r.stderr || '');
-  // node:test files print "# pass N / # fail N"; plain scripts print their own summary line.
-  const pass = /^# pass (\d+)/m.exec(out)?.[1];
-  const fail = /^# fail (\d+)/m.exec(out)?.[1];
+  // node:test summarises with a marker that differs per reporter: TAP prints "# pass N", the
+  // default spec reporter prints "ℹ pass N". Accept any non-digit prefix so the tally column keeps
+  // working whichever reporter a Node version defaults to. Plain scripts print their own summary.
+  const pass = /^\D*pass (\d+)\s*$/m.exec(out)?.[1];
+  const fail = /^\D*fail (\d+)\s*$/m.exec(out)?.[1];
   const tally = pass !== undefined ? `${pass} passed${fail && fail !== '0' ? `, ${fail} failed` : ''}` : (out.trim().split('\n').pop() || '').slice(0, 80);
   console.log(`${ok ? 'ok  ' : 'FAIL'} ${file.padEnd(40)} ${tally} (${Date.now() - t} ms)`);
   if (!ok && !QUIET) console.log(out);

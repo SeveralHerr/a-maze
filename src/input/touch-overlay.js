@@ -145,6 +145,11 @@ export function createTouchOverlay(root, opts) {
     'position:absolute;top:0;right:0;display:flex;gap:10px;pointer-events:none;' +
       'padding:calc(env(safe-area-inset-top,0px) + 10px) calc(env(safe-area-inset-right,0px) + 10px) 0 0;'
   );
+  // SEAM (integrator): the HUD's score/gem panel also lives in the top-right corner, so on a
+  // portrait phone these buttons landed on top of the score. The class is the only hook the page
+  // stylesheet has (everything else here is inline and would win the cascade); `styles.css` uses
+  // it to push the bar below the HUD's top row. Nothing in this module depends on the class.
+  bar.className = 'amaze-touch-bar';
 
   const BTN_IDLE =
     `min-width:64px;min-height:44px;padding:12px 12px 10px;box-sizing:border-box;` +

@@ -3,18 +3,54 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
-  <meta name="theme-color" content="#0b0f1a" />
-  <title>A-MAZE — Torchlit Descent</title>
+  <meta name="theme-color" content="#07090f" />
+  <meta name="color-scheme" content="dark" />
+  <title>A-MAZE — The Torchlit Descent</title>
+  <meta name="description" content="A retro first-person maze crawler. Your torch is the timer: descend, grab gems and oil, find the portal before the light dies. No downloads, no dependencies — procedural pixel dungeons in your browser." />
+  <meta name="author" content="SeveralHerr" />
+
+  <!-- Open Graph / social cards. No image asset by design (the whole game is procedural), so the
+       card falls back to the title and description. -->
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="A-MAZE" />
+  <meta property="og:title" content="A-MAZE — The Torchlit Descent" />
+  <meta property="og:description" content="Your torch is the timer. Descend a procedurally generated dungeon, collect gems and oil flasks, and reach the portal before the light dies." />
+  <meta name="twitter:card" content="summary" />
+  <meta name="twitter:title" content="A-MAZE — The Torchlit Descent" />
+  <meta name="twitter:description" content="Your torch is the timer. Descend a procedurally generated dungeon before the light dies." />
+
+  <!-- Favicon: a pixel torch, drawn inline as an SVG data URI. Zero asset files (§1). -->
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' shape-rendering='crispEdges'><rect width='16' height='16' fill='%23070910'/><rect x='7' y='9' width='2' height='6' fill='%237a4a1a'/><rect x='6' y='14' width='4' height='1' fill='%235a3413'/><rect x='6' y='8' width='4' height='2' fill='%23d9a441'/><rect x='6' y='5' width='4' height='3' fill='%23c2410c'/><rect x='7' y='3' width='2' height='3' fill='%23f59e0b'/><rect x='7' y='1' width='1' height='3' fill='%23fde68a'/><rect x='5' y='7' width='1' height='2' fill='%23c2410c'/><rect x='10' y='7' width='1' height='2' fill='%23c2410c'/></svg>" />
+
   <link rel="stylesheet" href="styles.css" />
+
+  <!-- The page is native ES modules with no bundler, so the browser only discovers the deep
+       imports one round trip at a time. Preloading the heavy leaves of the graph lets them be
+       fetched in parallel with main.js instead of after it. -->
+  <link rel="modulepreload" href="src/main.js" />
+  <link rel="modulepreload" href="src/renderer/raycaster.js" />
+  <link rel="modulepreload" href="src/renderer/textures.js" />
+  <link rel="modulepreload" href="src/ui/hud.js" />
+  <link rel="modulepreload" href="src/ui/menus.js" />
+  <link rel="modulepreload" href="src/ui/font.js" />
+  <link rel="modulepreload" href="src/ui/audio.js" />
+  <link rel="modulepreload" href="src/state/sim.js" />
+  <link rel="modulepreload" href="src/maze/level.js" />
+  <link rel="modulepreload" href="src/input/input.js" />
 </head>
 <body>
   <main id="app" aria-label="A-MAZE game">
     <canvas id="view" aria-hidden="true"></canvas>
-    <canvas id="overlay" aria-label="Game display"></canvas>
     <div id="post" aria-hidden="true"></div>
+    <canvas id="overlay" aria-label="A-MAZE: torchlit dungeon maze. Keyboard: WASD or arrows to move, mouse to look, Shift to sprint, M for the map, Esc to pause."></canvas>
     <div id="touch" aria-hidden="true"></div>
-    <noscript>A-MAZE needs JavaScript enabled.</noscript>
   </main>
+  <noscript>
+    <div id="noscript">
+      <h1>A-MAZE</h1>
+      <p>This game is built from plain ES modules and needs JavaScript enabled to run.</p>
+    </div>
+  </noscript>
   <script type="module" src="src/main.js"></script>
 </body>
 </html>

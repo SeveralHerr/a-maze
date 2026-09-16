@@ -11,11 +11,17 @@ tool dependency). `index.html` loads `src/main.js`. Deployed to itch.io
 ## Commands
 ```sh
 npm run serve                     # static dev server http://localhost:5173 — keep it running
-npm test                          # every src/*/*.test.mjs in its own Node process
-node tools/validate-mazes.mjs     # headless 100%-solvability runner (exit≠0 on any failure)
-node tools/stress.mjs             # extreme grid sizes: time/memory/no stack overflow
-node tools/verify.mjs --tag x     # headless Chrome autopilot run → logs/x.json + screenshots
+npm test                          # every src/*/*.test.mjs in its own Node process (359 tests)
+node tools/validate-mazes.mjs     # 117k-maze solvability matrix (exit≠0 on any failure); --quick
+node tools/stress.mjs             # extreme grid sizes: time/memory/no stack overflow; --quick
+node tools/verify.mjs --tag x     # headless Chrome autopilot run → logs/x.json + logs/shot-x-*.png
+                                  #   needs `npm run serve` running and Chrome (CHROME_PATH)
+                                  #   --seed N --soak 20 --fps 5 --url ... --keep-open
 ```
+Useful URLs while the dev server is up:
+`/` · `/?debug=1` (FPS + logging) · `/?headless=1` (exposes `window.__game`) · `/?seed=1337`
+(pins the run seed) · `/?fatal=1` (shows the boot failure screen) · `/src/renderer/preview.html`
+and `/src/ui/preview.html` (module harnesses).
 
 ## Rules that are not obvious from the code
 - `ARCHITECTURE.md` is the binding contract (types, signatures, allowed imports). Change it first, then code.
@@ -24,4 +30,12 @@ node tools/verify.mjs --tag x     # headless Chrome autopilot run → logs/x.jso
 - The reducer mutates store-owned state in place; renderer/ui/audio are read-only consumers.
 - Zero allocations per frame in the raycaster and sim hot paths; all tuning numbers live in `src/state/balance.js`; all colours in `src/renderer/palette.js`.
 - `?headless=1` exposes `window.__game` for tools; `?debug=1` shows FPS/logs.
+- Events are routed from a **store subscriber**, never after the tick dispatch: `state.events` is
+  cleared at the top of every dispatch, so anything read later has already been clobbered.
+- The HUD derives its score/fuel pops from state deltas, so main.js must not also pop on `pickup`.
+- `hud.render()` clears the overlay and `menus.render()` draws over it — that order is required.
+- Page layer order is `#view` → `#post` → `#overlay` → `#touch`; every layer above `#overlay` must
+  keep `pointer-events: none` or pointer lock and the virtual stick die silently.
+- CI runs `npm test`, `validate-mazes` and `stress` before every itch.io deploy; `verify.mjs` is
+  local-only (it needs a browser and the dev server).
 - `docs/STATUS.json` records waves, critic scores, open issues and blockers — read it before choosing work, update it after every step.

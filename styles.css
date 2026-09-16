@@ -1,10 +1,197 @@
-/* A-MAZE page shell. Integrator-owned. The game draws into two stacked canvases that are
-   rendered at a low internal resolution and scaled up with nearest-neighbour filtering. */
-:root { color-scheme: dark; --bg: #07090f; }
-* { box-sizing: border-box; }
-html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; touch-action: none; }
-#app { position: fixed; inset: 0; display: grid; place-items: center; user-select: none; -webkit-user-select: none; }
-#app > canvas, #post, #touch { position: absolute; inset: 0; width: 100%; height: 100%; }
-#app > canvas { image-rendering: pixelated; image-rendering: crisp-edges; }
-#overlay { cursor: default; }
-#post, #touch { pointer-events: none; }
+/* A-MAZE page shell — integrator territory (ARCHITECTURE.md §4.6/§4.7).
+ *
+ * The game is four stacked layers inside a fixed, non-scrolling viewport:
+ *
+ *   #view     the 3-D framebuffer (240 rows, upscaled with nearest-neighbour)
+ *   #post     CSS effect layers: scanlines, vignette, low-fuel pulse, flash, iris
+ *   #overlay  HUD + menus, drawn at device resolution so lettering stays crisp
+ *   #touch    on-screen controls, created by src/input only on a touch device
+ *
+ * #view and #post are sized in JS (src/main.js `layout()`) to the largest box that preserves the
+ * framebuffer's aspect — snapped to a whole pixel multiple when that costs almost nothing — and
+ * centred; the letterbox around them stays pure black, so the effect layers frame the world rather
+ * than the bars. #overlay and #touch are inset by the device's safe areas instead, so a notch or a
+ * home indicator never sits on the fuel gauge or the pause button.
+ */
+
+:root {
+  color-scheme: dark;
+  --bg: #07090f;
+  --gold: #d9a441;
+  --parchment: #e8d3a0;
+  --stone: #2b3446;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: var(--bg);
+  /* A game viewport never scrolls: no scrollbars, no rubber-banding, no pull-to-refresh, and no
+     browser gesture competing with the virtual stick. */
+  overflow: hidden;
+  overscroll-behavior: none;
+  touch-action: none;
+  -webkit-text-size-adjust: 100%;
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  color: var(--parchment);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  /* `fixed` (rather than relative) keeps mobile Safari from scrolling the page when the URL bar
+     collapses, which would otherwise shift the canvases out from under the pointer mapping. */
+  position: fixed;
+  inset: 0;
+}
+
+#app {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  /* The letterbox around the world is not "nothing": it is the cabinet the screen sits in. A very
+     dark stone wash reads as deliberate where flat #000 reads as a broken viewport. */
+  background: radial-gradient(ellipse 120% 90% at 50% 45%, #0c1018 0%, #05070c 70%, #030509 100%);
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* Portrait phones letterbox by construction (see `layout()` in main.js). A faint bezel around the
+   world sells the two bands as a cabinet — gauges above the screen, controls below it. */
+body.portrait #view {
+  box-shadow:
+    0 0 0 1px rgba(138, 155, 176, 0.16),
+    0 10px 34px rgba(0, 0, 0, 0.8);
+}
+
+/* ── World + effects: centred, aspect-preserved, sized by main.js ───────────────────────────── */
+
+#view,
+#post {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  /* Fallback before the first layout() call; JS replaces both with pixel sizes. */
+  width: 100%;
+  height: 100%;
+}
+
+#view {
+  display: block;
+  /* The framebuffer is 240 rows of deliberate pixel art: never let the browser smooth it. */
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  background: #000;
+}
+
+#post {
+  pointer-events: none;
+  overflow: hidden;
+}
+
+/* ── Overlay + touch controls: full-bleed inside the safe area ──────────────────────────────── */
+
+/* Sized with `calc`, not with four insets: an absolutely positioned *replaced* element (a canvas)
+   with `width: auto` falls back to its 300×150 intrinsic size instead of stretching between `left`
+   and `right`, which silently strands the whole HUD in the top-left corner. */
+#overlay,
+#touch {
+  position: absolute;
+  top: env(safe-area-inset-top, 0px);
+  left: env(safe-area-inset-left, 0px);
+  width: calc(100% - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));
+  height: calc(100% - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+}
+
+#overlay {
+  display: block;
+  cursor: default;
+  /* The overlay owns pointer lock and every gesture (src/input binds to it). */
+  touch-action: none;
+}
+
+/* The MAP/PAUSE buttons (src/input/touch-overlay.js) and the HUD's score panel both want the
+   top-right corner, and the HUD's top row is the taller of the two. The bar is pushed below it —
+   with `margin`, because the bar sets `top` and `padding` inline and would win the cascade. 15vh
+   clears the HUD's top row in both orientations and still lands where a thumb naturally reaches. */
+.amaze-touch-bar {
+  margin-top: 15vh;
+}
+
+/* #touch must stay transparent to input: the overlay's own buttons opt back in with
+   `pointer-events: auto`. If this layer ever swallowed events, pointer lock and the virtual stick
+   would both die silently — this is a verified failure mode, not a theoretical one. */
+#touch {
+  pointer-events: none;
+}
+
+/* While the pointer is captured the cursor is meaningless, and a visible arrow parked in the
+   middle of a first-person view reads as a bug. `main.js` toggles the class. */
+body.locked,
+body.locked #overlay {
+  cursor: none;
+}
+
+/* ── Focus ─────────────────────────────────────────────────────────────────────────────────── */
+
+/* Keyboard focus must stay visible for anyone tabbing, but the canvases are not interactive
+   targets and a focus ring around the whole screen is just noise. */
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+:focus-visible {
+  outline: 2px solid var(--gold);
+  outline-offset: 2px;
+}
+
+canvas:focus,
+canvas:focus-visible {
+  outline: none;
+}
+
+/* ── No-JavaScript fallback ────────────────────────────────────────────────────────────────── */
+
+#noscript {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  gap: 8px;
+  padding: 24px;
+  text-align: center;
+  background: radial-gradient(ellipse at 50% 40%, #151a26 0%, #07090f 70%);
+}
+
+#noscript h1 {
+  margin: 0;
+  color: var(--gold);
+  font-size: 28px;
+  letter-spacing: 6px;
+}
+
+#noscript p {
+  margin: 0;
+  color: #8a9bb0;
+  font-size: 14px;
+}
+
+/* ── Reduced motion ────────────────────────────────────────────────────────────────────────── */
+
+/* The in-game "Reduced Motion" setting handles head bob, shake and flicker. This only covers the
+   CSS layers, for a player whose OS asks for it before they reach the options screen. */
+@media (prefers-reduced-motion: reduce) {
+  #post {
+    transition: none !important;
+  }
+}

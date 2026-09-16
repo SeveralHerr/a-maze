@@ -1,8 +1,8 @@
 {
-  "updated": "2026-09-16T01:37:48.564Z",
-  "iteration": 2,
+  "updated": "2026-09-16T02:32:09.641Z",
+  "iteration": 4,
   "passThreshold": 8.5,
-  "wave": "3-hud-polish",
+  "wave": "integration",
   "waves": {
     "0-scaffold": {
       "status": "done",
@@ -374,7 +374,167 @@
       }
     },
     "integration": {
-      "status": "pending"
+      "status": "done",
+      "owner": "integrator",
+      "notes": "Integration complete: src/main.js composition root wires core/state/input/maze/renderer/ui/audio behind a guarded boot; index.html, styles.css, tools/verify.mjs autopilot and the CI quality gate delivered; ARCHITECTURE.md reconciled section by section with the shipped code. The game boots, plays, descends and ends with zero console output.",
+      "files": [
+        "src/main.js",
+        "index.html",
+        "styles.css",
+        "tools/verify.mjs",
+        "tools/test.mjs (tally regex)",
+        ".github/workflows/deploy-to-itchio.yml (quality gate)",
+        "ARCHITECTURE.md",
+        "CLAUDE.md"
+      ],
+      "seamFixes": [
+        "styles.css / layout (CRITICAL, found by running it): #overlay and #touch were absolutely positioned *replaced* elements with width:auto, so the canvas fell back to its 300x150 intrinsic size and the ENTIRE HUD and every menu rendered in a postage stamp in the top-left corner. Fixed with calc()-sized boxes; verify now asserts the overlay backing store matches the viewport.",
+        "index.html layer order (renderer ↔ ui): #post now sits BELOW #overlay, so the vignette/iris/flash frame the world and never darken the HUD or a menu panel. Without it the level-complete iris would have blacked out its own tally screen.",
+        "src/input/touch-overlay.js (input ↔ ui): the MAP/PAUSE bar and the HUD's score panel both claimed the top-right corner and overlapped on every touch device. One-line seam fix — the bar now carries class `amaze-touch-bar` (no behaviour change, documented in-file) — and styles.css pushes it below the HUD's top row.",
+        "src/main.js pauses on pointer-lock loss (input ↔ state): browsers give the pointer back on Escape WITHOUT delivering that keypress to the page, so the first Escape freed the cursor and left the game running behind it. Losing the lock while playing now dispatches pause.",
+        "Fuel budget (maze ↔ state, flagged by the maze builder as needing a decision): resolved in favour of balance.js's size-based floor and documented in ARCHITECTURE.md §4.4/§6. populate.js's path-derived curve leaves level 10 at ~1.2x the optimal route — unwinnable for a player who cannot see the maze; the shipped floor gives ~4x on level 1 and ~3x from level 6. Both stay in the code: populate keeps deriving (validate-mazes keeps proving feasibility), balance keeps raising.",
+        "Loading phase escape (state, flagged by the state builder): NOT changed in src/state. main.js owns recovery instead (build tokens, two reseeded retries, 12 s watchdog), keeping the phase machine total; documented in §4.2 so the next reader knows it is deliberate.",
+        "tools/test.mjs tally regex (reported independently by core, state, maze and renderer builders): parsed '^# pass N' but node:test's default reporter prints 'ℹ pass N', so the per-file column showed a duration. Now `^\\D*pass (\\d+)$` — 359 test counts are visible again.",
+        "HUD pop double-fire avoided: the HUD derives score/fuel pops from GameState deltas by design, so main.js deliberately does NOT also pop on pickup events (would show every gem twice). Documented in §4.6 and in main.js.",
+        "ARCHITECTURE.md reconciled with reality across §3 (GameState.sim, Validation.pathLength/deadEnds definitions, events cleared per dispatch), §4.1–§4.7 (every delivered signature), §5 (real gate thresholds) and §6 (new assumptions). 388 lines changed; every builder deviation is either adopted with its reason or marked an integrator decision."
+      ],
+      "verify": {
+        "tag": "integ",
+        "pass": true,
+        "fpsVsync": 120.2,
+        "fpsUnlimited": 630.6,
+        "renderMsAvg": 1.236,
+        "worldMsP99": 1.4,
+        "heapGrowthMB": 0.07,
+        "consoleErrors": 0,
+        "consoleWarnings": 0,
+        "pageErrors": 0,
+        "guardedErrors": 0,
+        "level1": {
+          "cleared": true,
+          "seconds": 25.5,
+          "fuelLeft": 75.95,
+          "fuelMax": 96
+        },
+        "level2": {
+          "cleared": true,
+          "seconds": 8.1
+        },
+        "deepestLevel": 10,
+        "itemsCollected": "3/6",
+        "audio": {
+          "state": "running",
+          "voices": 0,
+          "maxVoices": 24,
+          "failures": 0
+        },
+        "screenshots": [
+          "logs/shot-integ-title.png",
+          "logs/shot-integ-play.png",
+          "logs/shot-integ-minimap.png",
+          "logs/shot-integ-complete.png",
+          "logs/shot-integ-level2.png",
+          "logs/shot-integ-deep.png",
+          "logs/shot-integ-gameover.png",
+          "logs/shot-integ-mobile-title.png",
+          "logs/shot-integ-mobile-play.png"
+        ]
+      },
+      "openIssues": [
+        "MEDIUM — Portrait phones letterbox to a 4:3 band (~35% of screen height). §4.5 pins the framebuffer at 240 rows with the width clamped to 320…560, so it can NEVER be taller than 4:3; cropping to fill would cut the horizontal FOV to a slit. Laid out as a handheld cabinet instead (gauges above, world, control deck below with the compass, minimap and virtual stick). A real fix needs a renderer change (variable internal height) — a contract change, not a seam repair.",
+        "MEDIUM — Difficulty plateaus after level ~18: the maze is capped at 40x40 cells and the fuel-per-cell rate has finished decaying, so levels 18+ differ only by braid and the score multiplier. Fine for an arcade loop, but a future pass should add a late-game pressure (shrinking base fuel, or braid past 0.25).",
+        "LOW — tools/verify.mjs needs a browser and the dev server, so CI gates on npm test + validate-mazes + stress only. A CI verify would need a Chrome action plus a background server step.",
+        "LOW — The autopilot steers with the real input path but scrapes corners, so its fuel figures are pessimistic (it cleared level 1 with 76/96 s left; a clean run leaves more). Screenshots now wait for a clear corridor before firing, which fixed the 'nose against a wall' shots.",
+        "LOW — The level-complete iris closes to full black behind the tally panel; the corridor is not visible during the summary. Deliberate (§1 asks for an iris wipe) but a future pass could hold it at a dim porthole.",
+        "LOW — src/core/events.js and src/core/pool.js are not reachable from src/main.js (the renderer pools particles itself and nothing uses the emitter). They are tested, contract-listed helpers, ~350 lines shipped but unused.",
+        "LOW — Wall torches average one per ~14 floor tiles on level 1 and one per ~24 later, so a corridor with a visible flame is the exception rather than the rule. It reads well (see shot-integ-minimap.png) but tightening populate.js's 6-tile spacing would push the look closer to the reference's lit hall.",
+        "INFO — fps is reported twice on purpose: 120.2 with the compositor limiter on (this machine's display, and the number the gate uses) and 630 with --disable-gpu-vsync, which is what shows the render headroom. Full render callback 1.24 ms avg / world p99 1.4 ms against an 8 ms budget; heap +0.07 MB over a 20 s soak with forced GC; 0 console errors, 0 warnings, 0 page errors, 0 failed requests, 0 guarded runtime errors."
+      ],
+      "modules": [
+        "integration"
+      ],
+      "summary": "INTEGRATION COMPLETE — A-MAZE boots, plays, descends and ends with zero console output.\n\nWIRED (src/main.js, 830 lines, guarded boot → styled fatal panel instead of a black page):\npersist → store → raycaster(#view) → post(#post) → hud+menus(#overlay) → input(#overlay, touch into #touch) → audio → maze client → loop. step(dt) polls input once, offers the frame to menus.handleInput, falls through to composition-root hotkeys (pause/map/mute), then dispatches tick and advances a loading watchdog. render(alpha) mutates ONE RenderView (interpolated by lerp/lerpAngle), then raycaster → hud → menus → post → audio.update → input.updateOverlay; all per-frame objects (RenderView, post options, tick action) are reused. Events are routed from a store subscriber (not after the tick) because state.events is cleared at the top of every dispatch: audio.handle gets the array, pickups burst particles + tint the world, levelComplete/gameOver tint the page, phase changes start level builds and release pointer lock, gameOver/levelComplete/setSetting persist. Level requests carry a token (stale/late answers dropped), retry twice reseeded on genuine failure, and a 12 s watchdog rebuilds. Iris wipe closes for loading/complete/gameOver and opens on level start. Layout fits #view+#post to the framebuffer aspect, snapping to a whole pixel multiple when it costs <3% (exact 3x at 720p), centred — at 42% height in portrait where 240 rows must letterbox; #overlay/#touch are inset by safe areas. Auto-pause on blur, hidden tab AND pointer-lock loss. ?headless=1/?debug=1 expose window.__game {ready,state,dispatch,subscribe,stepOnce,stats,renderStats,audioStats,errors,input:{inject,clear}}; ?seed=N pins the run; ?fatal=1 shows the error screen.\n\nALSO: index.html (description, OG/Twitter cards, inline-SVG torch favicon, 10 modulepreloads, layer reorder to #view→#post→#overlay→#touch); styles.css (full-bleed, pixelated, safe areas, no scroll/overscroll, cursor hidden only while locked, focus-visible only, noscript panel); tools/verify.mjs (new, BFS-pathfinding autopilot through the real maze); CI quality gate; ARCHITECTURE.md reconciled section by section against the shipped code; CLAUDE.md commands/rules.\n\nNo skills were used — none in the available set (Godot/Blender/itch/artifact/design) applies to vanilla ES-module web-game integration. Skills that would have paid for themselves: (1) \"headless-browser-module-check\" wrapping the puppeteer-core + dev-server + window.__result harness that four builders and I each hand-rolled; (2) \"js-typecheck-jsdoc\" to run tsc --checkJs against a // @ts-check repo with no TypeScript dependency; (3) a \"web-game-verify\" skill with the fps/heap/console-gate patterns (CDP HeapProfiler.collectGarbage + Performance.getMetrics, vsync-on vs vsync-off fps) — I rebuilt all of it from scratch.",
+      "verifyPass": true,
+      "testsPass": true,
+      "validatePass": true,
+      "stressPass": true,
+      "metrics": {
+        "fps": 120.2,
+        "renderMsAvg": 1.236,
+        "renderMsP99": 1.4,
+        "heapGrowthMB": 0.07,
+        "consoleErrors": 0
+      },
+      "screenshots": [
+        "C:/Users/gotmi/Documents/GitHub/a-maze/logs/shot-integ-title.png",
+        "C:/Users/gotmi/Documents/GitHub/a-maze/logs/shot-integ-play.png",
+        "C:/Users/gotmi/Documents/GitHub/a-maze/logs/shot-integ-minimap.png",
+        "C:/Users/gotmi/Documents/GitHub/a-maze/logs/shot-integ-complete.png",
+        "C:/Users/gotmi/Documents/GitHub/a-maze/logs/shot-integ-level2.png",
+        "C:/Users/gotmi/Documents/GitHub/a-maze/logs/shot-integ-deep.png",
+        "C:/Users/gotmi/Documents/GitHub/a-maze/logs/shot-integ-gameover.png",
+        "C:/Users/gotmi/Documents/GitHub/a-maze/logs/shot-integ-mobile-title.png",
+        "C:/Users/gotmi/Documents/GitHub/a-maze/logs/shot-integ-mobile-play.png",
+        "C:/Users/gotmi/Documents/GitHub/a-maze/logs/fatal.png",
+        "C:/Users/gotmi/Documents/GitHub/a-maze/logs/ix-options.png",
+        "C:/Users/gotmi/Documents/GitHub/a-maze/logs/ix-debug.png",
+        "C:/Users/gotmi/Documents/GitHub/a-maze/logs/pause-shot.png",
+        "C:/Users/gotmi/Documents/GitHub/a-maze/logs/land-play.png",
+        "C:/Users/gotmi/Documents/GitHub/a-maze/logs/spr-torch-1.png",
+        "C:/Users/gotmi/Documents/GitHub/a-maze/logs/spr-exit-4.png"
+      ],
+      "integration": {
+        "selfScore": 9,
+        "tests": {
+          "passed": 359,
+          "failed": 0
+        },
+        "openIssues": [
+          "MEDIUM — Portrait phones letterbox to a 4:3 band (~35% of screen height). §4.5 pins the framebuffer at 240 rows with the width clamped to 320…560, so it can NEVER be taller than 4:3; cropping to fill would cut the horizontal FOV to a slit. Laid out as a handheld cabinet instead (gauges above, world, control deck below with the compass, minimap and virtual stick). A real fix needs a renderer change (variable internal height) — a contract change, not a seam repair.",
+          "MEDIUM — Difficulty plateaus after level ~18: the maze is capped at 40x40 cells and the fuel-per-cell rate has finished decaying, so levels 18+ differ only by braid and the score multiplier. Fine for an arcade loop, but a future pass should add a late-game pressure (shrinking base fuel, or braid past 0.25).",
+          "LOW — tools/verify.mjs needs a browser and the dev server, so CI gates on npm test + validate-mazes + stress only. A CI verify would need a Chrome action plus a background server step.",
+          "LOW — The autopilot steers with the real input path but scrapes corners, so its fuel figures are pessimistic (it cleared level 1 with 76/96 s left; a clean run leaves more). Screenshots now wait for a clear corridor before firing, which fixed the 'nose against a wall' shots.",
+          "LOW — The level-complete iris closes to full black behind the tally panel; the corridor is not visible during the summary. Deliberate (§1 asks for an iris wipe) but a future pass could hold it at a dim porthole.",
+          "LOW — src/core/events.js and src/core/pool.js are not reachable from src/main.js (the renderer pools particles itself and nothing uses the emitter). They are tested, contract-listed helpers, ~350 lines shipped but unused.",
+          "LOW — Wall torches average one per ~14 floor tiles on level 1 and one per ~24 later, so a corridor with a visible flame is the exception rather than the rule. It reads well (see shot-integ-minimap.png) but tightening populate.js's 6-tile spacing would push the look closer to the reference's lit hall.",
+          "INFO — fps is reported twice on purpose: 120.2 with the compositor limiter on (this machine's display, and the number the gate uses) and 630 with --disable-gpu-vsync, which is what shows the render headroom. Full render callback 1.24 ms avg / world p99 1.4 ms against an 8 ms budget; heap +0.07 MB over a 20 s soak with forced GC; 0 console errors, 0 warnings, 0 page errors, 0 failed requests, 0 guarded runtime errors."
+        ],
+        "contractDeviations": [
+          "styles.css / layout (CRITICAL, found by running it): #overlay and #touch were absolutely positioned *replaced* elements with width:auto, so the canvas fell back to its 300x150 intrinsic size and the ENTIRE HUD and every menu rendered in a postage stamp in the top-left corner. Fixed with calc()-sized boxes; verify now asserts the overlay backing store matches the viewport.",
+          "index.html layer order (renderer ↔ ui): #post now sits BELOW #overlay, so the vignette/iris/flash frame the world and never darken the HUD or a menu panel. Without it the level-complete iris would have blacked out its own tally screen.",
+          "src/input/touch-overlay.js (input ↔ ui): the MAP/PAUSE bar and the HUD's score panel both claimed the top-right corner and overlapped on every touch device. One-line seam fix — the bar now carries class `amaze-touch-bar` (no behaviour change, documented in-file) — and styles.css pushes it below the HUD's top row.",
+          "src/main.js pauses on pointer-lock loss (input ↔ state): browsers give the pointer back on Escape WITHOUT delivering that keypress to the page, so the first Escape freed the cursor and left the game running behind it. Losing the lock while playing now dispatches pause.",
+          "Fuel budget (maze ↔ state, flagged by the maze builder as needing a decision): resolved in favour of balance.js's size-based floor and documented in ARCHITECTURE.md §4.4/§6. populate.js's path-derived curve leaves level 10 at ~1.2x the optimal route — unwinnable for a player who cannot see the maze; the shipped floor gives ~4x on level 1 and ~3x from level 6. Both stay in the code: populate keeps deriving (validate-mazes keeps proving feasibility), balance keeps raising.",
+          "Loading phase escape (state, flagged by the state builder): NOT changed in src/state. main.js owns recovery instead (build tokens, two reseeded retries, 12 s watchdog), keeping the phase machine total; documented in §4.2 so the next reader knows it is deliberate.",
+          "tools/test.mjs tally regex (reported independently by core, state, maze and renderer builders): parsed '^# pass N' but node:test's default reporter prints 'ℹ pass N', so the per-file column showed a duration. Now `^\\D*pass (\\d+)$` — 359 test counts are visible again.",
+          "HUD pop double-fire avoided: the HUD derives score/fuel pops from GameState deltas by design, so main.js deliberately does NOT also pop on pickup events (would show every gem twice). Documented in §4.6 and in main.js.",
+          "ARCHITECTURE.md reconciled with reality across §3 (GameState.sim, Validation.pathLength/deadEnds definitions, events cleared per dispatch), §4.1–§4.7 (every delivered signature), §5 (real gate thresholds) and §6 (new assumptions). 388 lines changed; every builder deviation is either adopted with its reason or marked an integrator decision."
+        ],
+        "files": [
+          "src/main.js",
+          "index.html",
+          "styles.css",
+          "tools/verify.mjs",
+          "tools/test.mjs",
+          "src/input/touch-overlay.js",
+          ".github/workflows/deploy-to-itchio.yml",
+          "ARCHITECTURE.md",
+          "CLAUDE.md"
+        ]
+      },
+      "notesForIntegrator": {
+        "integration": [
+          "Boot: src/main.js is the only composition root. persist -> store -> raycaster(#view) -> post(#post) -> hud+menus(#overlay) -> input(#overlay, touch into #touch) -> audio -> maze client -> loop. Boot is guarded; a failure shows a styled fatal panel instead of a black page (?fatal=1 to see it).",
+          "Events are routed from a store subscriber, NOT after the tick, because state.events is cleared at the top of every dispatch.",
+          "render(alpha) mutates ONE reused RenderView, then raycaster -> hud -> menus -> post -> audio.update -> input.updateOverlay. The hud/menus order is required; no per-frame allocation.",
+          "Level builds carry a token (stale answers dropped), retry twice reseeded on genuine failure, and a 12 s watchdog rebuilds. Recovery lives in main.js, not in the phase machine.",
+          "Layer order in index.html is #view -> #post -> #overlay -> #touch; styles.css sizes #overlay/#touch with calc() (width:auto gave a 300x150 canvas) and keeps #post/#touch pointer-events:none.",
+          "Fuel seam resolved in favour of balance.js size-based floor (ARCHITECTURE.md 4.4/6); populate.js keeps deriving so validate-mazes keeps proving feasibility.",
+          "Headless hooks: ?headless=1 / ?debug=1 expose window.__game {ready,state,dispatch,subscribe,stepOnce,stats,renderStats,audioStats,errors,input:{inject,clear}}; ?seed=N pins the run. tools/verify.mjs drives these with a BFS autopilot and needs the dev server plus a browser, so CI gates on npm test + validate-mazes + stress only.",
+          "The HUD derives score/fuel pops from GameState deltas, so main.js deliberately does NOT also pop on pickup events (it would double-count every gem).",
+          "Auto-pause on blur, hidden tab AND pointer-lock loss (Escape releases the pointer without delivering the keypress)."
+        ]
+      }
     },
     "gauntlet": {
       "status": "pending"
@@ -384,7 +544,22 @@
     }
   },
   "modules": {},
-  "metrics": {},
+  "metrics": {
+    "source": "tools/verify.mjs --tag integ (1280x720, headless Chrome)",
+    "fpsVsyncLimited": 120.2,
+    "fpsUnlimited": 630.6,
+    "renderMsAvgFull": 1.236,
+    "renderMsAvgWorld": 0.958,
+    "renderMsP99World": 1.4,
+    "stepMsAvg": 0.1417,
+    "heapGrowthMB20s": 0.07,
+    "consoleErrors": 0,
+    "consoleWarnings": 0,
+    "tests": 359,
+    "mazesValidated": 117306,
+    "mazeFailures": 0,
+    "fps": 120.2
+  },
   "blocking": [],
   "history": [
     {
@@ -398,6 +573,18 @@
       "wave": "3-hud-polish",
       "updated": "2026-09-16T01:37:48.564Z",
       "summary": "Wave 3 (HUD and polish) delivered: src/ui font.js, format.js, hud.js, menus.js and audio.js plus the preview and audio harnesses. 87 tests passing, zero failures; both modules self-scored 8.8, above the 8.5 threshold. No new blockers. Watch items for integration: the score/slider/low-fuel constants mirrored out of balance.js into src/ui, and the required hud.render() then menus.render() frame order."
+    },
+    {
+      "iteration": 3,
+      "wave": "integration",
+      "updated": "2026-09-16T02:21:11.220Z",
+      "summary": "Integration complete. src/main.js wires core/state/input/maze/renderer/ui/audio behind a guarded boot; index.html and styles.css polished (layer order, safe areas, integer-fit scaling, pixelated upscale, inline SVG torch favicon); tools/verify.mjs plays the game with a BFS autopilot through level 1 and 2, descends to level 10 through the worker path, burns the torch out to game over and shoots the mobile layouts. Measured: 120.2 fps (vsync-limited), 1.133 ms average render, +0.05 MB heap over a 20 s soak, zero console output. CI now gates the itch.io deploy on tests + maze validation + stress."
+    },
+    {
+      "iteration": 4,
+      "wave": "integration",
+      "updated": "2026-09-16T02:32:09.641Z",
+      "summary": "Integration wave marked done. src/main.js (830 lines) wires every module behind a guarded boot; nine seam fixes applied (overlay canvas sizing, layer order, touch bar class, pointer-lock pause, fuel budget decision, loading-phase recovery, test tally regex); index.html, styles.css, tools/verify.mjs and the CI quality gate shipped; ARCHITECTURE.md reconciled with the code. verify/tests/validate/stress all pass: 359 tests, 120.2 fps vsync-limited, 1.236 ms average render, 1.4 ms world p99, +0.07 MB heap over a 20 s soak, 0 console errors. No blockers; remaining issues are portrait letterboxing and a late-game difficulty plateau."
     }
   ]
 }
