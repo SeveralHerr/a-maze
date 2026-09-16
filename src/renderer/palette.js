@@ -1,0 +1,320 @@
+// @ts-check
+/**
+ * @file Master palette — every pixel A-MAZE draws comes from this table (ARCHITECTURE.md §4.5).
+ *
+ * WHY an *indexed* palette rather than free-form colours: the raycaster shades pixels through a
+ * Doom-style **colormap** — a precomputed `LEVELS × PALETTE_SIZE` table of already-packed RGBA
+ * words (see `raycaster.js`). Shading one texel is then a single typed-array lookup instead of
+ * three float multiplies plus a pack, which is what keeps a 480×240 frame inside ~3 ms of plain
+ * JS. That only works if every texel is a palette *index*, so all art in `textures.js` is painted
+ * with the `C.*` indices exported here, and nothing anywhere invents an off-palette colour.
+ *
+ * Colours were sampled from `docs/art-reference.png`: cool blue-grey stone, warm grey-brown
+ * cobbles, dark brown ceiling timber, creeping green moss, and a warm fire ramp that is the only
+ * saturated warm light in the scene. Each material is a *ramp* (a short ordered run of related
+ * shades) so textures can dither between neighbouring steps instead of banding.
+ *
+ * Units & invariants:
+ * - Index `0` is the **transparency key**: fully transparent, never drawn by any blit. Sprite art
+ *   leaves it as the background; wall/floor/ceiling art must never use it.
+ * - `PALETTE[i]` is a 32-bit word in **native byte order**, ready to store straight into a
+ *   `Uint32Array` view of `ImageData.data` (RGBA bytes). Endianness is detected at load, so the
+ *   engine is correct on a big-endian host too, even though every shipping target is little-endian.
+ * - `PALETTE_SIZE` must stay ≤ 256: the colormap indexes with `(level << 8) | paletteIndex`.
+ * - Ramps are ordered **dark → light**.
+ *
+ * This module has no state and no DOM dependency, so it imports cleanly in Node for unit tests.
+ */
+
+/**
+ * True when the host stores the low byte of a 32-bit word first. A `Uint32Array` view over
+ * `ImageData.data` then reads/writes bytes in the order R,G,B,A ⇒ the packed word is 0xAABBGGRR.
+ * @type {boolean}
+ */
+export const LITTLE_ENDIAN = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+
+/**
+ * Pack a colour into one native-endian word suitable for a `Uint32Array` view of `ImageData`.
+ * @param {number} r 0..255
+ * @param {number} g 0..255
+ * @param {number} b 0..255
+ * @param {number} [a] 0..255, default 255 (opaque)
+ * @returns {number} uint32
+ */
+export function pack(r, g, b, a = 255) {
+  const rr = r < 0 ? 0 : r > 255 ? 255 : r | 0;
+  const gg = g < 0 ? 0 : g > 255 ? 255 : g | 0;
+  const bb = b < 0 ? 0 : b > 255 ? 255 : b | 0;
+  const aa = a < 0 ? 0 : a > 255 ? 255 : a | 0;
+  return LITTLE_ENDIAN
+    ? ((aa << 24) | (bb << 16) | (gg << 8) | rr) >>> 0
+    : ((rr << 24) | (gg << 16) | (bb << 8) | aa) >>> 0;
+}
+
+/**
+ * Authored palette: `[name, 0xRRGGBB]`, in ramp order. The array order *is* the index order, so
+ * inserting a colour in the middle renumbers everything — append to a ramp's end instead, or
+ * accept that saved screenshots change (nothing is persisted by index, so that is safe).
+ * @type {ReadonlyArray<readonly [string, number]>}
+ */
+const ENTRIES = /** @type {const} */ ([
+  // 0 — transparency key. Its RGB is irrelevant (alpha 0) but kept as the fog colour so a
+  // careless opaque blit of index 0 degrades to "distant darkness" rather than to a magenta hole.
+  ['empty', 0x0a0e18],
+
+  // ── Stone: cool blue-grey blocks, the dominant material (walls). ─────────────────────────────
+  ['stoneShadow', 0x11161f], // inside the mortar groove
+  ['stoneMortar', 0x1d2433], // mortar line (dark navy, as in the reference)
+  ['stoneDeep', 0x2b3446],
+  ['stoneDark', 0x3e4b5f],
+  ['stoneMid', 0x56657a],
+  ['stoneBase', 0x6d7d92], // average block face
+  ['stoneLight', 0x8a9bb0],
+  ['stoneBright', 0xa6b5c7],
+  ['stoneHilite', 0xc3ced9], // top-left bevel
+
+  // ── Moss & vines: the only cool-green in the scene, grows out of mortar and floor gaps. ──────
+  ['mossShadow', 0x12200f],
+  ['mossDeep', 0x27491f],
+  ['mossMid', 0x3d672a],
+  ['mossLight', 0x5e8a37],
+  ['mossTip', 0x86a852],
+
+  // ── Cobbles: warm grey-brown floor stones with near-black gaps. ──────────────────────────────
+  ['cobGap', 0x111010],
+  ['cobShadow', 0x211e1b],
+  ['cobDark', 0x34312c],
+  ['cobMid', 0x474440],
+  ['cobBase', 0x5b5751],
+  ['cobLight', 0x736e67],
+  ['cobBright', 0x8c867d],
+  ['cobHilite', 0xa69f95], // worn/wet top of a stone
+
+  // ── Timber: ceiling planks and beams. ────────────────────────────────────────────────────────
+  ['woodShadow', 0x140c06],
+  ['woodDark', 0x22160c],
+  ['woodMid', 0x3a2618],
+  ['woodBase', 0x4a3020],
+  ['woodLight', 0x5a3a22],
+  ['woodBright', 0x7a5230],
+  ['woodHilite', 0x96683c],
+
+  // ── Iron: sconces, floor grates, bolts. ──────────────────────────────────────────────────────
+  ['ironShadow', 0x0f1116],
+  ['ironDark', 0x1c1f26],
+  ['ironBase', 0x2f343d],
+  ['ironLight', 0x474d58],
+  ['ironHilite', 0x6b7280],
+
+  // ── Fire: torch flames. Emissive — drawn at full colormap level. ─────────────────────────────
+  ['fireDeep', 0x7a2408],
+  ['fireEmber', 0xc2410c],
+  ['fireMid', 0xff8a1e],
+  ['fireHot', 0xffcf4a],
+  ['fireCore', 0xfff3c4],
+
+  // ── Arcane: the exit portal's violet→cyan swirl. ─────────────────────────────────────────────
+  ['arcDeep', 0x1b0f3a],
+  ['arcViolet', 0x4c1d95],
+  ['arcMid', 0x7c3aed],
+  ['arcLight', 0xa78bfa],
+  ['arcCyan', 0x22d3ee],
+  ['arcPale', 0xa5f3fc],
+
+  // ── Gem: faceted cyan crystal with an emerald core. ──────────────────────────────────────────
+  ['gemDeep', 0x06323f],
+  ['gemMid', 0x0e7490],
+  ['gemBright', 0x22d3ee],
+  ['gemPale', 0xa5f3fc],
+  ['gemSpec', 0xecfeff],
+  ['emeraldDeep', 0x064e3b],
+  ['emeraldMid', 0x10b981],
+
+  // ── Oil flask: amber glass. ──────────────────────────────────────────────────────────────────
+  ['oilDeep', 0x33190a],
+  ['oilDark', 0x7c3f0a],
+  ['oilMid', 0xc97a16],
+  ['oilLight', 0xf0b040],
+  ['oilPale', 0xffe6a8],
+
+  // ── Gold / parchment: gothic lettering and UI trim (§4.6 samples these). ─────────────────────
+  ['goldDark', 0x3a2a0d],
+  ['goldMid', 0x8a6520],
+  ['goldBase', 0xc9962f],
+  ['goldLight', 0xe8c24a],
+  ['goldPale', 0xf7e3a1],
+
+  // ── Ambient: what "no light" looks like, plus a pure white for speculars/particles. ──────────
+  ['fog', 0x0a0e18], // cool blue-black the colormap fades everything into
+  ['void', 0x05070c], // deepest shadow, below fog
+  ['white', 0xffffff],
+]);
+
+/** Number of palette slots, including the transparency key at index 0. */
+export const PALETTE_SIZE = ENTRIES.length;
+
+/** Palette colours packed for direct framebuffer stores. `PALETTE[0]` is transparent (alpha 0). */
+export const PALETTE = new Uint32Array(PALETTE_SIZE);
+
+/** Flat RGB bytes, `i*3 + {0,1,2}` — what the colormap builder reads. */
+export const PALETTE_RGB = new Uint8Array(PALETTE_SIZE * 3);
+
+/** Palette names in index order (diagnostics, tests, the preview's swatch sheet). */
+export const PALETTE_NAMES = /** @type {ReadonlyArray<string>} */ (ENTRIES.map((e) => e[0]));
+
+/** @type {Record<string, number>} */
+const indexByName = Object.create(null);
+
+for (let i = 0; i < PALETTE_SIZE; i++) {
+  const [name, rgb] = ENTRIES[i];
+  const r = (rgb >> 16) & 255;
+  const g = (rgb >> 8) & 255;
+  const b = rgb & 255;
+  PALETTE[i] = i === 0 ? pack(r, g, b, 0) : pack(r, g, b, 255);
+  PALETTE_RGB[i * 3] = r;
+  PALETTE_RGB[i * 3 + 1] = g;
+  PALETTE_RGB[i * 3 + 2] = b;
+  indexByName[name] = i;
+}
+
+/**
+ * Palette indices by name — the vocabulary `textures.js` paints with, e.g. `C.stoneMid`.
+ * Frozen so a typo like `C.stonMid` reads as `undefined` and blows up loudly in a test rather
+ * than silently painting index 0 (a transparent hole) into a wall.
+ * @type {Readonly<Record<string, number>>}
+ */
+export const C = Object.freeze(indexByName);
+
+/** The transparency key. Sprites leave it untouched; `blit` skips it. */
+export const TRANSPARENT = 0;
+
+/**
+ * Build a ramp (ordered dark → light) from palette names.
+ * @param {...string} names
+ * @returns {Uint8Array} palette indices
+ */
+function ramp(...names) {
+  const out = new Uint8Array(names.length);
+  for (let i = 0; i < names.length; i++) {
+    const idx = indexByName[names[i]];
+    // A missing name is a programming error in this file; fail at load, not at paint time.
+    if (idx === undefined) throw new Error(`palette: unknown colour "${names[i]}"`);
+    out[i] = idx;
+  }
+  return out;
+}
+
+/**
+ * Material ramps, dark → light. Textures pick a step with `rampPick()` (ordered dither), which is
+ * why every ramp is an evenly-spaced perceptual run: dithering between neighbours must not show a
+ * hue jump.
+ * @type {Readonly<Record<'stone'|'moss'|'cobble'|'wood'|'iron'|'fire'|'arcane'|'gem'|'oil'|'gold', Uint8Array>>}
+ */
+export const RAMPS = Object.freeze({
+  stone: ramp(
+    'stoneShadow',
+    'stoneMortar',
+    'stoneDeep',
+    'stoneDark',
+    'stoneMid',
+    'stoneBase',
+    'stoneLight',
+    'stoneBright',
+    'stoneHilite',
+  ),
+  moss: ramp('mossShadow', 'mossDeep', 'mossMid', 'mossLight', 'mossTip'),
+  cobble: ramp(
+    'cobGap',
+    'cobShadow',
+    'cobDark',
+    'cobMid',
+    'cobBase',
+    'cobLight',
+    'cobBright',
+    'cobHilite',
+  ),
+  wood: ramp(
+    'woodShadow',
+    'woodDark',
+    'woodMid',
+    'woodBase',
+    'woodLight',
+    'woodBright',
+    'woodHilite',
+  ),
+  iron: ramp('ironShadow', 'ironDark', 'ironBase', 'ironLight', 'ironHilite'),
+  fire: ramp('fireDeep', 'fireEmber', 'fireMid', 'fireHot', 'fireCore'),
+  arcane: ramp('arcDeep', 'arcViolet', 'arcMid', 'arcLight', 'arcCyan', 'arcPale'),
+  gem: ramp('gemDeep', 'gemMid', 'gemBright', 'gemPale', 'gemSpec'),
+  oil: ramp('oilDeep', 'oilDark', 'oilMid', 'oilLight', 'oilPale'),
+  gold: ramp('goldDark', 'goldMid', 'goldBase', 'goldLight', 'goldPale'),
+});
+
+/** Every packed colour, for O(1) "is this on-palette?" checks in tests. */
+const PACKED_SET = new Set(PALETTE);
+
+/**
+ * True when `color` is one of the packed palette words. Used by the texture tests to prove no
+ * blending or off-palette colour ever reaches a texture buffer.
+ * @param {number} color uint32 in native byte order
+ * @returns {boolean}
+ */
+export function isPaletteColor(color) {
+  return PACKED_SET.has(color >>> 0);
+}
+
+/**
+ * `#rrggbb` string for a palette index — for CSS-side consumers (post.js, the preview page) that
+ * cannot use packed words. Out-of-range indices return the fog colour rather than throwing, so a
+ * bad index degrades to "dark" instead of breaking a style string.
+ * @param {number} index
+ * @returns {string}
+ */
+export function hex(index) {
+  const i = index >= 0 && index < PALETTE_SIZE ? index | 0 : C.fog;
+  const r = PALETTE_RGB[i * 3];
+  const g = PALETTE_RGB[i * 3 + 1];
+  const b = PALETTE_RGB[i * 3 + 2];
+  return `#${((1 << 24) | (r << 16) | (g << 8) | b).toString(16).slice(1)}`;
+}
+
+/**
+ * `rgba(r,g,b,a)` string for a palette index at a given alpha — the form post.js needs for
+ * gradients and tints.
+ * @param {number} index
+ * @param {number} alpha 0..1 (clamped)
+ * @returns {string}
+ */
+export function rgba(index, alpha) {
+  const i = index >= 0 && index < PALETTE_SIZE ? index | 0 : C.fog;
+  const a = alpha <= 0 ? 0 : alpha >= 1 ? 1 : alpha;
+  return `rgba(${PALETTE_RGB[i * 3]},${PALETTE_RGB[i * 3 + 1]},${PALETTE_RGB[i * 3 + 2]},${
+    Math.round(a * 1000) / 1000
+  })`;
+}
+
+/**
+ * Nearest palette index to an RGB triple by squared Euclidean distance in sRGB. Authoring aid
+ * (never used per frame): lets a texture routine quantise a computed colour onto the palette.
+ * Index 0 is excluded — it is a transparency key, not a colour.
+ * @param {number} r 0..255
+ * @param {number} g 0..255
+ * @param {number} b 0..255
+ * @returns {number} palette index ≥ 1
+ */
+export function nearestIndex(r, g, b) {
+  let best = 1;
+  let bestD = Infinity;
+  for (let i = 1; i < PALETTE_SIZE; i++) {
+    const dr = r - PALETTE_RGB[i * 3];
+    const dg = g - PALETTE_RGB[i * 3 + 1];
+    const db = b - PALETTE_RGB[i * 3 + 2];
+    // Weighted to match human luminance sensitivity; plain Euclidean picks muddy greens.
+    const d = dr * dr * 0.3 + dg * dg * 0.59 + db * db * 0.11;
+    if (d < bestD) {
+      bestD = d;
+      best = i;
+    }
+  }
+  return best;
+}

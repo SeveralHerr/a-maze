@@ -1,0 +1,636 @@
+// @ts-check
+/**
+ * @file Unit tests for src/state/sim.js — collision, line of sight, fog of war, movement feel,
+ * bump detection and the title attract camera.
+ *
+ * The collision suite is deliberately brute force: correctness here is a safety property ("the
+ * body is never inside a wall"), and the cheapest honest way to test a safety property is to try
+ * to violate it from every angle, speed and dt the game can produce.
+ */
+
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+import { TILE } from '../maze/constants.js';
+import { TAU } from '../core/math.js';
+import { createInitialState, reducer } from './game.js';
+import { ATTRACT, PLAYER, WORLD } from './balance.js';
+import {
+  hasLineOfSight,
+  moveCircle,
+  revealAround,
+  solidAt,
+  stepAttract,
+  stepPlaying,
+  updateDerived,
+} from './sim.js';
+
+// ─── Fixtures ────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Build a Maze from an ASCII picture: '#' = wall, anything else = floor, 'S' = start, 'E' = exit.
+ * @param {string[]} rows
+ * @returns {import('../core/types.js').Maze}
+ */
+function mazeFrom(rows) {
+  const height = rows.length;
+  const width = rows[0].length;
+  const tiles = new Uint8Array(width * height);
+  let start = { x: 1, y: 1 };
+  let exit = { x: 1, y: 1 };
+  for (let y = 0; y < height; y++) {
+    assert.equal(rows[y].length, width, `row ${y} has the wrong width`);
+    for (let x = 0; x < width; x++) {
+      const c = rows[y][x];
+      tiles[y * width + x] = c === '#' ? TILE.WALL : TILE.FLOOR;
+      if (c === 'S') start = { x, y };
+      if (c === 'E') exit = { x, y };
+    }
+  }
+  return {
+    width,
+    height,
+    cols: (width - 1) >> 1,
+    rows: (height - 1) >> 1,
+    tiles,
+    start,
+    exit,
+    seed: 1234,
+  };
+}
+
+/** A twisty 9×9 test maze with corners of every orientation. */
+const TWISTY = [
+  '#########',
+  '#S..#...#',
+  '###.#.#.#',
+  '#...#.#.#',
+  '#.#####.#',
+  '#.#...#.#',
+  '#.#.#.#.#',
+  '#...#..E#',
+  '#########',
+];
+
+/**
+ * An open arena: every tile floor except a sealed 1-tile border.
+ * @param {number} n side length in tiles
+ * @returns {import('../core/types.js').Maze}
+ */
+function openMaze(n) {
+  const rows = [];
+  for (let y = 0; y < n; y++) {
+    let r = '';
+    for (let x = 0; x < n; x++) r += x === 0 || y === 0 || x === n - 1 || y === n - 1 ? '#' : '.';
+    rows.push(r);
+  }
+  const maze = mazeFrom(rows);
+  maze.start = { x: 1, y: 1 };
+  maze.exit = { x: n - 2, y: n - 2 };
+  return maze;
+}
+
+/**
+ * @param {import('../core/types.js').Maze} maze
+ * @param {import('../core/types.js').Item[]} [items]
+ * @param {number} [fuel]
+ * @returns {import('../core/types.js').LevelData}
+ */
+function levelDataFor(maze, items = [], fuel = 100) {
+  return {
+    maze,
+    validation: {
+      solvable: true,
+      fullyConnected: true,
+      bordersSealed: true,
+      pathLength: 10,
+      floorCount: 10,
+      deadEnds: 1,
+      loops: 0,
+      path: null,
+      errors: [],
+    },
+    items,
+    torches: [],
+    fuel,
+    par: 50,
+  };
+}
+
+/**
+ * A state sitting in `playing` on the given maze.
+ * @param {import('../core/types.js').Maze} maze
+ * @param {import('../core/types.js').Item[]} [items]
+ * @param {number} [fuel]
+ * @returns {import('../core/types.js').GameState}
+ */
+function playing(maze, items = [], fuel = 100) {
+  const s = createInitialState();
+  reducer(s, { type: 'newGame', seed: 7 });
+  reducer(s, { type: 'levelReady', data: levelDataFor(maze, items, fuel) });
+  assert.equal(s.phase, 'playing');
+  return s;
+}
+
+/** Zero input frame. @type {import('./sim.js').SimInput} */
+const NONE = { moveX: 0, moveY: 0, turn: 0, lookDX: 0, sprint: false };
+
+/**
+ * @param {Partial<import('./sim.js').SimInput>} o
+ * @returns {import('./sim.js').SimInput}
+ */
+function input(o) {
+  return { ...NONE, ...o };
+}
+
+/**
+ * One gameplay step with the event queue cleared first — the reducer does this for every action,
+ * so a test calling `stepPlaying` directly must do it too or events pile up across steps.
+ * @param {import('../core/types.js').GameState} s
+ * @param {number} dt
+ * @param {import('./sim.js').SimInput} inp
+ * @returns {void}
+ */
+function step(s, dt, inp) {
+  s.events.length = 0;
+  stepPlaying(s, dt, inp);
+}
+
+/**
+ * Ground truth overlap test, written independently of the solver: is a circle at (x,y) intersecting
+ * any solid tile? Out-of-bounds counts as solid.
+ * @param {import('../core/types.js').Maze} maze
+ * @param {number} x
+ * @param {number} y
+ * @param {number} r
+ * @returns {boolean}
+ */
+function overlapsWall(maze, x, y, r) {
+  const { width: w, height: h, tiles } = maze;
+  const x0 = Math.floor(x - r);
+  const x1 = Math.floor(x + r);
+  const y0 = Math.floor(y - r);
+  const y1 = Math.floor(y + r);
+  const eps = 1e-9;
+  for (let ty = y0; ty <= y1; ty++) {
+    for (let tx = x0; tx <= x1; tx++) {
+      if (!solidAt(tiles, w, h, tx, ty)) continue;
+      // Nearest point on the tile rect to the circle centre.
+      const nx = x < tx ? tx : x > tx + 1 ? tx + 1 : x;
+      const ny = y < ty ? ty : y > ty + 1 ? ty + 1 : y;
+      const dx = x - nx;
+      const dy = y - ny;
+      if (dx * dx + dy * dy < r * r - eps) return true;
+    }
+  }
+  return false;
+}
+
+// ─── solidAt ─────────────────────────────────────────────────────────────────────────────────
+
+test('solidAt: out of bounds is solid, FLOOR is not', () => {
+  const m = mazeFrom(TWISTY);
+  assert.equal(solidAt(m.tiles, m.width, m.height, 1, 1), false);
+  assert.equal(solidAt(m.tiles, m.width, m.height, 0, 0), true);
+  assert.equal(solidAt(m.tiles, m.width, m.height, -1, 4), true);
+  assert.equal(solidAt(m.tiles, m.width, m.height, 4, -1), true);
+  assert.equal(solidAt(m.tiles, m.width, m.height, 9, 4), true);
+  assert.equal(solidAt(m.tiles, m.width, m.height, 4, 9), true);
+  // Any non-FLOOR value is solid, not just WALL.
+  const m2 = mazeFrom(TWISTY);
+  m2.tiles[1 * m2.width + 1] = 7;
+  assert.equal(solidAt(m2.tiles, m2.width, m2.height, 1, 1), true);
+});
+
+// ─── moveCircle: the anti-tunnelling guarantee ───────────────────────────────────────────────
+
+test('moveCircle: the body can never enter a wall, from any tile/angle/speed/dt', () => {
+  const maze = mazeFrom(TWISTY);
+  const r = PLAYER.RADIUS;
+  const out = new Float64Array(4);
+  const speeds = [1, 3.2, 5.12, 20];
+  const dts = [1 / 60, 0.1, 0.25];
+  const starts = [];
+  for (let ty = 0; ty < maze.height; ty++) {
+    for (let tx = 0; tx < maze.width; tx++) {
+      if (!solidAt(maze.tiles, maze.width, maze.height, tx, ty)) starts.push([tx + 0.5, ty + 0.5]);
+    }
+  }
+  assert.ok(starts.length > 10, 'fixture should have plenty of floor tiles');
+
+  let checks = 0;
+  for (const [sx, sy] of starts) {
+    for (let a = 0; a < 24; a++) {
+      const angle = (a / 24) * TAU;
+      const ux = Math.cos(angle);
+      const uy = Math.sin(angle);
+      for (const speed of speeds) {
+        for (const dt of dts) {
+          let x = sx;
+          let y = sy;
+          for (let i = 0; i < 24; i++) {
+            moveCircle(maze.tiles, maze.width, maze.height, x, y, ux * speed * dt, uy * speed * dt, r, out);
+            x = out[0];
+            y = out[1];
+            assert.ok(Number.isFinite(x) && Number.isFinite(y), 'position stayed finite');
+            assert.equal(
+              overlapsWall(maze, x, y, r),
+              false,
+              `entered a wall at (${x.toFixed(4)}, ${y.toFixed(4)}) angle=${angle.toFixed(2)} speed=${speed} dt=${dt}`,
+            );
+            checks++;
+          }
+        }
+      }
+    }
+  }
+  assert.ok(checks > 50000, `ran ${checks} positional checks`);
+});
+
+test('moveCircle: diagonal corner approaches never clip the corner', () => {
+  // A single wall block at (2,2) surrounded by floor: every diagonal approach hits a convex corner.
+  const maze = mazeFrom([
+    '#####',
+    '#...#',
+    '#.#.#',
+    '#...#',
+    '#####',
+  ]);
+  const r = PLAYER.RADIUS;
+  const out = new Float64Array(4);
+  const corners = [
+    [1.5, 1.5, 1, 1],
+    [3.5, 1.5, -1, 1],
+    [1.5, 3.5, 1, -1],
+    [3.5, 3.5, -1, -1],
+  ];
+  for (const [sx, sy, dx, dy] of corners) {
+    let x = sx;
+    let y = sy;
+    for (let i = 0; i < 300; i++) {
+      moveCircle(maze.tiles, maze.width, maze.height, x, y, dx * 0.05, dy * 0.05, r, out);
+      x = out[0];
+      y = out[1];
+      assert.equal(overlapsWall(maze, x, y, r), false, `clipped the corner at (${x}, ${y})`);
+    }
+    // Pressing straight into a convex corner stops the body — it must not squeeze past.
+    const cornerX = dx > 0 ? 2 : 3;
+    const cornerY = dy > 0 ? 2 : 3;
+    const d = Math.hypot(x - cornerX, y - cornerY);
+    assert.ok(d >= r - 1e-9, `stopped at the corner (distance ${d})`);
+  }
+});
+
+test('moveCircle: slides along a flat wall, keeping the tangential component', () => {
+  const maze = openMaze(9);
+  const r = PLAYER.RADIUS;
+  const out = new Float64Array(4);
+  // Start flush against the west wall, push north-west: the -x part is absorbed, +y survives.
+  const blocked = moveCircle(maze.tiles, maze.width, maze.height, 1 + r, 4, -0.05, 0.05, r, out);
+  assert.equal(blocked & 1, 1, 'x was blocked');
+  assert.equal(blocked & 2, 0, 'y was not blocked');
+  assert.ok(Math.abs(out[0] - (1 + r)) < 1e-9, 'x did not move into the wall');
+  assert.ok(Math.abs(out[1] - 4.05) < 1e-12, 'y slid the full amount');
+  assert.ok(Math.abs(out[2] - -0.05) < 1e-9, 'the lost displacement is the normal component');
+  assert.equal(out[3], 0);
+});
+
+test('moveCircle: a zero or non-finite move is a no-op', () => {
+  const maze = openMaze(9);
+  const out = new Float64Array(4);
+  assert.equal(moveCircle(maze.tiles, maze.width, maze.height, 4.5, 4.5, 0, 0, PLAYER.RADIUS, out), 0);
+  assert.deepEqual([...out], [4.5, 4.5, 0, 0]);
+  moveCircle(maze.tiles, maze.width, maze.height, 4.5, 4.5, NaN, 0, PLAYER.RADIUS, out);
+  assert.equal(out[0], 4.5);
+  assert.equal(out[1], 4.5);
+});
+
+test('moveCircle: an absurd displacement is capped, never tunnelled', () => {
+  const maze = mazeFrom(TWISTY);
+  const out = new Float64Array(4);
+  // 10 000 tiles of displacement in one call: bounded work, and still inside the maze.
+  moveCircle(maze.tiles, maze.width, maze.height, 1.5, 1.5, 10000, 10000, PLAYER.RADIUS, out);
+  assert.equal(overlapsWall(maze, out[0], out[1], PLAYER.RADIUS), false);
+  assert.ok(out[0] > 0 && out[0] < maze.width && out[1] > 0 && out[1] < maze.height);
+});
+
+test('moveCircle: a body that starts inside a wall can escape', () => {
+  const maze = mazeFrom(TWISTY);
+  const out = new Float64Array(4);
+  // (0.5, 0.5) is the solid corner tile — the body must be allowed to walk out.
+  moveCircle(maze.tiles, maze.width, maze.height, 0.5, 0.5, 1, 1, PLAYER.RADIUS, out);
+  assert.ok(out[0] > 0.5 && out[1] > 0.5, 'moved out of the wall rather than locking up');
+});
+
+// ─── Line of sight ───────────────────────────────────────────────────────────────────────────
+
+test('hasLineOfSight: blocked by walls, clear along a corridor', () => {
+  const maze = mazeFrom([
+    '#####',
+    '#...#',
+    '#.#.#',
+    '#...#',
+    '#####',
+  ]);
+  const { tiles, width: w, height: h } = maze;
+  assert.equal(hasLineOfSight(tiles, w, h, 1.5, 1.5, 1.5, 1.5), true, 'same tile');
+  assert.equal(hasLineOfSight(tiles, w, h, 1.5, 1.5, 3.5, 1.5), true, 'straight corridor');
+  assert.equal(hasLineOfSight(tiles, w, h, 1.5, 2.5, 3.5, 2.5), false, 'blocked by the pillar');
+  assert.equal(hasLineOfSight(tiles, w, h, 1.5, 1.5, 2.5, 2.5), true, 'the wall tile sees itself');
+  assert.equal(hasLineOfSight(tiles, w, h, 1.5, 1.5, NaN, 2), false, 'non-finite target is not visible');
+});
+
+// ─── Fog of war ──────────────────────────────────────────────────────────────────────────────
+
+test('revealAround: reveals what is visible, never what is behind a wall, within budget', () => {
+  const maze = mazeFrom(TWISTY);
+  const s = playing(maze);
+  const w = maze.width;
+  // levelReady already ran one reveal pass; run a few more so the budget cursor completes a sweep.
+  for (let i = 0; i < 6; i++) revealAround(s);
+  const explored = /** @type {Uint8Array} */ (s.explored);
+  assert.equal(explored[1 * w + 1], 1, 'the tile under the player is explored');
+  assert.equal(explored[1 * w + 2], 1, 'the corridor ahead is explored');
+  // (7,1) is more than REVEAL_RADIUS away from the start and behind walls.
+  assert.equal(explored[1 * w + 7], 0, 'a distant tile stays hidden');
+  let seen = 0;
+  for (let i = 0; i < explored.length; i++) seen += explored[i];
+  assert.ok(seen > 4 && seen < explored.length, `revealed a plausible number of tiles (${seen})`);
+});
+
+test('revealAround: budget bounds the probes per step and the cursor resumes', () => {
+  const maze = openMaze(21);
+  const s = playing(maze);
+  s.player.x = 10.5;
+  s.player.y = 10.5;
+  const explored = /** @type {Uint8Array} */ (s.explored);
+  explored.fill(0);
+  revealAround(s);
+  let after1 = 0;
+  for (let i = 0; i < explored.length; i++) after1 += explored[i];
+  // One own-tile write plus at most the probe budget.
+  assert.ok(after1 <= WORLD.REVEAL_BUDGET + 1, `first pass revealed ${after1} tiles`);
+  for (let i = 0; i < 20; i++) revealAround(s);
+  let after2 = 0;
+  for (let i = 0; i < explored.length; i++) after2 += explored[i];
+  assert.ok(after2 > after1, 'the sweep resumes and keeps revealing');
+});
+
+// ─── Movement feel ───────────────────────────────────────────────────────────────────────────
+
+test('movement: full input reaches walk speed in TIME_TO_TOP_SPEED seconds', () => {
+  const s = playing(openMaze(41));
+  s.player.x = 20.5;
+  s.player.y = 20.5;
+  s.player.angle = 0;
+  const dt = 1 / 60;
+  const steps = Math.round(PLAYER.TIME_TO_TOP_SPEED / dt); // 9
+  for (let i = 0; i < steps - 1; i++) stepPlaying(s, dt, input({ moveY: 1 }));
+  const nearly = Math.hypot(s.player.vx, s.player.vy);
+  assert.ok(nearly < PLAYER.WALK_SPEED, 'not at top speed one step early');
+  stepPlaying(s, dt, input({ moveY: 1 }));
+  assert.ok(
+    Math.abs(Math.hypot(s.player.vx, s.player.vy) - PLAYER.WALK_SPEED) < 1e-9,
+    'exactly at walk speed after TIME_TO_TOP_SPEED',
+  );
+});
+
+test('movement: sprint multiplies top speed, friction brings it to a full stop', () => {
+  const s = playing(openMaze(41));
+  s.player.x = 20.5;
+  s.player.y = 20.5;
+  s.player.angle = 0;
+  const dt = 1 / 60;
+  for (let i = 0; i < 40; i++) stepPlaying(s, dt, input({ moveY: 1, sprint: true }));
+  const top = Math.hypot(s.player.vx, s.player.vy);
+  assert.ok(
+    Math.abs(top - PLAYER.WALK_SPEED * PLAYER.SPRINT_MULT) < 1e-9,
+    `sprint top speed ${top}`,
+  );
+  // Friction: WALK*SPRINT / FRICTION ≈ 0.17 s ≈ 11 steps.
+  for (let i = 0; i < 12; i++) stepPlaying(s, dt, input({}));
+  assert.equal(s.player.vx, 0);
+  assert.equal(s.player.vy, 0);
+});
+
+test('movement: diagonal input is not faster than cardinal input', () => {
+  const s = playing(openMaze(41));
+  s.player.x = 20.5;
+  s.player.y = 20.5;
+  s.player.angle = 0;
+  for (let i = 0; i < 40; i++) stepPlaying(s, 1 / 60, input({ moveX: 1, moveY: 1 }));
+  assert.ok(Math.abs(Math.hypot(s.player.vx, s.player.vy) - PLAYER.WALK_SPEED) < 1e-9);
+});
+
+test('movement: keyboard turn eases in and approaches TURN_SPEED', () => {
+  const s = playing(openMaze(41));
+  s.player.x = 20.5;
+  s.player.y = 20.5;
+  s.player.angle = 0;
+  const dt = 1 / 60;
+  stepPlaying(s, dt, input({ turn: 1 }));
+  const firstStep = s.player.angle;
+  assert.ok(firstStep > 0 && firstStep < PLAYER.TURN_SPEED * dt, 'the first frame is eased, not instant');
+  let total = firstStep;
+  let prev = s.player.angle;
+  for (let i = 1; i < 60; i++) {
+    stepPlaying(s, dt, input({ turn: 1 }));
+    total += s.player.angle - prev >= 0 ? s.player.angle - prev : s.player.angle - prev + TAU;
+    prev = s.player.angle;
+  }
+  // One second of held turn ≈ TURN_SPEED radians, minus the ease-in lag (~1/TURN_EASE_RATE s).
+  assert.ok(total > PLAYER.TURN_SPEED * 0.9 && total <= PLAYER.TURN_SPEED, `turned ${total} rad in 1 s`);
+});
+
+test('movement: mouse yaw is applied directly and clamped by the reducer, not here', () => {
+  const s = playing(openMaze(9));
+  const before = s.player.angle;
+  stepPlaying(s, 1 / 60, input({ lookDX: 0.4 }));
+  assert.ok(Math.abs(s.player.angle - (before + 0.4)) < 1e-12, 'no smoothing on mouse look');
+});
+
+test('movement: the interpolation snapshot trails exactly one step', () => {
+  const s = playing(openMaze(41));
+  s.player.x = 20.5;
+  s.player.y = 20.5;
+  for (let i = 0; i < 10; i++) {
+    const bx = s.player.x;
+    stepPlaying(s, 1 / 60, input({ moveY: 1 }));
+    assert.equal(s.player.px, bx);
+  }
+});
+
+// ─── Head bob & footsteps ────────────────────────────────────────────────────────────────────
+
+test('bob: phase follows distance travelled and footsteps alternate feet', () => {
+  const s = playing(openMaze(61));
+  s.player.x = 30.5;
+  s.player.y = 30.5;
+  s.player.angle = 0;
+  /** @type {number[]} */
+  const feet = [];
+  let distance = 0;
+  for (let i = 0; i < 240; i++) {
+    const bx = s.player.x;
+    const by = s.player.y;
+    step(s, 1 / 60, input({ moveY: 1 }));
+    distance += Math.hypot(s.player.x - bx, s.player.y - by);
+    for (const e of s.events) if (e.type === 'footstep') feet.push(e.foot);
+  }
+  assert.ok(feet.length >= 6, `heard ${feet.length} footsteps over ${distance.toFixed(2)} tiles`);
+  for (let i = 1; i < feet.length; i++) assert.notEqual(feet[i], feet[i - 1], 'feet alternate');
+  // Two footsteps per stride, so steps ≈ distance / (STRIDE/2) within one step of rounding.
+  const expected = Math.floor(distance / (1.9 / 2));
+  assert.ok(Math.abs(feet.length - expected) <= 1, `${feet.length} steps vs ${expected} expected`);
+  assert.ok(s.player.bobAmp > 0.9, 'bob amplitude ramped up at full speed');
+  assert.ok(s.player.bob >= 0 && s.player.bob < TAU, 'bob phase stays wrapped');
+});
+
+test('bob: standing still emits no footsteps and the amplitude decays', () => {
+  const s = playing(openMaze(41));
+  s.player.x = 20.5;
+  s.player.y = 20.5;
+  for (let i = 0; i < 60; i++) step(s, 1 / 60, input({ moveY: 1 }));
+  for (let i = 0; i < 90; i++) {
+    step(s, 1 / 60, input({}));
+    for (const e of s.events) assert.notEqual(e.type, 'footstep');
+  }
+  assert.ok(s.player.bobAmp < 0.01, 'bob amplitude decayed to nothing');
+});
+
+// ─── Bump ────────────────────────────────────────────────────────────────────────────────────
+
+test('bump: a head-on impact fires once, then respects the cooldown', () => {
+  const s = playing(openMaze(9));
+  s.player.x = 4.5;
+  s.player.y = 4.5;
+  s.player.angle = 0; // east, into the wall at tile column 7... run until contact
+  let bumps = 0;
+  for (let i = 0; i < 120; i++) {
+    step(s, 1 / 60, input({ moveY: 1, sprint: true }));
+    for (const e of s.events) if (e.type === 'bump') bumps++;
+  }
+  assert.equal(bumps, 1, 'one thud per impact, not one per frame');
+  assert.ok(s.player.shake > 0, 'the impact shook the camera');
+});
+
+test('bump: sliding along a wall is silent', () => {
+  const s = playing(openMaze(21));
+  // Flush against the west wall, running north with a slight push into it.
+  s.player.x = 1 + PLAYER.RADIUS;
+  s.player.y = 10.5;
+  s.player.angle = -Math.PI / 2; // north
+  let bumps = 0;
+  for (let i = 0; i < 120; i++) {
+    step(s, 1 / 60, input({ moveY: 1, moveX: -0.15 }));
+    for (const e of s.events) if (e.type === 'bump') bumps++;
+  }
+  assert.equal(bumps, 0, 'grazing a wall must not thud');
+  assert.ok(s.player.y < 10.5 - 2, 'and the player still made progress along it');
+});
+
+// ─── Derived ─────────────────────────────────────────────────────────────────────────────────
+
+test('updateDerived: exitDist, nearExit ramp and lowFuel', () => {
+  const maze = openMaze(21);
+  const s = playing(maze, [], 100);
+  s.player.x = maze.exit.x + 0.5;
+  s.player.y = maze.exit.y + 0.5;
+  updateDerived(s);
+  assert.ok(s.derived.exitDist < 1e-9);
+  assert.equal(s.derived.nearExit, 1);
+  s.player.x = 1.5;
+  s.player.y = 1.5;
+  updateDerived(s);
+  assert.ok(s.derived.exitDist > WORLD.NEAR_EXIT_RANGE);
+  assert.equal(s.derived.nearExit, 0);
+  assert.equal(s.derived.lowFuel, false);
+  s.run.fuel = 19;
+  updateDerived(s);
+  assert.equal(s.derived.lowFuel, true);
+  s.levelData = null;
+  updateDerived(s);
+  assert.equal(s.derived.exitDist, Infinity);
+  assert.equal(s.derived.nearExit, 0);
+});
+
+// ─── Attract mode ────────────────────────────────────────────────────────────────────────────
+
+test('attract: the title camera wanders the maze without ever touching a wall', () => {
+  const maze = mazeFrom(TWISTY);
+  const s = createInitialState();
+  reducer(s, { type: 'levelReady', data: levelDataFor(maze) });
+  assert.equal(s.phase, 'title', 'levelReady in title keeps the phase');
+
+  let travelled = 0;
+  /** @type {Set<string>} */
+  const visited = new Set();
+  for (let i = 0; i < 3600; i++) {
+    const bx = s.player.x;
+    const by = s.player.y;
+    stepAttract(s, 1 / 60);
+    travelled += Math.hypot(s.player.x - bx, s.player.y - by);
+    assert.equal(
+      overlapsWall(maze, s.player.x, s.player.y, PLAYER.RADIUS),
+      false,
+      `attract camera walked into a wall at (${s.player.x}, ${s.player.y})`,
+    );
+    visited.add(`${Math.floor(s.player.x)},${Math.floor(s.player.y)}`);
+  }
+  assert.ok(travelled > 30, `camera covered ${travelled.toFixed(1)} tiles in 60 s`);
+  assert.ok(visited.size >= 8, `camera visited ${visited.size} distinct tiles`);
+  assert.ok(Number.isFinite(s.player.angle), 'angle stayed finite');
+});
+
+test('attract: turning is rate-limited, so the shot never snaps', () => {
+  const maze = mazeFrom(TWISTY);
+  const s = createInitialState();
+  reducer(s, { type: 'levelReady', data: levelDataFor(maze) });
+  const dt = 1 / 60;
+  const maxTurn = ATTRACT.TURN_RATE * dt + 1e-9;
+  for (let i = 0; i < 3600; i++) {
+    const before = s.player.angle;
+    stepAttract(s, dt);
+    let d = s.player.angle - before;
+    while (d > Math.PI) d -= TAU;
+    while (d < -Math.PI) d += TAU;
+    assert.ok(Math.abs(d) <= maxTurn, `turned ${d} rad in one step (cap ${maxTurn})`);
+  }
+});
+
+test('attract: deterministic for a given maze seed', () => {
+  const a = createInitialState();
+  const b = createInitialState();
+  reducer(a, { type: 'levelReady', data: levelDataFor(mazeFrom(TWISTY)) });
+  reducer(b, { type: 'levelReady', data: levelDataFor(mazeFrom(TWISTY)) });
+  for (let i = 0; i < 1200; i++) {
+    stepAttract(a, 1 / 60);
+    stepAttract(b, 1 / 60);
+  }
+  assert.equal(a.player.x, b.player.x);
+  assert.equal(a.player.y, b.player.y);
+  assert.equal(a.player.angle, b.player.angle);
+});
+
+test('attract: a dead end is handled by turning around, not by getting stuck', () => {
+  // A single 3-tile stub corridor: the camera must reverse at both ends.
+  const maze = mazeFrom(['#####', '#S..#', '#####']);
+  maze.exit = { x: 3, y: 1 };
+  const s = createInitialState();
+  reducer(s, { type: 'levelReady', data: levelDataFor(maze) });
+  let minX = Infinity;
+  let maxX = -Infinity;
+  for (let i = 0; i < 2400; i++) {
+    stepAttract(s, 1 / 60);
+    assert.equal(overlapsWall(maze, s.player.x, s.player.y, PLAYER.RADIUS), false);
+    minX = Math.min(minX, s.player.x);
+    maxX = Math.max(maxX, s.player.x);
+  }
+  assert.ok(maxX - minX > 1.2, `camera patrolled the stub (${minX.toFixed(2)}..${maxX.toFixed(2)})`);
+});
+
+test('attract: a state with no level data is a no-op, not a crash', () => {
+  const s = createInitialState();
+  stepAttract(s, 1 / 60);
+  assert.equal(s.player.x, 1.5);
+});

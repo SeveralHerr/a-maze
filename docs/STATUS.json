@@ -1,12 +1,252 @@
 {
-  "updated": "2026-09-15T22:45:00.000Z",
-  "iteration": 0,
+  "updated": "2026-09-16T00:20:09.289Z",
+  "iteration": 1,
   "passThreshold": 8.5,
-  "wave": "0-scaffold",
+  "wave": "1-foundations",
   "waves": {
     "0-scaffold": { "status": "done", "notes": "ARCHITECTURE.md contract, tools/serve.mjs, tools/test.mjs, package.json, CI workflow, index.html, styles.css" },
-    "1-foundations": { "status": "pending", "modules": ["core", "state", "input", "renderer"] },
-    "2-generation": { "status": "pending", "modules": ["maze"] },
+    "1-foundations": {
+      "status": "done",
+      "modules": ["core", "state", "input", "renderer"],
+      "notes": "All four foundation modules delivered, 287 tests passing, zero failures, every self-score above the 8.5 threshold. Verified in Node and in real headless Chrome.",
+      "core": {
+        "selfScore": 9,
+        "tests": { "passed": 82, "failed": 0 },
+        "openIssues": [
+          "FrameStats.droppedFrames is an estimate from frame intervals relative to the sim rate; on a 30 Hz display it reports one dropped frame per frame by design.",
+          "stepOnce() does not feed the statistics window, so stats() stays empty in a purely headless stepOnce-driven run.",
+          "Default vsync snapping (0.4 ms) makes the sim run ~0.1% slower than wall clock on a 59.94 Hz display; deliberate, disable with vsyncSnapMs: 0.",
+          "Allocation-free guarantees are asserted via V8's gc hook; those three tests silently skip if CI runs Node without it."
+        ],
+        "contractDeviations": [
+          "types.js splits multi-@property lines one per line (TS JSDoc parser honours one per line); shapes otherwise verbatim.",
+          "types.js adds aliases RunStats / BestScore / Derived and mirrors Action, RenderView, Flash.",
+          "createLoop accepts optional injectables {now, raf, caf, doc} plus vsyncSnapMs and onError; defaults unchanged.",
+          "Loop adds suspended, hz, stepDt, resetStats(); FrameStats adds samples and skippedSteps.",
+          "Rng adds u32(), chance(p), saveState(out?), restoreState(words); state() is a uint32 fingerprint of the 128-bit state.",
+          "math.js adds TAU, HALF_PI, clamp01, invLerp, angleDiff, damp, dist, mod.",
+          "pool.js returns {items, count, capacity, free, acquire, release, releaseAt, retain, clear}; reset runs on release.",
+          "log.js adds setDebug, isDebug, clearErrors, installGlobalErrorCapture; errors is the exported live ring buffer (cap 64)."
+        ],
+        "files": [
+          "src/core/types.js",
+          "src/core/loop.js",
+          "src/core/events.js",
+          "src/core/rng.js",
+          "src/core/math.js",
+          "src/core/pool.js",
+          "src/core/log.js",
+          "src/core/loop.test.mjs",
+          "src/core/events.test.mjs",
+          "src/core/rng.test.mjs",
+          "src/core/math.test.mjs",
+          "src/core/pool.test.mjs",
+          "src/core/log.test.mjs"
+        ]
+      },
+      "state": {
+        "selfScore": 8.9,
+        "tests": { "passed": 93, "failed": 0 },
+        "openIssues": [
+          "No escape hatch from the 'loading' phase: pause and toTitle are ignored there. Needs ARCHITECTURE.md to add loading --toTitle--> title if Esc should work during a long build.",
+          "No TypeScript dependency, so JSDoc types are hand-verified; a tsc --checkJs gate would need GameState to gain an @property {Object} sim line.",
+          "Analogue stick turn gets the same 18/s ease as a keyboard key; may want an input-side analogue flag.",
+          "levelParams' size-based fuel floor dominates maze/populate's path-based budget at every level (deliberate, but a design decision to revisit).",
+          "tools/test.mjs parses '^# pass N' but node:test prints 'i pass N', so per-file tally counts are missing (exit codes correct)."
+        ],
+        "contractDeviations": [
+          "Additive GameState.sim block (SimScratch) for determinism; structurally still a GameState.",
+          "levelParams() returns four extra fields (fuelBase, fuelPerCell, fuelPerPathTile, cells).",
+          "Events cleared at the start of EVERY dispatch, not only on tick (strict superset of the contract).",
+          "save.js functions take an optional trailing storage parameter for test injection.",
+          "Phase-machine edges pinned: newGame from title|gameOver|levelComplete|paused only; toTitle from gameOver|levelComplete|paused only.",
+          "derived.exitDist is Infinity when no level is loaded; derived.nearExit is 0 there.",
+          "run.gemsTotal counts gems on the current level, not the whole run.",
+          "run.bestCombo is a summary statistic only and never multiplies score.",
+          "Oil flask is left on the floor when the tank is within 1 s of full.",
+          "levelData and explored are preserved during 'loading' and swapped atomically by levelReady.",
+          "sim.js exports more helpers than §4.2 names (moveCircle, hasLineOfSight, solidAt, setPhase, completeLevel, endRun, recordBest, ...)."
+        ],
+        "files": [
+          "src/state/balance.js",
+          "src/state/sim.js",
+          "src/state/game.js",
+          "src/state/store.js",
+          "src/state/save.js",
+          "src/state/balance.test.mjs",
+          "src/state/sim.test.mjs",
+          "src/state/game.test.mjs",
+          "src/state/store.test.mjs",
+          "src/state/save.test.mjs"
+        ]
+      },
+      "input": {
+        "selfScore": 8.8,
+        "tests": { "passed": 64, "failed": 0 },
+        "openIssues": [
+          "Mouse look requires pointer lock or a held left-drag; if a browser refuses pointer lock there is no on-screen prompt (belongs to src/ui).",
+          "navigator.getGamepads() allocates a fresh array per poll while a pad is connected; unavoidable through the standard API.",
+          "Touch (0.0038 rad/px) and mouse (0.0024 rad/px) look sensitivities were tuned by feel, not playtested against the finished raycaster.",
+          "The virtual stick's 40% zone is measured against the canvas rect, so an ultra-wide landscape phone gives a very wide stick zone.",
+          "Gamepad rumble is not implemented (not in the contract)."
+        ],
+        "contractDeviations": [
+          "opts is a superset of {sensitivity, invertLook}: also shouldLockPointer, touchRoot, touchOverlay, env. All optional.",
+          "Input adds updateOverlay(state) and a pointerLocked getter; isTouch is an accessor (touch detected lazily).",
+          "createTouchOverlay takes {onAction, document} and returns {update, setStick, destroy, element}.",
+          "input.js owns the touch overlay (created lazily on first touch); main.js can opt out with {touchOverlay:false}.",
+          "Gamepad right-stick yaw feeds frame.turn rather than frame.lookDX (the only dt-correct option).",
+          "Settings.invertLook is applied to yaw (mouse + touch look).",
+          "bindings.js exports lookup tables, gamepad tables, deadzone helpers and CONTROL_HINTS beyond 'the default key map'.",
+          "src/input/fake-dom.test-util.mjs is a test-only DOM double inside the module folder."
+        ],
+        "files": [
+          "src/input/input.js",
+          "src/input/bindings.js",
+          "src/input/touch-overlay.js",
+          "src/input/input.test.mjs",
+          "src/input/bindings.test.mjs",
+          "src/input/touch-overlay.test.mjs",
+          "src/input/fake-dom.test-util.mjs"
+        ]
+      },
+      "renderer": {
+        "selfScore": 8.8,
+        "tests": { "passed": 48, "failed": 0 },
+        "openIssues": [
+          "Wall-torch light has no line-of-sight test around outside corners; a torch just around a convex corner spills slightly onto the adjacent corridor.",
+          "The first rendered frame costs ~40 ms in a cold browser (JIT warm-up) against ~1.2 ms steady state.",
+          "Wall variety is four painted variants plus a per-tile offset; repeats are visible in a big room.",
+          "The scanline overlay covers the whole viewport, including the black bars of a letterboxed portrait layout.",
+          "tools/test.mjs reports a duration instead of per-file pass counts (same note as core; exit codes correct)."
+        ],
+        "contractDeviations": [
+          "Palette is 66 entries, not ~32; the hard limit that matters (<=256) is asserted by a test.",
+          "createTextures returns an ARRAY for every field including floor (3) and ceiling (2).",
+          "createRaycaster takes an optional {textures, seed}; the returned object adds particles, textures, setTextures, depth(), dispose(); stats() is a superset of {ms}.",
+          "createPost returns {set, resize, destroy}; resize(cssW, cssH, internalH) is additive and required for correct scanlines; set() also accepts iris.",
+          "Shading uses a Doom-style COLORMAP (64 levels x 256 entries) rather than per-channel shade LUTs.",
+          "particles.js exports createParticles() (a pooled system) rather than a bare drawParticles(); RenderView shape is unchanged.",
+          "The head-bob/shake horizon is quantised to whole pixels to avoid a shimmering seam at the wall base."
+        ],
+        "files": [
+          "src/renderer/palette.js",
+          "src/renderer/textures.js",
+          "src/renderer/raycaster.js",
+          "src/renderer/post.js",
+          "src/renderer/particles.js",
+          "src/renderer/preview.html",
+          "src/renderer/preview.js",
+          "src/renderer/palette.test.mjs",
+          "src/renderer/textures.test.mjs",
+          "src/renderer/raycaster.test.mjs",
+          "src/renderer/particles.test.mjs",
+          "src/renderer/post.test.mjs"
+        ]
+      },
+      "notesForIntegrator": {
+        "core": [
+          "Wiring: const loop = createLoop({ step, render }) — step(dt) always gets exactly 1/60 s; render(alpha, frameDt) gives alpha in [0,1) for interpolating px/py/pangle. loop.stats() returns a REUSED object.",
+          "window.__game.errors = errors (from core/log.js); call installGlobalErrorCapture() once at boot. window.__game.stepOnce = loop.stepOnce and window.__game.stats = loop.stats match the contract.",
+          "The loop auto-pauses on document.hidden and resumes without replaying hidden time; loop.running stays true, loop.suspended says why.",
+          "Deterministic seeding: const rng = createRng(state.seed) then rng.fork('maze'), rng.fork('items'), rng.fork('textures'). randomSeed() produces a fresh run seed.",
+          "hash2(x, y, seed) is the per-pixel/per-tile noise primitive for renderer/textures.js.",
+          "The rng golden values are pinned by a test: if the generator changes, bump the amaze.v1 persistence key.",
+          "tools/test.mjs's '^# pass N' regex does not match node:test's 'i pass N'; a one-character tweak restores the per-file counts.",
+          "Browser smoke check: logs/core-smoke.html + logs/core-smoke.mjs (gitignored scratch), node logs/core-smoke.mjs exits non-zero on failure."
+        ],
+        "state": [
+          "EVENT ROUTING (can silently lose data): route state.events from a store subscriber — store.subscribe((s) => routeEvents(s.events, s)) — NOT only after the tick dispatch.",
+          "BOOT: const {best, settings} = loadPersist(); const store = createStore(createInitialState(settings, best), reducer); then dispatch levelReady with a demo level while phase is 'title'.",
+          "LOADING: on entering 'loading', call mazeClient.build(levelParams(state.level), seedFor(state)) and dispatch {type:'levelReady', data}. Per-level seed: createRng(state.seed).fork('level' + state.level).u32().",
+          "PERSISTENCE: savePersist({best: state.best, settings: state.settings}) on the gameOver event and on any setSetting action.",
+          "RENDERER WIRING: x = lerp(px, x, alpha), angle = lerpAngle(pangle, angle, alpha); light = clamp01(run.fuel / run.fuelMax); derived.nearExit drives the portal hum, derived.lowFuel the red vignette. state.explored is the minimap fog array (ty*width+tx).",
+          "state.levelData.items[i].taken is the authoritative collected flag.",
+          "HEADLESS TOOLS: {type:'debugWin'} wins the current level while playing; the reducer is deterministic given (seed, level data, input sequence).",
+          "NEVER mutate state from outside src/state; all writes go through dispatch.",
+          "Verified end to end: logs/state-integration.mjs plays 12 real generated levels with an autopilot (zero wall penetration, every level completed); logs/state-browser.* runs the same in headless Chrome with zero console output.",
+          "MEASURED: ~0 bytes allocated per idle step over 1,000,000 steps; 0.31 us/step in Node, ~23 us/step in Chrome.",
+          "BALANCE: populate.js treats fuelSeconds and par as FLOORS; the shipped curve gives ~4.7x on level 1 settling to ~2.0-2.5x from level 6. Retune via FUEL.PER_CELL_START / PER_CELL_END / DECAY_LEVELS."
+        ],
+        "input": [
+          "Wiring: createInput(document.getElementById('overlay'), { sensitivity, invertLook, shouldLockPointer: () => store.getState().phase === 'playing' }); in step(): dispatch {type:'tick', dt, input: input.poll()}; call input.updateOverlay(state) once per frame; input.setOptions on settings change; input.destroy() on teardown.",
+          "poll() returns THE SAME InputFrame and THE SAME pressed Set every call — copy anything you keep.",
+          "Pointer lock is requested on canvas click while shouldLockPointer() is true; input.requestPointerLock() is available for any other user gesture.",
+          "styles.css MUST keep #post, #touch { pointer-events: none; } or no click reaches #overlay and pointer lock plus the virtual stick die silently.",
+          "Escape is bound to BOTH 'back' and 'pause'; M and Tab both give 'map'; WASD and arrows also emit up/down/left/right. Disambiguate by phase.",
+          "Menu auto-repeat: keyboard at the OS rate, gamepad from our own timers (0.42 s delay, 0.11 s interval).",
+          "Verified in real headless Chrome (logs/input-smoke.*, screenshots logs/input-desktop.png and logs/input-mobile.png): keyboard, pointer lock, iPhone-emulated touch, zero console errors."
+        ],
+        "renderer": [
+          "Wiring, in order: const rc = createRaycaster(#view); const post = createPost(#post). On every resize call BOTH rc.resize(w, h, dpr) then post.resize(w, h, rc.internalSize.h).",
+          "Per frame: build ONE reusable RenderView (never allocate per frame) with the interpolated player, then rc.render(view). view.time is the renderer's clock in seconds.",
+          "Then post.set({ scanlines, vignette, lowFuelPulse, flash, iris }); set() is cheap every frame. iris 1 = open, 0 = closed: 0->1 on level start, 1->0 on level complete.",
+          "Two flash paths: view.flash tints the 3-D framebuffer only; post.set({flash}) tints the whole page including the HUD. Pick one per event.",
+          "Pickup sparkles: rc.particles.burst(PARTICLE.SPARK, x, y, 0.4, 24, 2.4, 0.7, PARTICLE_COLORS.spark, rng.next). Torch embers and gem twinkles are emitted by the renderer itself.",
+          "Per-run textures are optional: rc.setTextures(createTextures(state.seed)) during 'loading' only, not mid-level.",
+          "ASPECT RATIO: internal height is pinned at 240 and width clamped 320..560, so outside ~1.33..2.33 the browser stretches the world. Add #view { object-fit: contain } to letterbox (portrait phones are the real case).",
+          "rc.stats() and rc.internalSize are REUSED objects. stats().msAvg is valid from the first frame — good for tools/verify.mjs assertions.",
+          "rc.depth() is the live per-column wall distance buffer; treat as read-only.",
+          "The renderer never throws: a boot-order bug shows as a blank screen rather than a dead page — check stats().frames."
+        ]
+      }
+    },
+    "2-generation": {
+      "status": "done",
+      "modules": ["maze"],
+      "notes": "Generator, validator, populate, level, worker and client delivered. 67 unit tests, 117,306 mazes validated with zero failures, stress clean.",
+      "maze": {
+        "selfScore": 8.8,
+        "tests": { "passed": 67, "failed": 0 },
+        "openIssues": [
+          "Oil flasks fall back onto the solution path for ~6% of placements when a stretch has no side passage within 3 tiles; asserted to stay >=85% off-path.",
+          "WALK_SPEED (3.2) and CORNER_FACTOR (1.18) are duplicated knowledge between src/state/balance.js and src/maze/populate.js, since §2 forbids the import.",
+          "No static type-check was run (no TypeScript dev dependency); tsc --noEmit --allowJs --checkJs over src/maze would be a worthwhile CI addition.",
+          "tools/test.mjs reports a duration instead of per-file pass counts (same note as core; exit codes correct).",
+          "validate-mazes.mjs hand-matches the §6 level curve rather than importing balance.js, deliberately; pointing it at balance.js once final would catch drift.",
+          "The 4096x4096 maximum was verified once by hand (12.5 s generate, 491 MB RSS) but is not automated; stress.mjs covers 2000x2000 plus a 1x4096 guard."
+        ],
+        "contractDeviations": [
+          "populateLevel returns {items, torches, fuel, par} instead of {items, torches}; LevelData itself still matches §3 exactly.",
+          "params.fuelSeconds and params.par are treated as FLOORS on the derived path-based budget, not as the budget.",
+          "createMazeClient takes an optional options object (threshold, timeoutMs, mode, WorkerCtor); no-argument call behaves as specified.",
+          "MazeClient exposes extra read-only accessors mode() and pending().",
+          "Extra exports: fuelBudget, assertMazeValid, levelTransferList, handleMazeRequest, and the DIR_* / MAX_CELLS_PER_SIDE / WORKER_CELL_THRESHOLD / cellToTile / tileToCell constants.",
+          "DIRS is exported both as a frozen bundle and as individual typed arrays (Object.freeze throws on typed arrays).",
+          "Two Validation fields pinned: pathLength counts TILES inclusive of both endpoints; deadEnds counts FLOOR tiles with exactly one FLOOR neighbour.",
+          "validateMaze adds checks §4.4 does not list: thick-wall dimension invariant, odd-lattice start/exit, every logical cell carved.",
+          "A worker-reported build error is retried synchronously rather than rejected immediately.",
+          "generateMaze floors fractional cols/rows rather than throwing; NaN/Infinity/0/negative/>4096 throw RangeError."
+        ],
+        "files": [
+          "src/maze/constants.js",
+          "src/maze/generator.js",
+          "src/maze/validator.js",
+          "src/maze/populate.js",
+          "src/maze/level.js",
+          "src/maze/worker.js",
+          "src/maze/client.js",
+          "src/maze/constants.test.mjs",
+          "src/maze/generator.test.mjs",
+          "src/maze/validator.test.mjs",
+          "src/maze/populate.test.mjs",
+          "src/maze/level.test.mjs",
+          "src/maze/client.test.mjs",
+          "tools/validate-mazes.mjs",
+          "tools/stress.mjs"
+        ]
+      },
+      "notesForIntegrator": [
+        "FUEL SEAM — needs a decision. balance.js levelParams() returns fuelSeconds ~96 s at L1 to ~535 s at L30; populate treats that as a floor, so a direct run burns only 18-31% of the torch instead of the designed 50-85%. Fix (a) balance.js passes fuelSeconds: 0 / par: 0 and lets the maze module derive both (recommended), or (b) balance.js imports fuelBudget(pathLength, params) and scales it. LevelData.fuel is the authoritative number for run.fuel/run.fuelMax.",
+        "Wiring: const client = createMazeClient(); const data = await client.build(levelParams(level), seed); store.dispatch({type:'levelReady', data}). build() never throws synchronously and never rejects for infrastructure reasons. client.dispose() on teardown.",
+        "Worker packaging: src/maze/worker.js must be served from the same directory as client.js (new URL('./worker.js', import.meta.url), {type:'module'}). No bundling. Verified in real headless Chrome.",
+        "Transfer semantics: the worker transfers maze.tiles.buffer and validation.path.buffer; the received LevelData owns them. Call levelTransferList() again before posting it onward.",
+        "Renderer/state may import src/maze/constants.js for TILE and DIR_DX/DIR_DY/DIR_OPPOSITE (same numbering as Torch.face, 0=E,1=S,2=W,3=N, y down).",
+        "Item coordinates are tile CENTRES (tx+0.5, ty+0.5); torch x/y are the WALL tile with face pointing at the lit corridor.",
+        "Sizes: levels <=40x40 build in well under 2 ms, so the 400-cell threshold means levels 1-2 build inline and the rest go async. Level 1 gives ~5 items, ~5 torches, ~40 s of fuel.",
+        "Scratch browser check: logs/maze-worker-check.html + logs/maze-worker-check.mjs (gitignored); worth folding into tools/verify.mjs."
+      ]
+    },
     "3-hud-polish": { "status": "pending", "modules": ["ui", "renderer-polish"] },
     "integration": { "status": "pending" },
     "gauntlet": { "status": "pending" },
@@ -15,5 +255,12 @@
   "modules": {},
   "metrics": {},
   "blocking": [],
-  "history": []
+  "history": [
+    {
+      "iteration": 1,
+      "wave": "1-foundations",
+      "updated": "2026-09-16T00:20:09.289Z",
+      "summary": "Waves 1 and 2 delivered: src/core, src/state, src/input, src/renderer and src/maze. 354 tests passing, zero failures; self-scores 8.8-9.0, all above the 8.5 threshold. No blockers. Open decision for the integrator: the fuel seam between state/balance.js levelParams() and maze/populate.js fuelBudget()."
+    }
+  ]
 }

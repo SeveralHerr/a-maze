@@ -1,0 +1,176 @@
+// @ts-check
+/**
+ * @file Persistence for the two things worth keeping between sessions — the best score and the
+ * user's settings (ARCHITECTURE.md §4.2).
+ *
+ * Everything here is defensive on purpose. `localStorage` can be absent (Node, a worker), can
+ * throw on *access* (a sandboxed iframe, Safari with cookies blocked), can throw on write (quota
+ * exceeded, private mode), and can contain anything at all (another game on the same origin, an
+ * older build, a user editing devtools). None of that may stop the game booting, so every path
+ * degrades to factory defaults and reports `false` rather than throwing.
+ *
+ * ## Key / versioning
+ * The key is `amaze.v1` and the payload carries `v: 1`. Bump **both** if the stored shape changes
+ * or if the RNG stream changes — stored seeds replay differently after an RNG change, so an old
+ * record would refer to a maze that no longer exists.
+ */
+
+import { createLogger } from '../core/log.js';
+import { defaultSettings, sanitizeBest, sanitizeSettings } from './balance.js';
+
+/** @typedef {import('../core/types.js').Settings} Settings */
+/** @typedef {import('../core/types.js').BestScore} BestScore */
+
+/**
+ * The minimal slice of the Web Storage API this module uses. Declared structurally so tests (and
+ * any future backend) can pass a plain object.
+ * @typedef {Object} StorageLike
+ * @property {(key: string) => string|null} getItem
+ * @property {(key: string, value: string) => void} setItem
+ * @property {(key: string) => void} removeItem
+ */
+
+/**
+ * What is persisted, and what `loadPersist` always returns (fully populated, always valid).
+ * @typedef {{best: BestScore, settings: Settings}} Persist
+ */
+
+const log = createLogger('save');
+
+/** Storage key (ARCHITECTURE.md §4.2). Bump with `PERSIST_VERSION`. */
+export const PERSIST_KEY = 'amaze.v1';
+
+/** Payload schema version stored inside the record. */
+export const PERSIST_VERSION = 1;
+
+/**
+ * Upper bound on the serialised payload, in characters. The real record is ~150 chars; anything
+ * this large is corruption or someone else's data under our key, and parsing it is a waste of a
+ * frame during boot.
+ */
+const MAX_PAYLOAD_CHARS = 4096;
+
+/**
+ * The ambient `localStorage`, or `null` when there is none or touching it throws.
+ *
+ * Resolved on every call rather than cached at module load: `src/state` must import cleanly in
+ * Node, and a cached probe would also miss a storage that becomes available later.
+ * @returns {StorageLike|null}
+ */
+export function getDefaultStorage() {
+  try {
+    // `globalThis.localStorage` can throw on mere access in a sandboxed iframe, hence the try.
+    const ls = /** @type {any} */ (globalThis).localStorage;
+    if (ls && typeof ls.getItem === 'function' && typeof ls.setItem === 'function') {
+      return /** @type {StorageLike} */ (ls);
+    }
+  } catch (err) {
+    log.debug('localStorage unavailable', err);
+  }
+  return null;
+}
+
+/**
+ * Fresh factory-default persist record.
+ * @returns {Persist}
+ */
+export function defaultPersist() {
+  return { best: { score: 0, level: 0 }, settings: defaultSettings() };
+}
+
+/**
+ * Load the persisted best score and settings.
+ *
+ * Always returns a complete, valid `Persist`: missing storage, absent key, non-JSON text, a JSON
+ * value that is not an object, a version mismatch, or individual fields out of range all fall
+ * back to factory defaults (per field, so one bad setting does not discard the rest).
+ *
+ * @param {StorageLike|null} [storage] storage to read from; defaults to `localStorage` when present
+ * @returns {Persist} never null, never partial
+ */
+export function loadPersist(storage) {
+  const out = defaultPersist();
+  const store = storage === undefined ? getDefaultStorage() : storage;
+  if (store === null || typeof store.getItem !== 'function') return out;
+
+  /** @type {string|null} */
+  let raw = null;
+  try {
+    raw = store.getItem(PERSIST_KEY);
+  } catch (err) {
+    log.debug('read failed', err);
+    return out;
+  }
+  if (typeof raw !== 'string' || raw.length === 0) return out;
+  if (raw.length > MAX_PAYLOAD_CHARS) {
+    log.warn('persisted record is implausibly large; ignoring it');
+    return out;
+  }
+
+  /** @type {unknown} */
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    log.warn('persisted record is not valid JSON; using defaults', err);
+    return out;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return out;
+
+  const rec = /** @type {Record<string, unknown>} */ (parsed);
+  if (rec.v !== PERSIST_VERSION) {
+    // A record from another schema version is dropped, not migrated: there is only one version.
+    log.info('persisted record version mismatch; using defaults');
+    return out;
+  }
+  out.best = sanitizeBest(rec.best);
+  out.settings = sanitizeSettings(rec.settings);
+  return out;
+}
+
+/**
+ * Persist the best score and settings.
+ *
+ * The record is sanitised before writing, so a corrupted in-memory state cannot be laundered into
+ * storage; the write itself is wrapped because quota errors are routine in private-browsing modes.
+ *
+ * @param {{best?: unknown, settings?: unknown}|null|undefined} data typically `{best, settings}`
+ * @param {StorageLike|null} [storage] storage to write to; defaults to `localStorage` when present
+ * @returns {boolean} true when the record was written
+ */
+export function savePersist(data, storage) {
+  const store = storage === undefined ? getDefaultStorage() : storage;
+  if (store === null || typeof store.setItem !== 'function') return false;
+
+  const src = data === null || typeof data !== 'object' ? {} : data;
+  const record = {
+    v: PERSIST_VERSION,
+    best: sanitizeBest(src.best),
+    settings: sanitizeSettings(src.settings),
+  };
+  try {
+    store.setItem(PERSIST_KEY, JSON.stringify(record));
+    return true;
+  } catch (err) {
+    // Quota exceeded / storage disabled mid-session: the game carries on, unsaved.
+    log.warn('persist failed', err);
+    return false;
+  }
+}
+
+/**
+ * Remove the persisted record (used by a "reset progress" control and by tests).
+ * @param {StorageLike|null} [storage]
+ * @returns {boolean} true when the key was removed
+ */
+export function clearPersist(storage) {
+  const store = storage === undefined ? getDefaultStorage() : storage;
+  if (store === null || typeof store.removeItem !== 'function') return false;
+  try {
+    store.removeItem(PERSIST_KEY);
+    return true;
+  } catch (err) {
+    log.warn('clear failed', err);
+    return false;
+  }
+}

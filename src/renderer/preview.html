@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <title>A-MAZE — renderer preview</title>
+    <!-- Inline favicon: keeps the console free of a 404 so console-error checks stay meaningful. -->
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230a0e18'/%3E%3Cpath d='M4 12 L8 4 L12 12' stroke='%23e8c24a' fill='none'/%3E%3C/svg%3E" />
+    <!--
+      Standalone harness for src/renderer. It is NOT part of the shipped page: index.html and
+      styles.css are integrator territory, so this file carries its own minimal shell.
+
+      Query parameters (all optional):
+        ?pose=0..5   park the camera at a fixed preset instead of walking the maze
+        ?t=12.5      freeze the clock at this many seconds (renders exactly one frame)
+        ?light=0.8   torch strength 0..1 (default: oscillates, to show the radius change)
+        ?stats=1     overlay frame timings and counters
+        ?scan=0      disable the scanline overlay
+        ?seed=1234   repaint the textures from another seed
+    -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #07090f;
+        overflow: hidden;
+        color-scheme: dark;
+      }
+      #app {
+        position: fixed;
+        inset: 0;
+      }
+      #view {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        /* The framebuffer is 240 rows tall; nearest-neighbour upscaling is the whole look. */
+        image-rendering: pixelated;
+        image-rendering: crisp-edges;
+        /* The internal width is clamped to 320…560 columns, so on a very tall or very wide
+           viewport the buffer's aspect ratio no longer matches the element's. `contain`
+           letterboxes instead of stretching the world — the shipped page wants the same rule
+           (or `cover` to crop instead). */
+        object-fit: contain;
+      }
+      #post {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+      }
+      #stats {
+        position: absolute;
+        left: 10px;
+        bottom: 8px;
+        margin: 0;
+        padding: 6px 9px;
+        font: 12px/1.45 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        color: #e8c24a;
+        background: rgba(5, 7, 12, 0.66);
+        border: 1px solid rgba(232, 194, 74, 0.3);
+        white-space: pre;
+        pointer-events: none;
+      }
+      [hidden] {
+        display: none !important;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="view" aria-hidden="true"></canvas>
+      <div id="post" aria-hidden="true"></div>
+      <pre id="stats" hidden></pre>
+    </div>
+    <script type="module" src="./preview.js"></script>
+  </body>
+</html>
