@@ -584,33 +584,18 @@ test('pickups: a flask is left on the floor when the tank is already full', () =
   assert.ok(s.run.fuel > 40);
 });
 
-test('pickups: a near-full tank leaves the flask on the floor, it does not squander it', () => {
-  // The economy's central number. A flask is 35 % of the tank (38–53 s in practice), so consuming
-  // one for a 1 s top-up destroys ~97 % of it — and the player cannot read the gauge finely enough
-  // to avoid that deliberately. The threshold is half a flask, which is the rule
-  // `feasibility.test.mjs` proves the whole massive-maze balance against.
+test('pickups: a near-full tank tops off from a flask, clamped to the tank', () => {
+  // Playtest: "I cannot pick up oil and top off." Any room takes the flask (`FUEL.OIL_MIN_ROOM`); the
+  // over-fill is lost, never stored past the tank.
   const flask = oilFuel(100);
   const s = started(level([item(1, 'oil', 1.5, 1.5)], 100));
   s.run.fuel = s.run.fuelMax * 0.9; // 10 s of headroom against a ~35 s flask
-  ticks(s, 1);
-  assert.equal(countEvents(s, 'pickup'), 0, 'a 90 % tank does not swallow a flask for a sip');
-  assert.equal(/** @type {any} */ (s.levelData).items[0].taken, false, 'still on the floor');
-  assert.equal(s.run.refuels, 0);
-
-  // Just under half a flask of headroom: still not worth it.
-  s.run.fuel = s.run.fuelMax - flask * 0.5 + 0.5;
-  ticks(s, 1);
-  assert.equal(countEvents(s, 'pickup'), 0, 'just under half a flask of room is still a waste');
-
-  // Comfortably over half a flask of headroom: now it is taken, and at full face value.
-  s.run.fuel = s.run.fuelMax - flask;
-  const before = s.run.fuel;
   const events = collect(s, 2);
-  assert.equal(count(events, 'pickup'), 1, 'a real deficit takes the flask');
-  assert.ok(
-    s.run.fuel - before > flask * FUEL.OIL_MIN_USEFUL_FRACTION,
-    `gained ${(s.run.fuel - before).toFixed(1)} s of a ${flask.toFixed(1)} s flask`,
-  );
+  assert.equal(count(events, 'pickup'), 1, 'a 90 % tank still takes the flask');
+  assert.equal(/** @type {any} */ (s.levelData).items[0].taken, true);
+  assert.equal(s.run.refuels, 1);
+  assert.ok(s.run.fuel <= s.run.fuelMax && s.run.fuel > s.run.fuelMax - 1, 'topped off to the brim, not past it');
+  assert.ok(flask > 10, 'the flask was bigger than the room, so this really is a top-off');
 });
 
 test('pickups: an item with non-finite coordinates is never collected', () => {

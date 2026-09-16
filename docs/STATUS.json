@@ -1,5 +1,5 @@
 {
- "updated": "2026-09-16T23:59:00.000Z",
+ "updated": "2026-09-17T00:30:00.000Z",
  "iteration": 10,
  "passThreshold": 8.5,
  "wave": "gauntlet-stopped-r2",
@@ -730,10 +730,6 @@
   {
    "area": "gauntlet",
    "issue": "renderer/ui/state/input/audio below 8.5 at last scoring (round 2, pre-revision). Re-run: Workflow .claude/workflows/gauntlet.js with args {only:[...]}"
-  },
-  {
-   "area": "deploy",
-   "issue": "BUTLER_API_KEY secret not set on SeveralHerr/a-maze; itch deploy step will fail until set"
   }
  ],
  "history": [
@@ -850,6 +846,18 @@
     "stress": "pass"
    },
    "verifyPass": null
+  },
+  {
+   "iteration": 14,
+   "updated": "2026-09-17T00:30:00.000Z",
+   "wave": "oil-top-off",
+   "summary": "Playtest: \"I cannot pick up oil and top off.\" FUEL.OIL_MIN_USEFUL_FRACTION (0.55 of a flask must fit) replaced by FUEL.OIL_MIN_ROOM (1 s): walking over a flask tops the tank off, over-fill lost; only a brim-full tank leaves it. feasibility.test models detour judgement with its own FEAS_DETOUR_FRACTION 0.55. Accepted by the user as an easier curve: tension band L10-12 lowest tank 0.465->0.553 (path-only), 0 lowFuel cues, so the \"deep levels reach the alarm\" assertion was dropped; depth trend still enforced.",
+   "gates": {
+    "npmTest": "pass x2 (38/38)",
+    "validateMazes": "pass (117306 mazes)",
+    "stress": "pass"
+   },
+   "verifyPass": null
   }
  ],
  "openIssues": [
@@ -862,9 +870,9 @@
   "Oil flasks are still left on the floor when <55% would land; with the larger pickup radius this is now the most likely remaining 'walked past an item' report. Consider a HUD cue ('tank full') when standing on a skipped flask.",
   "Auto-fullscreen not yet checked on the real itch.io page, in Safari/iOS (iPhone has no element fullscreen) or Firefox; keyboard-started runs rely on transient activation surviving to the next sim step, and fullscreen + pointer lock from one gesture is only smoke-tested in headless Chrome.",
   "Pointer lock on a real click (and inside the itch.io iframe) after the input.js modality fix is not yet hand-verified; only unlocked mouse look was confirmed in the user's Chrome (touchscreen laptop, pointer: coarse).",
-  "A flask refused on a nearly full tank gives no feedback; consider a \"tank full\" cue (needs an event/derived flag in ARCHITECTURE.md + HUD).",
   "Warm player torch overrides the earlier art decision that the in-hand light stays blue-grey; renderer not re-scored by the art critic. Tune PLAYER_WARM if it reads too orange.",
   "raycaster 'rendering does not allocate' only detects retained growth: an injected short-lived per-column object allocation passes (also true at HEAD).",
-  "state/perf.test.mjs \"transient garbage: a step allocates less than one object\" failed 2 times in ~20 runs while the machine was busy (sim.js unchanged; 8/8 clean at HEAD and in the working tree when idle) - likely the same heapUsed/JIT-tier noise as the raycaster allocation test."
+  "state/perf.test.mjs \"transient garbage: a step allocates less than one object\" failed 2 times in ~20 runs while the machine was busy (sim.js unchanged; 8/8 clean at HEAD and in the working tree when idle) - likely the same heapUsed/JIT-tier noise as the raycaster allocation test.",
+  "Low-fuel alarm is no longer reached in the tension band (L10-12) since top-off pickup; if deep levels feel too safe, trim FUEL.OIL_FRACTION_END or LEVEL.OIL_CELLS_END and restore the feasibility assertion."
  ]
 }

@@ -668,24 +668,23 @@ test('pickups: every pair of item kinds on adjacent tiles is collected, across b
   }
 });
 
-test('pickups: a second adjacent flask refused on a topped-up tank is taken once the torch burns down', () => {
-  // The half-a-flask rule (sim.js takeItem): the first flask tops the tank up, so the second is left
-  // on the floor on purpose. It must really still be collectible — standing on it, without having to
-  // walk off and back — as soon as the tank has room for it.
+test('pickups: a second adjacent flask on a brim-full tank is taken after a moment of burn', () => {
+  // Topping off (sim.js takeItem): only a brim-full tank leaves a flask on the floor. The first flask
+  // fills the tank, so the second waits — but only for `FUEL.OIL_MIN_ROOM` of burn, standing on it.
   const maze = mazeFrom(['############', '#S........E#', '############']);
   const a = itemAt(1, 'oil', 3.5, 1.5);
   const b = itemAt(2, 'oil', 4.5, 1.5);
   const s = playing(maze, [a, b], 100);
-  s.run.fuel = s.run.fuelMax * 0.6;
+  s.run.fuel = s.run.fuelMax * 0.9;
   walkEastTo(s, 4.5);
   assert.equal(a.taken, true, 'first flask');
-  assert.equal(b.taken, false, 'second flask left for later (tank nearly full)');
   let t = 0;
   while (!b.taken && t < 120 && s.phase === 'playing') {
     step(s, 1 / 60, NONE);
     t += 1 / 60;
   }
   assert.equal(b.taken, true, `second flask taken after ${t.toFixed(1)} s standing on it`);
+  assert.ok(t < 3, `a top-off needs only a moment of burn (${t.toFixed(1)} s)`);
 });
 
 // ─── Derived ─────────────────────────────────────────────────────────────────────────────────

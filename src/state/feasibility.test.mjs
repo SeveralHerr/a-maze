@@ -38,6 +38,13 @@ import { createInitialState, reducer } from './game.js';
 /** Levels to prove. 25 covers the whole size ramp (caps at 15) and ten levels past it. */
 const MAX_LEVEL = 25;
 
+/**
+ * The modelled player walks off the route for a flask only when at least this much of it would land.
+ * The sim tops off from any flask the player walks over (`FUEL.OIL_MIN_ROOM`); this is the player's
+ * judgement about detours, not a sim rule.
+ */
+const FEAS_DETOUR_FRACTION = 0.55;
+
 /** Seeds per level. Path length varies ±40 % between seeds, so one seed proves nothing. */
 const SEEDS = 10;
 
@@ -193,9 +200,10 @@ function autopilot(data, level) {
         const trip = 2 * item.dist;
         if (item.kind !== 'oil') continue;
         const deficit = fuelMax - fuel;
-        // The sim itself refuses a flask that would overflow the tank; a competent player also does
-        // not walk three tiles off-route for a sip. The threshold is the sim's own rule (sim.js takeItem).
-        if (deficit < Math.max(1, flask * FUEL.OIL_MIN_USEFUL_FRACTION)) continue;
+        // The sim drinks a flask whenever the tank has room (sim.js takeItem), so one on the route is
+        // always taken; a competent player still does not walk off the route for a sip.
+        if (deficit < FUEL.OIL_MIN_ROOM) continue;
+        if (trip > 0 && deficit < flask * FEAS_DETOUR_FRACTION) continue;
         if (trip > wander) continue; // no budget left for the round trip
         wander -= trip;
         travelled += trip;
@@ -504,5 +512,8 @@ test('tension: the torch runs measurably lower deep in the curve, and every walk
     `a direct player's lowest tank must fall with depth: ${early1.avgMin.toFixed(3)} → ${deep1.avgMin.toFixed(3)}`,
   );
   assert.equal(early2.cues + early1.cues, 0, 'the early levels are generous: no low-fuel alarm');
-  assert.ok(deep2.cues + deep1.cues > 0, 'the deep levels reach the low-fuel alarm at least sometimes');
+  // No longer asserted: "the deep levels reach the low-fuel alarm at least sometimes". Topping off
+  // from any flask (`FUEL.OIL_MIN_ROOM`, a playtest request) lifted the deep band's lowest tank from
+  // ~0.47 to ~0.55 and the alarm stopped firing in these runs; the easier curve was accepted. The
+  // depth trend above is still enforced.
 });

@@ -55,8 +55,8 @@ tree is served locally (`npm run serve`) and uploaded to itch.io by CI.
   down are the shape of the tension curve. A level takes **7–22 refuels** to cross and the
   player is never more than ~60–90 s from darkness, whatever the depth. Gems scale with area too
   (≈ one per 50–60 cells), still favouring dead ends, and remain the score currency.
-  A flask is only consumed when at least `FUEL.OIL_MIN_USEFUL_FRACTION` (0.55) of its value would
-  land in the tank — otherwise it stays on the floor — and the low-fuel alarm fires at
+  Walking over a flask tops the tank off whenever it has at least `FUEL.OIL_MIN_ROOM` (1 s) of
+  room — the over-fill is lost, and only a brim-full tank leaves it on the floor — and the low-fuel alarm fires at
   `FUEL.LOW_FRACTION` (0.25) of the tank.
   **Placement guarantee:** walking the solution path, the gap between consecutive *reachable* oil
   flasks (on the path or within `LEVEL.OIL_REACH_TILES` = 3 tiles of it) never exceeds
@@ -360,8 +360,8 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   `resolveTank(level, offered)`, and `gapSafety(level)` (the refuel-chain headroom multiplier,
   `FUEL.GAP_SAFETY` 0.7 on level 1 → `FUEL.GAP_SAFETY_END` 0.8 at the cap, applied to
   `oilTargetGap`). `FUEL.LOW_FRACTION` (0.25) is the `lowFuel` threshold;
-  `FUEL.OIL_MIN_USEFUL_FRACTION` (0.55) is how much of a flask must be usable before the sim consumes
-  it (the same rule `feasibility.test.mjs` models); `LEVEL.DRAIN_RAMP_START` (5) is the last level
+  `FUEL.OIL_MIN_ROOM` (1 s) is the tank room below which the sim leaves a flask on the floor
+  (`feasibility.test.mjs` also models a player who skips off-route flasks for a sip); `LEVEL.DRAIN_RAMP_START` (5) is the last level
   that burns at 1× before `drainRate` climbs by `FUEL.DRAIN_PER_LEVEL`. Frozen tables `PLAYER / BUMP / BOB / WORLD / SIM / FUEL / SCORE /
   ATTRACT / LEVEL`. Removed with the old economy (nothing referenced them): `FUEL.BASE_SECONDS`,
   `PER_CELL_START/END`, `DECAY_LEVELS`, `PER_PATH_TILE_START/END`, `PAR_FRACTION`,

@@ -154,13 +154,6 @@ const _cand = new Int32Array(8);
 const _candW = new Int32Array(4);
 
 /**
- * Absolute floor, in fuel-seconds, on the useful gain that makes an oil flask worth consuming. The
- * real threshold is `FUEL.OIL_MIN_USEFUL_FRACTION` of the flask's value; this only stops a
- * degenerate level (a zero-second flask) from making the test vacuous.
- */
-const OIL_MIN_GAIN = 1;
-
-/**
  * Longest per-axis displacement, in tiles, that `collectAround` will sweep. The real maximum is
  * `WALK_SPEED × SPRINT_MULT × SIM.MAX_DT` = 1.28; anything beyond this is a teleport (a test or tool
  * moving the player by hand) and is treated as a point test at the destination, which also keeps
@@ -892,13 +885,11 @@ function takeItem(state, it) {
   // An unknown kind is data corruption, not an oil flask. Defaulting to oil here would hand a free
   // refuel to any malformed item that reached the level (`{}` used to be treated as a flask).
   if (it.kind !== 'oil') return;
-  // Walking over a flask with a near-full tank would burn most of it for nothing, which reads as a
-  // bug to the player: a flask is 38–53 s and the tank is 110–150 s, so a 1 s top-up destroys ~97 %
-  // of the pickup. Leave it on the floor until at least half of it would land — it is still there
-  // on the way back, and that is the rule `feasibility.test.mjs` proves the level curve against.
+  // Walking over a flask tops the tank off whenever it has room (`FUEL.OIL_MIN_ROOM`); the over-fill
+  // is lost. Only a brim-full tank leaves the flask on the floor — refusing a flask the player can
+  // see they want read as a bug in playtesting.
   const gain = oilFuel(run.fuelMax);
-  const useful = Math.max(OIL_MIN_GAIN, gain * FUEL.OIL_MIN_USEFUL_FRACTION);
-  if (run.fuelMax - run.fuel < useful) return;
+  if (run.fuelMax - run.fuel < FUEL.OIL_MIN_ROOM) return;
   it.taken = true;
   const before = run.fuel;
   run.fuel = Math.min(run.fuelMax, run.fuel + gain);

@@ -264,18 +264,16 @@ export const FUEL = Object.freeze({
    */
   OIL_FRACTION_END: 0.44,
   /**
-   * How much of a flask's face value must actually land in the tank before the flask is consumed,
-   * as a fraction of `oilFuel(fuelMax)`. A flask is 38–66 s; consuming one for a 1 s top-up is
-   * ~97 % of the central resource destroyed, and the player cannot see the tank well enough to
-   * avoid it deliberately. The flask stays on the floor until 55 % of it would land — exactly
-   * the rule `feasibility.test.mjs` models (`deficit < max(1, flask × fraction)`), so the shipped
-   * sim and the feasibility proof agree.
+   * Room, in fuel-seconds, the tank must have before walking over a flask drinks it; the gain is
+   * clamped to the tank, so only a brim-full tank leaves a flask on the floor.
    *
-   * Raised from 0.5: at 0.5 a flask was drunk as soon as the tank fell below ~82 %, so a player who
-   * explored was topped up continuously and the tank never went below ~65 % at any depth (0 `lowFuel`
-   * cues in 36 wandering runs over levels 1–12). The alarm has to be reachable to mean anything.
+   * It used to be a fraction of the flask (0.55): the flask stayed down until 55 % of it would land,
+   * which kept the low-oil alarm reachable. Playtesting read that as "I cannot pick up oil to top
+   * off" — a flask you walk over and cannot take looks like a bug — so topping off wins and the
+   * over-fill is lost. `feasibility.test.mjs` still models a player who does not walk *off* the
+   * route for a sip (`FEAS_DETOUR_FRACTION` there); flasks on the route are always drunk.
    */
-  OIL_MIN_USEFUL_FRACTION: 0.55,
+  OIL_MIN_ROOM: 1,
   /** Lower clamp on an oil flask's value, in fuel-seconds. */
   OIL_MIN: 25,
   /** Upper clamp on an oil flask's value, in fuel-seconds (above the curve's 66 s at the cap). */
@@ -300,7 +298,7 @@ export const FUEL = Object.freeze({
    * Drain alone cannot make a level tense: `oilTargetGap` is derived from it, so a faster burn also
    * packs the chain flasks closer. The drain shortens the *un-guaranteed* stretches (detours, the
    * scatter flasks); the depth trend proper comes from `OIL_FRACTION_END`, `GAP_SAFETY_END`,
-   * `OIL_MIN_USEFUL_FRACTION` and `LEVEL.OIL_CELLS_END` together.
+   * and `LEVEL.OIL_CELLS_END` together.
    *
    * Measured with the real reducer (60 Hz, 15 seeds × levels 1–20, a 2× wanderer that makes 20-tile
    * side excursions and a walker that never leaves the solution path): the wanderer's lowest tank
