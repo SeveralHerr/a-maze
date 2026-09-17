@@ -74,14 +74,14 @@ import { TILE, DIR_COUNT, DIR_DX, DIR_DY, MAX_CELLS_PER_SIDE } from './constants
  * in genuinely different sections of the maze, so the opening turns a long backtrack into a loop;
  * a smaller value would mostly join sibling corridors and change nothing the player can feel.
  */
-export const SHORTCUT_DETOUR = 24;
+export const SHORTCUT_DETOUR = 12;
 
 /**
  * Default fraction of the carved start→exit route that shortcuts must preserve. Shortcuts exist to
  * spare the player long backtracks, not to trivialise the level: unguarded, four shortcuts halve
  * a 16×16 route (measured 314 → 150 tiles).
  */
-export const SHORTCUT_ROUTE_KEEP = 0.9;
+export const SHORTCUT_ROUTE_KEEP = 0.85;
 
 /**
  * Validate one grid dimension. Non-integers are floored (a caller computing `cols` from a curve

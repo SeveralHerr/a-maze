@@ -1,6 +1,6 @@
 {
  "updated": "2026-09-16T23:53:53.000Z",
- "iteration": 11,
+ "iteration": 12,
  "passThreshold": 8.5,
  "wave": "unlocks",
  "waves": {
@@ -894,6 +894,12 @@
     "state": 8.0
    },
    "stressPass": true
+   },
+   {
+   "iteration": 12,
+   "updated": "2026-09-16T23:14:53.339Z",
+   "wave": "maze-shortcuts-denser",
+   "summary": "Playtest asked for a bunch more shortcuts (screenshot of a 32x32 level with ~20 extra spots marked). The old tuning requested 21 on 32x32 but only ~13 landed: the 0.9 route guard rejected the rest, and at detour 24/16 candidates ran out. Retuned LEVEL.SHORTCUT_CELLS 48->24, SHORTCUT_DETOUR 24->12, SHORTCUT_ROUTE_KEEP 0.9->0.85 (generator defaults match). Placed per level (10 seeds): 16x16 2->7, 24x24 8->20, 32x32 13->33, 64x64 66->164, 128x128 325->683. feasibility.test.mjs: 250/250 runs won, lowest tank L1/2 0.697 vs L10-12 0.534 (was 0.70 vs 0.57), so the tension curve holds."
   }
  ],
  "openIssues": [

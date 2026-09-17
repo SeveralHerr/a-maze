@@ -49,7 +49,7 @@ tree is served locally (`npm run serve`) and uploaded to itch.io by CI.
   reached at level 15. `LEVEL.MAX_CELLS` in `balance.js` is the **single documented size knob** and
   the cap level is *derived* from it (`CAP_LEVEL`), never typed twice. Past the cap, levels get
   **harder, not bigger**: every level (level 1 included) also gets one cross-section **shortcut**
-  per `LEVEL.SHORTCUT_CELLS` (48) cells, so long cul-de-sacs sometimes have a back door;
+  per `LEVEL.SHORTCUT_CELLS` (24) cells, so long cul-de-sacs sometimes have a back door;
   braid keeps rising (0→0.6 over 17 levels, square-root shaped, 0.6 from
   level 18), the torch drains 3 % faster per level (`FUEL.DRAIN_PER_LEVEL`) from
   `LEVEL.DRAIN_RAMP_START` (level 5, so the ramp is felt inside the size curve) to a 1.35× ceiling
@@ -483,8 +483,8 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
 
 ### 4.4 `src/maze` (Wave 2)
 - `constants.js` — `TILE = { FLOOR:0, WALL:1 }`, `DIRS`.
-- `generator.js` — `generateMaze({cols, rows, seed, braid=0, shortcuts=0, shortcutDetour=24,
-  shortcutRouteKeep=0.9}) → Maze`. **Iterative randomized
+- `generator.js` — `generateMaze({cols, rows, seed, braid=0, shortcuts=0, shortcutDetour=12,
+  shortcutRouteKeep=0.85}) → Maze`. **Iterative randomized
   recursive backtracker** with an explicit `Int32Array` stack (no recursion → no stack overflow at
   any size), followed by optional **shortcuts** (knock through up to `shortcuts` walls whose two
   cells are ≥ `shortcutDetour` cells apart by path — a bounded BFS on the live tiles — while keeping

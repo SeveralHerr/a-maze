@@ -447,26 +447,27 @@ export const LEVEL = Object.freeze({
    * cells apart by path, so a long cul-de-sac sometimes has a back door and corridors that look
    * like they should meet sometimes do — less forced backtracking, and a maze you can get lost in
    * because it is no longer a tree. Braid cannot do this: it opens dead-end *tips*, mostly into a
-   * sibling twig. Measured over 20 seeds (`src/maze/generator.js` shortcut pass): the largest
-   * start-and-exit-free cul-de-sac falls 37 → 18 cells on level 1, 71 → 29 on level 2, 164 → 62 on
-   * level 8, 111 → 54 at the cap. Small grids accept fewer than requested (≈2 of 5 on level 1):
-   * the detour and route rules run out of candidates, which is the intended "a few" there.
+   * sibling twig. Doubled from 48 in a playtest pass that asked for "a bunch" more: placed per
+   * maze size (10 seeds) went 2 → 7 at 16×16, 8 → 20 at 24×24, 13 → 33 at 32×32,
+   * 66 → 164 at 64×64 and 325 → 683 at the cap. Small grids accept fewer than requested (≈7 of 11
+   * on level 1): the detour and route rules run out of candidates.
    */
-  SHORTCUT_CELLS: 48,
+  SHORTCUT_CELLS: 24,
   /**
    * Minimum path distance, in cells, between the two cells a shortcut joins (so each one spares at
-   * least 48 tiles of backtracking). 24 rather than 16 for a measured reason: at 16 the extra loops
-   * send a wandering player on long excursions between flasks early on, and the lowest tank on
-   * levels 1–2 fell from 0.76 to 0.65 — flattening the "L1 generous, L10 tense" curve that
-   * `feasibility.test.mjs` guards. At 24 it is 0.70 against 0.57 deep (20 seeds per level).
+   * least 24 tiles of backtracking). Lowered from 24 with the doubled density: at 24 or 16 the
+   * candidates run out and half the requests go unplaced (32×32: 25 of 51 at 16). Re-measured in
+   * `feasibility.test.mjs` (10 seeds per level) the lowest tank is still 0.70 on levels 1–2 against
+   * 0.53 deep, so the "L1 generous, L10 tense" curve survives.
    */
-  SHORTCUT_DETOUR: 24,
+  SHORTCUT_DETOUR: 12,
   /**
    * Fraction of the carved start→exit route shortcuts must leave intact. They exist to spare
    * backtracking, not to hand out a faster exit: unguarded, four of them halve a 16×16 route.
-   * At 0.9 the level-1 route drops ≈ 6 % (314 → 296 tiles).
+   * At 0.85 the level-1 route drops at most 15 %; at 0.9 the guard alone rejected ~40 % of the
+   * requests on a 32×32 level.
    */
-  SHORTCUT_ROUTE_KEEP: 0.9,
+  SHORTCUT_ROUTE_KEEP: 0.85,
   /**
    * Levels over which braid ramps from 0 to `BRAID_MAX`. Longer than the size ramp on purpose, so
    * braid **keeps rising past the size cap** (0.49 at `CAP_LEVEL`, 0.6 from level 18).
