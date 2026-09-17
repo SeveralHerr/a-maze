@@ -129,7 +129,7 @@ function makeState(phase) {
  * @returns {any}
  */
 function press(action) {
-  return { moveX: 0, moveY: 0, turn: 0, lookDX: 0, sprint: false, pressed: new Set([action]) };
+  return { moveX: 0, moveY: 0, turn: 0, lookDX: 0, pressed: new Set([action]) };
 }
 
 /**
@@ -167,8 +167,9 @@ test('title navigation reaches every item and wraps', () => {
   assert.ok(log.includes('newGame'));
   assert.ok(log.includes('sfx:uiConfirm'));
 
-  // Down to Options, confirm, and back out again.
+  // Down past the Shrine to Options, confirm, and back out again.
   assert.equal(menus.handleInput(press('down'), state), true);
+  menus.handleInput(press('down'), state);
   assert.ok(log.includes('sfx:uiMove'));
   menus.handleInput(press('confirm'), state);
   menus.render(state);
@@ -178,7 +179,8 @@ test('title navigation reaches every item and wraps', () => {
   menus.render(state);
   assert.equal(menus.screen(), 'title', 'and the title list remembers where it was');
 
-  // Up from Options to Descend, then up again wraps round to Credits.
+  // Up from Options past the Shrine to Descend, then up again wraps round to Credits.
+  menus.handleInput(press('up'), state);
   menus.handleInput(press('up'), state);
   menus.handleInput(press('up'), state);
   menus.handleInput(press('confirm'), state);
@@ -247,6 +249,7 @@ test('the abandon dialog: back and the first row both keep the run', () => {
 test('options: arrows adjust settings without mutating state', () => {
   const { menus, log, settings } = harness();
   const state = makeState('title');
+  menus.handleInput(press('down'), state); // Shrine
   menus.handleInput(press('down'), state); // Options
   menus.handleInput(press('confirm'), state);
 
@@ -282,6 +285,7 @@ test('options: arrows adjust settings without mutating state', () => {
 test('options: the Fullscreen row sits above Back and toggles the fullscreen setting', () => {
   const { menus, settings } = harness();
   const state = makeState('title');
+  menus.handleInput(press('down'), state); // Shrine
   menus.handleInput(press('down'), state); // Options
   menus.handleInput(press('confirm'), state);
   // Up from the first row wraps to Back; one more up is the last setting row.
@@ -297,6 +301,7 @@ test('options: the Fullscreen row sits above Back and toggles the fullscreen set
 test('options: the sensitivity slider stays inside its own range', () => {
   const { menus, settings } = harness();
   const state = makeState('title');
+  menus.handleInput(press('down'), state);
   menus.handleInput(press('down'), state);
   menus.handleInput(press('confirm'), state);
   menus.handleInput(press('down'), state);
@@ -326,6 +331,7 @@ test('level complete: confirm skips the tally, then descends', () => {
   assert.equal(log.filter((e) => e === 'nextLevel').length, 1);
 
   log.length = 0;
+  menus.handleInput(press('down'), state);
   menus.handleInput(press('down'), state);
   menus.handleInput(press('confirm'), state);
   menus.render(state);
@@ -363,6 +369,7 @@ test('Escape on level complete never abandons the run', () => {
   menus.render(state);
   assert.equal(menus.screen(), 'complete');
   menus.handleInput(press('up'), state);
+  menus.handleInput(press('up'), state);
   log.length = 0;
   menus.handleInput(press('confirm'), state);
   assert.deepEqual(log.filter((e) => e === 'nextLevel'), ['nextLevel'], 'the tally stayed finished');
@@ -376,6 +383,7 @@ test('game over: back is still a direct exit (that run is already over)', () => 
   assert.deepEqual(log.filter((e) => e === 'quit'), ['quit']);
   // …and so is its Title row: no dialog.
   log.length = 0;
+  menus.handleInput(press('down'), state);
   menus.handleInput(press('down'), state);
   menus.handleInput(press('confirm'), state);
   assert.deepEqual(log.filter((e) => e === 'quit'), ['quit']);
@@ -408,6 +416,7 @@ test('game over: retry and title', () => {
   assert.ok(log.includes('newGame'));
   log.length = 0;
   menus.handleInput(press('down'), state);
+  menus.handleInput(press('down'), state);
   menus.handleInput(press('confirm'), state);
   assert.ok(log.includes('quit'));
 });
@@ -416,6 +425,7 @@ test('a phase change closes any open sub-screen', () => {
   const { menus } = harness();
   const title = makeState('title');
   menus.render(title);
+  menus.handleInput(press('down'), title);
   menus.handleInput(press('down'), title);
   menus.handleInput(press('confirm'), title);
   menus.render(title);
@@ -466,6 +476,7 @@ test('the map row cycles through its three states and writes both settings shape
   // Walk into Options and down to the Map row.
   menus.render(state);
   menus.handleInput(press('down'), state);
+  menus.handleInput(press('down'), state);
   menus.handleInput(press('confirm'), state);
   menus.render(state);
   assert.equal(menus.screen(), 'options');
@@ -497,6 +508,7 @@ test('left and right step the map row in both directions and wrap', () => {
   const { menus, settings } = harness();
   const state = makeState('title');
   menus.render(state);
+  menus.handleInput(press('down'), state);
   menus.handleInput(press('down'), state);
   menus.handleInput(press('confirm'), state);
   menus.render(state);
@@ -590,7 +602,8 @@ function optionsHarness(cssW, cssH, dpr) {
   menus.resize(cssW, cssH, dpr);
   const state = makeState('title');
   menus.render(state);
-  menus.handleInput(press('down'), state); // Descend → Options
+  menus.handleInput(press('down'), state); // Descend → Shrine
+  menus.handleInput(press('down'), state); // → Options
   menus.handleInput(press('confirm'), state);
   menus.render(state);
   /**
@@ -840,7 +853,8 @@ test('the Controls panel is reachable from the title and from pause', () => {
   const { menus, log } = harness();
   const title = makeState('title');
   menus.render(title);
-  // Title rows: Descend, Options, Controls, Credits.
+  // Title rows: Descend, Shrine, Options, Controls, Credits.
+  menus.handleInput(press('down'), title);
   menus.handleInput(press('down'), title);
   menus.handleInput(press('down'), title);
   menus.handleInput(press('confirm'), title);
@@ -881,6 +895,7 @@ test('a caller-supplied control table is used, sanitised and never trusted blind
   menus.render(state);
   menus.handleInput(press('down'), state);
   menus.handleInput(press('down'), state);
+  menus.handleInput(press('down'), state);
   menus.handleInput(press('confirm'), state);
   assert.doesNotThrow(() => menus.render(state));
   assert.equal(menus.screen(), 'controls');
@@ -902,15 +917,15 @@ test('reduced motion finishes the level-complete tally instead of rolling it', (
 });
 
 test('the loading screen size mirror matches the shipped curve', () => {
-  // These are the numbers ARCHITECTURE.md §6 / balance.js LEVEL publish: 16 + 8 per depth, capped
-  // at 128 (depth 15). If balance.js moves, this test is the tripwire.
-  assert.equal(cellsForLevel(1), 16);
+  // These are the numbers ARCHITECTURE.md §1 / balance.js LEVEL publish: the lean 10×10 first floor,
+  // then 16 + 8 per depth, capped at 128 (depth 15). If balance.js moves, this test is the tripwire.
+  assert.equal(cellsForLevel(1), 10);
   assert.equal(cellsForLevel(2), 24);
   assert.equal(cellsForLevel(8), 72);
   assert.equal(cellsForLevel(15), 128);
   assert.equal(cellsForLevel(30), 128, 'past the cap a level gets harder, not bigger');
-  assert.equal(cellsForLevel(0), 16);
-  assert.equal(cellsForLevel(NaN), 16);
+  assert.equal(cellsForLevel(0), 10);
+  assert.equal(cellsForLevel(NaN), 10);
 });
 
 test('NEW BEST is measured against the record the run started with, strictly', async () => {
@@ -1008,4 +1023,91 @@ test('the end screens survive a run with no optional stat fields', () => {
     state.run.distance = 1240;
     assert.doesNotThrow(() => menus.render(state), `${phase} with refuels and distance`);
   }
+});
+
+// ─── Unlocks wave: Shrine and Boon (ARCHITECTURE.md §4.9) ────────────────────────────────────
+
+const CATALOGUE = [
+  { id: 'reservoir', name: 'Reservoir', group: 'torch', costs: [15, 30], blurb: 'A deeper tank.', ranks: ['Tank +10%', 'Tank +20%'] },
+  { id: 'chalk', name: 'Chalk', group: 'fortune', costs: [10], blurb: 'Mark walls.', ranks: ['4 marks per floor'] },
+  { id: 'magnet', name: 'Gem Magnet', group: 'fortune', costs: [15, 40], blurb: 'Pull gems.', ranks: ['Pull 1.2', 'Pull 1.6'] },
+];
+
+/** @param {string} phase @param {number} purse @param {Record<string, number>} ranks */
+function unlockHarness(phase, purse, ranks) {
+  const log = [];
+  const menus = createMenus(null, {
+    unlocks: CATALOGUE,
+    onBuy: (id) => log.push(`buy:${id}`),
+    onClaimBoon: (id) => log.push(`claim:${id}`),
+    onNextLevel: () => log.push('nextLevel'),
+    onUiSound: (t) => log.push(`sfx:${t}`),
+  });
+  const state = /** @type {any} */ (makeState(phase));
+  state.progress = { purse, ranks, boonLevel: 0 };
+  state.offer = { open: false, level: 0, ids: [] };
+  return { menus, state, log };
+}
+
+test('shrine: reached from the title, buys what the purse can pay for, refuses the rest', () => {
+  const { menus, state, log } = unlockHarness('title', 20, { chalk: 1 });
+  menus.render(state);
+  menus.handleInput(press('down'), state); // Shrine
+  menus.handleInput(press('confirm'), state);
+  menus.render(state);
+  assert.equal(menus.screen(), 'shrine');
+  menus.handleInput(press('confirm'), state); // Reservoir, 15 of 20
+  assert.deepEqual(log.filter((e) => e.startsWith('buy')), ['buy:reservoir']);
+  log.length = 0;
+  menus.handleInput(press('down'), state); // Chalk, already maxed
+  menus.handleInput(press('confirm'), state);
+  menus.handleInput(press('down'), state); // Magnet, 15 — but pretend the purse is spent
+  state.progress.purse = 5;
+  menus.handleInput(press('confirm'), state);
+  assert.equal(log.some((e) => e.startsWith('buy')), false, 'maxed and unaffordable rows never buy');
+  assert.equal(log.filter((e) => e === 'sfx:uiDeny').length, 2);
+  menus.handleInput(press('back'), state);
+  menus.render(state);
+  assert.equal(menus.screen(), 'title');
+});
+
+test('shrine: open from level complete and game over too', () => {
+  for (const [phase, base] of [['levelComplete', 'complete'], ['gameOver', 'gameover']]) {
+    const { menus, state } = unlockHarness(phase, 0, {});
+    state.settings.reducedMotion = true; // no tally to skip
+    menus.render(state);
+    menus.handleInput(press('down'), state);
+    menus.handleInput(press('confirm'), state);
+    menus.render(state);
+    assert.equal(menus.screen(), 'shrine', `from ${phase}`);
+    menus.handleInput(press('back'), state);
+    menus.render(state);
+    assert.equal(menus.screen(), base);
+  }
+});
+
+test('boon: opens itself after the tally, claims the chosen card, and Descend never skips it', () => {
+  const { menus, state, log } = unlockHarness('levelComplete', 0, {});
+  state.offer = { open: true, level: 3, ids: ['reservoir', 'chalk', 'magnet'] };
+  menus.render(state);
+  menus.handleInput(press('confirm'), state); // skip the tally
+  menus.render(state);
+  assert.equal(menus.screen(), 'boon', 'the boon opens itself');
+  menus.handleInput(press('back'), state); // Decide Later
+  menus.render(state);
+  assert.equal(menus.screen(), 'complete');
+  // First row is now "Choose a Boon"; Descend (second row) shows the boon instead of forfeiting it.
+  menus.handleInput(press('down'), state);
+  menus.handleInput(press('confirm'), state);
+  menus.render(state);
+  assert.equal(log.includes('nextLevel'), false);
+  assert.equal(menus.screen(), 'boon');
+  menus.handleInput(press('right'), state);
+  menus.handleInput(press('confirm'), state);
+  assert.deepEqual(log.filter((e) => e.startsWith('claim')), ['claim:chalk']);
+  state.offer.open = false;
+  menus.render(state);
+  assert.equal(menus.screen(), 'complete');
+  menus.handleInput(press('confirm'), state);
+  assert.ok(log.includes('nextLevel'), 'with the boon claimed, Descend descends');
 });

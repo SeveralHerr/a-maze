@@ -133,7 +133,7 @@ function playing(maze, items = [], fuel = 100) {
 }
 
 /** Zero input frame. @type {import('./sim.js').SimInput} */
-const NONE = { moveX: 0, moveY: 0, turn: 0, lookDX: 0, sprint: false };
+const NONE = { moveX: 0, moveY: 0, turn: 0, lookDX: 0 };
 
 /**
  * @param {Partial<import('./sim.js').SimInput>} o
@@ -395,19 +395,16 @@ test('movement: full input reaches walk speed in TIME_TO_TOP_SPEED seconds', () 
   );
 });
 
-test('movement: sprint multiplies top speed, friction brings it to a full stop', () => {
+test('movement: one top speed (no sprint, whatever a stale frame says), friction brings it to a full stop', () => {
   const s = playing(openMaze(41));
   s.player.x = 20.5;
   s.player.y = 20.5;
   s.player.angle = 0;
   const dt = 1 / 60;
-  for (let i = 0; i < 40; i++) stepPlaying(s, dt, input({ moveY: 1, sprint: true }));
+  for (let i = 0; i < 40; i++) stepPlaying(s, dt, /** @type {any} */ ({ ...input({ moveY: 1 }), sprint: true }));
   const top = Math.hypot(s.player.vx, s.player.vy);
-  assert.ok(
-    Math.abs(top - PLAYER.WALK_SPEED * PLAYER.SPRINT_MULT) < 1e-9,
-    `sprint top speed ${top}`,
-  );
-  // Friction: WALK*SPRINT / FRICTION ≈ 0.17 s ≈ 11 steps.
+  assert.ok(Math.abs(top - PLAYER.WALK_SPEED) < 1e-9, `top speed ${top}`);
+  // Friction: WALK / FRICTION ≈ 0.11 s ≈ 7 steps.
   for (let i = 0; i < 12; i++) stepPlaying(s, dt, input({}));
   assert.equal(s.player.vx, 0);
   assert.equal(s.player.vy, 0);
@@ -507,7 +504,7 @@ test('bump: a head-on impact fires once, then respects the cooldown', () => {
   s.player.angle = 0; // east, into the wall at tile column 7... run until contact
   let bumps = 0;
   for (let i = 0; i < 120; i++) {
-    step(s, 1 / 60, input({ moveY: 1, sprint: true }));
+    step(s, 1 / 60, input({ moveY: 1 }));
     for (const e of s.events) if (e.type === 'bump') bumps++;
   }
   assert.equal(bumps, 1, 'one thud per impact, not one per frame');
@@ -587,9 +584,9 @@ test('pickups: an item on the far side of a one-tile wall is never collected', (
   ]);
   const gem = itemAt(1, 'gem', 4.5, 1.5);
   const s = playing(maze, [gem], 100);
-  // Press into the wall from the adjacent tile, walking and sprinting, at normal and clamped dt.
+  // Press into the wall from the adjacent tile at full speed, at normal and clamped dt.
   for (const dt of [1 / 60, 0.25]) {
-    for (let i = 0; i < 120; i++) step(s, dt, input({ moveY: 1, sprint: i % 2 === 0 }));
+    for (let i = 0; i < 120; i++) step(s, dt, input({ moveY: 1 }));
     assert.ok(s.player.x <= 3 - PLAYER.RADIUS + 1e-9, 'pressed flat against the wall');
     assert.equal(gem.taken, false, `nothing grabbed through the wall at dt=${dt}`);
     s.run.fuel = 100;
@@ -598,14 +595,14 @@ test('pickups: an item on the far side of a one-tile wall is never collected', (
   assert.equal(s.phase, 'playing');
 });
 
-test('pickups: a sprint step at the dt clamp sweeps its whole path, not just its end point', () => {
-  // Open room, player sprinting east at full speed with dt = SIM.MAX_DT (1.28 tiles per step). The
+test('pickups: a long step at the dt clamp sweeps its whole path, not just its end point', () => {
+  // Open room, player walking east at full speed with dt = SIM.MAX_DT (0.8 tiles per step). The
   // gem sits 0.7 off the line of travel, half way along the step: both end points are
-  // √(0.64² + 0.7²) ≈ 0.95 away, so only the swept test can see it.
+  // √(0.4² + 0.7²) ≈ 0.81 away, so only the swept test can see it.
   const maze = openMaze(12);
   const gem = itemAt(1, 'gem', 5.5, 5.5);
   const s = playing(maze, [gem], 100);
-  const speed = PLAYER.WALK_SPEED * PLAYER.SPRINT_MULT;
+  const speed = PLAYER.WALK_SPEED;
   const dt = 0.25;
   const p = s.player;
   p.x = gem.x - (speed * dt) / 2;
@@ -614,8 +611,8 @@ test('pickups: a sprint step at the dt clamp sweeps its whole path, not just its
   p.vx = speed;
   p.vy = 0;
   const x0 = p.x;
-  step(s, dt, input({ moveY: 1, sprint: true }));
-  assert.ok(Math.abs(p.x - x0 - speed * dt) < 1e-9, 'the step covered the full 1.28 tiles');
+  step(s, dt, input({ moveY: 1 }));
+  assert.ok(Math.abs(p.x - x0 - speed * dt) < 1e-9, 'the step covered the full 0.8 tiles');
   assert.ok(Math.hypot(x0 - gem.x, 0.7) > WORLD.PICKUP_RADIUS, 'the start is out of reach');
   assert.ok(Math.hypot(p.x - gem.x, p.y - gem.y) > WORLD.PICKUP_RADIUS, 'so is the end');
   assert.equal(gem.taken, true, 'the gem passed under the swept path was collected');

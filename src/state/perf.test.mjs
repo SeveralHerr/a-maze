@@ -88,11 +88,11 @@ function installed(params, seed, level = 1) {
  * @returns {void}
  */
 function drive(state, steps, phase = 0) {
-  const input = { moveX: 0, moveY: 1, turn: 0, lookDX: 0, sprint: false };
+  const input = { moveX: 0, moveY: 1, turn: 0, lookDX: 0 };
   for (let i = 0; i < steps; i++) {
     const t = i + phase;
     input.turn = Math.sin(t / 97) + Math.sin(t / 31) * 0.5;
-    input.sprint = (t & 63) === 0;
+
     state.events.length = 0;
     state.run.fuel = state.run.fuelMax;
     stepPlaying(state, 1 / 60, input);
@@ -182,7 +182,7 @@ test('item grid: only the items near the player are picked up, however many ther
   buildItemGrid(state);
   const before = state.run.gems;
   state.events.length = 0;
-  stepPlaying(state, 1 / 60, { moveX: 0, moveY: 0, turn: 0, lookDX: 0, sprint: false });
+  stepPlaying(state, 1 / 60, { moveX: 0, moveY: 0, turn: 0, lookDX: 0 });
   assert.equal(state.run.gems, before + 1, 'the item under the player was collected');
   let taken = 0;
   for (const it of data.items) if (it.taken) taken++;
@@ -254,7 +254,7 @@ test('transient garbage: a step allocates less than one object, turning or walki
   // would be ≥ 28 B/tick.
   const gc = getGc();
   const { state } = installed(levelParams(15), 20_240_607, 15);
-  const input = { moveX: 0, moveY: 0, turn: 1, lookDX: 0.02, sprint: false };
+  const input = { moveX: 0, moveY: 0, turn: 1, lookDX: 0.02 };
   const tick = { type: 'tick', dt: 1 / 60, input };
   const CHUNK = 400_000;
   /**
@@ -328,7 +328,7 @@ test('108 000 ticks (30 minutes) on a max-size level: no drift, no leak, no NaN'
   const { state, data } = installed(levelParams(15), 8_675_309, 15);
   const maze = data.maze;
   const rng = createRng(4242);
-  const input = { moveX: 0, moveY: 1, turn: 0, lookDX: 0, sprint: false };
+  const input = { moveX: 0, moveY: 1, turn: 0, lookDX: 0 };
   const TICKS = 108_000;
   const DT = 1 / 60;
 
@@ -343,10 +343,10 @@ test('108 000 ticks (30 minutes) on a max-size level: no drift, no leak, no NaN'
   let refills = 0;
   let minFuel = state.run.fuelMax;
   for (let i = 0; i < TICKS; i++) {
-    // A drunkard's walk that still makes progress: re-aim every ~2 s, sprint in bursts.
+    // A drunkard's walk that still makes progress: re-aim every ~2 s.
     if (i % 120 === 0) input.turn = rng.range(-1, 1);
     input.moveX = (i % 600) < 60 ? rng.range(-1, 1) : 0;
-    input.sprint = (i & 511) < 90;
+
     state.events.length = 0;
     stepPlaying(state, DT, input);
     state.time += DT;

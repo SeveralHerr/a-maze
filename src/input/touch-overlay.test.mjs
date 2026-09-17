@@ -249,22 +249,21 @@ test('the bar rests below the full map header line in every mode', () => {
   m.overlay.destroy();
 });
 
-test('the knob lights up while the flick-to-sprint latch is on, writing only on change', () => {
+test('the CHALK button appears only with the unlock, dims at zero charges, and never moves MAP', () => {
   const m = mount();
-  const knob = m.layer.childNodes[1];
-  m.overlay.setStick(true, 100, 500, 130, 470, false);
-  const idleBorder = knob.style.borderColor;
-  m.overlay.setStick(true, 100, 500, 100, 440, true);
-  assert.notEqual(knob.style.borderColor, idleBorder, 'sprint is visible');
-  assert.match(knob.style.boxShadow, /rgba\(255,160,40/);
-  knob.style.boxShadow = 'SENTINEL';
-  m.overlay.setStick(true, 100, 500, 100, 439, true);
-  assert.equal(knob.style.boxShadow, 'SENTINEL', 'no rewrite while the latch holds');
-  m.overlay.setStick(true, 100, 500, 110, 480, false);
-  assert.doesNotMatch(knob.style.boxShadow, /255,160,40/);
-  m.overlay.setStick(true, 100, 500, 100, 440, true);
-  m.overlay.setStick(false, 0, 0, 0, 0, false);
-  assert.doesNotMatch(knob.style.boxShadow, /255,160,40/, 'releasing the stick resets the look');
+  const bar = m.layer.childNodes[2];
+  const chalk = bar.childNodes[0];
+  assert.equal(chalk.textContent, 'CHALK');
+  m.overlay.update({ phase: 'playing', run: { mapFound: true, chalk: 0 }, perks: { chalk: 0 } });
+  assert.equal(chalk.style.display, 'none', 'hidden without the unlock');
+  m.overlay.update({ phase: 'playing', run: { mapFound: true, chalk: 4 }, perks: { chalk: 4 } });
+  assert.equal(chalk.style.display, '');
+  assert.ok(!chalk.style.opacity, 'lit while there are charges');
+  m.overlay.update({ phase: 'playing', run: { mapFound: true, chalk: 0 }, perks: { chalk: 4 } });
+  assert.equal(chalk.style.opacity, '0.4', 'dimmed once the charges are spent');
+  chalk.style.opacity = 'SENTINEL';
+  m.overlay.update({ phase: 'playing', run: { mapFound: true, chalk: 0 }, perks: { chalk: 4 } });
+  assert.equal(chalk.style.opacity, 'SENTINEL', 'written only on a change');
   m.overlay.destroy();
 });
 

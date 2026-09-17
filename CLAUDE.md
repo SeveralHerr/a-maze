@@ -11,7 +11,7 @@ tool dependency). `index.html` loads `src/main.js`. Deployed to itch.io
 ## Commands
 ```sh
 npm run serve                     # static dev server http://localhost:5173 — keep it running
-npm test                          # every src/*/*.test.mjs in its own Node process (678 tests)
+npm test                          # every src/*/*.test.mjs in its own Node process (729 tests)
 node tools/validate-mazes.mjs     # 117k mazes + the 750-level campaign incl. the refuel chain; --quick
 node tools/stress.mjs             # extreme grid sizes + the gameplay maximum + leak loops; --quick
 node tools/verify.mjs --tag x     # headless Chrome autopilot run → logs/x.json + logs/shot-x-*.png

@@ -1,7 +1,7 @@
 // @ts-check
 /**
  * @file Every full-screen interface in A-MAZE: title, options, credits, pause, loading, level
- * complete and game over (ARCHITECTURE.md §4.6).
+ * complete, game over, and the unlocks wave's Boon and Shrine (ARCHITECTURE.md §4.6, §4.9).
  *
  * The menus are an **immediate-mode** layer: `render` lays the current screen out from scratch
  * every frame and records the rectangle of each interactive row as it goes; `handlePointer` then
@@ -54,12 +54,16 @@ import {
   drawArt,
   compileArt,
   drawFlame,
+  drawGemIcon,
   drawPanel,
+  drawUnlockIcon,
   drawWell,
   fitScaleAt,
+  strokeRect,
   withAlpha,
   withAlphaStep,
   ICON_SIZE,
+  UNLOCK_ICON,
 } from './hud.js';
 
 /** @typedef {import('../core/types.js').GameState} GameState */
@@ -102,7 +106,9 @@ const SCORE_RULES = Object.freeze({
  * @type {Readonly<Record<string, number>>}
  */
 const LEVEL_RULES = Object.freeze({
-  /** `LEVEL.BASE_CELLS` — cells per side on depth 1. */
+  /** `LEVEL.FIRST_CELLS` — the lean first floor (depth 1 only). */
+  FIRST_CELLS: 10,
+  /** `LEVEL.BASE_CELLS` — cells per side the curve starts from (depth 2 is BASE + GROWTH). */
   BASE_CELLS: 16,
   /** `LEVEL.GROWTH` — cells added per side per depth. */
   GROWTH: 8,
@@ -117,6 +123,7 @@ const LEVEL_RULES = Object.freeze({
  */
 export function cellsForLevel(level) {
   const lv = Number.isFinite(level) ? Math.max(1, Math.floor(level)) : 1;
+  if (lv === 1) return LEVEL_RULES.FIRST_CELLS;
   return Math.min(LEVEL_RULES.MAX_CELLS, LEVEL_RULES.BASE_CELLS + (lv - 1) * LEVEL_RULES.GROWTH);
 }
 
@@ -159,6 +166,8 @@ const MAX_CHOICE_VALUES = 4;
  *   value. It is handed the settings writer rather than calling `onSetting` itself, so a choice
  *   that shadows more than one stored field (the map does — see `map.js`) stays declarative.
  * @property {(state:GameState) => boolean} [enabled] defaults to always enabled
+ * @property {string} [unlock]      Shrine rows: the catalogue id the row buys (§4.9)
+ * @property {number} [slot]        Boon rows: which of the offered unlocks the card is (§4.9)
  */
 
 /**
@@ -169,6 +178,7 @@ const MAX_CHOICE_VALUES = 4;
 /** Title screen. */
 const TITLE_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
   { id: 'descend', label: 'Descend', kind: 'action' },
+  { id: 'shrine', label: 'Shrine', kind: 'action' },
   { id: 'options', label: 'Options', kind: 'action' },
   { id: 'controls', label: 'Controls', kind: 'action' },
   { id: 'credits', label: 'Credits', kind: 'action' },
@@ -229,14 +239,62 @@ const CONTROLS_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
 /** Level-complete screen. */
 const COMPLETE_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
   { id: 'next', label: 'Descend', kind: 'action' },
+  { id: 'shrine', label: 'Shrine', kind: 'action' },
+  { id: 'quit', label: 'Quit to Title', kind: 'action' },
+]);
+
+/** Level-complete screen while a boon waits to be chosen (§4.9): the boon is the first row. */
+const COMPLETE_BOON_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
+  { id: 'boon', label: 'Choose a Boon', kind: 'action' },
+  { id: 'next', label: 'Descend', kind: 'action' },
+  { id: 'shrine', label: 'Shrine', kind: 'action' },
   { id: 'quit', label: 'Quit to Title', kind: 'action' },
 ]);
 
 /** Game-over screen. */
 const GAMEOVER_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
   { id: 'retry', label: 'Try Again', kind: 'action' },
+  { id: 'shrine', label: 'Shrine', kind: 'action' },
   { id: 'quit', label: 'Title', kind: 'action' },
 ]);
+
+/**
+ * The Boon: three cards and a way out that keeps the gift for later (§4.9). A card whose slot the
+ * offer does not fill (fewer than three unlocks left below their max) is disabled and not drawn.
+ */
+const BOON_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
+  { id: 'claim', label: '', kind: 'action', slot: 0, enabled: (s) => boonIdAt(s, 0) !== '' },
+  { id: 'claim', label: '', kind: 'action', slot: 1, enabled: (s) => boonIdAt(s, 1) !== '' },
+  { id: 'claim', label: '', kind: 'action', slot: 2, enabled: (s) => boonIdAt(s, 2) !== '' },
+  { id: 'later', label: 'Decide Later', kind: 'back' },
+]);
+
+/** Boon cards on the screen, the rows before `later`. */
+const BOON_CARDS = 3;
+
+/**
+ * The offered unlock id in a boon slot, or '' when the slot is empty or no boon is open.
+ * @param {GameState} state
+ * @param {number} slot
+ * @returns {string}
+ */
+function boonIdAt(state, slot) {
+  const offer = /** @type {any} */ (state).offer;
+  if (!offer || offer.open !== true || !Array.isArray(offer.ids)) return '';
+  const id = offer.ids[slot];
+  return typeof id === 'string' ? id : '';
+}
+
+/** Boon screen copy. */
+const BOON_HEADING = 'Choose a Boon';
+const BOON_NOTE = 'A NEW DEPTH  ·  ONE GIFT IS YOURS';
+const BOON_NOTE_SHORT = 'ONE GIFT IS YOURS';
+
+/** Shrine copy. */
+const SHRINE_HEADING = 'Shrine';
+const SHRINE_GROUP_LABEL = Object.freeze({ torch: 'TORCH', sight: 'SIGHT', fortune: 'FORTUNE' });
+const SHRINE_NOT_OWNED = 'Not yet owned';
+const SHRINE_MASTERED = 'Mastered';
 
 /**
  * "Abandon the descent?" — the confirmation behind every *Quit to Title* that would throw a live run
@@ -264,6 +322,49 @@ const CONFIRM_NOTE_RUN = 'YOUR RUN ENDS HERE';
 /** Its note, from a cleared depth (the tally screen). */
 const CONFIRM_NOTE_CLEARED = 'NO FURTHER DESCENT';
 
+/**
+ * One unlock as the menus need it. The authority is `UNLOCKS` in `src/state/balance.js`; `src/ui`
+ * may not import it (§2), so the composition root hands it in through `createMenus(canvas,
+ * {unlocks})` exactly like the Controls table.
+ * @typedef {{id:string, name:string, group:string, max:number, costs:ReadonlyArray<number>, ranks:ReadonlyArray<string>, blurb:string}} UnlockInfo
+ */
+
+/** Most unlocks the Shrine lists (its rows plus Back must fit `MAX_ROWS`). */
+const MAX_SHRINE_ROWS = 15;
+
+/**
+ * Make a caller-supplied catalogue safe to draw: well-formed entries only, strings translated to
+ * the bitmap faces, and capped. Runs once, when the menus are created.
+ * @param {unknown} list
+ * @returns {ReadonlyArray<UnlockInfo>}
+ */
+function sanitizeUnlocks(list) {
+  if (!Array.isArray(list)) return Object.freeze([]);
+  /** @type {UnlockInfo[]} */
+  const out = [];
+  for (let i = 0; i < list.length && out.length < MAX_SHRINE_ROWS; i++) {
+    const u = list[i];
+    if (u === null || typeof u !== 'object') continue;
+    if (typeof u.id !== 'string' || typeof u.name !== 'string') continue;
+    const costs = Array.isArray(u.costs) ? u.costs.filter((c) => typeof c === 'number' && Number.isFinite(c)) : [];
+    const ranks = Array.isArray(u.ranks) ? u.ranks.map((r) => translateGlyphs(String(r))) : [];
+    const max = Math.min(costs.length, ranks.length);
+    if (max <= 0) continue;
+    out.push(
+      Object.freeze({
+        id: u.id,
+        name: translateGlyphs(u.name),
+        group: typeof u.group === 'string' ? u.group : '',
+        max,
+        costs: Object.freeze(costs.slice(0, max)),
+        ranks: Object.freeze(ranks.slice(0, max)),
+        blurb: typeof u.blurb === 'string' ? translateGlyphs(u.blurb) : '',
+      }),
+    );
+  }
+  return Object.freeze(out);
+}
+
 /** Title screen copy. */
 const TITLE_SUBTITLE = 'The Torchlit Descent';
 const TITLE_VERSION = 'v0.1';
@@ -284,6 +385,8 @@ const SCREENS = Object.freeze({
   controls: Object.freeze({ id: 'controls', items: CONTROLS_ITEMS }),
   confirm: Object.freeze({ id: 'confirm', items: CONFIRM_ITEMS }),
   complete: Object.freeze({ id: 'complete', items: COMPLETE_ITEMS }),
+  completeBoon: Object.freeze({ id: 'complete', items: COMPLETE_BOON_ITEMS }),
+  boon: Object.freeze({ id: 'boon', items: BOON_ITEMS }),
   gameover: Object.freeze({ id: 'gameover', items: GAMEOVER_ITEMS }),
   loading: Object.freeze({ id: 'loading', items: NO_ITEMS }),
   none: Object.freeze({ id: 'none', items: NO_ITEMS }),
@@ -451,7 +554,7 @@ const DEFAULT_CONTROL_HINTS = Object.freeze([
   Object.freeze({ label: 'Strafe', keys: 'A D', pad: 'Left stick' }),
   Object.freeze({ label: 'Turn', keys: 'Q E  ·  LEFT RIGHT', pad: 'Right stick' }),
   Object.freeze({ label: 'Look', keys: 'MOUSE', pad: 'Right stick' }),
-  Object.freeze({ label: 'Sprint', keys: 'SHIFT', pad: 'Triggers' }),
+  Object.freeze({ label: 'Chalk', keys: 'C', pad: 'X' }),
   Object.freeze({ label: 'Map', keys: 'M  ·  TAB', pad: 'View' }),
   Object.freeze({ label: 'Pause', keys: 'ESC  ·  P', pad: 'Menu' }),
   Object.freeze({ label: 'Mute', keys: 'N', pad: '—' }),
@@ -467,14 +570,13 @@ const TOUCH_HINT = 'Touch: stick moves, drag looks';
  *
  * A player holding a phone has no W key, no Shift and no Tab, so the keyboard table told them
  * nothing they could use — and its one touch line did not fit a phone's panel. On a device whose
- * primary pointer is a finger the panel shows this table instead. Sprint is an outward *flick* of
- * the stick, not a deflection (see `TOUCH_SPRINT_FLICK_RATIO` in `input.js`), and the two buttons
- * carry the labels `MAP` and `PAUSE`.
+ * primary pointer is a finger the panel shows this table instead. The two buttons carry
+ * the labels `MAP` and `PAUSE`, and a `CHALK` button appears once the Chalk unlock is owned.
  * @type {ReadonlyArray<ControlHint>}
  */
 const TOUCH_CONTROL_HINTS = Object.freeze([
   Object.freeze({ label: 'Move', keys: 'LEFT STICK' }),
-  Object.freeze({ label: 'Sprint', keys: 'FLICK THE STICK' }),
+  Object.freeze({ label: 'Chalk', keys: 'CHALK BUTTON' }),
   Object.freeze({ label: 'Look', keys: 'DRAG RIGHT SIDE' }),
   Object.freeze({ label: 'Map', keys: 'MAP BUTTON' }),
   Object.freeze({ label: 'Pause', keys: 'PAUSE BUTTON' }),
@@ -657,6 +759,10 @@ const PICK_PALETTE = Object.freeze([
  * @property {(key:keyof Settings, value:number|boolean) => void} [onSetting]
  * @property {() => void} [onNextLevel]  descend after a level-complete tally
  * @property {(type:'uiMove'|'uiConfirm'|'uiBack'|'uiDeny') => void} [onUiSound]
+ * @property {(id:string) => void} [onBuy]        buy the next rank of an unlock at the Shrine (§4.9)
+ * @property {(id:string) => void} [onClaimBoon]  claim one of the offered boon's unlocks (§4.9)
+ * @property {ReadonlyArray<UnlockInfo>} [unlocks] the catalogue the Shrine and Boon show; main.js
+ *   passes `UNLOCKS` from `src/state/balance.js`. Omitted, the Shrine is an empty list.
  * @property {ReadonlyArray<ControlHint>} [controls] what the Controls panel lists. The composition
  *   root passes `CONTROL_HINTS` from `src/input/bindings.js` — the module that owns the bindings —
  *   because `src/ui` may not import `src/input` (§2). Omitted, the mirrored default is used.
@@ -693,6 +799,22 @@ export function createMenus(overlayCanvas, callbacks) {
    * @type {ReadonlyArray<ControlHint>}
    */
   const controlHints = sanitizeHints(/** @type {any} */ (cb).controls);
+  /** The unlock catalogue, resolved once (see {@link sanitizeUnlocks}). */
+  const unlocks = sanitizeUnlocks(/** @type {any} */ (cb).unlocks);
+  /** The Shrine's rows: one per unlock, then Back. Built once from the catalogue. */
+  const shrineScreen = Object.freeze({
+    id: 'shrine',
+    items: /** @type {ReadonlyArray<MenuItem>} */ (
+      Object.freeze([
+        ...unlocks.map((u) => Object.freeze({ id: 'unlock', label: u.name, kind: /** @type {const} */ ('action'), unlock: u.id })),
+        Object.freeze({ id: 'back', label: 'Back', kind: /** @type {const} */ ('back') }),
+      ])
+    ),
+  });
+  /** First Shrine row in view when the list scrolls. */
+  let shrineTop = 0;
+  /** Set once the boon has opened itself on this level-complete visit (§4.9). */
+  let boonShown = false;
 
   /** Sub-screen open over the title or pause screen, or null. @type {string|null} */
   let sub = null;
@@ -788,6 +910,21 @@ export function createMenus(overlayCanvas, callbacks) {
   let pressedRow = -1;
   /** Row whose slider is being dragged, or −1. */
   let dragRow = -1;
+  /** Whether the row under the last press was already the selected one (see `handlePointer`). */
+  let pressedWasSelected = false;
+  /** Shrine rows that fit the list window on the last layout. */
+  let shrineVisible = 0;
+  /** Whether the last layout was narrow (the boon's cards stack instead of standing side by side). */
+  let lastNarrow = false;
+  /** A purchase's flash on its row: seconds since, and which row (−1 none). */
+  const buyFlash = { t: -1, row: -1 };
+  /** Shrine readouts, rebuilt only when their numbers change. */
+  const purseMemo = createTextMemo((n) => formatInt(n));
+  const costMemo = createTextMemo((n) => formatInt(n));
+  const needMemo = createTextMemo((n) => 'NEED ' + formatInt(n) + ' MORE');
+  const boonNoteMemo = createTextMemo((level) => 'DEPTH ' + level + ' CLEARED');
+  /** Wrapped blurbs, keyed by catalogue index, width and scale. @type {Map<number, string[]>} */
+  const wrapCache = new Map();
   /**
    * The best score as it stood when the current run started, or −1 when no frame has shown it.
    * "NEW BEST!" is measured against this, strictly, exactly as `recordBest` in src/state does —
@@ -811,6 +948,7 @@ export function createMenus(overlayCanvas, callbacks) {
     if (sub === 'credits') return SCREENS.credits;
     if (sub === 'controls') return SCREENS.controls;
     if (sub === 'confirm') return SCREENS.confirm;
+    if (sub === 'shrine') return shrineScreen;
     return null;
   }
 
@@ -828,10 +966,13 @@ export function createMenus(overlayCanvas, callbacks) {
       case 'loading':
         return SCREENS.loading;
       case 'levelComplete':
-        // Only the abandon confirmation opens over the tally.
-        return sub === 'confirm' ? SCREENS.confirm : SCREENS.complete;
+        // The abandon confirmation, the Shrine and the Boon open over the tally.
+        if (sub === 'confirm') return SCREENS.confirm;
+        if (sub === 'shrine') return shrineScreen;
+        if (sub === 'boon') return SCREENS.boon;
+        return boonIdAt(state, 0) !== '' ? SCREENS.completeBoon : SCREENS.complete;
       case 'gameOver':
-        return SCREENS.gameover;
+        return sub === 'shrine' ? shrineScreen : SCREENS.gameover;
       default:
         return SCREENS.none;
     }
@@ -936,7 +1077,13 @@ export function createMenus(overlayCanvas, callbacks) {
   function noteScreen(state, screen) {
     currentScreenId = screen.id;
     currentBaseId =
-      state.phase === 'paused' ? 'pause' : state.phase === 'levelComplete' ? 'complete' : 'title';
+      state.phase === 'paused'
+        ? 'pause'
+        : state.phase === 'levelComplete'
+          ? 'complete'
+          : state.phase === 'gameOver'
+            ? 'gameover'
+            : 'title';
   }
 
   /**
@@ -1001,6 +1148,12 @@ export function createMenus(overlayCanvas, callbacks) {
         return true;
       case 'quit':
         sound('uiConfirm');
+        // Quitting past a free boon would forfeit it silently, the same mistake Descend guards
+        // against: show the boon first (§4.9).
+        if (screen.id === 'complete' && boonIdAt(state, 0) !== '') {
+          openSub('boon');
+          return true;
+        }
         if (screen.id === 'gameover') {
           // That run is already over; there is nothing left to lose.
           invoke(cb.onQuit, 'onQuit');
@@ -1016,8 +1169,53 @@ export function createMenus(overlayCanvas, callbacks) {
         return true;
       case 'next':
         sound('uiConfirm');
+        // A boon still waiting is shown rather than forfeited: descending past a free gift by
+        // reflex is the one mistake this screen can make for the player (§4.9).
+        if (boonIdAt(state, 0) !== '') {
+          openSub('boon');
+          return true;
+        }
         invoke(cb.onNextLevel, 'onNextLevel');
         return true;
+      case 'shrine':
+        sound('uiConfirm');
+        openSub('shrine');
+        return true;
+      case 'boon':
+        sound('uiConfirm');
+        openSub('boon');
+        return true;
+      case 'unlock': {
+        const info = unlockInfo(item.unlock);
+        if (info === null) {
+          sound('uiDeny');
+          return false;
+        }
+        const rank = rankOf(state, info.id);
+        if (rank >= info.max || purseOf(state) < info.costs[rank]) {
+          sound('uiDeny');
+          return false;
+        }
+        sound('uiConfirm');
+        invoke(cb.onBuy, 'onBuy', info.id);
+        buyFlash.t = 0;
+        buyFlash.row = row;
+        return true;
+      }
+      case 'claim': {
+        const id = boonIdAt(state, item.slot === undefined ? -1 : item.slot);
+        if (id === '') {
+          sound('uiDeny');
+          return false;
+        }
+        sound('uiConfirm');
+        // The level-complete list loses its boon row with the claim, so the remembered row would now
+        // name a different item: land on Descend, which is what comes next.
+        savedIndex.complete = 0;
+        closeSub();
+        invoke(cb.onClaimBoon, 'onClaimBoon', id);
+        return true;
+      }
       default:
         sound('uiDeny');
         return false;
@@ -1185,15 +1383,20 @@ export function createMenus(overlayCanvas, callbacks) {
       if (next !== index) {
         index = next;
         sound('uiMove');
+        followShrine(screen, true);
       }
       consumed = true;
     }
+    // The boon's cards sit side by side on a wide screen, so left/right walk them too.
+    const boonCards = screen === SCREENS.boon && !lastNarrow;
     if (pressed(frame, 'left')) {
-      adjust(screen, index, -1, state);
+      if (boonCards) stepBoon(-1, count);
+      else adjust(screen, index, -1, state);
       consumed = true;
     }
     if (pressed(frame, 'right')) {
-      adjust(screen, index, 1, state);
+      if (boonCards) stepBoon(1, count);
+      else adjust(screen, index, 1, state);
       consumed = true;
     }
     if (pressed(frame, 'confirm')) {
@@ -1235,6 +1438,81 @@ export function createMenus(overlayCanvas, callbacks) {
       consumed = true;
     }
     return consumed;
+  }
+
+  /**
+   * Move the boon selection sideways across the cards (never onto "Decide Later").
+   * @param {number} dir
+   * @param {number} count
+   * @returns {void}
+   */
+  function stepBoon(dir, count) {
+    const cards = Math.min(BOON_CARDS, count);
+    if (index >= cards) {
+      index = dir > 0 ? 0 : cards - 1;
+    } else {
+      index = menuStep(rowEnabled, index, dir, cards);
+    }
+    if (!rowEnabled[index]) index = menuStep(rowEnabled, -1, 1, cards);
+    sound('uiMove');
+  }
+
+  /**
+   * Keep the Shrine's selected row in its scrolled window.
+   *
+   * `margin` is for keyboard and touch selection: a row one short of either edge scrolls the list so
+   * the next row is always visible (and tappable). A hovering mouse passes false, because scrolling
+   * the row out from under the pointer would re-select the next one and the list would run away.
+   * @param {Screen} screen
+   * @param {boolean} margin
+   * @returns {void}
+   */
+  function followShrine(screen, margin) {
+    if (screen !== shrineScreen) return;
+    const rows = unlocks.length;
+    const visible = shrineVisible;
+    if (visible <= 0 || rows <= visible) {
+      shrineTop = 0;
+      return;
+    }
+    if (index >= rows) return; // Back is laid out below the list, always visible
+    const pad = margin && visible >= 3 ? 1 : 0;
+    if (index - pad < shrineTop) shrineTop = Math.max(0, index - pad);
+    if (index + pad >= shrineTop + visible) shrineTop = Math.min(rows - visible, index + pad - visible + 1);
+  }
+
+  /**
+   * The catalogue entry for an id, or null.
+   * @param {string|undefined} id
+   * @returns {UnlockInfo|null}
+   */
+  function unlockInfo(id) {
+    if (typeof id !== 'string') return null;
+    for (let i = 0; i < unlocks.length; i++) if (unlocks[i].id === id) return unlocks[i];
+    return null;
+  }
+
+  /**
+   * The rank of an unlock the state holds (0 when the state carries no progress).
+   * @param {GameState} state
+   * @param {string} id
+   * @returns {number}
+   */
+  function rankOf(state, id) {
+    const progress = /** @type {any} */ (state).progress;
+    const r = progress && progress.ranks ? progress.ranks[id] : 0;
+    return typeof r === 'number' && Number.isFinite(r) ? Math.max(0, r | 0) : 0;
+  }
+
+  /**
+   * The purse the state holds.
+   * @param {GameState} state
+   * @returns {number}
+   */
+  function purseOf(state) {
+    const progress = /** @type {any} */ (state).progress;
+    const p = progress ? progress.purse : 0;
+    return typeof p === 'number' && Number.isFinite(p) ? Math.max(0, Math.floor(p)) : 0;
   }
 
   /**
@@ -1298,8 +1576,13 @@ export function createMenus(overlayCanvas, callbacks) {
       case 'pointerdown':
       case 'mousedown':
         if (row < 0 || !rowEnabled[row]) return false;
+        // A Shrine purchase takes a press on the row that was ALREADY selected: a finger has no
+        // hover, so the first tap on a row reads it and the second one buys. A mouse hovered the row
+        // before clicking it, so one click still buys.
+        pressedWasSelected = row === index;
         index = row;
         pressedRow = row;
+        followShrine(screen, true);
         if (screen.items[row].kind === 'slider') {
           dragRow = row;
           applySliderDrag(screen, row, state);
@@ -1326,6 +1609,10 @@ export function createMenus(overlayCanvas, callbacks) {
         // value. Only a click on the row but off every word falls through to `activate`, which
         // steps the cycle the way confirm does.
         const item = screen.items[row];
+        if (item !== undefined && item.id === 'unlock' && !pressedWasSelected) {
+          sound('uiMove');
+          return true;
+        }
         if (item !== undefined && item.kind === 'choice') {
           const word = choiceHit(row, ptr[0], ptr[1]);
           const values = item.values;
@@ -1435,9 +1722,14 @@ export function createMenus(overlayCanvas, callbacks) {
       // mouse should stop being told to tap. One media query per screen entry, never per frame.
       coarsePointer = -1;
       if (screen.id === 'controls') padSeenAt = -1;
+      if (screen.id === 'shrine') shrineTop = 0;
       screenSerial++;
     }
     anim.enterT += dt;
+    if (buyFlash.t >= 0) {
+      buyFlash.t += dt;
+      if (buyFlash.t > 0.6) buyFlash.t = -1;
+    }
     if (anim.tallyT >= 0) {
       anim.tallyT += dt;
       for (let i = 0; i < tallyCounters.length; i++) tallyCounters[i].update(dt);
@@ -1482,6 +1774,7 @@ export function createMenus(overlayCanvas, callbacks) {
       savedIndex.gameover = 0;
     }
     if (state.phase === 'levelComplete') {
+      boonShown = false;
       // The tally belongs to the phase, not to the screen: opening the abandon dialog over it and
       // cancelling must not roll it again.
       anim.tallyT = 0;
@@ -1503,6 +1796,12 @@ export function createMenus(overlayCanvas, callbacks) {
     if (state === null || typeof state !== 'object') return;
     lastState = state;
     syncPhase(state);
+    // A boon opens itself the moment the tally is done (§4.9) — once per visit, so "Decide Later"
+    // stays decided.
+    if (state.phase === 'levelComplete' && tallyDone && !boonShown && sub === null && boonIdAt(state, 0) !== '') {
+      boonShown = true;
+      openSub('boon');
+    }
     const screen = screenFor(state);
     noteScreen(state, screen);
     advance(state, screen);
@@ -1513,6 +1812,7 @@ export function createMenus(overlayCanvas, callbacks) {
       return;
     }
     const m = surface.metrics;
+    lastNarrow = m.narrow;
     if (screen.id === 'none' || m.w < 32 || m.h < 32) {
       rowCount = 0;
       surface.endFrame();
@@ -1552,6 +1852,12 @@ export function createMenus(overlayCanvas, callbacks) {
         break;
       case 'gameover':
         drawGameOver(ctx, m, state, screen, enter, reduced);
+        break;
+      case 'shrine':
+        drawShrine(ctx, m, state, screen, enter, reduced);
+        break;
+      case 'boon':
+        drawBoon(ctx, m, state, screen, enter, reduced);
         break;
       default:
         break;
@@ -1899,7 +2205,9 @@ export function createMenus(overlayCanvas, callbacks) {
 
     // The menu never outranks the lettering: at most one step above the subtitle, and never taller
     // than its share of the room it has been given.
-    const pitchPad = band ? 5 * u : 6 * u;
+    // A fifth row (the Shrine, §4.9) is paid for out of the gaps, not out of the lettering: the
+    // words stay the size they were with four rows at every viewport the layout audit measures.
+    const pitchPad = band ? (rows > 4 ? 4 * u : 5 * u) : rows > 4 ? 4 * u : 6 * u;
     // …and never as tall as the wordmark: a menu word's cap height (10 display rows a step) stays
     // under ~¾ of the wordmark's (24 rows a step). On a phone the wordmark is width-bound at ×1, and
     // ×2 menu words in the display face's heavy strokes outweighed it.
@@ -2408,7 +2716,7 @@ export function createMenus(overlayCanvas, callbacks) {
   /**
    * What the game is played with. `src/input/bindings.js` owns the bindings and exports the table
    * (`CONTROL_HINTS`); it is drawn here in the same panel style as Credits, because a first-person
-   * maze whose player never learns about sprint, the map key or mouse look is a harder game than
+   * maze whose player never learns about chalk, the map key or mouse look is a harder game than
    * it was designed to be.
    *
    * With a gamepad connected the table gains a third column — the pad binding for each action —
@@ -3229,6 +3537,643 @@ export function createMenus(overlayCanvas, callbacks) {
     }
 
     drawItemList(ctx, m, state, screen, Math.round(y), itemScale, rowH, reduced);
+  }
+
+  // ── Unlocks: shared pieces (§4.9) ──
+
+  /**
+   * Rank pips: one small block per rank, lit gold for the ranks owned, an iron socket for the rest,
+   * and — when `next` — the rank a purchase or boon would add, lit in fire.
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {number} x left edge
+   * @param {number} y top edge
+   * @param {number} rank owned
+   * @param {number} max
+   * @param {number} pip block side in UI px
+   * @param {boolean} next highlight the next rank
+   * @returns {number} the width drawn
+   */
+  function drawPips(ctx, x, y, rank, max, pip, next) {
+    const gap = Math.max(1, pip >> 1);
+    for (let r = 0; r < max; r++) {
+      const px = x + r * (pip + gap);
+      ctx.fillStyle = COLOR.void;
+      ctx.fillRect(px - 1, y - 1, pip + 2, pip + 2);
+      // An empty socket is lit iron, not dark iron: on the dark stone panels a dark socket vanished.
+      ctx.fillStyle = r < rank ? COLOR.goldLight : next && r === rank ? COLOR.fireHot : COLOR.ironLight;
+      ctx.fillRect(px, y, pip, pip);
+      if (r < rank) {
+        ctx.fillStyle = COLOR.goldPale;
+        ctx.fillRect(px, y, pip, Math.max(1, pip >> 2));
+      }
+    }
+    return max > 0 ? max * (pip + gap) - gap : 0;
+  }
+
+  /**
+   * Width `drawPips` will use.
+   * @param {number} max
+   * @param {number} pip
+   * @returns {number}
+   */
+  function pipsWidth(max, pip) {
+    const gap = Math.max(1, pip >> 1);
+    return max > 0 ? max * (pip + gap) - gap : 0;
+  }
+
+  /**
+   * A catalogue string wrapped to a width, cached: wrapping allocates, so it is done once per
+   * (entry, text, width, scale) rather than per frame.
+   * @param {number} key small integer naming the entry and which of its texts
+   * @param {string} text
+   * @param {number} width UI px
+   * @param {number} scale
+   * @returns {string[]}
+   */
+  function wrapped(key, text, width, scale) {
+    const k = ((key * 4096 + Math.max(0, Math.min(4095, Math.round(width)))) * 16 + scale) | 0;
+    let lines = wrapCache.get(k);
+    if (lines === undefined) {
+      lines = text === '' ? [] : wrapText(text, width, { font: 'hud', size: scale });
+      if (wrapCache.size > 512) wrapCache.clear();
+      wrapCache.set(k, lines);
+    }
+    return lines;
+  }
+
+  // ── Shrine (§4.9) ──
+
+  /**
+   * The Shrine: the purse, every unlock as a row (icon, name, rank pips, the next rank's price), and
+   * a detail plaque for the selected one — what it is, what you have, what the next rank does, and
+   * whether the purse can pay. Confirm buys.
+   *
+   * Wide: the list and the plaque side by side on one stone panel. Narrow: the plaque sits under
+   * the list, reduced to the lines that decide a purchase. The list scrolls whenever it is taller
+   * than the room it has, keeping the selection in view (`followShrine`).
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {SurfaceMetrics} m
+   * @param {GameState} state
+   * @param {Screen} screen
+   * @param {number} enter
+   * @param {boolean} reduced
+   * @returns {void}
+   */
+  function drawShrine(ctx, m, state, screen, enter, reduced) {
+    const u = m.u;
+    const cx = Math.round(m.w / 2);
+    drawScrim(ctx, m, state.phase === 'title' ? 0.72 : 0.8);
+    const narrow = m.narrow;
+    const items = screen.items;
+    const count = syncEnabled(screen, state);
+    const rows = unlocks.length;
+    const purse = purseOf(state);
+
+    const panelW = Math.round(Math.min(m.w - 4 * u, Math.max(narrow ? 92 * u : 150 * u, m.w * (narrow ? 0.94 : 0.84))));
+    const panelH = Math.round(m.h - 4 * u);
+    const px = Math.round(cx - panelW / 2);
+    const py = 2 * u + panelSlide(enter, u, reduced);
+    drawPanel(ctx, px, py, panelW, panelH, u, PANEL_OPTIONS);
+
+    // Heading, rule, purse.
+    const headScale = fitScaleAt(SHRINE_HEADING, panelW * 0.5, 'display', Math.max(2, u + 1), 1);
+    const headH = heightAt('display', headScale);
+    drawAt(ctx, SHRINE_HEADING, cx, py + 4 * u, 'display', headScale, 'gothic', 'center');
+    const ruleY = py + 4 * u + headH + 2 * u;
+    drawRule(ctx, cx, ruleY, Math.round(panelW * 0.28), u);
+    const textSize = narrow ? Math.max(1, u - 1) : u;
+    const purseText = purseMemo(purse);
+    const gemS = Math.max(1, textSize);
+    const purseW = ICON_SIZE.gem * gemS + 2 * u + measureAt(purseText, 'hud', textSize);
+    const purseY = ruleY + 4 * u;
+    drawGemIcon(ctx, cx - (purseW >> 1), purseY, gemS);
+    drawAt(ctx, purseText, cx - (purseW >> 1) + ICON_SIZE.gem * gemS + 2 * u, purseY, 'hud', textSize, 'hudGem');
+
+    const left = px + 6 * u;
+    const right = px + panelW - 6 * u;
+    const bodyTop = purseY + heightAt('hud', textSize) + 5 * u;
+    // 56 % on a wide panel: at 52 % "Dead-End Whisper" left no room for the pip column on any row.
+    const listW = narrow ? right - left : Math.round((right - left) * 0.56);
+    fitShrineRows(listW, textSize, u);
+    const rowText = shrineFit.text;
+    const pip = shrineFit.pip;
+    // Back row at the bottom of the panel, like every other sub-screen's way out. A phone keeps it
+    // at least a step above the list's words, so the way out never reads as the smallest thing.
+    const backScale = Math.max(1, Math.min(u, headScale - 1), narrow ? Math.min(2, headScale) : 1);
+    const backH = heightAt('display', backScale) + 4 * u;
+    const backY = py + panelH - 3 * u - backH;
+    // The detail plaque: beside the list on a wide panel, under it on a narrow one (three lines at
+    // the list's own size: NOW, NEXT, and the price with its prompt).
+    const lineH = heightAt('hud', textSize) + 2 * u;
+    const rowLineH = heightAt('hud', rowText) + 2 * u;
+    const detailH = narrow ? 3 * rowLineH + 6 * u : 0;
+    const listBottom = backY - 3 * u - detailH;
+    const iconS = rowText;
+    const iconW = UNLOCK_ICON * iconS;
+    const rowH = Math.max(iconW, heightAt('hud', rowText)) + 4 * u;
+    const visible = Math.max(1, Math.floor((listBottom - bodyTop) / rowH));
+    shrineVisible = visible;
+    if (shrineTop > Math.max(0, rows - visible)) shrineTop = Math.max(0, rows - visible);
+    if (index < rows && (index < shrineTop || index >= shrineTop + visible)) followShrine(screen, false);
+
+    for (let i = 0; i < count; i++) {
+      const item = items[i];
+      if (item.kind === 'back') continue;
+      const slot = i - shrineTop;
+      if (slot < 0 || slot >= visible) {
+        recordRow(i, 0, 0, 0, 0);
+        continue;
+      }
+      const info = unlocks[i];
+      const rank = rankOf(state, info.id);
+      const maxed = rank >= info.max;
+      const cost = maxed ? 0 : info.costs[rank];
+      const affordable = !maxed && purse >= cost;
+      const selected = i === index;
+      const rowY = bodyTop + slot * rowH;
+      const rx = left - 3 * u;
+      const rw = listW + 6 * u;
+      if (selected) {
+        ctx.fillStyle = withAlpha(COLOR.goldMid, 0.22);
+        ctx.fillRect(rx, rowY - 2 * u, rw, rowH - u);
+        ctx.fillStyle = COLOR.goldBase;
+        ctx.fillRect(rx, rowY - 2 * u, u, rowH - u);
+      }
+      if (buyFlash.t >= 0 && buyFlash.row === i && !reduced) {
+        ctx.fillStyle = withAlphaStep(COLOR.fireCore, ((1 - buyFlash.t / 0.6) * 40) | 0);
+        ctx.fillRect(rx, rowY - 2 * u, rw, rowH - u);
+      }
+      recordRow(i, rx, rowY - 2 * u, rw, rowH - u);
+      const contentY = rowY + ((rowH - 4 * u - iconW) >> 1);
+      drawUnlockIcon(ctx, info.id, left, contentY, iconS);
+      const textY = rowY + ((rowH - 4 * u - heightAt('hud', rowText)) >> 1);
+      const nameStyle = selected ? 'hudBright' : rank > 0 ? 'hudGold' : 'hud';
+      drawAt(ctx, info.name, left + iconW + 3 * u, textY, 'hud', rowText, nameStyle);
+      // Right side of the row: the price (or MAX) and the pips before it.
+      const priceText = maxed ? 'MAX' : costMemo(cost);
+      const priceStyle = maxed ? 'hudGold' : affordable ? 'hudGem' : 'hudDim';
+      const rowRight = left + listW;
+      drawAt(ctx, priceText, rowRight, textY, 'hud', rowText, priceStyle, 'right');
+      const priceW = Math.max(measureAt('000', 'hud', rowText), measureAt(priceText, 'hud', rowText));
+      const pw = pipsWidth(info.max, pip);
+      const pipX = rowRight - priceW - 3 * u - pw;
+      // Pips on every row or on none: `fitShrineRows` decides once whether a full pip column clears
+      // the longest name, so no row loses its pips while its neighbours keep them.
+      if (shrineFit.pips) {
+        drawPips(ctx, pipX, rowY + ((rowH - 4 * u - pip) >> 1), rank, info.max, pip, selected && affordable);
+      }
+    }
+    // Scroll hints: a pair of small gold chevrons when rows are hidden above or below.
+    if (rows > visible) {
+      const chevX = left + (listW >> 1);
+      ctx.fillStyle = COLOR.goldLight;
+      if (shrineTop > 0) {
+        for (let k = 0; k < 3; k++) ctx.fillRect(chevX - k * u, bodyTop - 4 * u + k * u, (2 * k + 1) * u, u);
+      }
+      if (shrineTop + visible < rows) {
+        const cy = bodyTop + visible * rowH - u;
+        for (let k = 0; k < 3; k++) ctx.fillRect(chevX - k * u, cy + (2 - k) * u, (2 * k + 1) * u, u);
+      }
+    }
+
+    // Detail for the selected unlock (the Back row keeps showing the last unlock it was on).
+    const sel = index < rows ? index : Math.min(rows - 1, Math.max(0, shrineTop));
+    if (rows > 0) {
+      const info = unlocks[sel];
+      const rank = rankOf(state, info.id);
+      const maxed = rank >= info.max;
+      const cost = maxed ? 0 : info.costs[rank];
+      const affordable = !maxed && purse >= cost;
+      if (narrow) {
+        let y = listBottom + 3 * u;
+        ctx.fillStyle = withAlphaStep(COLOR.stoneDark, 40);
+        ctx.fillRect(left, y - 2 * u, right - left, Math.max(1, u >> 1));
+        // NOW before NEXT, as on the wide plaque, at the list's own size.
+        const nowLine = rank > 0 ? info.ranks[rank - 1] : SHRINE_NOT_OWNED;
+        const nextLine = maxed ? SHRINE_MASTERED : info.ranks[rank];
+        drawLabelled(ctx, 'NOW', nowLine, left, right, y, rowText, u, rank > 0 ? 'hudGold' : 'hudDim');
+        y += rowLineH;
+        drawLabelled(ctx, 'NEXT', nextLine, left, right, y, rowText, u, maxed ? 'hudGold' : 'hudBright');
+        y += rowLineH;
+        if (!maxed) drawPriceLine(ctx, left, right, y, rowText, u, cost, affordable, purse, reduced);
+      } else {
+        const dx = left + listW + 8 * u;
+        const dw = right - dx;
+        const dy = bodyTop - 2 * u;
+        const dh = listBottom - dy;
+        drawWell(ctx, dx, dy, dw, dh, u, withAlpha(COLOR.void, 0.55), COLOR.stoneDeep);
+        const inL = dx + 5 * u;
+        const inW = dw - 10 * u;
+        let y = dy + 5 * u;
+        // One scale for every name, chosen by the longest, so the plaque does not change size as the
+        // cursor walks the list.
+        const nameScale = fitScaleAt(shrineFit.longest, inW, 'display', Math.max(1, u), 1);
+        // The price line sits on the well's floor, where the eye lands last; NOW and NEXT stand on it,
+        // each taking a second line when its value is too long to sit beside the label.
+        const priceY = dy + dh - 4 * u - heightAt('hud', textSize);
+        const nowText = rank > 0 ? info.ranks[rank - 1] : SHRINE_NOT_OWNED;
+        const nextText = maxed ? SHRINE_MASTERED : info.ranks[rank];
+        const nowKey = 20000 + (sel * 8 + rank) * 2;
+        const nowLines = labelledLines(nowText, inW, textSize, u, nowKey);
+        const effectLines = nowLines + labelledLines(nextText, inW, textSize, u, nowKey + 1);
+        let effectsY = priceY - 3 * u - effectLines * lineH;
+        // The blurb is shown whole: the icon gives up size first (down to 2u) to make room for it.
+        const blurb = wrapped(sel * 64, info.blurb, inW, textSize);
+        const textBlock = heightAt('display', nameScale) + 2 * u + lineH + 2 * u + blurb.length * lineH;
+        let bigS = Math.max(2, 3 * u);
+        while (bigS > Math.max(2, 2 * u) && y + UNLOCK_ICON * bigS + 3 * u + textBlock > effectsY - 2 * u) bigS--;
+        const bigW = UNLOCK_ICON * bigS;
+        drawUnlockIcon(ctx, info.id, dx + ((dw - bigW) >> 1), y, bigS);
+        y += bigW + 3 * u;
+        drawAt(ctx, info.name, dx + (dw >> 1), y, 'display', nameScale, 'gothic', 'center');
+        y += heightAt('display', nameScale) + 2 * u;
+        const group = /** @type {any} */ (SHRINE_GROUP_LABEL)[info.group] || '';
+        const pw = pipsWidth(info.max, pip);
+        const groupW = group === '' ? 0 : measureAt(group, 'hud', textSize) + 4 * u;
+        const lineX = dx + ((dw - groupW - pw) >> 1);
+        if (group !== '') drawAt(ctx, group, lineX, y, 'hud', textSize, 'hudDim');
+        drawPips(ctx, lineX + groupW, y + ((heightAt('hud', textSize) - pip) >> 1), rank, info.max, pip, affordable);
+        y += lineH + 2 * u;
+        // Whole or not at all: a sentence cut off mid-way reads broken. Without it, NOW and NEXT move
+        // up under the heading instead of leaving a hole in the middle of the plaque.
+        if (y + blurb.length * lineH <= effectsY - 2 * u) {
+          for (let k = 0; k < blurb.length; k++) {
+            drawAt(ctx, blurb[k], dx + (dw >> 1), y, 'hud', textSize, 'hud', 'center');
+            y += lineH;
+          }
+        } else {
+          effectsY = Math.min(effectsY, y + 2 * u);
+        }
+        drawLabelled(ctx, 'NOW', nowText, inL, inL + inW, effectsY, textSize, u, rank > 0 ? 'hudGold' : 'hudDim', lineH, nowKey);
+        drawLabelled(ctx, 'NEXT', nextText, inL, inL + inW, effectsY + nowLines * lineH, textSize, u, maxed ? 'hudGold' : 'hudBright', lineH, nowKey + 1);
+        if (!maxed) drawPriceLine(ctx, inL, inL + inW, priceY, textSize, u, cost, affordable, purse, reduced);
+      }
+    }
+
+    // Back.
+    const backRow = count - 1;
+    if (backRow >= 0 && items[backRow].kind === 'back') {
+      const selected = backRow === index;
+      const label = items[backRow].label;
+      const w = measureAt(label, 'display', backScale);
+      drawAt(ctx, label, cx, backY + 2 * u, 'display', backScale, selected ? 'gothicHot' : 'gothic', 'center');
+      if (selected) {
+        const fs = Math.max(1, Math.round(backScale * 0.8));
+        const frame = reduced ? 0 : ((anim.clock * 11) | 0) % 3;
+        drawFlame(ctx, cx - (w >> 1) - ICON_SIZE.flameW * fs - 2 * u, backY + 2 * u - fs, fs, frame);
+        drawFlame(ctx, cx + (w >> 1) + 2 * u, backY + 2 * u - fs, fs, frame + 1);
+      }
+      const bw = Math.max(w + 16 * u, panelW * 0.4);
+      recordRow(backRow, cx - bw / 2, backY, bw, backH);
+    }
+    rowCount = count;
+  }
+
+  /**
+   * The Shrine list's fitted numbers, recomputed only when the width or the text size changes (the
+   * fit measures every name, which is catalogue-sized work that has no business running per frame).
+   */
+  const shrineFit = { key: -1, text: 1, pip: 3, pips: true, longest: '' };
+
+  /**
+   * Fit the Shrine's rows: one text size for every row (the largest at which the longest name and a
+   * three-digit price fit), pips scaled with it, and whether a full pip column still clears the
+   * longest name — for every row, or for none.
+   * @param {number} listW
+   * @param {number} textSize
+   * @param {number} u
+   * @returns {void}
+   */
+  function fitShrineRows(listW, textSize, u) {
+    const key = (Math.round(listW) * 16 + textSize) * 8 + u;
+    if (key === shrineFit.key) return;
+    shrineFit.key = key;
+    let longest = '';
+    let maxRanks = 0;
+    for (let i = 0; i < unlocks.length; i++) {
+      if (measureAt(unlocks[i].name, 'hud', 1) > measureAt(longest, 'hud', 1)) longest = unlocks[i].name;
+      if (unlocks[i].max > maxRanks) maxRanks = unlocks[i].max;
+    }
+    shrineFit.longest = longest;
+    let text = textSize;
+    for (;;) {
+      const need = UNLOCK_ICON * text + 3 * u + measureAt(longest, 'hud', text) + 3 * u + measureAt('000', 'hud', text);
+      if (need <= listW || text <= 1) break;
+      text--;
+    }
+    shrineFit.text = text;
+    shrineFit.pip = Math.max(3, Math.round(text * 2.5));
+    const pipCol = pipsWidth(maxRanks, shrineFit.pip) + 3 * u;
+    shrineFit.pips =
+      UNLOCK_ICON * text + 3 * u + measureAt(longest, 'hud', text) + 2 * u + pipCol + measureAt('000', 'hud', text) <= listW;
+  }
+
+  /**
+   * How many lines `drawLabelled` needs for a value: 1 beside its label, otherwise the label's line
+   * plus the value wrapped to the full width below it.
+   * @param {string} value
+   * @param {number} width
+   * @param {number} size
+   * @param {number} u
+   * @param {number} key wrap-cache key for this value
+   * @returns {number}
+   */
+  function labelledLines(value, width, size, u, key) {
+    if (measureAt(value, 'hud', size) <= width - measureAt('NEXT', 'hud', size) - 3 * u) return 1;
+    return 1 + wrapped(key, value, width, size).length;
+  }
+
+  /**
+   * A label and its value: the label dim on the left, the value on the right of the same line — or,
+   * when the value is too long for that (with `lineH` given), right-aligned on the line below at full
+   * size, rather than shrunk to a whisper beside it. Without `lineH` the value is shrunk to fit.
+   * A long effect ("Whole dead ends darken") must never overprint "NOW".
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {string} label
+   * @param {string} value
+   * @param {number} left
+   * @param {number} right
+   * @param {number} y
+   * @param {number} size
+   * @param {number} u
+   * @param {string} valueStyle
+   * @param {number} [lineH] pitch of the lines below; enables the wrapped form
+   * @param {number} [key] wrap-cache key (required with `lineH`)
+   * @returns {void}
+   */
+  function drawLabelled(ctx, label, value, left, right, y, size, u, valueStyle, lineH, key) {
+    const labelW = measureAt('NEXT', 'hud', size) + 3 * u;
+    drawAt(ctx, label, left, y, 'hud', size, 'hudDim');
+    if (lineH !== undefined && key !== undefined && labelledLines(value, right - left, size, u, key) > 1) {
+      const lines = wrapped(key, value, right - left, size);
+      for (let k = 0; k < lines.length; k++) drawAt(ctx, lines[k], right, y + (k + 1) * lineH, 'hud', size, valueStyle, 'right');
+      return;
+    }
+    const valueSize = fitScaleAt(value, right - left - labelW, 'hud', size, 1);
+    const dy = (heightAt('hud', size) - heightAt('hud', valueSize)) >> 1;
+    drawAt(ctx, value, right, y + dy, 'hud', valueSize, valueStyle, 'right');
+  }
+
+  /**
+   * The price of the next rank and what to do about it: gem and cost on the left, the prompt (or how
+   * many gems are missing) on the right when both fit, the prompt alone otherwise.
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {number} left
+   * @param {number} right
+   * @param {number} y
+   * @param {number} size
+   * @param {number} u
+   * @param {number} cost
+   * @param {boolean} affordable
+   * @param {number} purse
+   * @param {boolean} reduced
+   * @returns {void}
+   */
+  function drawPriceLine(ctx, left, right, y, size, u, cost, affordable, purse, reduced) {
+    const prompt = affordable ? (primaryPointerIsCoarse() ? 'TAP AGAIN TO BUY' : 'ENTER TO BUY') : needMemo(cost - purse);
+    const costText = costMemo(cost);
+    const gemS = Math.max(1, size);
+    const costW = ICON_SIZE.gem * gemS + 2 * u + measureAt(costText, 'hud', size);
+    const promptW = measureAt(prompt, 'hud', size);
+    const blink = affordable && !reduced ? 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(anim.clock * 3.6)) : 1;
+    const style = affordable ? 'hudGold' : 'hudAlarm';
+    if (costW + 4 * u + promptW <= right - left) {
+      drawGemIcon(ctx, left, y, gemS);
+      drawAt(ctx, costText, left + ICON_SIZE.gem * gemS + 2 * u, y, 'hud', size, affordable ? 'hudGem' : 'hudDim');
+      drawAt(ctx, prompt, right, y, 'hud', size, style, 'right', 'top', blink);
+    } else {
+      drawAt(ctx, prompt, left, y, 'hud', fitScaleAt(prompt, right - left, 'hud', size, 1), style, 'left', 'top', blink);
+    }
+  }
+
+  // ── Boon (§4.9) ──
+
+  /**
+   * The Boon: three cards to choose one unlock rank from, free. Each card carries the unlock's
+   * icon large, its name in the gothic face, its rank pips with the rank on offer lit in fire, and
+   * what that rank does. Cards rise into place one after another; the selected one lifts and its
+   * frame burns. Wide: side by side. Narrow: stacked, icon to the left of the words.
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {SurfaceMetrics} m
+   * @param {GameState} state
+   * @param {Screen} screen
+   * @param {number} enter
+   * @param {boolean} reduced
+   * @returns {void}
+   */
+  function drawBoon(ctx, m, state, screen, enter, reduced) {
+    const u = m.u;
+    const cx = Math.round(m.w / 2);
+    drawScrim(ctx, m, 0.8);
+    const narrow = m.narrow;
+    const count = syncEnabled(screen, state);
+    let cards = 0;
+    for (let i = 0; i < BOON_CARDS; i++) if (rowEnabled[i]) cards++;
+
+    const headScale = fitScaleAt(BOON_HEADING, m.w * 0.84, 'display', Math.max(2, u + 1), 1);
+    const headH = heightAt('display', headScale);
+    const slide = panelSlide(enter, u, reduced);
+    let y = 5 * u + slide;
+    drawAt(ctx, BOON_HEADING, cx, y, 'display', headScale, 'gothic', 'center');
+    y += headH + 3 * u;
+    // A breathing band of gold under the rule — the one screen in the game that hands something out.
+    // Under the heading, never through it: drawn across the letters it read as a strikethrough.
+    if (!reduced) {
+      const glow = (18 + 10 * Math.sin(anim.clock * 2.2)) | 0;
+      ctx.fillStyle = withAlphaStep(COLOR.goldMid, glow);
+      ctx.fillRect(cx - Math.round(m.w * 0.3), y - u, Math.round(m.w * 0.6), 2 * u);
+    }
+    drawRule(ctx, cx, y, Math.round(Math.min(m.w * 0.3, 90 * u)), u);
+    y += 4 * u;
+    const textSize = narrow ? Math.max(1, u - 1) : u;
+    const offer = /** @type {any} */ (state).offer;
+    const note = offer && typeof offer.level === 'number' ? boonNoteMemo(offer.level) : '';
+    const noteLine = measureAt(BOON_NOTE, 'hud', textSize) <= m.w - 8 * u ? BOON_NOTE : BOON_NOTE_SHORT;
+    if (note !== '') {
+      drawAt(ctx, note, cx, y, 'hud', textSize, 'hudGold', 'center');
+      y += heightAt('hud', textSize) + 2 * u;
+    }
+    drawAt(ctx, noteLine, cx, y, 'hud', textSize, 'hudDim', 'center');
+    y += heightAt('hud', textSize) + 6 * u;
+
+    const laterScale = Math.max(1, Math.min(u, headScale - 1));
+    const laterH = heightAt('display', laterScale) + 4 * u;
+    const laterY = m.h - 4 * u - laterH;
+    const areaTop = y;
+    const areaBottom = laterY - 4 * u;
+    const lineH = heightAt('hud', textSize) + 2 * u;
+    const pip = Math.max(3, 3 * textSize);
+
+    // Card geometry is the same for every card; only the position differs.
+    const cardGap = narrow ? 3 * u : 6 * u;
+    const cardW = narrow
+      ? m.w - 8 * u
+      : Math.min(110 * u, Math.floor((m.w - 8 * u - cardGap * (cards - 1)) / Math.max(1, cards)));
+    const cardH = narrow
+      ? Math.floor((areaBottom - areaTop - cardGap * (cards - 1)) / Math.max(1, cards))
+      : Math.min(areaBottom - areaTop, Math.max(90 * u, Math.round(cardW * 1.1)));
+    // Pre-pass: one name scale, one icon scale, one effect size and one blurb decision for all the
+    // cards, so three cards side by side never disagree about how they are laid out.
+    let longestName = '';
+    let longestW = 0;
+    for (let k = 0; k < BOON_CARDS; k++) {
+      const other = rowEnabled[k] ? unlockInfo(boonIdAt(state, k)) : null;
+      if (other === null) continue;
+      const nw = measureAt(other.name, 'display', 1);
+      if (nw > longestW) {
+        longestW = nw;
+        longestName = other.name;
+      }
+    }
+    let bigS = 1;
+    let nameScale = 1;
+    let eSize = textSize;
+    let showBlurbs = true;
+    if (!narrow) {
+      bigS = Math.max(2, Math.min(4 * u, Math.floor((cardW * 0.36) / UNLOCK_ICON)));
+      nameScale = fitScaleAt(longestName, cardW - 10 * u, 'display', Math.max(1, u), 1);
+      const fixed = 6 * u + UNLOCK_ICON * bigS + 4 * u + heightAt('display', nameScale) + 3 * u + pip + 4 * u + u + 3 * u;
+      for (let k = 0; k < BOON_CARDS; k++) {
+        const other = rowEnabled[k] ? unlockInfo(boonIdAt(state, k)) : null;
+        if (other === null) continue;
+        const ui = unlocks.indexOf(other);
+        const r = rankOf(state, other.id);
+        const e = wrapped((ui * 16 + r) * 4 + 2, other.ranks[Math.min(r, other.max - 1)], cardW - 10 * u, textSize);
+        const b = wrapped(ui * 64 + 1, other.blurb, cardW - 10 * u, textSize);
+        if (fixed + (e.length + b.length) * lineH > cardH) showBlurbs = false;
+      }
+    } else {
+      bigS = Math.max(1, Math.min(3 * u, Math.floor((cardH - 6 * u) / UNLOCK_ICON)));
+      while (bigS > 1 && 8 * u + UNLOCK_ICON * bigS + 4 * u + longestW > cardW - 4 * u) bigS--;
+      const tw = cardW - 12 * u - UNLOCK_ICON * bigS;
+      nameScale = fitScaleAt(longestName, tw, 'display', Math.max(1, u), 1);
+      const room = cardH - 7 * u - heightAt('display', nameScale) - 2 * u - pip - 3 * u;
+      for (let k = 0; k < BOON_CARDS; k++) {
+        const other = rowEnabled[k] ? unlockInfo(boonIdAt(state, k)) : null;
+        if (other === null) continue;
+        const ui = unlocks.indexOf(other);
+        const r = rankOf(state, other.id);
+        const text = other.ranks[Math.min(r, other.max - 1)];
+        while (eSize > 1 && wrapped((ui * 16 + r) * 4 + 3, text, tw, eSize).length * (heightAt('hud', eSize) + u) > room) eSize--;
+      }
+    }
+
+    for (let i = 0; i < BOON_CARDS; i++) {
+      if (!rowEnabled[i]) {
+        recordRow(i, 0, 0, 0, 0);
+        continue;
+      }
+      const id = boonIdAt(state, i);
+      const info = unlockInfo(id);
+      if (info === null) {
+        recordRow(i, 0, 0, 0, 0);
+        continue;
+      }
+      const rank = rankOf(state, info.id);
+      const selected = i === index;
+      // Cards arrive one after another, 90 ms apart, rising 8u into place.
+      const age = anim.enterT - 0.08 - i * 0.09;
+      const rise = reduced ? 1 : clamp01(age / 0.22);
+      if (rise <= 0) {
+        recordRow(i, 0, 0, 0, 0);
+        continue;
+      }
+      const eased = 1 - (1 - rise) * (1 - rise);
+      const lift = selected && !reduced ? Math.round((0.5 + 0.5 * Math.sin(anim.clock * 3.4)) * u) + u : 0;
+      let x = 0;
+      let cy = 0;
+      let w = 0;
+      let h = 0;
+      let slot = 0;
+      for (let k = 0; k < i; k++) if (rowEnabled[k]) slot++;
+      w = cardW;
+      h = cardH;
+      if (!narrow) {
+        const total = cards * cardW + (cards - 1) * cardGap;
+        x = cx - (total >> 1) + slot * (cardW + cardGap);
+        cy = areaTop + ((areaBottom - areaTop - h) >> 1);
+      } else {
+        x = 4 * u;
+        cy = areaTop + slot * (h + cardGap);
+      }
+      const drawY = cy + Math.round((1 - eased) * 8 * u) - lift;
+      const before = ctx.globalAlpha;
+      ctx.globalAlpha = before * eased;
+      drawPanel(ctx, x, drawY, w, h, u, selected ? PANEL_END : PANEL_OPTIONS);
+      if (selected) {
+        const burn = reduced ? 48 : (36 + 20 * (0.5 + 0.5 * Math.sin(anim.clock * 5))) | 0;
+        ctx.fillStyle = withAlphaStep(COLOR.fireHot, burn);
+        strokeRect(ctx, x, drawY, w, h, Math.max(1, u));
+      }
+      recordRow(i, x, cy, w, h);
+
+      if (!narrow) {
+        let ty = drawY + 6 * u;
+        const bigW = UNLOCK_ICON * bigS;
+        drawUnlockIcon(ctx, info.id, x + ((w - bigW) >> 1), ty, bigS);
+        ty += bigW + 4 * u;
+        drawAt(ctx, info.name, x + (w >> 1), ty, 'display', nameScale, selected ? 'gothicHot' : 'gothic', 'center');
+        ty += heightAt('display', nameScale) + 3 * u;
+        const pw = pipsWidth(info.max, pip);
+        drawPips(ctx, x + ((w - pw) >> 1), ty, rank, info.max, pip, true);
+        ty += pip + 4 * u;
+        const ui = unlocks.indexOf(info);
+        // Keys: (catalogue index * 16 + rank) * 4 + kind, because the effect text changes with rank.
+        const effect = wrapped((ui * 16 + rank) * 4 + 2, info.ranks[Math.min(rank, info.max - 1)], w - 10 * u, textSize);
+        for (let k = 0; k < effect.length && ty + lineH <= drawY + h - 4 * u; k++) {
+          drawAt(ctx, effect[k], x + (w >> 1), ty, 'hud', textSize, 'hudBright', 'center');
+          ty += lineH;
+        }
+        const blurb = wrapped(ui * 64 + 1, info.blurb, w - 10 * u, textSize);
+        ty += u;
+        // Shown on every card or on none (decided in the pre-pass), and never cut mid-sentence.
+        if (showBlurbs && ty + blurb.length * lineH <= drawY + h - 3 * u) {
+          for (let k = 0; k < blurb.length; k++) {
+            drawAt(ctx, blurb[k], x + (w >> 1), ty, 'hud', textSize, 'hudDim', 'center');
+            ty += lineH;
+          }
+        }
+      } else {
+        // The icon gives way to the name (sized in the pre-pass): a stacked card on a phone is wide
+        // enough for either a big icon or "Dead-End Whisper" in the gothic face, not both.
+        const bigW = UNLOCK_ICON * bigS;
+        const ix = x + 4 * u;
+        drawUnlockIcon(ctx, info.id, ix, drawY + ((h - bigW) >> 1), bigS);
+        const tx = ix + bigW + 4 * u;
+        const tw = x + w - 4 * u - tx;
+        let ty = drawY + 4 * u;
+        drawAt(ctx, info.name, tx, ty, 'display', nameScale, selected ? 'gothicHot' : 'gothic');
+        ty += heightAt('display', nameScale) + 2 * u;
+        drawPips(ctx, tx, ty, rank, info.max, pip, true);
+        ty += pip + 3 * u;
+        // Wrapped to the words' column at the one size every card's effect fits at (the pre-pass): a
+        // phone's text size wrapped "Store 50s of overflow" into four lines and lost the last one.
+        const lines = wrapped((unlocks.indexOf(info) * 16 + rank) * 4 + 3, info.ranks[Math.min(rank, info.max - 1)], tw, eSize);
+        for (let k = 0; k < lines.length && ty + heightAt('hud', eSize) <= drawY + h - 2 * u; k++) {
+          drawAt(ctx, lines[k], tx, ty, 'hud', eSize, 'hudBright');
+          ty += heightAt('hud', eSize) + u;
+        }
+      }
+      ctx.globalAlpha = before;
+    }
+
+    // Decide Later.
+    const laterRow = count - 1;
+    if (laterRow >= 0) {
+      const label = screen.items[laterRow].label;
+      const selected = laterRow === index;
+      const w = measureAt(label, 'display', laterScale);
+      drawAt(ctx, label, cx, laterY + 2 * u, 'display', laterScale, selected ? 'gothicHot' : 'gothicDim', 'center');
+      if (selected) {
+        const fs = Math.max(1, Math.round(laterScale * 0.8));
+        const frame = reduced ? 0 : ((anim.clock * 11) | 0) % 3;
+        drawFlame(ctx, cx - (w >> 1) - ICON_SIZE.flameW * fs - 2 * u, laterY + 2 * u - fs, fs, frame);
+        drawFlame(ctx, cx + (w >> 1) + 2 * u, laterY + 2 * u - fs, fs, frame + 1);
+      }
+      const bw = Math.max(w + 16 * u, m.w * 0.3);
+      recordRow(laterRow, cx - bw / 2, laterY, bw, laterH);
+    }
+    rowCount = count;
   }
 
   /**

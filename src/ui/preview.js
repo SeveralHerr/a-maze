@@ -387,7 +387,6 @@ const frame = {
   moveY: 0,
   turn: 0,
   lookDX: 0,
-  sprint: false,
   pressed: new Set(),
 };
 

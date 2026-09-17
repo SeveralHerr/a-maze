@@ -47,6 +47,43 @@
  * @property {number} seed
  */
 
+/**
+ * A chalk mark on one face of a wall tile (ARCHITECTURE.md §4.9). `face` uses the torch numbering
+ * (0=E, 1=S, 2=W, 3=N: the outward normal of the chalked side); `seed` picks the lettering variant.
+ * @typedef {{x:number, y:number, face:0|1|2|3, seed:number}} ChalkMark
+ */
+
+/**
+ * Persisted meta progression (§4.9): gems banked across runs, unlock ranks by id, and the deepest
+ * level a boon has been claimed for.
+ * @typedef {{purse:number, ranks:Record<string, number>, boonLevel:number}} Progress
+ */
+
+/**
+ * Flat per-run numbers derived from `Progress.ranks` by `balance.computePerks` (§4.9). Multipliers
+ * are 1 and everything else is 0 with no unlocks.
+ * @typedef {Object} Perks
+ * @property {number} tankMult      × the level's tank
+ * @property {number} oilMult       × a flask's value
+ * @property {number} drainMult     × the level's drain
+ * @property {number} emberSeconds  fuel a dead torch rekindles with, once per level (0 = none)
+ * @property {number} siphonCap     seconds of flask overflow the reserve holds (0 = none)
+ * @property {number} flame         × the player torch's light radius
+ * @property {number} reveal        fog-of-war reveal radius, tiles
+ * @property {number} oilSense      flasks within this many tiles show through walls (0 = none)
+ * @property {number} scrollSense   the HUD pulses within this many tiles of the scroll (0 = none)
+ * @property {number} whisper       dead-end branch depth that darkens (0 = none, 255 = all)
+ * @property {number} lodestone     1 = exit needle once the scroll is found
+ * @property {number} chalk         chalk charges per level
+ * @property {number} magnet        gem pull radius, tiles (0 = none)
+ * @property {number} gemPurse      purse gems per gem picked up
+ */
+
+/**
+ * The pick-one-of-three offered on clearing a new record depth (§4.9).
+ * @typedef {{open:boolean, level:number, ids:string[]}} BoonOffer
+ */
+
 /** @typedef {'gem'|'oil'|'map'} ItemKind  'map' = the level's hidden map scroll (ARCHITECTURE.md §4.8) */
 
 /**
@@ -89,7 +126,8 @@
 
 /**
  * Edge-triggered semantic actions (menu navigation and toggles).
- * @typedef {'confirm'|'back'|'pause'|'map'|'up'|'down'|'left'|'right'|'mute'} InputAction
+ * `chalk` marks the wall ahead (§4.9).
+ * @typedef {'confirm'|'back'|'pause'|'map'|'up'|'down'|'left'|'right'|'mute'|'chalk'} InputAction
  */
 
 /**
@@ -100,7 +138,6 @@
  * @property {number} moveY           forward -1..1 (forward +)
  * @property {number} turn            keyboard/stick turn -1..1 (right +), scaled by dt in sim
  * @property {number} lookDX          accumulated mouse/touch yaw delta in radians since last poll (already sensitivity-scaled)
- * @property {boolean} sprint
  * @property {Set<InputAction>} pressed   edge-triggered this poll
  */
 
@@ -154,8 +191,9 @@
  * the run, where a small maze was fully described by time and gems. `refuels` counts flasks burned
  * **this level** (reset by `levelReady`); `distance` accumulates tiles walked over the whole **run**.
  * `mapFound` is true once this level's map scroll is picked up (or the level has none); the map is
- * locked until then (ARCHITECTURE.md §4.8).
- * @typedef {{score:number, gems:number, gemsTotal:number, fuel:number, fuelMax:number, levelTime:number, totalTime:number, levelScore:number, bestCombo:number, refuels:number, distance:number, mapFound:boolean}} RunStats
+ * locked until then (ARCHITECTURE.md §4.8). `chalk` = chalk charges left this level, `reserve` = siphon
+ * seconds stored, `emberUsed` = this level's ember has rekindled the torch (§4.9).
+ * @typedef {{score:number, gems:number, gemsTotal:number, fuel:number, fuelMax:number, levelTime:number, totalTime:number, levelScore:number, bestCombo:number, refuels:number, distance:number, mapFound:boolean, chalk:number, reserve:number, emberUsed:boolean}} RunStats
  */
 
 /**
@@ -165,7 +203,7 @@
 
 /**
  * Values recomputed every step for renderer/hud/audio (the `GameState.derived` shape).
- * @typedef {{exitDist:number, nearExit:number, lowFuel:boolean}} Derived
+ * @typedef {{exitDist:number, nearExit:number, lowFuel:boolean, scrollSense:number}} Derived
  */
 
 /**
@@ -183,6 +221,10 @@
  * @property {BestScore} best
  * @property {Settings} settings
  * @property {Derived} derived        recomputed each step for renderer/hud/audio
+ * @property {Progress} progress      persisted unlocks and purse (§4.9)
+ * @property {Perks} perks            numbers derived from `progress` (§4.9)
+ * @property {BoonOffer} offer        the boon pending on a level clear (§4.9)
+ * @property {ChalkMark[]} marks      chalk marks on this level (§4.9)
  * @property {GameEvent[]} events     events emitted by the LAST step (cleared at start of each step)
  */
 
@@ -191,7 +233,9 @@
  * @typedef {{type:'footstep', foot:0|1} | {type:'bump', strength:number} | {type:'pickup', kind:ItemKind, x:number, y:number, value:number}
  *   | {type:'levelStart', level:number} | {type:'levelComplete', level:number, bonus:number}
  *   | {type:'lowFuel'} | {type:'gameOver', score:number, newBest:boolean} | {type:'phase', from:Phase, to:Phase}
- *   | {type:'uiMove'} | {type:'uiConfirm'}} GameEvent
+ *   | {type:'uiMove'} | {type:'uiConfirm'}
+ *   | {type:'chalk', ok:boolean, x:number, y:number} | {type:'ember', seconds:number}
+ *   | {type:'unlock', id:string, rank:number, boon:boolean}} GameEvent
  */
 
 // ─── Cross-seam shapes mirrored from §4.2 / §4.5 ─────────────────────────────────────────────
@@ -200,7 +244,8 @@
  * Store actions (ARCHITECTURE.md §4.2). `setSetting` is keyed by a `Settings` property name.
  * @typedef {{type:'tick', dt:number, input:InputFrame} | {type:'newGame', seed:number} | {type:'levelReady', data:LevelData}
  *   | {type:'pause'} | {type:'resume'} | {type:'nextLevel'} | {type:'toTitle'}
- *   | {type:'setSetting', key:keyof Settings, value:number|boolean|string} | {type:'debugWin'}} Action
+ *   | {type:'setSetting', key:keyof Settings, value:number|boolean|string} | {type:'debugWin'}
+ *   | {type:'buyUnlock', id:string} | {type:'claimBoon', id:string}} Action
  */
 
 /**
@@ -222,6 +267,10 @@
  * @property {Flash} flash
  * @property {boolean} portalOpen
  * @property {boolean} reducedMotion
+ * @property {ChalkMark[]} [marks]   chalk marks on the level (§4.9); identity + length drive the rebuild
+ * @property {number} [flame]         × the player torch radius (Wide Flame, default 1)
+ * @property {number} [oilSense]      flasks within this many tiles draw through walls (default 0)
+ * @property {number} [whisper]       dead-end branch depth to darken (default 0 = off)
  */
 
 // ─── Core module shapes (re-exported for one-stop type imports) ──────────────────────────────

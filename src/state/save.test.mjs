@@ -210,3 +210,37 @@ test('node: an ambient storage is used when one exists', () => {
     delete (/** @type {any} */ (globalThis).localStorage);
   }
 });
+
+// ─── Unlock progression (ARCHITECTURE.md §4.9) ───────────────────────────────────────────────
+
+test('progress: purse, ranks and boon level survive a round trip, sanitised both ways', () => {
+  const store = fakeStorage();
+  const progress = { purse: 87, ranks: { reservoir: 2, chalk: 1, lodestone: 7 }, boonLevel: 3 };
+  assert.equal(savePersist({ best: { score: 1, level: 1 }, settings: defaultSettings(), progress }, store), true);
+  const loaded = loadPersist(store);
+  assert.equal(loaded.progress.purse, 87);
+  assert.equal(loaded.progress.ranks.reservoir, 2);
+  assert.equal(loaded.progress.ranks.chalk, 1);
+  assert.equal(loaded.progress.ranks.lodestone, 1, 'an impossible rank is clamped before it is written');
+  assert.equal(loaded.progress.boonLevel, 3);
+});
+
+test('progress: a version-1 record from before the unlocks wave keeps its best and settings', () => {
+  const settings = { ...defaultSettings(), volume: 0.3 };
+  const legacy = JSON.stringify({ v: PERSIST_VERSION, best: { score: 900, level: 4 }, settings });
+  const store = fakeStorage({ seed: { [PERSIST_KEY]: legacy } });
+  const loaded = loadPersist(store);
+  assert.deepEqual(loaded.best, { score: 900, level: 4 }, 'no wipe for existing players');
+  assert.equal(loaded.settings.volume, 0.3);
+  assert.equal(loaded.progress.purse, 0, 'progress simply starts empty');
+});
+
+test('progress: a save that omits progress keeps the progress already stored', () => {
+  const store = fakeStorage();
+  savePersist({ best: { score: 1, level: 1 }, settings: defaultSettings(), progress: { purse: 42, ranks: { chalk: 2 }, boonLevel: 1 } }, store);
+  savePersist({ best: { score: 5, level: 2 }, settings: defaultSettings() }, store);
+  const loaded = loadPersist(store);
+  assert.equal(loaded.best.score, 5);
+  assert.equal(loaded.progress.purse, 42, 'a settings-only write never wipes the purse');
+  assert.equal(loaded.progress.ranks.chalk, 2);
+});

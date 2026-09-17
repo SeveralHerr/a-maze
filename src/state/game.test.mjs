@@ -20,7 +20,13 @@ import {
   levelBonus,
   levelParams,
   oilFuel,
+  UNLOCKS,
+  UNLOCK_FX,
+  unlockCost,
 } from './balance.js';
+
+/** The lean first floor's tank: every level-1 fixture's offered fuel is clamped to it. */
+const TANK1 = levelParams(1).fuelSeconds;
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────────────────────
 
@@ -93,7 +99,6 @@ function frame(o = {}) {
     moveY: 0,
     turn: 0,
     lookDX: 0,
-    sprint: false,
     pressed: new Set(),
     ...o,
   });
@@ -188,7 +193,14 @@ test('createInitialState: a clean, valid, contract-shaped state', () => {
     refuels: 0,
     distance: 0,
     mapFound: true,
+    chalk: 0,
+    reserve: 0,
+    emberUsed: false,
   });
+  assert.deepEqual(s.offer, { open: false, level: 0, ids: [] });
+  assert.deepEqual(s.marks, []);
+  assert.equal(s.progress.purse, 0);
+  assert.equal(s.perks.tankMult, 1, 'nothing unlocked on a clean profile');
   assert.equal(s.derived.exitDist, Infinity);
   assert.equal(s.derived.lowFuel, false);
   assert.deepEqual(s.events, []);
@@ -530,7 +542,7 @@ test('pickups: score scales with level', () => {
 });
 
 test('pickups: oil refills fuel, capped at the tank, and re-arms the low-fuel cue', () => {
-  const s = started(level([item(1, 'oil', 2.5, 1.5)], 100));
+  const s = started(level([item(1, 'oil', 2.5, 1.5)], TANK1));
   s.run.fuel = 10; // below the 20 % warning line
   ticks(s, 1);
   assert.equal(s.derived.lowFuel, true);
@@ -540,7 +552,7 @@ test('pickups: oil refills fuel, capped at the tank, and re-arms the low-fuel cu
   assert.ok(s.run.fuel > 10, 'the flask refilled the torch');
   assert.ok(s.run.fuel <= s.run.fuelMax, 'never over-fills');
   assert.equal(s.derived.lowFuel, false);
-  const expected = Math.min(100, 10 + oilFuel(100));
+  const expected = Math.min(TANK1, 10 + oilFuel(TANK1));
   assert.ok(Math.abs(s.run.fuel - (expected - s.run.levelTime)) < 1.5, 'restored the documented amount');
 });
 
@@ -553,7 +565,7 @@ test('run stats: refuels count flasks per level, distance is the run odometer', 
   assert.equal(s.run.refuels, 1, 'one flask burned');
   assert.ok(s.run.distance > 0.5, `walked ${s.run.distance.toFixed(2)} tiles`);
   // The odometer measures distance *covered*, so it can never outrun the top speed × time.
-  const ceiling = PLAYER.WALK_SPEED * PLAYER.SPRINT_MULT * s.run.levelTime;
+  const ceiling = PLAYER.WALK_SPEED * s.run.levelTime;
   assert.ok(s.run.distance <= ceiling, 'the odometer cannot exceed top speed × time');
 
   // A new level resets the per-level tally but keeps the run odometer.
@@ -573,7 +585,7 @@ test('run stats: refuels count flasks per level, distance is the run odometer', 
 
 test('pickups: a flask is left on the floor when the tank is already full', () => {
   const s = started(level([item(1, 'oil', 1.5, 1.5)], 100));
-  assert.equal(s.run.fuel, 100);
+  assert.equal(s.run.fuel, TANK1, 'level 1 is the lean first floor: its tank clamps the offer');
   ticks(s, 1);
   assert.equal(countEvents(s, 'pickup'), 0, 'not consumed for nothing');
   assert.equal(/** @type {any} */ (s.levelData).items[0].taken, false, 'still there to come back for');
@@ -783,23 +795,21 @@ test('fuel: running out ends the run and records the best score once', () => {
   assert.equal(s.phase, 'gameOver');
 });
 
-test('fuel: sprinting drains FUEL.SPRINT_MULT× as fast, but only while actually moving', () => {
+test('fuel: there is no sprint — walking and standing burn the same torch, and a stale flag is ignored', () => {
   const LONG = ['#########', '#S.....E#', '#########'];
   const walk = started(level([], 100, LONG));
-  const sprint = started(level([], 100, LONG));
+  const legacy = started(level([], 100, LONG));
   const still = started(level([], 100, LONG));
   ticks(walk, 60, { moveY: 1 });
-  ticks(sprint, 60, { moveY: 1, sprint: true });
-  ticks(still, 60, { sprint: true });
-  const usedWalk = 100 - walk.run.fuel;
-  const usedSprint = 100 - sprint.run.fuel;
-  const usedStill = 100 - still.run.fuel;
+  ticks(legacy, 60, { moveY: 1, sprint: true });
+  ticks(still, 60, {});
+  const usedWalk = walk.run.fuelMax - walk.run.fuel;
+  const usedLegacy = legacy.run.fuelMax - legacy.run.fuel;
+  const usedStill = still.run.fuelMax - still.run.fuel;
   assert.ok(Math.abs(usedWalk - 1) < 0.02, `walking burned ${usedWalk} s`);
-  assert.ok(
-    Math.abs(usedSprint - usedWalk * FUEL.SPRINT_MULT) < 0.05,
-    `sprinting burned ${usedSprint} s against ${usedWalk} s walking`,
-  );
-  assert.ok(Math.abs(usedStill - 1) < 0.02, 'holding sprint while standing still costs nothing extra');
+  assert.ok(Math.abs(usedStill - 1) < 0.02, `standing burned ${usedStill} s`);
+  assert.ok(Math.abs(usedLegacy - usedWalk) < 1e-9, 'an old frame carrying sprint:true changes nothing');
+  assert.ok(Math.abs(legacy.player.x - walk.player.x) < 1e-9, 'nor the speed');
 });
 
 test('exit: reaching the portal completes the level with the contract bonus', () => {
@@ -956,7 +966,7 @@ test('determinism: the same seed and inputs produce a bit-identical state', () =
           moveX: Math.cos(phase * 0.7),
           turn: Math.sin(phase * 1.3),
           lookDX: Math.sin(phase * 2.1) * 0.02,
-          sprint: i % 11 === 0,
+          chalk: i % 11 === 0,
         }),
       });
     }
@@ -1016,7 +1026,7 @@ test('reducer: a whole simulated run stays finite and in bounds', () => {
     reducer(s, {
       type: 'tick',
       dt: 1 / 60,
-      input: frame({ moveY: 1, turn: Math.sin(i / 23), sprint: i % 7 === 0 }),
+      input: frame({ moveY: 1, turn: Math.sin(i / 23) }),
     });
     assert.ok(Number.isFinite(s.player.x) && Number.isFinite(s.player.y));
     assert.ok(s.player.x > 0 && s.player.x < 9 && s.player.y > 0 && s.player.y < 5);

@@ -37,7 +37,14 @@ tree is served locally (`npm run serve`) and uploaded to itch.io by CI.
   visibly shrinks and the screen edges darken. Collect **gems** (+score) and **oil flasks** (+fuel);
   reach the glowing **exit portal** to descend. The **map is locked** on every level until the player finds that level's hidden **map scroll** (§4.8). Each descent grows the maze (to a cap) and
   multiplies score. Fuel hits 0 → game over → score summary → high score saved.
-- **Size curve _(massive mazes)_:** level 1 is **16×16 cells = 33×33 tiles**, growing **+8 cells per
+- **Progression _(unlocks wave — §4.9)_:** the world keeps getting harsher while **the player gets
+  stronger**. Gems are also a **persisted purse**; clearing a depth deeper than any boon already
+  claimed offers a free **Boon** (pick 1 of 3 unlock ranks), and the **Shrine** (title, level
+  complete, game over) spends gems on ranks. Unlocks **carry across runs**. The oil placement
+  guarantee is computed from **base stats only**, so every unlock is pure slack on top of it.
+- **Size curve _(massive mazes)_:** level 1 is a lean **10×10-cell** first floor (`LEVEL.FIRST_CELLS`,
+  an 80 s tank, thinner flasks and gems — `LEVEL.FIRST_*`); from level 2 the curve is the one below
+  unchanged, as if level 1 were **16×16 cells = 33×33 tiles**, growing **+8 cells per
   side per level** to a cap of **128×128 cells = 257×257 tiles = 16 384 cells ≈ 33 000 floor tiles**,
   reached at level 15. `LEVEL.MAX_CELLS` in `balance.js` is the **single documented size knob** and
   the cap level is *derived* from it (`CAP_LEVEL`), never typed twice. Past the cap, levels get
@@ -72,8 +79,9 @@ tree is served locally (`npm run serve`) and uploaded to itch.io by CI.
   _Consequence of the tank (deliberate, see `SCORE`):_ the clear bonus is roughly constant per level
   because the tank no longer grows, while gems scale with area (6 at level 1 → 273 at the cap), so
   the incentive tips from "get out fast" to "explore" as the labyrinth grows.
-- **Controls:** WASD/arrows move + turn, mouse look (always live while playing; pointer lock when captured, plain mouse movement otherwise — it sums with arrow-key turning), Shift sprint (fast but
-  wasteful: drains fuel 2× at 1.6× speed, so a sprinted tile costs 1.25× a walked one), M cycles the map **off → corner → full** (once this level's map scroll is found), Esc/P pause, Enter/Space confirm. Touch: left
+- **Controls:** WASD/arrows move + turn, mouse look (always live while playing; pointer lock when captured, plain mouse movement otherwise — it sums with arrow-key turning). **There is no sprint**
+  (removed in the unlocks wave: one walking speed, so the torch is the only clock). C chalks the
+  wall ahead once the Chalk unlock is owned (pad X, touch CHALK button). M cycles the map **off → corner → full** (once this level's map scroll is found), Esc/P pause, Enter/Space confirm. Touch: left
   virtual stick move, right half drag to turn, tap buttons for pause/map. Gamepad: standard mapping.
 - **Feedback cues:** head bob, footstep sounds synced to bob, wall-bump thud + tiny camera
   shake, gem sparkle particles + chime + score pop, fuel pickup whoosh + light flare, low-fuel
@@ -200,9 +208,8 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
  * @property {number} moveY           forward -1..1 (forward +)
  * @property {number} turn            keyboard/stick turn -1..1 (right +), scaled by dt in sim
  * @property {number} lookDX          accumulated mouse/touch yaw delta in radians since last poll (already sensitivity-scaled)
- * @property {boolean} sprint
- * @property {Set<InputAction>} pressed   edge-triggered this poll
- * @typedef {'confirm'|'back'|'pause'|'map'|'up'|'down'|'left'|'right'|'mute'} InputAction
+ * @property {Set<InputAction>} pressed   edge-triggered this poll   (no `sprint`: removed, §1)
+ * @typedef {'confirm'|'back'|'pause'|'map'|'up'|'down'|'left'|'right'|'mute'|'chalk'} InputAction
  */
 /**
  * @typedef {Object} Player
@@ -249,6 +256,12 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
  * @property {Settings} settings
  * @property {{exitDist:number, nearExit:number, lowFuel:boolean}} derived   recomputed each step for renderer/hud/audio
  *   (`exitDist` is Infinity and `nearExit` 0 while no level is loaded — an honest "unknown")
+ * @property {Progress} progress       persisted meta progression (§4.9): `{purse, ranks, boonLevel}`
+ * @property {Perks} perks             flat numbers derived from `progress.ranks` (§4.9), read-only outside src/state
+ * @property {BoonOffer} offer         `{open, level, ids}` — the pick-1-of-3 pending on a level clear
+ * @property {ChalkMark[]} marks       chalk marks on THIS level `{x, y, face, seed}` (wall tile + face)
+ *   `run` also gains `chalk` (charges left this level), `reserve` (siphon seconds) and `emberUsed`;
+ *   `derived` gains `scrollSense` (0..1, proximity of the unfound map scroll).
  * @property {GameEvent[]} events     events emitted by the action just dispatched. Cleared at the
  *   top of EVERY dispatch, not only on `tick`, so a subscriber sees each event exactly once and a
  *   UI-driven `phase` event cannot be clobbered by the following tick. The array identity is
@@ -263,7 +276,9 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
  * @typedef {{type:'footstep', foot:0|1} | {type:'bump', strength:number} | {type:'pickup', kind:ItemKind, x:number, y:number, value:number}
  *   | {type:'levelStart', level:number} | {type:'levelComplete', level:number, bonus:number}
  *   | {type:'lowFuel'} | {type:'gameOver', score:number, newBest:boolean} | {type:'phase', from:Phase, to:Phase}
- *   | {type:'uiMove'} | {type:'uiConfirm'} } GameEvent
+ *   | {type:'uiMove'} | {type:'uiConfirm'}
+ *   | {type:'chalk', ok:boolean, x:number, y:number} | {type:'ember', seconds:number}
+ *   | {type:'unlock', id:string, rank:number, boon:boolean} } GameEvent
  */
 ```
 
@@ -333,7 +348,7 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   66 049 tiles:
   - **Pickups** query a uniform 4-tile bucket grid in CSR form (`WORLD.ITEM_GRID_TILES`, two flat
     `Int32Array`s, grow-only pooled), built **once per level** by `buildItemGrid` in the `levelReady`
-    reducer and never per step. `collectAround` visits at most the 2×2 buckets overlapping the swept pickup
+    reducer and never per step. `collectAround` visits at most the 2×2 buckets (3×3 with the Gem Magnet) overlapping the swept pickup
     disc. Taken items stay in the grid (removing them would be the O(items) work being avoided), and
     a non-finite player position bails early so the clamp can never degenerate into a full scan.
     Measured: 0.675 µs/step on a 128×128 level with 819 items vs 0.635 µs on the old 6×6 level with
@@ -372,7 +387,8 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   `'off'|'corner'|'full'`, default `'corner'`. `coerceSetting` takes only a listed string and
   **ignores** anything else rather than snapping to the default, so a garbage `setSetting` leaves
   the player's choice alone. `minimap` stays as the legacy boolean mirror (§3).
-- `save.js` — `loadPersist() → {best, settings}` / `savePersist({best, settings})` / `clearPersist()`;
+- `save.js` — `loadPersist() → {best, settings, progress}` / `savePersist({best, settings, progress})` / `clearPersist()`
+  (`progress` is additive inside payload version 1: an older record without it loads fresh progress);
   wraps `localStorage` in try/catch; validates shape; key `amaze.v1`, payload version 1. Every
   failure mode (absent storage, throwing storage, quota, non-JSON, foreign record, version
   mismatch, oversized payload) degrades to factory defaults rather than throwing. All three take an
@@ -380,7 +396,10 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
 - **Actions** (`Action` union):
   `{type:'tick', dt, input:InputFrame}` · `{type:'newGame', seed}` · `{type:'levelReady', data:LevelData}` ·
   `{type:'pause'}` · `{type:'resume'}` · `{type:'nextLevel'}` · `{type:'toTitle'}` ·
-  `{type:'setSetting', key, value}` · `{type:'debugWin'}` (headless tools only).
+  `{type:'setSetting', key, value}` · `{type:'debugWin'}` (headless tools only) ·
+  `{type:'buyUnlock', id}` (title | levelComplete | gameOver; needs the purse and a rank to buy) ·
+  `{type:'claimBoon', id}` (levelComplete with an open offer naming `id`) — §4.9.
+  `createInitialState(settings?, best?, progress?)` takes the persisted progress as a third argument.
 - Phase machine: `title --newGame--> loading --levelReady--> playing <--pause/resume--> paused`;
   `playing --exit reached--> levelComplete --nextLevel--> loading`; `playing --fuel 0--> gameOver --toTitle--> title`.
   In `title` the sim runs an **attract-mode camera** wandering the title maze (main.js dispatches
@@ -555,7 +574,7 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   `ArrayBuffer`s on the books (48.9 MB → 0.0 MB, measured).
 
 ### 4.5 `src/renderer` (Wave 1 shell, Wave 3 polish)
-- `palette.js` — the master palette (**75 colours**, hard limit 256; `map` parchment + `seal` red ramps for the scroll) sampled from the art
+- `palette.js` — the master palette (**79 colours**, hard limit 256; `map` parchment + `seal` red ramps for the scroll, `chalk` for the wall lettering) sampled from the art
   reference; every material needs a 5–9 step ramp for the ordered dither to avoid banding at 240p.
   All textures and UI colours come from here. Exports `PALETTE`, `PALETTE_RGB`, `C` (name → index),
   `RAMPS`, `pack`, `hex`, `rgba`, `nearestIndex`.
@@ -626,7 +645,8 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
     point lights on the last frame, as world positions of the flames (already offset off their
     wall). Reused object and live arrays, exactly like `depth()`; **diagnostic only**, no consumer
     in main.js — it is the seam the nearest-8 equivalence test needs.
-- `RenderView` = `{ player:{x,y,angle,bob,bobAmp,shake}, maze:Maze, items:Item[], torches:Torch[], exit:Vec2, time:number, light:number /*0..1 torch strength*/, flash:{r,g,b,a}, portalOpen:boolean, reducedMotion:boolean }`
+- `RenderView` = `{ player:{x,y,angle,bob,bobAmp,shake}, maze:Maze, items:Item[], torches:Torch[], exit:Vec2, time:number, light:number /*0..1 torch strength*/, flash:{r,g,b,a}, portalOpen:boolean, reducedMotion:boolean, marks:ChalkMark[], flame:number /*torch radius ×*/, oilSense:number /*tiles*/, whisper:number /*dead-end depth, 0 off*/ }`
+  (the last four are the unlocks wave, §4.9; omitted fields mean "no unlock")
   — built once by main.js and mutated in place. `time` is the sim clock in seconds: it drives every
   animation and is differenced internally for particle timing, so pausing the sim freezes effects.
 - `post.js` — `createPost(rootEl) → { set({scanlines?, vignette?, lowFuelPulse?, flash?, iris?}), resize(cssW, cssH, internalH), destroy() }`
@@ -712,7 +732,7 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
     correctness depends on it. If the sim ever reveals further, the local box would miss tiles — the
     rolling sweep still catches them within ~0.3 s, so it degrades to a slight lag rather than a
     hole, but the constant must be raised to match.
-- `hud.js` — `createHud(overlayCanvas, {map?:'off'|'corner'|'full', minimap?:boolean|MapMode}) → { render(state, frameStats?, alpha?), resize(cssW, cssH, dpr?), surface, pop(value, kind?), cycleMap(settings?), mapMode(settings?), mapStats(), mapLocked(state), notice(text), reset(), dispose() }`
+- `hud.js` — _(unlocks wave: also draws the chalk/scroll-sense chips, the lodestone needle and the siphon reserve, §4.9)_ `createHud(overlayCanvas, {map?:'off'|'corner'|'full', minimap?:boolean|MapMode}) → { render(state, frameStats?, alpha?), resize(cssW, cssH, dpr?), surface, pop(value, kind?), cycleMap(settings?), mapMode(settings?), mapStats(), mapLocked(state), notice(text), reset(), dispose() }`
   (`minimap: true` still means `'corner'`, so an older call site keeps working):
   fuel gauge, score with rolling counter + pop-up deltas, gem count, depth, level timer, the map
   (via `map.js`), FPS in
@@ -746,7 +766,7 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   the HUD renders per frame while events are per dispatch, so events would be missed on a
   double-step frame and replayed on a double-render one. main.js must therefore **not** also pop
   on `pickup` events.
-- `menus.js` — `createMenus(overlayCanvas, callbacks:{onNewGame, onResume, onQuit, onNextLevel, onSetting, onUiSound, controls?}) → { render(state), handleInput(frame:InputFrame, state):boolean, handlePointer(ev):boolean, resize(cssW, cssH, dpr?), surface, screen(), dispose() }`:
+- `menus.js` — `createMenus(overlayCanvas, callbacks:{onNewGame, onResume, onQuit, onNextLevel, onSetting, onUiSound, controls?, onBuy?, onClaimBoon?, unlocks?})` (the last three: §4.9) → { render(state), handleInput(frame:InputFrame, state):boolean, handlePointer(ev):boolean, resize(cssW, cssH, dpr?), surface, screen(), dispose() }`:
   title (logo "A-MAZE" in gold gothic lettering + "Descend", "Options", "Controls", "Credits"),
   pause (which also gains a "Controls" row), a **Controls** sub-screen, options (volume, music, sensitivity, scanlines, **Map** — a three-state `choice` row, not a
   toggle — reduced motion, invert look), loading, level complete (staggered tally: gems, fuel bonus,
@@ -915,10 +935,10 @@ looked at.
 cutting an L-turn or junction keeps the player's centre `PLAYER.RADIUS` (0.22) from the wall corner,
 which is √0.5 ≈ 0.707 from the tile centre, so the closest approach was ≈ 0.49 > 0.45. Walls are
 whole tiles, so an item behind a wall is always ≥ 1.72 away: any radius below ~1.5 cannot grab
-through a wall, and 0.75 still keeps the pickup disc inside the 2×2 bucket query. `WORLD.EXIT_RADIUS`
+through a wall, and 0.75 still keeps the pickup disc inside the 2×2 bucket query (3×3 with the Gem Magnet, §4.9). `WORLD.EXIT_RADIUS`
 stays larger than `PICKUP_RADIUS` (0.8). `collectAround` also tests the swept segment from the
-previous step's position (`player.px/py`) to the current one, so a sprinting step can never skip an
-item — still no allocation, still ≤ 2 buckets per axis (the longest step is 1.28 tiles at `MAX_DT` sprinting, and 1.28 + 2×0.75 < 4; a jump over 1.5 tiles per axis — a teleport — falls back to the plain disc test).
+previous step's position (`player.px/py`) to the current one, so a long step can never skip an
+item — still no allocation, still ≤ 2 buckets per axis without the Gem Magnet (the longest step is 0.8 tiles at `MAX_DT`, and 0.8 + 2×0.75 < 4; ≤ 3 with a rank-3 magnet's 2-tile reach; a jump over 1.5 tiles per axis — a teleport — falls back to the plain disc test).
 The "oil only when ≥ 55 % would land" rule is unchanged.
 
 **Map scroll.**
@@ -957,8 +977,69 @@ The "oil only when ≥ 55 % would land" rule is unchanged.
   own particle burst colour and world flash. The persisted `mapMode` preference is untouched by the
   lock, so the map comes back in the player's chosen mode the moment the scroll is found.
 
+### 4.9 Unlocks, Boons, the Shrine and chalk _(unlocks wave — cross-module seam)_
+
+**Catalogue & numbers (`src/state/balance.js`).** `UNLOCKS` is the frozen catalogue — one entry per
+unlock `{id, name, group:'torch'|'sight'|'fortune', max, costs:number[], ranks:string[]}` (`ranks[r]`
+is the player-facing effect of owning rank `r+1`). Effect magnitudes live in `UNLOCK_FX`, and
+`computePerks(ranks, out?) → Perks` turns ranks into flat numbers:
+`{tankMult, oilMult, drainMult, emberSeconds, siphonCap, flame, reveal, oilSense, scrollSense, whisper,
+lodestone, chalk, magnet, gemPurse}`. Also `sanitizeProgress`, `defaultProgress`, `unlockCost(id, rank)`,
+`boonCandidates(progress)`. `src/ui` may not import state, so **main.js passes `UNLOCKS` to the menus**
+(`createMenus(canvas, {unlocks})`), the same seam `CONTROL_HINTS` uses; HUD and renderer read the
+computed `state.perks` / `RenderView` fields and never the catalogue's numbers.
+
+| id | effect per rank (max) |
+|----|------------------------|
+| `reservoir` | tank +10 % (5) · `richOil` flask +12 % (4) · `slowWick` drain −6 % (4) |
+| `ember` | once per level, a dead torch rekindles for 10/18/28 s (3) · `siphon` flask overflow stored, 15/30/50 s, pours in below half a tank (3) |
+| `wideFlame` | torch light radius +15 % (3) · `cartographer` fog reveal radius 3→4→5 (2) · `oilSense` flasks within 5/8/12 tiles show through walls (3) |
+| `scrollSense` | HUD pulse within 14/28 tiles of the unfound scroll (2) · `whisper` walls of dead-end branches darken, 4/10/all tiles deep (3) · `lodestone` exit needle once the scroll is found (1) |
+| `chalk` | 4/8/16 chalk marks per level (3) · `magnet` gems within 1.2/1.6/2.0 tiles with line of sight are pulled in (3) · `appraiser` +1 purse gem per gem per rank (3) |
+
+**State.** `progress = {purse, ranks:{id→rank}, boonLevel}` is persisted by `save.js`. `perks` is
+recomputed on boot, `newGame`, `levelReady`, `buyUnlock` and `claimBoon` — never per step. On a gem
+pickup `progress.purse += perks.gemPurse` (abandoned runs keep their gems). `completeLevel` opens
+`offer` when `level > progress.boonLevel` and some unlock is below its max: up to 3 ids drawn by
+`createRng(seed).fork('boon' + level)`. `claimBoon` raises that rank by one, sets `boonLevel = level`
+and closes the offer; `nextLevel` with an open offer forfeits it (the depth can be boon'd again later).
+`buyUnlock` costs `unlockCost(id, rank)` from the purse. Both emit `unlock`.
+- **The guarantee is untouched:** `levelParams` / `populate.js` never see perks. Perks only raise the
+  tank (`fuelMax = resolveTank × tankMult`), the flask (`oilFuel × oilMult`), lower the drain
+  (`drainRate × drainMult`), or add fuel (ember, siphon) — every one is ≥ the base the chain was built for.
+- **Nothing per step became O(items/tiles):** the magnet widens the pickup capsule to ≤ 2.0 tiles
+  (the bucket query stays ≤ 3×3 buckets; walking is ≤ 0.8 tiles per clamped step) and pays one DDA
+  line-of-sight probe per candidate gem; the reveal window grows to 11×11 with a budget of only
+  `REVEAL_BUDGET + 4 × rank` (+16 measured as a 2× step cost at rank 2); scroll sense is one distance to an index cached at `levelReady`.
+- **Chalk:** a `chalk` press while playing casts a DDA ray ≤ `CHALK.REACH` (2.5) tiles along the view;
+  the first wall face hit gets a mark (one per face; a charge is spent) and `{type:'chalk', ok:true}`,
+  otherwise `ok:false` (no charge, out of reach or already marked). `run.chalk = perks.chalk` on
+  `levelReady`; `marks` is emptied there.
+- **Ember / siphon:** the fuel-out test rekindles once per level before `endRun` (`ember` event);
+  the siphon stores the overflow of a flask (and lets a brim-full tank take a flask while the reserve
+  has room for at least a quarter of it) and pours `SIPHON.POUR_RATE` s/s while the tank is below `SIPHON.POUR_BELOW` of full.
+
+**Renderer.** `textures.chalk[8]` are 64×64 masks (0 clear, 1 stroke, 2 dust) of the word **A-MAZE**
+lettered big and diagonally at a random ±20–50° slant with chalky dropout. `raycaster.js` keeps a
+per-level `Uint8Array(tiles)` of chalked face bits (rebuilt on a level change, appended when
+`view.marks.length` grows) and, only on a column whose hit face is chalked, overrides the texel with
+the chalk ramp (variant = hash of tile and face; `u` runs along the viewer's right so the word always
+reads left to right). `view.whisper` builds a dead-end mask once per level (leaf-peeling BFS that never
+peels the start or exit) and dims wall faces bordering a marked floor tile. `view.oilSense` draws flasks
+within range through walls as a stippled ghost. `view.flame` scales the player torch radius.
+
+**UI.** `menus.js` gains two sub-screens: **`boon`** (three cards: icon, name, rank pips, the next rank's
+effect; opens itself once the level-complete tally is done while `offer.open`; *Descend* with an open
+offer opens it instead of forfeiting) and **`shrine`** (reachable from title, level complete and game
+over: the purse, a scrolling list of every unlock with rank pips and cost, and a detail panel with the
+current → next effect; confirm buys). Callbacks `onBuy(id)` and `onClaimBoon(id)`. `screen()` may also
+return `'boon' | 'shrine'`. `hud.js` draws a chalk-charges chip, the siphon reserve under the fuel gauge,
+the scroll-sense pulse and the lodestone needle; main.js raises notices for `ember` and a failed `chalk`.
+`audio.js` voices `chalk` (a scrape), `ember` (a rekindle) and `unlock` (a chime).
+`touch-overlay.js` shows a CHALK button only while `state.perks.chalk > 0`.
+
 ## 5. Quality gates (automated)
-- `npm test` — every `src/*/*.test.mjs` (node:test) in its own process (**678 tests in 37 files**).
+- `npm test` — every `src/*/*.test.mjs` (node:test) in its own process (**729 tests in 39 files**).
   Two of those files, `src/state/perf.test.mjs` and `src/state/feasibility.test.mjs`, import
   `src/maze` as a **test-only** dependency: the §2 runtime rule is unchanged (`src/state` still
   imports only `src/maze/constants.js` at runtime), but a feasibility proof over fake mazes would

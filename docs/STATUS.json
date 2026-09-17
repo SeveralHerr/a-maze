@@ -1,8 +1,8 @@
 {
- "updated": "2026-09-17T01:00:00.000Z",
- "iteration": 10,
+ "updated": "2026-09-16T23:53:53.000Z",
+ "iteration": 11,
  "passThreshold": 8.5,
- "wave": "gauntlet-stopped-r2",
+ "wave": "unlocks",
  "waves": {
   "0-scaffold": {
    "status": "done",
@@ -608,6 +608,26 @@
      ]
     }
    }
+  },
+  "unlocks": {
+   "status": "done",
+   "notes": "Sprint removed everywhere. Lean 10x10 first floor (80 s tank). Persistent progression: gems fill a saved purse; Shrine (title/level complete/game over) buys ranks of 14 unlocks; a free Boon (pick 1 of 3) on clearing a new record depth. Chalk marks scrawl a big diagonal A-MAZE on walls. Oil placement guarantee untouched: perks are slack only. ARCHITECTURE.md section 4.9.",
+   "gates": {
+    "npmTest": "729 tests / 39 files pass",
+    "validateMazes": "117306 mazes + 750 levels, 0 failures",
+    "stress": "OK",
+    "verify": "PASS, 0 errors, fps 120 vsync, render 1.46 ms avg, heap +0.08 MB"
+   },
+   "gauntlet": {
+    "ui": {
+     "score": 6.8,
+     "note": "quick 2-critic pass; all high/medium issues fixed afterwards (detail overprint, cut blurbs, inconsistent boon cards, glow strikethrough, pips, phone detail, chalk legibility) and re-shot; not re-scored"
+    },
+    "state": {
+     "score": 8.0,
+     "note": "0 regressions base vs maxed over 216 paired runs, 117k-action fuzz clean, chalk exact over 60k probes; fixed afterwards: Cartographer step cost 2.0x -> 1.06x (reveal sweeps now complete across steps, which also halved base step cost), savePersist keeps stored progress, persist on pause, siphon min room, quit guards an open boon, Appraiser repriced, stale comments; not re-scored"
+    }
+   }
   }
  },
  "modules": {
@@ -864,6 +884,16 @@
    "updated": "2026-09-17T01:00:00.000Z",
    "wave": "maze-shortcuts",
    "summary": "Cross-section shortcuts so a dead end is not always a long backtrack (and the maze stops being a tree you can map in your head). New generator pass connectSections (src/maze/generator.js, own rng stream maze.connect, runs after carve and before braid): knocks through up to LEVEL.SHORTCUT_CELLS=48 cells-per-shortcut walls whose two cells are >= SHORTCUT_DETOUR=24 cells apart by path (bounded BFS on the live tiles, so shortcuts self-space), rejecting any that would cut the start->exit route below SHORTCUT_ROUTE_KEEP=0.9 (distance fields from start and a reference exit, repaired incrementally per accepted wall). Applies from level 1 (~2 of 5 requested fit on 16x16). Measured over 20 seeds, largest start/exit-free cul-de-sac: L1 37->18 cells, L2 71->29, L8 164->62, cap 111->54; L1 route 314->296 tiles; 128x128 generation +~25 ms (worker). Detour 16 was tried first and flattened the feasibility tension curve (lowest tank L1-2 0.76->0.65 vs 0.57 deep) because long loop corridors send wanderers further between flasks; 24 keeps it at 0.70 vs 0.57. Gates: npm test 38/38 files, validate-mazes 117306 mazes 0 failures (campaign perfect-maze check now requires braid AND shortcuts to be 0), stress OK. verify.mjs (browser) not run."
+  },
+  {
+   "iteration": 11,
+   "updated": "2026-09-16T23:53:53.000Z",
+   "wave": "unlocks",
+   "scores": {
+    "ui": 6.8,
+    "state": 8.0
+   },
+   "stressPass": true
   }
  ],
  "openIssues": [
@@ -873,12 +903,15 @@
   "No typecheck runs anywhere in the repo (no tsconfig, no tsc dependency), so // @ts-check is enforced only by an editor.",
   "The phone depth panel is four rows tall and its lower edge sits close to the top of the 3-D band in portrait. Cosmetic, within tolerance, but it is the tightest spot in the mobile layout.",
   "verify.mjs (full ~8 min autopilot run) was not re-run after the map-scroll wave; only a targeted headless smoke check was. Its autopilot ignores the scroll, so the map stays locked in its screenshots.",
-  "Oil flasks are still left on the floor when <55% would land; with the larger pickup radius this is now the most likely remaining 'walked past an item' report. Consider a HUD cue ('tank full') when standing on a skipped flask.",
   "Auto-fullscreen not yet checked on the real itch.io page, in Safari/iOS (iPhone has no element fullscreen) or Firefox; keyboard-started runs rely on transient activation surviving to the next sim step, and fullscreen + pointer lock from one gesture is only smoke-tested in headless Chrome.",
   "Pointer lock on a real click (and inside the itch.io iframe) after the input.js modality fix is not yet hand-verified; only unlocked mouse look was confirmed in the user's Chrome (touchscreen laptop, pointer: coarse).",
   "Warm player torch overrides the earlier art decision that the in-hand light stays blue-grey; renderer not re-scored by the art critic. Tune PLAYER_WARM if it reads too orange.",
   "raycaster 'rendering does not allocate' only detects retained growth: an injected short-lived per-column object allocation passes (also true at HEAD).",
   "state/perf.test.mjs \"transient garbage: a step allocates less than one object\" failed 2 times in ~20 runs while the machine was busy (sim.js unchanged; 8/8 clean at HEAD and in the working tree when idle) - likely the same heapUsed/JIT-tier noise as the raycaster allocation test.",
-  "Low-fuel alarm is no longer reached in the tension band (L10-12) since top-off pickup; if deep levels feel too safe, trim FUEL.OIL_FRACTION_END or LEVEL.OIL_CELLS_END and restore the feasibility assertion."
+  "Low-fuel alarm is no longer reached in the tension band (L10-12) since top-off pickup; if deep levels feel too safe, trim FUEL.OIL_FRACTION_END or LEVEL.OIL_CELLS_END and restore the feasibility assertion.",
+  "Unlocks balance: a fully upgraded character keeps the lowest tank at 0.63-0.80 on levels 1-4 (base 0.27-0.60), so the torch clock barely matters early for a veteran. Intended power curve per the design ask, but consider capping combined torch multipliers or ramping drain with best depth.",
+  "The Shrine list hides rank pips on wide layouts when the longest name leaves no pip column (they show in the detail plaque and on phones).",
+  "tools/verify.mjs does not yet drive the Shrine, the Boon or chalk; they are covered by unit/layout tests and logs/shots-unlocks.mjs, logs/shot-chalk.mjs, logs/critic-unlocks.mjs scratch scripts.",
+  "Progress persistence is last-writer-wins across two open tabs."
  ]
 }

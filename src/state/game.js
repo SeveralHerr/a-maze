@@ -42,10 +42,15 @@ import {
   SETTING_KEYS,
   SIM,
   coerceSetting,
+  computePerks,
   drainRate,
+  oilFuel,
   resolveTank,
   sanitizeBest,
+  sanitizeProgress,
   sanitizeSettings,
+  unlockCost,
+  unlockDef,
 } from './balance.js';
 import {
   allocExplored,
@@ -85,7 +90,7 @@ const log = createLogger('state');
  * escapes the synchronous reducer call.
  * @type {SimInput}
  */
-const _input = { moveX: 0, moveY: 0, turn: 0, lookDX: 0, sprint: false };
+const _input = { moveX: 0, moveY: 0, turn: 0, lookDX: 0, chalk: false };
 
 /**
  * Phases from which `newGame` is honoured. See the phase-machine note in the file header.
@@ -100,6 +105,13 @@ const NEW_GAME_FROM = Object.freeze(['title', 'gameOver', 'levelComplete', 'paus
 const TO_TITLE_FROM = Object.freeze(['gameOver', 'levelComplete', 'paused']);
 
 /**
+ * Phases in which the Shrine is open for `buyUnlock` (ARCHITECTURE.md §4.9): the title and the two
+ * end screens. Never mid-level — a purchase changes the perks, and perks are fixed for a level.
+ * @type {ReadonlyArray<string>}
+ */
+const SHRINE_FROM = Object.freeze(['title', 'levelComplete', 'gameOver']);
+
+/**
  * Build a fresh `GameState`.
  *
  * Both arguments are treated as untrusted (they normally come from `localStorage` via `save.js`):
@@ -107,10 +119,12 @@ const TO_TITLE_FROM = Object.freeze(['gameOver', 'levelComplete', 'paused']);
  *
  * @param {unknown} [settings] persisted settings, or undefined for factory defaults
  * @param {unknown} [best] persisted best score, or undefined for a clean slate
+ * @param {unknown} [progress] persisted unlocks and purse (§4.9), or undefined for none
  * @returns {State} a state in phase `title` with no level loaded (a valid `GameState`)
  */
-export function createInitialState(settings, best) {
+export function createInitialState(settings, best, progress) {
   const sanitizedBest = sanitizeBest(best);
+  const sanitizedProgress = sanitizeProgress(progress);
   return {
     phase: 'title',
     time: 0,
@@ -149,10 +163,18 @@ export function createInitialState(settings, best) {
       distance: 0,
       // No level is loaded yet, so there is no scroll to find; `levelReady` sets it (§4.8).
       mapFound: true,
+      // Unlocks wave (§4.9): chalk charges left, siphon reserve, and this level's ember spent.
+      chalk: 0,
+      reserve: 0,
+      emberUsed: false,
     },
     best: sanitizedBest,
     settings: sanitizeSettings(settings),
-    derived: { exitDist: Infinity, nearExit: 0, lowFuel: false },
+    derived: { exitDist: Infinity, nearExit: 0, lowFuel: false, scrollSense: 0 },
+    progress: sanitizedProgress,
+    perks: computePerks(sanitizedProgress.ranks),
+    offer: { open: false, level: 0, ids: [] },
+    marks: [],
     events: [],
     // Non-contract simulation scratch — see SimScratch in sim.js.
     sim: createSimScratch(),
@@ -198,12 +220,22 @@ export function reducer(state, action) {
       return;
     case 'nextLevel':
       if (state.phase === 'levelComplete') {
+        // An unclaimed boon is forfeited, not banked: `progress.boonLevel` is untouched, so the same
+        // depth offers one again on a later run (§4.9).
+        closeOffer(state);
         state.level++;
         setPhase(state, 'loading');
       }
       return;
+    case 'buyUnlock':
+      applyBuyUnlock(state, a.id);
+      return;
+    case 'claimBoon':
+      applyClaimBoon(state, a.id);
+      return;
     case 'toTitle':
       if (TO_TITLE_FROM.indexOf(state.phase) >= 0) {
+        closeOffer(state);
         // Quitting from pause abandons a live run: its points still count toward the record.
         if (state.phase === 'paused') recordBest(state);
         setPhase(state, 'title');
@@ -254,7 +286,7 @@ function readInput(src) {
     _input.moveY = 0;
     _input.turn = 0;
     _input.lookDX = 0;
-    _input.sprint = false;
+    _input.chalk = false;
     return _input;
   }
   const f = /** @type {Record<string, unknown>} */ (src);
@@ -266,7 +298,8 @@ function readInput(src) {
     typeof look === 'number' && Number.isFinite(look)
       ? clamp(look, -SIM.MAX_LOOK_DX, SIM.MAX_LOOK_DX)
       : 0;
-  _input.sprint = f.sprint === true;
+  const pressed = /** @type {any} */ (f.pressed);
+  _input.chalk = pressed !== null && typeof pressed === 'object' && typeof pressed.has === 'function' && pressed.has('chalk') === true;
   return _input;
 }
 
@@ -350,6 +383,13 @@ function applyNewGame(state, rawSeed) {
   run.bestCombo = 0;
   run.refuels = 0;
   run.distance = 0;
+  run.chalk = 0;
+  run.reserve = 0;
+  run.emberUsed = false;
+  // A run's perks are the ranks owned when it starts (the Shrine is closed mid-run anyway).
+  refreshPerks(state);
+  closeOffer(state);
+  clearMarks(state);
   // Locked until `levelReady` decides (§4.8). `false`, not `true`: the HUD shows "MAP FOUND" on a
   // false→true delta, so resetting to true here would flash that banner at the start of every run
   // that follows one where the scroll was never found.
@@ -471,9 +511,14 @@ function applyLevelReady(state, data) {
     const kind = items[i].kind;
     if (playable) items[i].taken = false;
     if (kind === 'gem') gems++;
-    else if (kind === 'map') hasMap = true;
+    else if (kind === 'map') {
+      hasMap = true;
+      // Cached once per level so Scroll Sense costs one distance per step (§4.9).
+      state.sim.scrollIdx = i;
+    }
   }
   run.mapFound = !hasMap;
+  clearMarks(state);
 
   if (phase === 'title') {
     startAttract(state);
@@ -483,8 +528,16 @@ function applyLevelReady(state, data) {
   // The tank is `src/state`'s number, not the maze's (see balance.resolveTank): the torch economy
   // depends on it being small and independent of the maze's area.
   const fuel = resolveTank(state.level, level.fuel);
-  run.fuelMax = fuel;
-  run.fuel = fuel;
+  // Unlocks only ever ADD to the base economy the level was built for (§4.9): the tank grows, the
+  // flask is priced off the base tank, and the drain can only fall.
+  refreshPerks(state);
+  const perks = state.perks;
+  const tank = Math.max(fuel, Math.round(fuel * perks.tankMult));
+  run.fuelMax = tank;
+  run.fuel = tank;
+  run.chalk = perks.chalk;
+  run.reserve = 0;
+  run.emberUsed = false;
   run.gems = 0;
   run.gemsTotal = gems;
   run.levelTime = 0;
@@ -493,13 +546,98 @@ function applyLevelReady(state, data) {
   // deliberately *not* reset here, so "WALKED" on the game-over screen covers the whole descent.
   run.refuels = 0;
 
-  state.sim.drain = drainRate(state.level);
+  state.sim.drain = drainRate(state.level) * Math.min(1, perks.drainMult);
+  state.sim.flaskBase = oilFuel(fuel);
   state.sim.rng = null;
   placePlayerAtStart(state);
   revealAround(state);
   updateDerived(state);
   setPhase(state, 'playing');
   state.events.push({ type: 'levelStart', level: state.level });
+}
+
+// ─── Unlocks (ARCHITECTURE.md §4.9) ──────────────────────────────────────────────────────────
+
+/**
+ * Recompute `state.perks` from `state.progress.ranks`, in place. A state built by hand without the
+ * unlock blocks (an old fixture) gets them here rather than throwing.
+ * @param {State} state
+ * @returns {void}
+ */
+function refreshPerks(state) {
+  if (!state.progress) state.progress = sanitizeProgress(null);
+  if (!state.perks) state.perks = computePerks(state.progress.ranks);
+  else computePerks(state.progress.ranks, state.perks);
+}
+
+/**
+ * Close any pending boon offer.
+ * @param {State} state
+ * @returns {void}
+ */
+function closeOffer(state) {
+  if (!state.offer) {
+    state.offer = { open: false, level: 0, ids: [] };
+    return;
+  }
+  state.offer.open = false;
+}
+
+/**
+ * Empty the level's chalk marks. A fresh array rather than `length = 0`, so the renderer — which
+ * keys its chalk mask on the array's identity — can never mistake the new level's marks for an
+ * extension of the old one's.
+ * @param {State} state
+ * @returns {void}
+ */
+function clearMarks(state) {
+  if (!Array.isArray(state.marks) || state.marks.length > 0) state.marks = [];
+}
+
+/**
+ * Buy the next rank of an unlock at the Shrine. Ignored outside `SHRINE_FROM`, for an unknown id, a
+ * maxed unlock, or a purse that cannot pay.
+ * @param {State} state
+ * @param {unknown} id
+ * @returns {void}
+ */
+function applyBuyUnlock(state, id) {
+  if (SHRINE_FROM.indexOf(state.phase) < 0) return;
+  const def = unlockDef(id);
+  if (def === undefined) return;
+  refreshPerks(state);
+  const progress = state.progress;
+  const rank = progress.ranks[def.id] | 0;
+  const cost = unlockCost(def.id, rank);
+  if (!(cost <= progress.purse)) return;
+  progress.purse -= cost;
+  progress.ranks[def.id] = rank + 1;
+  computePerks(progress.ranks, state.perks);
+  state.events.push({ type: 'unlock', id: def.id, rank: rank + 1, boon: false });
+}
+
+/**
+ * Claim one of the open boon's unlocks for free. Ignored unless a boon is open in `levelComplete`
+ * and `id` is one of the offered ids and still below its max.
+ * @param {State} state
+ * @param {unknown} id
+ * @returns {void}
+ */
+function applyClaimBoon(state, id) {
+  if (state.phase !== 'levelComplete') return;
+  const offer = state.offer;
+  if (!offer || !offer.open || typeof id !== 'string' || offer.ids.indexOf(id) < 0) return;
+  const def = unlockDef(id);
+  if (def === undefined) return;
+  refreshPerks(state);
+  const progress = state.progress;
+  const rank = progress.ranks[def.id] | 0;
+  if (rank >= def.max) return;
+  progress.ranks[def.id] = rank + 1;
+  if (offer.level > progress.boonLevel) progress.boonLevel = offer.level;
+  offer.open = false;
+  computePerks(progress.ranks, state.perks);
+  state.events.push({ type: 'unlock', id: def.id, rank: rank + 1, boon: true });
 }
 
 // ─── setSetting ──────────────────────────────────────────────────────────────────────────────

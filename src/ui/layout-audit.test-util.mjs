@@ -248,3 +248,25 @@ export const VIEWPORTS = Object.freeze([
   Object.freeze({ w: 844, h: 390, dpr: 3, name: '844x390@3' }),
   Object.freeze({ w: 1920, h: 1080, dpr: 1, name: '1920x1080' }),
 ]);
+
+/**
+ * The unlock catalogue as the menus receive it (ARCHITECTURE.md §4.9). A mirror of `UNLOCKS` in
+ * `src/state/balance.js` — `src/ui` tests may not import state — kept to the real strings, because
+ * the layout audit is only honest against the longest names and effects that actually ship.
+ */
+export const UNLOCK_FIXTURE = Object.freeze([
+  { id: 'reservoir', name: 'Reservoir', group: 'torch', costs: [15, 30, 55, 90, 140], blurb: 'A deeper oil tank for your torch.', ranks: ['Tank +10%', 'Tank +20%', 'Tank +30%', 'Tank +40%', 'Tank +50%'] },
+  { id: 'richOil', name: 'Rich Oil', group: 'torch', costs: [15, 35, 65, 110], blurb: 'Every flask burns longer.', ranks: ['Flasks +12%', 'Flasks +24%', 'Flasks +36%', 'Flasks +48%'] },
+  { id: 'slowWick', name: 'Slow Wick', group: 'torch', costs: [20, 45, 85, 140], blurb: 'The flame drinks oil more slowly.', ranks: ['Burn -6%', 'Burn -12%', 'Burn -18%', 'Burn -24%'] },
+  { id: 'ember', name: 'Ember Reserve', group: 'torch', costs: [25, 60, 120], blurb: 'Once per floor, a dead torch rekindles.', ranks: ['Rekindle for 10s', 'Rekindle for 18s', 'Rekindle for 28s'] },
+  { id: 'siphon', name: 'Siphon', group: 'torch', costs: [20, 50, 100], blurb: 'Spilled oil is saved and poured back in.', ranks: ['Store 15s of overflow', 'Store 30s of overflow', 'Store 50s of overflow'] },
+  { id: 'wideFlame', name: 'Wide Flame', group: 'sight', costs: [15, 35, 70], blurb: 'Your torch throws its light further.', ranks: ['Light +15%', 'Light +30%', 'Light +45%'] },
+  { id: 'cartographer', name: 'Cartographer', group: 'sight', costs: [30, 80], blurb: 'Map what you see from further away.', ranks: ['Reveal 4 tiles', 'Reveal 5 tiles'] },
+  { id: 'oilSense', name: 'Oil Sense', group: 'sight', costs: [20, 50, 100], blurb: 'Nearby flasks glow through the walls.', ranks: ['Sense within 5 tiles', 'Sense within 8 tiles', 'Sense within 12 tiles'] },
+  { id: 'scrollSense', name: 'Scroll Sense', group: 'sight', costs: [15, 40], blurb: 'Feel the map scroll when it is near.', ranks: ['Sense within 14 tiles', 'Sense within 28 tiles'] },
+  { id: 'whisper', name: 'Dead-End Whisper', group: 'sight', costs: [40, 100, 180], blurb: 'Passages that lead nowhere grow dark.', ranks: ['Last 4 tiles darken', 'Last 10 tiles darken', 'Whole dead ends darken'] },
+  { id: 'lodestone', name: 'Lodestone', group: 'sight', costs: [150], blurb: 'Once the map is found, a needle finds the exit.', ranks: ['Needle points to the exit'] },
+  { id: 'chalk', name: 'Chalk', group: 'fortune', costs: [10, 30, 70], blurb: 'Scrawl A-MAZE on a wall to mark your way.', ranks: ['4 marks per floor', '8 marks per floor', '16 marks per floor'] },
+  { id: 'magnet', name: 'Gem Magnet', group: 'fortune', costs: [15, 40, 80], blurb: 'Gems in sight leap into your hand.', ranks: ['Pull within 1.2 tiles', 'Pull within 1.6 tiles', 'Pull within 2 tiles'] },
+  { id: 'appraiser', name: 'Appraiser', group: 'fortune', costs: [45, 120, 240], blurb: 'Each gem is worth more at the Shrine.', ranks: ['2 shrine gems per gem', '3 shrine gems per gem', '4 shrine gems per gem'] },
+]);

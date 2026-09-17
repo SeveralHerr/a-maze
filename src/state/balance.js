@@ -45,14 +45,12 @@ import { clamp, clamp01, lerp } from '../core/math.js';
 export const PLAYER = Object.freeze({
   /** Collision radius in tiles. 0.22 leaves 0.28 of clearance each side of a 1-tile corridor. */
   RADIUS: 0.22,
-  /** Ground speed in tiles/second with no sprint. ~3.2 reads as a brisk jog at this scale. */
-  WALK_SPEED: 3.2,
   /**
-   * Multiplier applied to `WALK_SPEED` while sprinting. Must stay well below `FUEL.SPRINT_MULT`:
-   * sprint is *fast but wasteful* — it buys time with torch, so every sprinted tile has to cost more
-   * fuel than a walked one (`balance.test.mjs` pins the ratio).
+   * Ground speed in tiles/second. ~3.2 reads as a brisk jog at this scale. There is only one speed:
+   * sprint was removed in the unlocks wave (ARCHITECTURE.md §1), so the torch is the only clock and a
+   * tile always costs the same fuel.
    */
-  SPRINT_MULT: 1.6,
+  WALK_SPEED: 3.2,
   /** Seconds to go from standstill to `WALK_SPEED` under full input. */
   TIME_TO_TOP_SPEED: 0.15,
   /** Acceleration in tiles/s², derived: WALK_SPEED / TIME_TO_TOP_SPEED. */
@@ -69,17 +67,10 @@ export const PLAYER = Object.freeze({
    */
   TURN_SPEED: 4,
   /**
-   * Multiplier on `TURN_SPEED` while sprinting. Holding sprint through a corner should not mean
-   * overshooting it; the turn scales with the speed it has to keep up with.
-   */
-  SPRINT_TURN_MULT: 1.25,
-  /**
    * Smoothing rate (1/s) applied to the commanded keyboard turn rate. High enough to feel
    * immediate, low enough to round off the first and last frame of a tap — the "slight ease".
    */
   TURN_EASE_RATE: 18,
-  /** Speed (tiles/s) above which holding sprint actually counts as sprinting for fuel drain. */
-  SPRINT_MIN_SPEED: 0.6,
   /**
    * Maximum displacement per collision substep, in tiles. Must be < RADIUS so that a body flush
    * against a wall can never push its centre past the wall's mid-plane in one substep, and well
@@ -159,10 +150,10 @@ export const WORLD = Object.freeze({
    * Side of one bucket of the item lookup grid, in tiles (`sim.js`).
    *
    * A level now carries hundreds of items (≈ 820 at the size cap), so the pickup test may not scan
-   * them. The grid is built once per level and queried with the 2×2 buckets that can overlap the
+   * them. The grid is built once per level and queried with the buckets that can overlap the
    * pickup capsule (the step's swept segment grown by the radius). 4 tiles is the sweet spot: the
-   * longest step (`WALK_SPEED × SPRINT_MULT × SIM.MAX_DT` = 1.28) plus twice `PICKUP_RADIUS` (0.75)
-   * is 2.78 tiles, below it, so the query can never touch more than 2 buckets per axis, while a bucket still covers only 16 tiles and
+   * longest step (`WALK_SPEED × SIM.MAX_DT` = 0.8) plus twice `PICKUP_RADIUS` (0.75)
+   * is 2.3 tiles, below it so without the Gem Magnet the query touches at most 2 buckets per axis (its 2-tile reach makes it 0.8 + 2×2.0 = 4.8, i.e. 3), while a bucket still covers only 16 tiles and
    * therefore holds a handful of items at any density the level curve can produce.
    */
   ITEM_GRID_TILES: 4,
@@ -215,23 +206,6 @@ export const SIM = Object.freeze({
 export const FUEL = Object.freeze({
   /** Base drain in fuel-seconds per real second, before the per-level `drain` multiplier. */
   DRAIN: 1,
-  /**
-   * Drain multiplier while sprinting (ARCHITECTURE.md §1).
-   *
-   * Fuel per *tile* is what the player actually spends, and that is `SPRINT_MULT / PLAYER.SPRINT_MULT`
-   * times the walking cost. At the old 1.5 against a 1.6× speed a sprinted tile was 6 % *cheaper*
-   * than a walked one (measured: 0.294 vs 0.313 fuel-s/tile down a 200-tile corridor), so holding
-   * Shift the whole level was strictly optimal and the only trade-off in the controls ran backwards.
-   * At 2.0 a sprinted tile costs 1.25× a walked one: sprint is for a dash to a flask you can see or
-   * to a portal you have found, and it burns the fuel-remaining clear bonus to do it.
-   */
-  SPRINT_MULT: 2,
-  /**
-   * Floor on `SPRINT_MULT / PLAYER.SPRINT_MULT` — the fuel-per-tile premium of sprinting. Not read by
-   * the sim; it is the invariant `balance.test.mjs` holds the two speeds to, so re-tuning either
-   * multiplier cannot silently make sprint free again.
-   */
-  SPRINT_TILE_PREMIUM_MIN: 1.15,
   /**
    * Fraction of `fuelMax` at or below which `derived.lowFuel` is true (mirrored by `src/ui/hud.js`
    * as `LOW_FUEL_FRACTION` — §4.6; raise both together).
@@ -439,8 +413,25 @@ export const ATTRACT = Object.freeze({
  * decision: `MAX_CELLS` is the single documented knob for it.
  */
 export const LEVEL = Object.freeze({
-  /** Logical cells per side on level 1. */
+  /**
+   * Cells per side the size curve starts from: level L is `BASE_CELLS + (L − 1) × GROWTH`. Level 1
+   * itself is overridden by the lean first floor (`FIRST_CELLS`); level 2 onward is unchanged.
+   */
   BASE_CELLS: 16,
+  /**
+   * The first floor (unlocks wave, ARCHITECTURE.md §1): a small 10×10-cell labyrinth with a short
+   * tank and thin pickings, so a new player learns the torch loop in about a minute and the first
+   * boon arrives quickly. Only level 1 reads the `FIRST_*` numbers.
+   */
+  FIRST_CELLS: 10,
+  /** Tank on the first floor, seconds (the curve's `FUEL.TANK_START` resumes on level 2). */
+  FIRST_TANK: 80,
+  /** Cells per scatter flask on the first floor (the refuel chain still places what it needs). */
+  FIRST_OIL_CELLS: 34,
+  /** Scatter-flask floor on the first floor (the level curve's `OIL_MIN` is 6). */
+  FIRST_OIL_MIN: 3,
+  /** Gem floor on the first floor (the level curve's `GEM_MIN` is 6). */
+  FIRST_GEM_MIN: 4,
   /** Cells added per side per level. */
   GROWTH: 8,
   /**
@@ -578,6 +569,8 @@ function levelNumber(level) {
  * @returns {number} seconds, `FUEL.TANK_START`…`FUEL.TANK_END`
  */
 export function tankSeconds(level) {
+  // The lean first floor has its own, shorter tank (see `LEVEL.FIRST_TANK`).
+  if (levelNumber(level) === 1) return LEVEL.FIRST_TANK;
   // The tank finishes ramping exactly when the maze stops growing, so one knob moves both.
   return lerp(FUEL.TANK_START, FUEL.TANK_END, sizeRamp(level));
 }
@@ -642,9 +635,19 @@ export function travelTiles(seconds, drain = 1) {
  * @returns {number} tiles (≥ 1)
  */
 export function estimatedPathTiles(level) {
-  const lv = levelNumber(level);
-  const side = Math.min(LEVEL.MAX_CELLS, LEVEL.BASE_CELLS + (lv - 1) * LEVEL.GROWTH);
+  const side = sideCells(level);
   return Math.max(1, Math.round(side * LEVEL.PATH_TILES_PER_SIDE));
+}
+
+/**
+ * Cells per side of a level's labyrinth: the lean first floor, then the massive-maze curve.
+ * @param {number} level 1-based
+ * @returns {number}
+ */
+export function sideCells(level) {
+  const lv = levelNumber(level);
+  if (lv === 1) return LEVEL.FIRST_CELLS;
+  return Math.min(LEVEL.MAX_CELLS, LEVEL.BASE_CELLS + (lv - 1) * LEVEL.GROWTH);
 }
 
 /**
@@ -669,8 +672,9 @@ export function estimatedPathTiles(level) {
 export function levelParams(level) {
   const lv = levelNumber(level);
 
-  const side = Math.min(LEVEL.MAX_CELLS, LEVEL.BASE_CELLS + (lv - 1) * LEVEL.GROWTH);
+  const side = sideCells(lv);
   const cells = side * side;
+  const first = lv === 1;
 
   const braid =
     Math.pow(clamp01((lv - 1) / LEVEL.BRAID_RAMP_LEVELS), LEVEL.BRAID_RAMP_SHAPE) * LEVEL.BRAID_MAX;
@@ -678,10 +682,10 @@ export function levelParams(level) {
 
   // Density ramp: t = 0 on level 1, 1 once the maze has stopped growing.
   const t = clamp01((lv - 1) / LEVEL.DENSITY_RAMP_LEVELS);
-  const oilDensity = 1 / lerp(LEVEL.OIL_CELLS_START, LEVEL.OIL_CELLS_END, t);
+  const oilDensity = 1 / (first ? LEVEL.FIRST_OIL_CELLS : lerp(LEVEL.OIL_CELLS_START, LEVEL.OIL_CELLS_END, t));
   const gemDensity = 1 / lerp(LEVEL.GEM_CELLS_START, LEVEL.GEM_CELLS_END, t);
-  const gems = clamp(Math.round(cells * gemDensity), LEVEL.GEM_MIN, LEVEL.GEM_MAX);
-  const oil = clamp(Math.round(cells * oilDensity), LEVEL.OIL_MIN, LEVEL.OIL_MAX);
+  const gems = clamp(Math.round(cells * gemDensity), first ? LEVEL.FIRST_GEM_MIN : LEVEL.GEM_MIN, LEVEL.GEM_MAX);
+  const oil = clamp(Math.round(cells * oilDensity), first ? LEVEL.FIRST_OIL_MIN : LEVEL.OIL_MIN, LEVEL.OIL_MAX);
 
   const fuelSeconds = Math.round(tankSeconds(lv));
   const drain = drainRate(lv);
@@ -915,4 +919,279 @@ export function sanitizeBest(src) {
     out.level = Math.min(Number.MAX_SAFE_INTEGER, Math.floor(level));
   }
   return out;
+}
+
+// ─── Unlocks (ARCHITECTURE.md §4.9) ──────────────────────────────────────────────────────────
+
+/**
+ * One unlock in the catalogue. `costs[r]` is the purse price of rank `r + 1`; `ranks[r]` is what
+ * owning rank `r + 1` does, in the player's words (the Shrine and the Boon cards print it). The
+ * catalogue is **data the UI shows**; the numbers the sim uses live in {@link UNLOCK_FX} and must be
+ * edited together with the `ranks` text.
+ * @typedef {Object} UnlockDef
+ * @property {string} id
+ * @property {string} name
+ * @property {'torch'|'sight'|'fortune'} group
+ * @property {number} max
+ * @property {ReadonlyArray<number>} costs
+ * @property {ReadonlyArray<string>} ranks
+ * @property {string} blurb one line describing the unlock as a whole
+ */
+
+/** @typedef {import('../core/types.js').Progress} Progress */
+/** @typedef {import('../core/types.js').Perks} Perks */
+
+/**
+ * Effect magnitudes per rank, indexed by rank (index 0 = not owned). Every number here is
+ * **slack on top of the base economy**: the oil placement guarantee is built from `levelParams`
+ * alone, which never sees these, so no value in this table can make a level unfinishable — the
+ * worst a mistuned entry can do is make the game easier than intended.
+ */
+export const UNLOCK_FX = Object.freeze({
+  /** × tank. 5 ranks of +10 %. */
+  reservoir: Object.freeze([1, 1.1, 1.2, 1.3, 1.4, 1.5]),
+  /** × flask value. 4 ranks of +12 %. */
+  richOil: Object.freeze([1, 1.12, 1.24, 1.36, 1.48]),
+  /** × drain. 4 ranks of −6 %. */
+  slowWick: Object.freeze([1, 0.94, 0.88, 0.82, 0.76]),
+  /** Seconds the ember rekindles a dead torch with, once per level. */
+  ember: Object.freeze([0, 10, 18, 28]),
+  /** Seconds of flask overflow the siphon reserve holds. */
+  siphon: Object.freeze([0, 15, 30, 50]),
+  /** × player torch light radius. */
+  wideFlame: Object.freeze([1, 1.15, 1.3, 1.45]),
+  /** Fog-of-war reveal radius, tiles. `src/ui/map.js` mirrors the maximum as `MAP.REVEAL_RADIUS`. */
+  cartographer: Object.freeze([3, 4, 5]),
+  /** Flask x-ray range, tiles. */
+  oilSense: Object.freeze([0, 5, 8, 12]),
+  /** Scroll-sense range, tiles. */
+  scrollSense: Object.freeze([0, 14, 28]),
+  /** Dead-end branch depth that darkens, tiles (255 = every branch, however deep). */
+  whisper: Object.freeze([0, 4, 10, 255]),
+  /** 1 = exit needle. */
+  lodestone: Object.freeze([0, 1]),
+  /** Chalk charges per level. */
+  chalk: Object.freeze([0, 4, 8, 16]),
+  /** Gem pull radius, tiles. Must stay ≤ 2.0 (see `WORLD.ITEM_GRID_TILES`). */
+  magnet: Object.freeze([0, 1.2, 1.6, 2]),
+  /** Purse gems per gem picked up. */
+  appraiser: Object.freeze([1, 2, 3, 4]),
+});
+
+/**
+ * The unlock catalogue, in Shrine order (torch, sight, fortune). Prices climb steeply per rank so
+ * the first rank of anything is one or two floors of gems (level 2 carries ~11, level 5 ~43) while
+ * a maxed build is a long-term goal across many runs.
+ * @type {ReadonlyArray<UnlockDef>}
+ */
+export const UNLOCKS = Object.freeze([
+  unlock('reservoir', 'Reservoir', 'torch', [15, 30, 55, 90, 140], 'A deeper oil tank for your torch.', [
+    'Tank +10%', 'Tank +20%', 'Tank +30%', 'Tank +40%', 'Tank +50%']),
+  unlock('richOil', 'Rich Oil', 'torch', [15, 35, 65, 110], 'Every flask burns longer.', [
+    'Flasks +12%', 'Flasks +24%', 'Flasks +36%', 'Flasks +48%']),
+  unlock('slowWick', 'Slow Wick', 'torch', [20, 45, 85, 140], 'The flame drinks oil more slowly.', [
+    'Burn -6%', 'Burn -12%', 'Burn -18%', 'Burn -24%']),
+  unlock('ember', 'Ember Reserve', 'torch', [25, 60, 120], 'Once per floor, a dead torch rekindles.', [
+    'Rekindle for 10s', 'Rekindle for 18s', 'Rekindle for 28s']),
+  unlock('siphon', 'Siphon', 'torch', [20, 50, 100], 'Spilled oil is saved and poured back in.', [
+    'Store 15s of overflow', 'Store 30s of overflow', 'Store 50s of overflow']),
+  unlock('wideFlame', 'Wide Flame', 'sight', [15, 35, 70], 'Your torch throws its light further.', [
+    'Light +15%', 'Light +30%', 'Light +45%']),
+  unlock('cartographer', 'Cartographer', 'sight', [30, 80], 'Map what you see from further away.', [
+    'Reveal 4 tiles', 'Reveal 5 tiles']),
+  unlock('oilSense', 'Oil Sense', 'sight', [20, 50, 100], 'Nearby flasks glow through the walls.', [
+    'Sense within 5 tiles', 'Sense within 8 tiles', 'Sense within 12 tiles']),
+  unlock('scrollSense', 'Scroll Sense', 'sight', [15, 40], 'Feel the map scroll when it is near.', [
+    'Sense within 14 tiles', 'Sense within 28 tiles']),
+  unlock('whisper', 'Dead-End Whisper', 'sight', [40, 100, 180], 'Passages that lead nowhere grow dark.', [
+    'Last 4 tiles darken', 'Last 10 tiles darken', 'Whole dead ends darken']),
+  unlock('lodestone', 'Lodestone', 'sight', [150], 'Once the map is found, a needle finds the exit.', [
+    'Needle points to the exit']),
+  unlock('chalk', 'Chalk', 'fortune', [10, 30, 70], 'Scrawl A-MAZE on a wall to mark your way.', [
+    '4 marks per floor', '8 marks per floor', '16 marks per floor']),
+  unlock('magnet', 'Gem Magnet', 'fortune', [15, 40, 80], 'Gems in sight leap into your hand.', [
+    'Pull within 1.2 tiles', 'Pull within 1.6 tiles', 'Pull within 2 tiles']),
+  unlock('appraiser', 'Appraiser', 'fortune', [45, 120, 240], 'Each gem is worth more at the Shrine.', [
+    '2 shrine gems per gem', '3 shrine gems per gem', '4 shrine gems per gem']),
+]);
+
+/**
+ * Build one frozen catalogue entry.
+ * @param {string} id
+ * @param {string} name
+ * @param {'torch'|'sight'|'fortune'} group
+ * @param {number[]} costs
+ * @param {string} blurb
+ * @param {string[]} ranks
+ * @returns {UnlockDef}
+ */
+function unlock(id, name, group, costs, blurb, ranks) {
+  return Object.freeze({
+    id,
+    name,
+    group,
+    max: costs.length,
+    costs: Object.freeze(costs.slice()),
+    ranks: Object.freeze(ranks.slice()),
+    blurb,
+  });
+}
+
+/** Unlock ids in catalogue order. @type {ReadonlyArray<string>} */
+export const UNLOCK_IDS = Object.freeze(UNLOCKS.map((u) => u.id));
+
+/**
+ * Catalogue entry by id, or undefined.
+ * @param {unknown} id
+ * @returns {UnlockDef|undefined}
+ */
+export function unlockDef(id) {
+  if (typeof id !== 'string') return undefined;
+  for (let i = 0; i < UNLOCKS.length; i++) if (UNLOCKS[i].id === id) return UNLOCKS[i];
+  return undefined;
+}
+
+/**
+ * Purse price of buying the rank after `rank`, or `Infinity` when there is none.
+ * @param {string} id
+ * @param {number} rank the rank currently owned
+ * @returns {number}
+ */
+export function unlockCost(id, rank) {
+  const def = unlockDef(id);
+  const r = Number.isFinite(rank) ? Math.max(0, Math.floor(rank)) : 0;
+  if (def === undefined || r >= def.max) return Infinity;
+  return def.costs[r];
+}
+
+/**
+ * Fresh, empty progression.
+ * @returns {Progress}
+ */
+export function defaultProgress() {
+  /** @type {Record<string, number>} */
+  const ranks = {};
+  for (let i = 0; i < UNLOCK_IDS.length; i++) ranks[UNLOCK_IDS[i]] = 0;
+  return { purse: 0, ranks, boonLevel: 0 };
+}
+
+/**
+ * Build a legal `Progress` from anything (it normally comes from `localStorage`): unknown ids are
+ * dropped, ranks are clamped to each unlock's max, the purse and boon level to non-negative integers.
+ * @param {unknown} src
+ * @returns {Progress} a fresh object
+ */
+export function sanitizeProgress(src) {
+  const out = defaultProgress();
+  if (src === null || typeof src !== 'object') return out;
+  const obj = /** @type {Record<string, unknown>} */ (src);
+  const purse = obj.purse;
+  if (typeof purse === 'number' && Number.isFinite(purse) && purse > 0) {
+    out.purse = Math.min(Number.MAX_SAFE_INTEGER, Math.floor(purse));
+  }
+  const boon = obj.boonLevel;
+  if (typeof boon === 'number' && Number.isFinite(boon) && boon > 0) {
+    out.boonLevel = Math.min(1e6, Math.floor(boon));
+  }
+  const ranks = obj.ranks;
+  if (ranks !== null && typeof ranks === 'object' && !Array.isArray(ranks)) {
+    const r = /** @type {Record<string, unknown>} */ (ranks);
+    for (let i = 0; i < UNLOCKS.length; i++) {
+      const def = UNLOCKS[i];
+      const v = Object.prototype.hasOwnProperty.call(r, def.id) ? r[def.id] : undefined;
+      if (typeof v === 'number' && Number.isFinite(v)) out.ranks[def.id] = clamp(Math.floor(v), 0, def.max);
+    }
+  }
+  return out;
+}
+
+/**
+ * Turn unlock ranks into the flat numbers the sim, HUD and renderer read (ARCHITECTURE.md §4.9).
+ * Called on boot, `newGame`, `levelReady`, `buyUnlock` and `claimBoon` — never per step.
+ * @param {Record<string, number>|null|undefined} ranks
+ * @param {Perks} [out] filled in place when given (the state's own `perks` object)
+ * @returns {Perks}
+ */
+export function computePerks(ranks, out) {
+  const p = out || /** @type {Perks} */ ({});
+  p.tankMult = perkFx(ranks, 'reservoir');
+  p.oilMult = perkFx(ranks, 'richOil');
+  p.drainMult = perkFx(ranks, 'slowWick');
+  p.emberSeconds = perkFx(ranks, 'ember');
+  p.siphonCap = perkFx(ranks, 'siphon');
+  p.flame = perkFx(ranks, 'wideFlame');
+  p.reveal = perkFx(ranks, 'cartographer');
+  p.oilSense = perkFx(ranks, 'oilSense');
+  p.scrollSense = perkFx(ranks, 'scrollSense');
+  p.whisper = perkFx(ranks, 'whisper');
+  p.lodestone = perkFx(ranks, 'lodestone');
+  p.chalk = perkFx(ranks, 'chalk');
+  p.magnet = perkFx(ranks, 'magnet');
+  p.gemPurse = perkFx(ranks, 'appraiser');
+  return p;
+}
+
+/**
+ * The effect value of one unlock at the rank `ranks` holds (clamped into the table).
+ * @param {Record<string, number>|null|undefined} ranks
+ * @param {keyof typeof UNLOCK_FX} id
+ * @returns {number}
+ */
+function perkFx(ranks, id) {
+  const table = UNLOCK_FX[id];
+  const raw = ranks && typeof ranks[id] === 'number' ? ranks[id] : 0;
+  const r = Number.isFinite(raw) ? clamp(Math.floor(raw), 0, table.length - 1) : 0;
+  return table[r];
+}
+
+/**
+ * Unlock ids a boon may offer: everything still below its max rank, in catalogue order.
+ * @param {Progress} progress
+ * @returns {string[]}
+ */
+export function boonCandidates(progress) {
+  /** @type {string[]} */
+  const out = [];
+  const ranks = progress && progress.ranks ? progress.ranks : {};
+  for (let i = 0; i < UNLOCKS.length; i++) {
+    const def = UNLOCKS[i];
+    const r = typeof ranks[def.id] === 'number' ? ranks[def.id] : 0;
+    if (r < def.max) out.push(def.id);
+  }
+  return out;
+}
+
+/** How many unlocks a boon offers. */
+export const BOON_CHOICES = 3;
+
+/**
+ * Siphon reserve behaviour (Siphon unlock). The reserve pours back while the tank is below
+ * `POUR_BELOW` of full, at `POUR_RATE` fuel-seconds per second — fast enough to matter within a
+ * corridor, slow enough that the gauge visibly climbs rather than jumping.
+ */
+export const SIPHON = Object.freeze({
+  POUR_BELOW: 0.5,
+  POUR_RATE: 4,
+});
+
+/**
+ * Chalk (Chalk unlock). `REACH` is how far the chalk hand reaches along the view, in tiles: far
+ * enough to mark the wall closing a short stub, never across a junction.
+ */
+export const CHALK = Object.freeze({
+  REACH: 2.5,
+  /** DDA cells walked at most by the chalk ray (safety valve; 2.5 tiles cross at most 6 cells). */
+  MAX_CELLS: 8,
+});
+
+/**
+ * Reveal budget per step for a reveal radius. It grows by only 4 probes per extra tile of radius:
+ * scaling it with the window's area (+16 per tile) measured as a 2.0× step cost at rank 2, and the
+ * rolling cursor fills the wider ring within a few steps without it.
+ * @param {number} radius tiles
+ * @returns {number}
+ */
+export function revealBudget(radius) {
+  const extra = Math.max(0, Math.floor(radius) - WORLD.REVEAL_RADIUS);
+  return WORLD.REVEAL_BUDGET + 4 * extra;
 }

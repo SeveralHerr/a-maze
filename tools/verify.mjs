@@ -35,9 +35,9 @@ const MIN_FPS = 55;
 const MAX_RENDER_MS_AVG = 8;
 const MAX_RENDER_MS_P99 = 16;
 const MAX_HEAP_GROWTH_MB = 5;
-// Massive mazes: level 1 is 16×16 cells with a ~290-tile solution path, not 6×6 with ~40. The
-// autopilot walks it at sprint speed with item detours; measured at ~150 s, so these are ~2.5×
-// the measured time rather than a tight fit. They are *wall-clock* budgets for the test, not
+// Level 1 is the lean 10×10-cell first floor; level 2 is 24×24. There is no sprint (§1), so the
+// autopilot walks at the one walking speed with item detours; these stay generous multiples of the
+// measured time rather than a tight fit. They are *wall-clock* budgets for the test, not
 // gameplay targets — the gameplay budget is the torch, and that is asserted separately.
 /** Wall-clock budget for the autopilot to finish level 1, seconds. */
 const LEVEL1_BUDGET_S = 400;
@@ -391,12 +391,11 @@ function installAutopilot() {
     const err = wrap(Math.atan2(ty - p.y, tx - p.x) - p.angle);
     const aligned = Math.cos(err);
     // Turn with the keyboard/stick axis (the real control path), walk forward only when the
-    // heading is roughly right, and sprint down the straights so a level fits in a test run.
+    // heading is roughly right.
     g.input.inject({
       turn: Math.max(-1, Math.min(1, err * 2.6)),
       moveY: aligned > 0.35 ? 1 : aligned > -0.2 ? 0.45 : 0,
       moveX: 0,
-      sprint: aligned > 0.93 && Math.abs(err) < 0.12,
     });
   }
 
@@ -680,7 +679,7 @@ try {
       await sleep(120);
     }
   };
-  await press('down'); // Descend → Options
+  await press('down', 2); // Descend → Shrine → Options
   await press('confirm');
   await sleep(400);
   report.options = await page.evaluate(() => ({

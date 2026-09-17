@@ -25,6 +25,7 @@ import {
   intersects,
   playingState,
   portraitBand,
+  UNLOCK_FIXTURE,
 } from './layout-audit.test-util.mjs';
 
 installFakeDocument();
@@ -113,8 +114,10 @@ function screenBoxes(vp, screen, tweak) {
   menus.render(state);
   if (screen === 'options') {
     press(menus, state, 'down');
+    press(menus, state, 'down');
     press(menus, state, 'confirm');
   } else if (screen === 'controls') {
+    press(menus, state, 'down');
     press(menus, state, 'down');
     press(menus, state, 'down');
     press(menus, state, 'confirm');
@@ -429,5 +432,66 @@ test('controls: a connected gamepad adds a clean PAD column', () => {
   } finally {
     if (saved !== undefined) Object.defineProperty(g, 'navigator', saved);
     else delete g.navigator;
+  }
+});
+
+// ─── Unlocks wave: Shrine, Boon and the perk HUD (ARCHITECTURE.md §4.9) ─────────────────────
+
+/**
+ * A title/level-complete state carrying progress and an open boon.
+ * @param {string} phase
+ * @returns {any}
+ */
+function unlockState(phase) {
+  const state = playingState(phase);
+  state.progress = { purse: 260, ranks: { reservoir: 2, richOil: 1, siphon: 2, oilSense: 3, whisper: 3, lodestone: 1, chalk: 3 }, boonLevel: 0 };
+  state.offer = { open: true, level: 15, ids: ['whisper', 'appraiser', 'ember'] };
+  return state;
+}
+
+test('shrine and boon: clean at every viewport, scrolled or not, with the longest shipped strings', () => {
+  for (const vp of VIEWPORTS) {
+    for (const [screen, phase, downs] of [['shrine', 'title', 0], ['shrine', 'title', 12], ['boon', 'levelComplete', 0]]) {
+      const menus = createMenus(drawableCanvas(vp.w, vp.h), { unlocks: UNLOCK_FIXTURE });
+      menus.resize(vp.w, vp.h, vp.dpr);
+      if (isPortrait(vp)) menus.surface.setViewRect(...portraitBand(vp.w, vp.h));
+      const state = unlockState(phase);
+      menus.render(state);
+      if (screen === 'shrine') {
+        press(menus, state, 'down');
+        press(menus, state, 'confirm');
+        for (let i = 0; i < downs; i++) press(menus, state, 'down');
+      } else {
+        press(menus, state, 'confirm'); // skip the tally; the boon opens itself
+      }
+      settle(menus, state, 2);
+      assert.equal(menus.screen(), screen, `${vp.name}: reached ${screen}`);
+      const boxes = collectLayout(() => {
+        state.time += 1 / 60;
+        menus.render(state);
+      });
+      const texts = boxes.filter((b) => b.kind === 'text');
+      assert.ok(texts.length >= 6, `${vp.name} ${screen}: drew its text (${texts.length})`);
+      assert.deepEqual(auditLayout(boxes, menus.surface.metrics), [], `${vp.name} ${screen} after ${downs} downs`);
+    }
+  }
+});
+
+test('HUD: the chalk chip, scroll sense and lodestone are clean at every viewport', () => {
+  for (const vp of VIEWPORTS) {
+    for (const found of [false, true]) {
+      const hud = hudAt(vp, 'corner');
+      const state = playingState();
+      state.perks = { chalk: 16, scrollSense: 28, lodestone: 1, siphonCap: 50, flame: 1, oilSense: 0, whisper: 0 };
+      state.run.chalk = 12;
+      state.run.reserve = 30;
+      state.run.mapFound = found;
+      state.derived.scrollSense = 0.6;
+      hud.render(state, null, 0);
+      state.time += 1;
+      const boxes = collectLayout(() => hud.render(state, null, 0));
+      assert.ok(boxes.some((b) => b.kind === 'text' && b.label === '×12'), `${vp.name}: the chalk count is on screen`);
+      assert.deepEqual(auditLayout(boxes, hud.surface.metrics), [], `${vp.name} scroll found=${found}`);
+    }
   }
 });

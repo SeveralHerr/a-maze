@@ -33,9 +33,9 @@ import {
 } from './bindings.js';
 
 test('ACTIONS covers the contract vocabulary exactly once', () => {
-  const expected = ['confirm', 'back', 'pause', 'map', 'up', 'down', 'left', 'right', 'mute'];
+  const expected = ['confirm', 'back', 'pause', 'map', 'up', 'down', 'left', 'right', 'mute', 'chalk'];
   assert.deepEqual([...ACTIONS], expected);
-  assert.equal(ACTION_COUNT, 9);
+  assert.equal(ACTION_COUNT, 10);
   assert.equal(new Set(ACTIONS).size, ACTIONS.length);
 });
 
@@ -73,8 +73,11 @@ test('keyboard layout matches the design: arrows turn, WASD moves, A/D strafe, Q
   assert.equal(KEY_HOLD.KeyE, HOLD.TURN_R);
   assert.equal(KEY_HOLD.ArrowLeft, HOLD.TURN_L);
   assert.equal(KEY_HOLD.ArrowRight, HOLD.TURN_R);
-  assert.equal(KEY_HOLD.ShiftLeft, HOLD.SPRINT);
-  assert.equal(KEY_HOLD.ShiftRight, HOLD.SPRINT);
+  // Sprint was removed (ARCHITECTURE.md §1): Shift drives nothing, and C chalks.
+  assert.equal(KEY_HOLD.ShiftLeft, undefined);
+  assert.equal(KEY_ACTION_MASK.ShiftLeft, undefined);
+  assert.equal(KEY_ACTION_MASK.KeyC, ACTION_BIT.chalk);
+  assert.equal(/** @type {any} */ (HOLD).SPRINT, undefined);
   // Every hold slot is reachable from the keyboard, and none points outside the array.
   const used = new Set(Object.values(KEY_HOLD));
   for (let i = 0; i < HOLD_COUNT; i++) assert.ok(used.has(i), `slot ${i} is bound`);
@@ -123,7 +126,8 @@ test('gamepad standard mapping: A/B/Start/Back and the d-pad', () => {
   assert.equal(GAMEPAD_BUTTON_ACTION[15], ACTION_BIT.right);
   assert.equal(GAMEPAD_BUTTON_HOLD[12], HOLD.FORWARD);
   assert.equal(GAMEPAD_BUTTON_HOLD[14], HOLD.TURN_L);
-  assert.equal(GAMEPAD_BUTTON_HOLD[10], HOLD.SPRINT);
+  for (const b of [4, 6, 7, 10]) assert.equal(GAMEPAD_BUTTON_HOLD[b], undefined, `button ${b} no longer sprints`);
+  assert.equal(GAMEPAD_BUTTON_ACTION[2], ACTION_BIT.chalk, 'X chalks');
   // Unbound buttons must read as undefined, never as 0 (= slot FORWARD).
   assert.equal(GAMEPAD_BUTTON_HOLD[3], undefined);
   assert.equal(GAMEPAD_BUTTON_ACTION[5], undefined);
@@ -239,12 +243,12 @@ test('createBindings(null) reproduces the default tables exactly', () => {
 });
 
 test('createBindings applies overrides wholesale per key and is total on garbage', () => {
-  const b = createBindings({ KeyI: ['forward', 'up'], KeyW: [], KeyQ: ['sprint', 'forward', 'mute'] });
+  const b = createBindings({ KeyI: ['forward', 'up'], KeyW: [], KeyQ: ['turnRight', 'forward', 'mute'] });
   assert.equal(b.keyHold.KeyI, HOLD.FORWARD);
   assert.equal(b.keyActionMask.KeyI, ACTION_BIT.up);
   assert.equal(b.keyHold.KeyW, undefined, 'an empty list unbinds');
   assert.equal(b.keyActionMask.KeyW, undefined);
-  assert.equal(b.keyHold.KeyQ, HOLD.SPRINT, 'first hold name wins');
+  assert.equal(b.keyHold.KeyQ, HOLD.TURN_R, 'first hold name wins');
   assert.equal(b.keyActionMask.KeyQ, ACTION_BIT.mute);
   assert.equal(b.keyHold.ArrowUp, HOLD.FORWARD, 'untouched keys keep their defaults');
   // 'back' is the action, 'backward' the slot: no ambiguity.
@@ -271,7 +275,9 @@ test('describeControls generates the hints from the tables, so they follow a rem
   assert.equal(rows.Move.keys, 'W S / ↑ ↓');
   assert.equal(rows.Strafe.keys, 'A D');
   assert.equal(rows.Turn.keys, 'Q E / ← →');
-  assert.equal(rows.Sprint.keys, 'Shift', 'left/right shift collapse to one keycap');
+  assert.equal(rows.Sprint, undefined, 'there is no sprint row');
+  assert.equal(rows.Chalk.keys, 'C');
+  assert.equal(rows.Chalk.pad, 'X');
   assert.equal(rows.Map.keys, 'M / Tab');
   assert.equal(rows.Pause.keys, 'Esc / P');
   assert.equal(rows.Mute.keys, 'N');

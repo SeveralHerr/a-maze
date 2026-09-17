@@ -1,7 +1,7 @@
 // @ts-check
 /**
- * @file Persistence for the two things worth keeping between sessions — the best score and the
- * user's settings (ARCHITECTURE.md §4.2).
+ * @file Persistence for what is worth keeping between sessions — the best score, the user's
+ * settings and the unlock progression (ARCHITECTURE.md §4.2, §4.9).
  *
  * Everything here is defensive on purpose. `localStorage` can be absent (Node, a worker), can
  * throw on *access* (a sandboxed iframe, Safari with cookies blocked), can throw on write (quota
@@ -11,15 +11,18 @@
  *
  * ## Key / versioning
  * The key is `amaze.v1` and the payload carries `v: 1`. Bump **both** if the stored shape changes
- * or if the RNG stream changes — stored seeds replay differently after an RNG change, so an old
- * record would refer to a maze that no longer exists.
+ * incompatibly or if the RNG stream changes — stored seeds replay differently after an RNG change,
+ * so an old record would refer to a maze that no longer exists. `progress` was added *inside*
+ * version 1 on purpose: it is optional, a record without it loads empty progress, and bumping the
+ * version would have wiped every existing player's best score and settings for nothing.
  */
 
 import { createLogger } from '../core/log.js';
-import { defaultSettings, sanitizeBest, sanitizeSettings } from './balance.js';
+import { defaultProgress, defaultSettings, sanitizeBest, sanitizeProgress, sanitizeSettings } from './balance.js';
 
 /** @typedef {import('../core/types.js').Settings} Settings */
 /** @typedef {import('../core/types.js').BestScore} BestScore */
+/** @typedef {import('../core/types.js').Progress} Progress */
 
 /**
  * The minimal slice of the Web Storage API this module uses. Declared structurally so tests (and
@@ -32,7 +35,7 @@ import { defaultSettings, sanitizeBest, sanitizeSettings } from './balance.js';
 
 /**
  * What is persisted, and what `loadPersist` always returns (fully populated, always valid).
- * @typedef {{best: BestScore, settings: Settings}} Persist
+ * @typedef {{best: BestScore, settings: Settings, progress: Progress}} Persist
  */
 
 const log = createLogger('save');
@@ -44,7 +47,8 @@ export const PERSIST_KEY = 'amaze.v1';
 export const PERSIST_VERSION = 1;
 
 /**
- * Upper bound on the serialised payload, in characters. The real record is ~150 chars; anything
+ * Upper bound on the serialised payload, in characters. The real record is ~550 chars with every
+ * unlock listed; anything
  * this large is corruption or someone else's data under our key, and parsing it is a waste of a
  * frame during boot.
  */
@@ -75,7 +79,7 @@ export function getDefaultStorage() {
  * @returns {Persist}
  */
 export function defaultPersist() {
-  return { best: { score: 0, level: 0 }, settings: defaultSettings() };
+  return { best: { score: 0, level: 0 }, settings: defaultSettings(), progress: defaultProgress() };
 }
 
 /**
@@ -125,6 +129,7 @@ export function loadPersist(storage) {
   }
   out.best = sanitizeBest(rec.best);
   out.settings = sanitizeSettings(rec.settings);
+  out.progress = sanitizeProgress(rec.progress);
   return out;
 }
 
@@ -134,7 +139,8 @@ export function loadPersist(storage) {
  * The record is sanitised before writing, so a corrupted in-memory state cannot be laundered into
  * storage; the write itself is wrapped because quota errors are routine in private-browsing modes.
  *
- * @param {{best?: unknown, settings?: unknown}|null|undefined} data typically `{best, settings}`
+ * @param {{best?: unknown, settings?: unknown, progress?: unknown}|null|undefined} data typically
+ *   `{best, settings, progress}`; an omitted `progress` keeps the progress already stored
  * @param {StorageLike|null} [storage] storage to write to; defaults to `localStorage` when present
  * @returns {boolean} true when the record was written
  */
@@ -143,10 +149,14 @@ export function savePersist(data, storage) {
   if (store === null || typeof store.setItem !== 'function') return false;
 
   const src = data === null || typeof data !== 'object' ? {} : data;
+  // A caller that does not mention progress keeps what is stored: writing empty progress would wipe
+  // a player's purse and unlocks from any save path that only meant to store a setting.
+  const progress = src.progress === undefined ? loadPersist(store).progress : sanitizeProgress(src.progress);
   const record = {
     v: PERSIST_VERSION,
     best: sanitizeBest(src.best),
     settings: sanitizeSettings(src.settings),
+    progress,
   };
   try {
     store.setItem(PERSIST_KEY, JSON.stringify(record));

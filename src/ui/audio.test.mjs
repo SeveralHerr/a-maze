@@ -614,11 +614,11 @@ function filterFreqs(ops) {
   return ops.filter((o) => o.param === 'frequency' && o.node.kind === 'filter').map((o) => o.value);
 }
 
-test('footsteps alternate pitch per foot and are louder when sprinting', () => {
+test('footsteps alternate pitch per foot and are louder at a full stride', () => {
   const { ctx, audio } = makeAudio();
   audio.unlock();
   const walking = makeState({ player: { ...makeState().player, vx: 2.4, vy: 0 } });
-  const sprinting = makeState({ player: { ...makeState().player, vx: 5.1, vy: 0 } });
+  const striding = makeState({ player: { ...makeState().player, vx: 3.2, vy: 0 } });
 
   const m0 = ctx.ops.length;
   audio.handle([{ type: 'footstep', foot: 0 }], walking);
@@ -631,8 +631,8 @@ test('footsteps alternate pitch per foot and are louder when sprinting', () => {
   ctx.advance(0.5);
 
   const m2 = ctx.ops.length;
-  audio.handle([{ type: 'footstep', foot: 0 }], sprinting);
-  const sprint = ctx.opsSince(m2);
+  audio.handle([{ type: 'footstep', foot: 0 }], striding);
+  const stride = ctx.opsSince(m2);
 
   const leftF = filterFreqs(left)[0];
   const rightF = filterFreqs(right)[0];
@@ -640,8 +640,8 @@ test('footsteps alternate pitch per foot and are louder when sprinting', () => {
   assert.ok(leftF > rightF, 'the two feet have distinct centre frequencies');
 
   assert.ok(
-    peakGain(sprint) > peakGain(left) * 1.2,
-    `sprint step (${peakGain(sprint)}) should be clearly louder than a walk step (${peakGain(left)})`,
+    peakGain(stride) > peakGain(left) * 1.2,
+    `full stride (${peakGain(stride)}) should be clearly louder than a walk step (${peakGain(left)})`,
   );
   assert.ok(peakGain(left) <= AUDIO.STEP_GAIN.max + 1e-6);
 });

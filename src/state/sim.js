@@ -40,9 +40,11 @@
  * O(tiles) per step:
  * - **Pickups** query a uniform bucket grid (`buildItemGrid`, built once per level in the
  *   `levelReady` reducer, flat `Int32Array`s reused across levels). The pickup capsule (the step's
- *   swept segment, ≤ 1.28 tiles, grown by the 0.75 radius) is at most 2.78 tiles across and a
- *   bucket is 4, so a step touches at most 2×2 buckets — a handful of items.
- * - **Fog of war** probes at most `WORLD.REVEAL_BUDGET` tiles inside a fixed 7×7 window.
+ *   swept segment, ≤ 0.8 tiles, grown by the 0.75 radius) is at most 2.3 tiles across and a
+ *   bucket is 4, so a step touches at most 2×2 buckets — a handful of items (3×3 with a rank-3 Gem
+ *   Magnet's 2-tile reach, §4.9: still a constant).
+ * - **Fog of war** probes at most `WORLD.REVEAL_BUDGET` tiles inside a fixed window (7×7, 11×11 with
+ *   a maxed Cartographer — the budget does not grow with it, so neither does the probe cost).
  * - **`explored`** is allocated once per level (and reused from a pool across levels).
  * Everything else is O(1). `perf.test.mjs` pins this on real generated levels: a step on a 128×128
  * level with 819 items measured 0.68 µs against 0.64 µs for the old 6×6 level with six.
@@ -62,7 +64,24 @@ import {
   wrapAngle,
 } from '../core/math.js';
 import { createRng } from '../core/rng.js';
-import { ATTRACT, BOB, BUMP, FUEL, PLAYER, SCORE, WORLD, gemScore, levelBonus, oilFuel } from './balance.js';
+import {
+  ATTRACT,
+  BOB,
+  BUMP,
+  CHALK,
+  FUEL,
+  PLAYER,
+  SCORE,
+  SIPHON,
+  WORLD,
+  BOON_CHOICES,
+  boonCandidates,
+  computePerks,
+  gemScore,
+  levelBonus,
+  oilFuel,
+  revealBudget,
+} from './balance.js';
 
 /** @typedef {import('../core/types.js').GameState} GameState */
 /** @typedef {import('../core/types.js').Maze} Maze */
@@ -70,6 +89,14 @@ import { ATTRACT, BOB, BUMP, FUEL, PLAYER, SCORE, WORLD, gemScore, levelBonus, o
 /** @typedef {import('../core/types.js').Item} Item */
 /** @typedef {import('../core/types.js').Phase} Phase */
 /** @typedef {import('../core/types.js').Rng} Rng */
+/** @typedef {import('../core/types.js').Perks} Perks */
+
+/**
+ * Perks with nothing unlocked, for a state built without a `perks` block (older fixtures, tools).
+ * Frozen: the sim only ever reads it.
+ * @type {Readonly<Perks>}
+ */
+const BASE_PERKS = Object.freeze(computePerks(null));
 
 /**
  * Normalised per-step input. `stepPlaying` takes this rather than a raw `InputFrame` so every
@@ -79,7 +106,7 @@ import { ATTRACT, BOB, BUMP, FUEL, PLAYER, SCORE, WORLD, gemScore, levelBonus, o
  * @property {number} moveY   forward −1..1 (forward +)
  * @property {number} turn    keyboard/stick turn −1..1 (right +)
  * @property {number} lookDX  mouse/touch yaw delta in radians for this step
- * @property {boolean} sprint
+ * @property {boolean} [chalk] the `chalk` action was pressed this step (ARCHITECTURE.md §4.9)
  */
 
 /**
@@ -96,8 +123,14 @@ import { ATTRACT, BOB, BUMP, FUEL, PLAYER, SCORE, WORLD, gemScore, levelBonus, o
  * @property {number} combo        consecutive gems inside `SCORE.COMBO_WINDOW`
  * @property {number} comboTimer   seconds left on the combo window
  * @property {number} revealCursor resume index for the budgeted fog-of-war reveal
+ * @property {number} revealSeen   window slots the current reveal sweep has already visited
+ * @property {number} revealX      player x when the last reveal sweep completed (−1e9: none yet)
+ * @property {number} revealY      player y when the last reveal sweep completed
  * @property {number} runBestScore best score at the moment the run started (for `newBest`)
- * @property {number} drain        the level's fuel drain multiplier (`balance.drainRate`)
+ * @property {number} drain        the level's fuel drain multiplier (`balance.drainRate` × Slow Wick)
+ * @property {number} flaskBase    a flask's base value on this level (`oilFuel` of the base tank), or 0
+ *   for "derive it from `run.fuelMax`" (a state installed without `levelReady`)
+ * @property {number} scrollIdx    index of this level's map scroll in `levelData.items`, or −1
  * @property {LevelData|null} gridFor the level the item grid was built for (identity check)
  * @property {number} gridW        item-grid buckets across
  * @property {number} gridH        item-grid buckets down
@@ -155,9 +188,9 @@ const _candW = new Int32Array(4);
 
 /**
  * Longest per-axis displacement, in tiles, that `collectAround` will sweep. The real maximum is
- * `WALK_SPEED × SPRINT_MULT × SIM.MAX_DT` = 1.28; anything beyond this is a teleport (a test or tool
+ * `WALK_SPEED × SIM.MAX_DT` = 0.8; anything beyond this is a teleport (a test or tool
  * moving the player by hand) and is treated as a point test at the destination, which also keeps
- * the bucket box within 2×2 whatever `px/py` hold.
+ * the bucket box within 3×3 whatever `px/py` hold.
  */
 const MAX_SWEEP = 1.5;
 
@@ -181,8 +214,13 @@ export function createSimScratch() {
     combo: 0,
     comboTimer: 0,
     revealCursor: 0,
+    revealSeen: 0,
+    revealX: -1e9,
+    revealY: -1e9,
     runBestScore: 0,
     drain: 1,
+    flaskBase: 0,
+    scrollIdx: -1,
     gridFor: null,
     gridW: 0,
     gridH: 0,
@@ -220,7 +258,12 @@ export function resetSimScratch(sim) {
   sim.combo = 0;
   sim.comboTimer = 0;
   sim.revealCursor = 0;
+  sim.revealSeen = 0;
+  sim.revealX = -1e9;
+  sim.revealY = -1e9;
   sim.drain = 1;
+  sim.flaskBase = 0;
+  sim.scrollIdx = -1;
   // Drops the reference to the previous level's data — and forces a rebuild before the next query.
   sim.gridFor = null;
   sim.gridW = 0;
@@ -712,12 +755,28 @@ export function revealAround(state) {
   const tiles = maze.tiles;
   const px = state.player.x;
   const py = state.player.y;
-  const R = WORLD.REVEAL_RADIUS;
+  // Cartographer widens the window (at most 11×11). The probe budget grows only slightly with it: a
+  // budget scaled to the window doubled the step cost at rank 2, and the rolling cursor fills the
+  // wider ring within a few steps anyway.
+  const perks = state.perks || BASE_PERKS;
+  const R = perks.reveal > WORLD.REVEAL_RADIUS ? perks.reveal : WORLD.REVEAL_RADIUS;
 
   // Always know the tile you are standing on, even if it somehow fails the LOS probe.
   const ownX = Math.floor(px);
   const ownY = Math.floor(py);
   if (ownX >= 0 && ownY >= 0 && ownX < w && ownY < h) explored[ownY * w + ownX] = 1;
+
+  // A completed sweep from (nearly) here has already seen everything there is to see: the tiles still
+  // dark in the window are behind walls, and probing them again every step was most of the step's
+  // cost with a maxed Cartographer (2.0× base). Re-sweep once the player has moved a twelfth of the
+  // reveal radius (a quarter tile at the base radius of 3): a wider window's rim moves no faster.
+  const sim = state.sim;
+  if (sim.revealCursor === 0 && sim.revealSeen === 0) {
+    const mx = px - sim.revealX;
+    const my = py - sim.revealY;
+    const gate = R / 12;
+    if (mx * mx + my * my < gate * gate) return;
+  }
 
   const x0 = Math.max(0, Math.floor(px - R));
   const x1 = Math.min(w - 1, Math.floor(px + R));
@@ -728,11 +787,18 @@ export function revealAround(state) {
   if (total <= 0) return;
 
   const r2 = R * R;
-  let budget = WORLD.REVEAL_BUDGET;
-  let cursor = state.sim.revealCursor;
+  let budget = R === WORLD.REVEAL_RADIUS ? WORLD.REVEAL_BUDGET : revealBudget(R);
+  let cursor = sim.revealCursor;
   if (!(cursor >= 0) || cursor >= total) cursor = 0;
+  // A sweep spans steps: it is complete once every slot of the window has been visited, however many
+  // steps that took. Counting only a sweep that finished inside one step's budget meant a window with
+  // more hidden tiles than the budget (any Cartographer window in a twisty maze) never completed,
+  // and so was re-probed on every step for ever.
+  let seen = sim.revealSeen;
+  if (!(seen >= 0) || seen >= total) seen = 0;
+  const remaining = total - seen;
 
-  for (let k = 0; k < total; k++) {
+  for (let k = 0; k < remaining; k++) {
     let i = cursor + k;
     if (i >= total) i -= total;
     const tx = x0 + (i % span);
@@ -741,7 +807,8 @@ export function revealAround(state) {
     if (explored[idx] !== 0) continue;
     if (dist2(px, py, tx + 0.5, ty + 0.5) > r2) continue;
     if (budget <= 0) {
-      state.sim.revealCursor = i; // resume here next step
+      sim.revealCursor = i; // resume here next step
+      sim.revealSeen = seen + k;
       return;
     }
     budget--;
@@ -753,7 +820,10 @@ export function revealAround(state) {
     _los[3] = ty + 0.5;
     if (lineOfSightIO(tiles, w, h, _los)) explored[idx] = 1;
   }
-  state.sim.revealCursor = 0;
+  sim.revealCursor = 0;
+  sim.revealSeen = 0;
+  sim.revealX = px;
+  sim.revealY = py;
 }
 
 // ─── Pickups ─────────────────────────────────────────────────────────────────────────────────
@@ -762,13 +832,15 @@ export function revealAround(state) {
  * Collect every item whose centre is within `WORLD.PICKUP_RADIUS` of the segment the player's
  * centre travelled this step (`player.px,py` → `player.x,y`; ARCHITECTURE.md §4.8).
  *
- * Testing the swept segment rather than only the end point means a fast step (sprint at the
- * `SIM.MAX_DT` clamp covers 1.28 tiles) cannot hop over an item. The segment is a chord between two
+ * Testing the swept segment rather than only the end point means a long step (walking at the
+ * `SIM.MAX_DT` clamp covers 0.8 tiles) cannot hop over an item. The segment is a chord between two
  * positions the collision solver produced, so it cannot reach through a wall either: an item behind
- * a one-tile wall is ≥ 1.72 from both end points, and a chord no longer than 1.28 between them stays
- * ≥ √(1.72² − 0.64²) ≈ 1.60 from it — more than twice the radius.
+ * a one-tile wall is ≥ 1.72 from both end points, and a chord no longer than 0.8 between them stays
+ * ≥ √(1.72² − 0.4²) ≈ 1.67 from it — more than twice the radius. The Gem Magnet's wider reach is
+ * the one exception that could, which is why it also requires line of sight.
  *
- * Only the buckets overlapping the capsule's bounding box are visited (2×2 at most), so the cost does not
+ * Only the buckets overlapping the capsule's bounding box are visited (2×2 at most, 3×3 with the
+ * Gem Magnet), so the cost does not
  * depend on how many items the level holds — the difference between a 6×6 level with 4 items and a
  * 128×128 level with 820. The grid is built by `buildItemGrid`; if it describes a different level
  * (a consumer swapped `levelData` without going through the reducer) it is rebuilt once here rather
@@ -810,11 +882,18 @@ function collectAround(state) {
   const sx = x1 - x0;
   const sy = y1 - y0;
   const len2 = sx * sx + sy * sy;
-  const r = WORLD.PICKUP_RADIUS;
-  const pr2 = r * r;
+  // The Gem Magnet (§4.9) widens the capsule for gems only, to at most 2 tiles: with a walking step
+  // of at most 0.8 tiles the box below spans at most 3×3 buckets, still a constant.
+  const perks = state.perks || BASE_PERKS;
+  const pickR = WORLD.PICKUP_RADIUS;
+  const magnetR = perks.magnet > pickR ? perks.magnet : pickR;
+  const r = magnetR;
+  const pr2 = pickR * pickR;
+  const mr2 = magnetR * magnetR;
+  const maze = level.maze;
   const cell = WORLD.ITEM_GRID_TILES;
 
-  // The capsule's bounding box in bucket coordinates. Segment + 2r < cell, so at most 2×2 buckets.
+  // The capsule's bounding box in bucket coordinates: 2×2 buckets at most, 3×3 with the magnet.
   let bx0 = Math.floor(((x0 < x1 ? x0 : x1) - r) / cell);
   let bx1 = Math.floor(((x0 < x1 ? x1 : x0) + r) / cell);
   let by0 = Math.floor(((y0 < y1 ? y0 : y1) - r) / cell);
@@ -846,7 +925,18 @@ function collectAround(state) {
         else if (t > 1) t = 1;
         const cx = ix - (x0 + sx * t);
         const cy = iy - (y0 + sy * t);
-        if (!(cx * cx + cy * cy <= pr2)) continue;
+        const d2 = cx * cx + cy * cy;
+        if (!(d2 <= pr2)) {
+          // Outside plain reach: only a gem inside the magnet's reach that the player can actually
+          // see is pulled in, never one through a wall. Distance is taken from the swept segment but
+          // sight from where the step ended: the stricter test, since that is where the player is.
+          if (it.kind !== 'gem' || !(d2 <= mr2)) continue;
+          _los[0] = x1;
+          _los[1] = y1;
+          _los[2] = ix;
+          _los[3] = iy;
+          if (!lineOfSightIO(maze.tiles, maze.width, maze.height, _los)) continue;
+        }
         takeItem(state, it);
       }
     }
@@ -873,6 +963,9 @@ function takeItem(state, it) {
   if (it.kind === 'gem') {
     it.taken = true;
     run.gems++;
+    // Every gem also goes into the persisted purse the Shrine spends (§4.9), Appraiser-weighted.
+    const progress = state.progress;
+    if (progress) progress.purse += (state.perks || BASE_PERKS).gemPurse;
     const value = gemScore(state.level);
     run.score += value;
     // Combo is a display statistic only — §1 pins the score formula, so it must not multiply.
@@ -888,11 +981,20 @@ function takeItem(state, it) {
   // Walking over a flask tops the tank off whenever it has room (`FUEL.OIL_MIN_ROOM`); the over-fill
   // is lost. Only a brim-full tank leaves the flask on the floor — refusing a flask the player can
   // see they want read as a bug in playtesting.
-  const gain = oilFuel(run.fuelMax);
-  if (run.fuelMax - run.fuel < FUEL.OIL_MIN_ROOM) return;
+  const perks = state.perks || BASE_PERKS;
+  // The flask is priced off the level's BASE tank, so Reservoir and Rich Oil stack additively
+  // rather than a bigger tank also silently inflating every flask (§4.9).
+  const gain = (sim.flaskBase > 0 ? sim.flaskBase : oilFuel(run.fuelMax)) * perks.oilMult;
+  const cap = perks.siphonCap;
+  const reserve = run.reserve > 0 ? run.reserve : 0;
+  // A brim-full tank still takes a flask while the Siphon reserve has real room for it — a quarter
+  // of the flask at least, so a nearly full reserve does not waste most of a flask to store a sip.
+  if (run.fuelMax - run.fuel < FUEL.OIL_MIN_ROOM && !(cap > 0 && cap - reserve >= Math.max(FUEL.OIL_MIN_ROOM, gain * 0.25))) return;
   it.taken = true;
   const before = run.fuel;
-  run.fuel = Math.min(run.fuelMax, run.fuel + gain);
+  const filled = run.fuel + gain;
+  run.fuel = Math.min(run.fuelMax, filled);
+  if (cap > 0 && filled > run.fuelMax) run.reserve = Math.min(cap, reserve + (filled - run.fuelMax));
   // The refuel tally is a per-level statistic (§3 RunStats): on a labyrinth that takes 7–22 flasks
   // to cross, "how many times did I refill" is the number that describes the level.
   run.refuels++;
@@ -912,6 +1014,17 @@ function takeItem(state, it) {
 export function updateDerived(state) {
   const d = state.derived;
   const level = state.levelData;
+  // Scroll Sense (§4.9): proximity to this level's unfound scroll, one distance to a cached index.
+  let sense = 0;
+  const perks = state.perks || BASE_PERKS;
+  if (level !== null && perks.scrollSense > 0 && !state.run.mapFound && state.sim.scrollIdx >= 0) {
+    const scroll = level.items[state.sim.scrollIdx];
+    if (scroll !== undefined && !scroll.taken) {
+      const sd = dist(state.player.x, state.player.y, scroll.x, scroll.y);
+      sense = sd < perks.scrollSense ? 1 - sd / perks.scrollSense : 0;
+    }
+  }
+  d.scrollSense = sense;
   if (level !== null) {
     const ex = level.maze.exit.x + 0.5;
     const ey = level.maze.exit.y + 0.5;
@@ -1003,11 +1116,35 @@ export function completeLevel(state) {
   run.levelScore = bonus;
   run.score += bonus;
   recordBest(state);
+  openBoonOffer(state);
   const p = state.player;
   p.vx = 0;
   p.vy = 0;
   setPhase(state, 'levelComplete');
   state.events.push({ type: 'levelComplete', level: state.level, bonus });
+}
+
+/**
+ * Offer a boon for this clear when it is a depth no boon has been claimed for yet and something is
+ * still below its max rank (ARCHITECTURE.md §4.9). Up to `BOON_CHOICES` distinct unlocks, drawn from a
+ * stream forked on the run seed and the level, so a replayed run is offered the same three.
+ * Allocates a small id array once per level clear.
+ * @param {SimState} state
+ * @returns {void}
+ */
+function openBoonOffer(state) {
+  const offer = state.offer;
+  const progress = state.progress;
+  if (!offer || !progress) return;
+  offer.open = false;
+  if (state.level <= progress.boonLevel) return;
+  const pool = boonCandidates(progress);
+  if (pool.length === 0) return;
+  const rng = createRng(state.seed >>> 0).fork('boon' + state.level);
+  rng.shuffle(pool);
+  offer.ids = pool.slice(0, BOON_CHOICES);
+  offer.level = state.level;
+  offer.open = true;
 }
 
 /**
@@ -1037,9 +1174,9 @@ export function endRun(state) {
  *   a win, not a loss.
  * - Pickups run *before* the drain, so a flask collected on the frame the torch would die saves it.
  *
- * Fuel drains at `FUEL.DRAIN × sim.drain × (FUEL.SPRINT_MULT while sprinting)`, where `sim.drain` is
- * the level's multiplier: 1 through `LEVEL.DRAIN_RAMP_START`, then climbing `FUEL.DRAIN_PER_LEVEL`
- * per level to `FUEL.DRAIN_MAX` (`balance.drainRate`, installed by the `levelReady` reducer).
+ * Fuel drains at `FUEL.DRAIN × sim.drain`, where `sim.drain` is the level's multiplier (× Slow
+ * Wick): 1 through `LEVEL.DRAIN_RAMP_START`, then climbing `FUEL.DRAIN_PER_LEVEL` per level to
+ * `FUEL.DRAIN_MAX` (`balance.drainRate`, installed by the `levelReady` reducer).
  *
  * @param {SimState} state must be in phase `playing` with `levelData` loaded
  * @param {number} dt seconds, finite and > 0 (clamped by the caller)
@@ -1092,7 +1229,7 @@ export function stepPlayingBody(state, input) {
   // ── Aim ──────────────────────────────────────────────────────────────────────────────────
   // Mouse yaw is applied raw: smoothing a pointer delta is indistinguishable from input lag.
   // The keyboard/stick turn gets a short ease so tapping a turn key does not snap.
-  const turnTop = PLAYER.TURN_SPEED * (input.sprint ? PLAYER.SPRINT_TURN_MULT : 1);
+  const turnTop = PLAYER.TURN_SPEED;
   sim.turnVel = damp(sim.turnVel, input.turn * turnTop, PLAYER.TURN_EASE_RATE, dt);
   p.angle = wrapAngle(p.angle + input.lookDX + sim.turnVel * dt);
 
@@ -1106,7 +1243,7 @@ export function stepPlayingBody(state, input) {
     ix *= inv;
     iy *= inv;
   }
-  const top = PLAYER.WALK_SPEED * (input.sprint ? PLAYER.SPRINT_MULT : 1);
+  const top = PLAYER.WALK_SPEED;
   const cosA = Math.cos(p.angle);
   const sinA = Math.sin(p.angle);
   // forward = (cos, sin); right = (−sin, cos) because y grows downward.
@@ -1156,7 +1293,7 @@ export function stepPlayingBody(state, input) {
       lost >= speedBefore * BUMP.MIN_FRACTION
     ) {
       sim.bumpCd = BUMP.COOLDOWN;
-      const strength = clamp01(lost / (PLAYER.WALK_SPEED * PLAYER.SPRINT_MULT));
+      const strength = clamp01(lost / PLAYER.WALK_SPEED);
       p.shake = clamp01(p.shake + lost * BUMP.SHAKE_PER_SPEED);
       state.events.push({ type: 'bump', strength });
     }
@@ -1184,10 +1321,19 @@ export function stepPlayingBody(state, input) {
   // ── Pickups ──────────────────────────────────────────────────────────────────────────────
   collectAround(state);
 
+  // ── Chalk ────────────────────────────────────────────────────────────────────────────────
+  if (input.chalk === true) chalkWall(state);
+
   // ── Fuel ─────────────────────────────────────────────────────────────────────────────────
-  const sprinting = input.sprint && speedNow > PLAYER.SPRINT_MIN_SPEED;
-  run.fuel -= dt * FUEL.DRAIN * sim.drain * (sprinting ? FUEL.SPRINT_MULT : 1);
+  run.fuel -= dt * FUEL.DRAIN * sim.drain;
   if (run.fuel < 0) run.fuel = 0;
+  // Siphon (§4.9): the stored overflow pours back in while the tank is below half.
+  if (run.reserve > 0 && run.fuelMax > 0 && run.fuel < run.fuelMax * SIPHON.POUR_BELOW) {
+    let pour = SIPHON.POUR_RATE * dt;
+    if (pour > run.reserve) pour = run.reserve;
+    run.reserve -= pour;
+    run.fuel += pour;
+  }
   if (run.fuelMax > 0) {
     if (sim.lowFuelArmed) {
       if (run.fuel <= run.fuelMax * FUEL.LOW_FRACTION) {
@@ -1209,12 +1355,92 @@ export function stepPlayingBody(state, input) {
     return;
   }
   if (run.fuel <= 0) {
-    endRun(state);
-    updateDerived(state);
-    return;
+    // Ember Reserve (§4.9): once per level the dead torch rekindles instead of ending the run.
+    const ember = (state.perks || BASE_PERKS).emberSeconds;
+    if (ember > 0 && !run.emberUsed) {
+      run.emberUsed = true;
+      run.fuel = ember;
+      state.events.push({ type: 'ember', seconds: ember });
+    } else {
+      endRun(state);
+      updateDerived(state);
+      return;
+    }
   }
 
   updateDerived(state);
+}
+
+// ─── Chalk (ARCHITECTURE.md §4.9) ────────────────────────────────────────────────────────────
+
+/**
+ * Chalk the wall face straight ahead, if one is within `CHALK.REACH`.
+ *
+ * A DDA ray along the view finds the first solid tile; the face it entered through is the one the
+ * player is looking at. One mark per face, one charge per mark. Emits `chalk` either way, so the
+ * composition root can tell the player why nothing happened (no charges, nothing in reach, already
+ * marked). Allocates one mark and one event, only on the step the key was pressed.
+ * @param {SimState} state
+ * @returns {void}
+ */
+function chalkWall(state) {
+  const level = state.levelData;
+  const run = state.run;
+  const p = state.player;
+  if (level === null) return;
+  if (!(run.chalk > 0) || !Array.isArray(state.marks)) {
+    state.events.push({ type: 'chalk', ok: false, x: p.x, y: p.y });
+    return;
+  }
+  const maze = level.maze;
+  const w = maze.width;
+  const h = maze.height;
+  const tiles = maze.tiles;
+  const rdx = Math.cos(p.angle);
+  const rdy = Math.sin(p.angle);
+  const ddx = rdx === 0 ? 1e30 : Math.abs(1 / rdx);
+  const ddy = rdy === 0 ? 1e30 : Math.abs(1 / rdy);
+  let mx = Math.floor(p.x);
+  let my = Math.floor(p.y);
+  const stepX = rdx < 0 ? -1 : 1;
+  const stepY = rdy < 0 ? -1 : 1;
+  let sdx = (rdx < 0 ? p.x - mx : mx + 1 - p.x) * ddx;
+  let sdy = (rdy < 0 ? p.y - my : my + 1 - p.y) * ddy;
+  for (let i = 0; i < CHALK.MAX_CELLS; i++) {
+    let side = 0;
+    let d = 0;
+    if (sdx < sdy) {
+      d = sdx;
+      sdx += ddx;
+      mx += stepX;
+    } else {
+      d = sdy;
+      sdy += ddy;
+      my += stepY;
+      side = 1;
+    }
+    if (d > CHALK.REACH) break;
+    if (mx < 0 || my < 0 || mx >= w || my >= h) break;
+    if (!solidAt(tiles, w, h, mx, my)) continue;
+    // Outward normal of the face entered: moving +x enters through the west face, and so on.
+    const face = /** @type {0|1|2|3} */ (side === 0 ? (stepX > 0 ? 2 : 0) : stepY > 0 ? 3 : 1);
+    const hx = p.x + rdx * d;
+    const hy = p.y + rdy * d;
+    const marks = state.marks;
+    for (let k = 0; k < marks.length; k++) {
+      const m = marks[k];
+      if (m.x === mx && m.y === my && m.face === face) {
+        state.events.push({ type: 'chalk', ok: false, x: hx, y: hy });
+        return;
+      }
+    }
+    run.chalk--;
+    const seed = (Math.imul(mx, 73856093) ^ Math.imul(my, 19349663) ^ Math.imul(face + 1, 83492791) ^ Math.imul(marks.length + 1, 2654435761 | 0)) >>> 0;
+    marks.push({ x: mx, y: my, face, seed });
+    state.events.push({ type: 'chalk', ok: true, x: hx, y: hy });
+    return;
+  }
+  state.events.push({ type: 'chalk', ok: false, x: p.x, y: p.y });
 }
 
 // ─── Attract mode (title screen) ─────────────────────────────────────────────────────────────

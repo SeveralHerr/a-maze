@@ -143,12 +143,15 @@ export const AUDIO = Object.freeze({
   /** Perceptual curve applied to the 0..1 volume sliders (equal-ish loudness steps). */
   VOLUME_EXP: 1.7,
   /**
-   * Footstep gain at a standstill-crawl vs. at full sprint. Pre-filter amplitudes: a band-pass on
-   * white noise throws most of the energy away, so these sit higher than they look.
+   * Footstep gain at a crawl vs. at a full stride. Pre-filter amplitudes: a band-pass on white
+   * noise throws most of the energy away, so these sit higher than they look.
    */
   STEP_GAIN: Object.freeze({ min: 0.22, max: 0.46 }),
-  /** Speeds (tiles/s) that map to STEP_GAIN.min / max. Mirrors balance.js WALK_SPEED 3.2×1.6. */
-  STEP_SPEED: Object.freeze({ min: 1.4, max: 5.1 }),
+  /**
+   * Speeds (tiles/s) that map to STEP_GAIN.min / max. The top mirrors balance.js `WALK_SPEED` (3.2):
+   * there is no sprint any more (§1), so a full stride is the loudest step.
+   */
+  STEP_SPEED: Object.freeze({ min: 1, max: 3.2 }),
   /** Seconds between gems that still counts as a combo (audio-side, purely cosmetic). */
   COMBO_WINDOW: 1.6,
   /** Highest combo step that still raises the arpeggio (one pentatonic scale step per combo). */
@@ -1482,9 +1485,9 @@ export function createAudio(options) {
   /**
    * Footstep: a short band-passed grit burst plus a soft low thump for body weight.
    * Alternating feet get different centre frequencies so a walk cycle has a left/right feel, and
-   * every step is detuned a few percent so a corridor sprint never turns into a drum machine.
+   * every step is detuned a few percent so a long corridor never turns into a drum machine.
    * @param {0|1} foot
-   * @param {number} intensity 0 = crawl, 1 = full sprint
+   * @param {number} intensity 0 = crawl, 1 = full stride
    */
   function playFootstep(foot, intensity) {
     const t = now();
@@ -1595,6 +1598,57 @@ export function createAudio(options) {
     sfx('sine', degreeHz(10), degreeHz(10), c, 0.02, 0.7, 0.09, PRI.CUE, 0.4, 2.76, 0.12, pan);
     sfx('sine', degreeHz(12), degreeHz(12), c + 0.11, 0.02, 0.7, 0.085, PRI.CUE, 0.4, 2.76, 0.12, pan);
     sfx('sine', degreeHz(15), degreeHz(15), c + 0.22, 0.03, 1.1, 0.08, PRI.CUE, 0.5, 2.76, 0.1, pan);
+  }
+
+  /**
+   * Chalk (§4.9): the scrape of a stick across stone — four short, bright, band-passed strokes, one
+   * per stroke of the lettering, each a little higher and quieter, over a dry grit bed. No tone at
+   * all, so it can never be mistaken for a pickup.
+   * @param {number} [pan]
+   */
+  function playChalk(pan = 0) {
+    const t = now();
+    sfxNoise('highpass', 1800, 2400, 0.7, t, 0.004, 0.32, 0.06, PRI.CUE, 0.05, pan);
+    for (let i = 0; i < 4; i++) {
+      const f = (2600 + i * 420) * rng.range(0.9, 1.1);
+      const at = t + i * 0.07 + rng.range(0, 0.02);
+      sfxNoise('bandpass', f, f * 1.25, 3.2, at, 0.006, 0.06, 0.22 - i * 0.03, PRI.CUE, 0.06, pan);
+    }
+  }
+
+  /** A chalk press that marked nothing: one dull, dry tap on stone. */
+  function playChalkDeny() {
+    const t = now();
+    sfxNoise('lowpass', 700, 400, 0.8, t, 0.002, 0.08, 0.14, PRI.CUE, 0.04);
+  }
+
+  /**
+   * Ember Reserve (§4.9): the torch was dead and catches again — a breath of air drawn in (a
+   * low-passed noise swell), a crackle of catching wick, and a warm rising fifth underneath.
+   */
+  function playEmber() {
+    const t = now();
+    sfxNoise('lowpass', 300, 1800, 0.7, t, 0.25, 0.7, 0.2, PRI.STING, 0.2);
+    for (let i = 0; i < 5; i++) {
+      const f = 2200 * rng.range(0.8, 1.3);
+      sfxNoise('bandpass', f, f, 2.5, t + 0.3 + i * 0.06 + rng.range(0, 0.03), 0.002, 0.04, 0.18, PRI.CUE, 0.1);
+    }
+    sfx('triangle', degreeHz(3), degreeHz(7), t + 0.25, 0.08, 0.9, 0.12, PRI.STING, 0.4);
+  }
+
+  /**
+   * An unlock gained (§4.9): a bright climbing arpeggio in the level key with a bell partial — a
+   * boon rings a step higher and one note longer than a Shrine purchase, because it is a gift.
+   * @param {boolean} boon
+   */
+  function playUnlock(boon) {
+    const t = now();
+    const steps = boon ? [7, 9, 12, 14, 17] : [7, 10, 12, 14];
+    for (let i = 0; i < steps.length; i++) {
+      const last = i === steps.length - 1;
+      sfx('sine', degreeHz(steps[i]), degreeHz(steps[i]), t + i * 0.075, 0.01, last ? 1.2 : 0.4, 0.1, PRI.STING, 0.45, 2.76, 0.14);
+    }
+    sfxNoise('highpass', 5000, 7000, 0.7, t, 0.01, 0.5, 0.05, PRI.CUE, 0.3);
   }
 
   /** Low fuel: a detuned minor-second swell that arrives just before the first heartbeat. */
@@ -2092,6 +2146,18 @@ export function createAudio(options) {
           case 'uiConfirm':
             if (!muted) playUiSound('confirm');
             break;
+          case 'chalk':
+            if (!muted) {
+              if (e.ok === true) playChalk(pickupPan(e.x, e.y, state));
+              else playChalkDeny();
+            }
+            break;
+          case 'ember':
+            if (!muted) playEmber();
+            break;
+          case 'unlock':
+            if (!muted) playUnlock(e.boon === true);
+            break;
           default:
             break; // forward-compatible: unknown event types are simply not audible
         }
@@ -2287,7 +2353,7 @@ export function createAudio(options) {
 
   /**
    * How hard the current footstep should land, from the player's ground speed.
-   * WHY speed and not `input.sprint`: sprinting into a wall should not sound like a full stride.
+   * WHY speed and not the input: walking into a wall should not sound like a full stride.
    * @param {GameState|null|undefined} state
    * @returns {number} 0..1
    */

@@ -216,7 +216,7 @@ test('store + game reducer: the real wiring survives a scripted session', () => 
     store.dispatch({
       type: 'tick',
       dt: 1 / 60,
-      input: /** @type {any} */ ({ moveX: 0, moveY: 1, turn: 0, lookDX: 0, sprint: false, pressed: new Set() }),
+      input: /** @type {any} */ ({ moveX: 0, moveY: 1, turn: 0, lookDX: 0, pressed: new Set() }),
     });
   }
   assert.deepEqual(phases, ['loading', 'playing', 'levelComplete']);

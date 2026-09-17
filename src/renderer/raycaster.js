@@ -53,7 +53,7 @@
 import { hash2, createRng } from '../core/rng.js';
 import { DIR_DX, DIR_DY, TILE } from '../maze/constants.js';
 import { C, LITTLE_ENDIAN, PALETTE_RGB, PALETTE_SIZE, pack } from './palette.js';
-import { createTextures, MAP_FLOOR_ROW, SIZE as TEX } from './textures.js';
+import { CHALK_VARIANTS, createTextures, MAP_FLOOR_ROW, SIZE as TEX } from './textures.js';
 import { createParticles, PARTICLE, PARTICLE_COLORS } from './particles.js';
 import { createSpriteIndex } from './sprite-index.js';
 
@@ -136,6 +136,25 @@ const MAX_LIGHTS = 8;
  * one offered (see `addSprite`), so even an overflow can only cost distant decoration.
  */
 const MAX_SPRITES = 384;
+
+// ─── Unlocks wave (ARCHITECTURE.md §4.9) ─────────────────────────────────────────────────────────
+
+/**
+ * Colormap levels a chalk texel sits above the wall it is written on (16.16). Chalk is a pale mark
+ * on dark stone; lit exactly like the stone it vanished into the gloom at the distance a player
+ * decides whether to turn into a corridor, so it borrows a little of the light a white surface
+ * actually throws back. Not emissive: it still fades with the torch and the fog.
+ */
+const CHALK_LIFT_FX = 10 * 65536;
+
+/**
+ * Light multiplier on a wall face that borders a dead-end branch (Dead-End Whisper). Low enough to
+ * read as "this way is darker" at a glance, high enough that the stone texture still shows.
+ */
+const WHISPER_DIM = 0.5;
+
+/** Colormap level a flask seen through a wall is drawn at (Oil Sense): a dim, steady ghost. */
+const OIL_GHOST_LEVEL = 34;
 
 /**
  * Radius in tiles inside which a billboard can still change a pixel.
@@ -860,6 +879,8 @@ export function createRaycaster(canvas, options) {
   const sprWallA = new Float64Array(MAX_SPRITES);
   const sprWallB = new Float64Array(MAX_SPRITES);
   const sprOrder = new Int32Array(MAX_SPRITES);
+  /** 1 = the sprite may draw through walls as a stippled ghost (Oil Sense, §4.9). */
+  const sprXray = new Uint8Array(MAX_SPRITES);
   /** @type {Texture[]} reused slots; assignment only, never a fresh array */
   const sprTex = new Array(MAX_SPRITES);
   let sprN = 0;
@@ -937,6 +958,31 @@ export function createRaycaster(canvas, options) {
   let planeLen = 1;
   let horizon = 0;
   let torchInvR = 1 / TORCH_MAX_R;
+
+  // ── Chalk marks and the dead-end whisper (§4.9) ──
+  /**
+   * Chalked faces per tile: bit `1 << face` set when that face carries a mark. Sized to the level,
+   * grow-only, rebuilt on a level change and appended to as marks arrive — one read per wall column.
+   */
+  let chalkMask = new Uint8Array(0);
+  /** @type {object|null} the maze `chalkMask` describes */
+  let chalkMaze = null;
+  /** @type {ReadonlyArray<{x:number, y:number, face:number, seed:number}>|null} marks array applied */
+  let chalkMarks = null;
+  /** How many of `chalkMarks` are in the mask. */
+  let chalkApplied = 0;
+  /** Seed per chalked face, so the lettering variant is the mark's own (index = tile·4 + face). */
+  let chalkSeed = new Int32Array(0);
+  /** 1 = floor tile inside a dead-end branch within the whisper depth. */
+  let whisperMask = new Uint8Array(0);
+  /** @type {object|null} */
+  let whisperMaze = null;
+  let whisperDepth = 0;
+  /** Whether the mask is live for the current frame (`view.whisper > 0` and built). */
+  let whisperOn = false;
+  /** Per-frame Wide Flame and Oil Sense values, copied off the view. */
+  let flameMult = 1;
+  let oilSense2 = 0;
   let torchPower = 1;
   /**
    * The player torch's firelight tint at the centre of its pool this frame, 16.16 tint steps. An
@@ -1044,6 +1090,111 @@ export function createRaycaster(canvas, options) {
       torchVis = new Uint8Array(torches.length * VIS_AREA);
     } else {
       torchVisReady.fill(0, 0, torches.length);
+    }
+  }
+
+  /**
+   * Bring the chalk mask up to date with `view.marks` (§4.9). A new level (maze identity) or a new
+   * marks array clears it; marks appended to the same array are added one by one. Each mark costs
+   * one write when it arrives — nothing per frame beyond two comparisons.
+   * @param {RenderView} view
+   * @returns {void}
+   */
+  function syncChalk(view) {
+    const maze = view.maze;
+    const marks = /** @type {any} */ (view).marks;
+    const list = Array.isArray(marks) ? marks : null;
+    const n = maze.width * maze.height;
+    if (maze !== chalkMaze || list !== chalkMarks) {
+      if (chalkMask.length < n) {
+        chalkMask = new Uint8Array(n);
+        chalkSeed = new Int32Array(n * 4);
+      } else if (chalkApplied > 0 || maze !== chalkMaze) {
+        chalkMask.fill(0, 0, n);
+      }
+      chalkMaze = maze;
+      chalkMarks = list;
+      chalkApplied = 0;
+    }
+    if (list === null) return;
+    for (; chalkApplied < list.length; chalkApplied++) {
+      const m = list[chalkApplied];
+      if (!m) continue;
+      const x = m.x | 0;
+      const y = m.y | 0;
+      if (x < 0 || y < 0 || x >= maze.width || y >= maze.height) continue;
+      const face = (m.face | 0) & 3;
+      const t = y * maze.width + x;
+      chalkMask[t] |= 1 << face;
+      chalkSeed[t * 4 + face] = m.seed | 0;
+    }
+  }
+
+  /**
+   * Build the dead-end whisper mask for this level when the depth asks for one (§4.9).
+   *
+   * Leaf peeling: every floor tile with one open neighbour is a dead end; peel it, and any neighbour
+   * left with one open neighbour becomes the next leaf, up to `depth` rounds. The start and the exit
+   * are never peeled, so the route between them — and every loop — survives, and what is marked is
+   * exactly "a passage that only leads back". O(tiles), once per level (or per depth change).
+   * @param {RenderView} view
+   * @returns {void}
+   */
+  function syncWhisper(view) {
+    const raw = /** @type {any} */ (view).whisper;
+    const depth = Number.isFinite(raw) && raw > 0 ? Math.min(255, Math.floor(raw)) : 0;
+    whisperOn = depth > 0;
+    if (!whisperOn) return;
+    const maze = view.maze;
+    if (maze === whisperMaze && depth === whisperDepth) return;
+    whisperMaze = maze;
+    whisperDepth = depth;
+    const w = maze.width;
+    const h = maze.height;
+    const n = w * h;
+    const tiles = maze.tiles;
+    if (whisperMask.length < n) whisperMask = new Uint8Array(n);
+    else whisperMask.fill(0, 0, n);
+    const deg = new Uint8Array(n);
+    let queue = new Int32Array(Math.max(16, n));
+    let head = 0;
+    let tail = 0;
+    const start = maze.start ? maze.start.y * w + maze.start.x : -1;
+    const exit = maze.exit ? maze.exit.y * w + maze.exit.x : -1;
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const t = y * w + x;
+        if (tiles[t] !== TILE_FLOOR) continue;
+        const d =
+          (tiles[t - 1] === TILE_FLOOR ? 1 : 0) +
+          (tiles[t + 1] === TILE_FLOOR ? 1 : 0) +
+          (tiles[t - w] === TILE_FLOOR ? 1 : 0) +
+          (tiles[t + w] === TILE_FLOOR ? 1 : 0);
+        deg[t] = d;
+        if (d === 1 && t !== start && t !== exit) {
+          whisperMask[t] = 1; // round 1
+          queue[tail++] = t;
+        }
+      }
+    }
+    while (head < tail) {
+      const t = queue[head++];
+      const round = whisperMask[t];
+      if (round >= depth) continue;
+      for (let k = 0; k < 4; k++) {
+        const nb = k === 0 ? t - 1 : k === 1 ? t + 1 : k === 2 ? t - w : t + w;
+        if (nb < 0 || nb >= n || tiles[nb] !== TILE_FLOOR || whisperMask[nb] !== 0) continue;
+        if (deg[nb] > 0) deg[nb]--;
+        if (deg[nb] === 1 && nb !== start && nb !== exit) {
+          whisperMask[nb] = round >= 254 ? 254 : round + 1;
+          if (tail >= queue.length) {
+            const grown = new Int32Array(queue.length * 2);
+            grown.set(queue);
+            queue = grown;
+          }
+          queue[tail++] = nb;
+        }
+      }
     }
   }
 
@@ -1584,6 +1735,23 @@ export function createRaycaster(canvas, options) {
       // Texture column: where along the wall face the ray landed.
       let wallX = side === 0 ? camY + dist * rdy : camX + dist * rdx;
       wallX -= Math.floor(wallX);
+      // Chalk (§4.9): which face was hit, and where along it in the viewer's own left-to-right —
+      // taken before the per-tile mirroring below, so the word never reads backwards.
+      let decal = null;
+      let decalX = 0;
+      const tileAt = mapY * mw + mapX;
+      const chalkBits = chalkMaze === maze ? chalkMask[tileAt] : 0;
+      if (chalkBits !== 0) {
+        const faceHit = side === 0 ? (stepX > 0 ? 2 : 0) : stepY > 0 ? 3 : 1;
+        if ((chalkBits & (1 << faceHit)) !== 0) {
+          const set = textures.chalk;
+          if (set && set.length > 0) {
+            const alongRight = side === 0 ? stepX > 0 : stepY < 0;
+            decalX = (((alongRight ? wallX : 1 - wallX) * TEX) | 0) & (TEX - 1);
+            decal = set[((chalkSeed[tileAt * 4 + faceHit] >>> 0) % CHALK_VARIANTS) % set.length].indices;
+          }
+        }
+      }
       let texX = (wallX * TEX) | 0;
       // Mirror two of the four facings so neighbouring faces of the same block agree.
       if (side === 0 ? rdx > 0 : rdy < 0) texX = TEX - 1 - texX;
@@ -1595,7 +1763,12 @@ export function createRaycaster(canvas, options) {
       const hitX = camX + dist * rdx + nx * 0.02;
       const hitY = camY + dist * rdy + ny * 0.02;
       const shade = side === 1 ? SIDE_SHADE : 1;
-      const illum = illumWall(hitX, hitY, nx, ny);
+      let illum = illumWall(hitX, hitY, nx, ny);
+      // Dead-End Whisper (§4.9): the face borders a floor tile that only leads back.
+      if (whisperOn) {
+        const ft = (mapY + ny) * mw + mapX + nx;
+        if (ft >= 0 && ft < mw * mh && whisperMask[ft] !== 0) illum *= WHISPER_DIM;
+      }
       // Sconce tint for the whole column: which light reaches a wall does not change up its height.
       const warmFx = illumWarmFx;
       const lvl = levelFx(illum, dist, shade);
@@ -1659,7 +1832,28 @@ export function createRaycaster(canvas, options) {
         let cur = lvl - (run === 0 ? horizon - from : from - horizon) * rampStep;
         const curStep = run === 0 ? rampStep : -rampStep;
         let pi = from * w + x;
-        if (warmFx === 0) {
+        if (decal !== null) {
+          // A chalked face: the wall texel, or the chalk over it lifted a few levels. Rare (a
+          // handful of columns on the frames a mark is in view), so it gets its own loop and the two
+          // loops below stay exactly as fast as before.
+          for (let y = from; y < to; y++) {
+            const ty = (texPos >> 16) & (TEX - 1);
+            texPos += stepFx;
+            const bk = ((y & 3) << 2) | bayerCol;
+            const chalkIdx = decal[(ty << 6) | decalX];
+            let level = (cur + (chalkIdx !== 0 ? CHALK_LIFT_FX : 0) + BAYER16[bk]) >> 16;
+            if (level < 0) level = 0;
+            else if (level > LEVEL_MAX) level = LEVEL_MAX;
+            // Chalk takes no firelight tint: under the torch's warm core a tinted white read as
+            // orange flame, and the mark has to read as chalk at a glance.
+            buf[pi] =
+              chalkIdx !== 0
+                ? colormap[(level << 8) | chalkIdx]
+                : colormap[(((warmFx + BAYER_W[bk]) >> 16) << WARM_SHIFT) | (level << 8) | tIdx[(ty << 6) | texX]];
+            cur += curStep;
+            pi += w;
+          }
+        } else if (warmFx === 0) {
           // No sconce reaches this column — most of them, most frames — so skip the tint dither.
           for (let y = from; y < to; y++) {
             const ty = (texPos >> 16) & (TEX - 1);
@@ -1876,9 +2070,10 @@ export function createRaycaster(canvas, options) {
    * @param {number} face mounting wall's outward-normal direction (0=E 1=S 2=W 3=N, as `Torch.face`),
    *   or -1 for a free-standing sprite
    * @param {number} off tiles the sprite stands in front of its mounting face (ignored when `face` is -1)
+   * @param {number} [xray] 1 = draw through walls as a stippled ghost (Oil Sense, §4.9)
    * @returns {void}
    */
-  function addSprite(x, y, tex, scale, vOff, level, warm, dist2, face, off) {
+  function addSprite(x, y, tex, scale, vOff, level, warm, dist2, face, off, xray) {
     let i;
     if (sprN < MAX_SPRITES) {
       i = sprN++;
@@ -1897,6 +2092,7 @@ export function createRaycaster(canvas, options) {
     sprWarm[i] = warm;
     sprDist[i] = dist2;
     sprWallK[i] = 0;
+    sprXray[i] = xray === 1 ? 1 : 0;
     if (face >= 0) {
       const nx = DIR_DX[face & 3];
       const ny = DIR_DY[face & 3];
@@ -2096,7 +2292,10 @@ export function createRaycaster(canvas, options) {
           // Gentle bob and a slow spin — enough life that a pickup catches the eye down a corridor.
           const spin = ((time * (isGem ? 6 : 3) + phase) | 0) % frames.length;
           const bobZ = Math.sin(time * 2.2 + phase) * 0.045;
-          const lvl = levelFx(illumFlat(it.x, it.y, allLights, lightN) * (isGem ? 1.25 : 1.1), d, 1);
+          let lvl = levelFx(illumFlat(it.x, it.y, allLights, lightN) * (isGem ? 1.25 : 1.1), d, 1);
+          // Oil Sense (§4.9): a flask in range is drawn through walls, and never darker than its ghost.
+          const sensed = !isGem && d2 <= oilSense2;
+          if (sensed && lvl < OIL_GHOST_LEVEL * FX_ONE) lvl = OIL_GHOST_LEVEL * FX_ONE;
           // A flask under a sconce picks up the pool's amber like the cobbles around it. A gem does
           // not: its cyan is how a player spots one down a corridor, and under a full sconce tint
           // (blue × 0.3) it went olive — so it keeps its own colour, like the emissive sprites.
@@ -2116,6 +2315,7 @@ export function createRaycaster(canvas, options) {
             d2,
             -1,
             0,
+            sensed ? 1 : 0,
           );
         }
       }
@@ -2229,6 +2429,7 @@ export function createRaycaster(canvas, options) {
       const wallK = sprWallK[i];
       const wallA = sprWallA[i];
       const wallB = sprWallB[i];
+      const xray = sprXray[i] === 1;
       const stepFx = ((TEX / size) * FX_ONE) | 0;
       let texFx = ((x0 - leftF) * (TEX / size) * FX_ONE) | 0;
       const texYStart = ((y0 - topF) * (TEX / size) * FX_ONE) | 0;
@@ -2248,7 +2449,24 @@ export function createRaycaster(canvas, options) {
             if (onWall < depthTest) depthTest = onWall;
           }
         }
-        if (depthTest >= zbuf[x]) continue; // hidden behind nearer geometry
+        if (depthTest >= zbuf[x]) {
+          if (!xray) continue; // hidden behind nearer geometry
+          // Oil Sense: behind a wall the flask is a half-stippled ghost at a fixed dim level, its own
+          // colours untinted, so it reads as "felt, not seen".
+          any = true;
+          let gp = texYStart;
+          let gpi = y0 * w + x;
+          for (let y = y0; y < y1; y++) {
+            const ty = gp >> 16;
+            gp += stepFx;
+            if (ty >= 0 && ty < TEX && ((x + y) & 1) === 0) {
+              const gi = ind[(ty << 6) | tx];
+              if (gi !== 0) buf[gpi] = colormap[(OIL_GHOST_LEVEL << 8) | gi];
+            }
+            gpi += w;
+          }
+          continue;
+        }
         any = true;
         const bayerCol = x & 3;
         let tp = texYStart;
@@ -2421,7 +2639,14 @@ export function createRaycaster(canvas, options) {
       dip = n > 0.45 ? (n > 0.75 ? 1 : (n - 0.45) / 0.3) : 0;
       dip = dip * gutter * GUTTER_DEPTH * (reduced ? 0.5 : 1);
     }
-    torchInvR = 1 / ((TORCH_MIN_R + (TORCH_MAX_R - TORCH_MIN_R) * light) * (1 - GUTTER_SHRINK * dip));
+    // Wide Flame (§4.9) scales the pool's reach; the torch still shrinks with the oil left.
+    const flameRaw = /** @type {any} */ (view).flame;
+    flameMult = Number.isFinite(flameRaw) && flameRaw > 1 ? Math.min(2, flameRaw) : 1;
+    const senseRaw = /** @type {any} */ (view).oilSense;
+    const sense = Number.isFinite(senseRaw) && senseRaw > 0 ? Math.min(SPRITE_FAR, senseRaw) : 0;
+    oilSense2 = sense * sense;
+    torchInvR =
+      1 / ((TORCH_MIN_R + (TORCH_MAX_R - TORCH_MIN_R) * light) * flameMult * (1 - GUTTER_SHRINK * dip));
     torchPower =
       PLAYER_TORCH_CEILING * (PLAYER_POWER_EMPTY + (1 - PLAYER_POWER_EMPTY) * light) * flicker * (1 - dip);
     // The warm core breathes with the flame and shrinks with the oil left.
@@ -2430,6 +2655,8 @@ export function createRaycaster(canvas, options) {
     buf.fill(fogPacked);
     // Cheap identity check; a real rebuild happens only on a level change (§4.5).
     syncIndexes(view);
+    syncChalk(view);
+    syncWhisper(view);
     gatherLights(view, time);
     renderWalls(view);
     renderFlats(maze);

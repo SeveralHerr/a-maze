@@ -165,6 +165,14 @@ const ENTRIES = /** @type {const} */ ([
   ['sealDark', 0x4a0f0d], // ribbon in shadow
   ['sealMid', 0x7a1a14], // ribbon & wax body
   ['sealLight', 0xa8352a], // the one lit bead on the wax
+
+  // ── Chalk: the player's A-MAZE scrawls on the walls (§4.9). Appended, so no index moves. ─────
+  // Bone white rather than pure white or blue-grey: the blue-grey faded into the cold stone at a
+  // corridor's length, and a pure white read as a light source rather than a mark on the wall.
+  ['chalkDust', 0x76726a], // powder smeared around a stroke
+  ['chalkSmudge', 0xa7a398], // a stroke's broken edge
+  ['chalkMid', 0xd5d1c5], // the body of a stroke
+  ['chalkPale', 0xf4f0e3], // where the chalk bit hardest
 ]);
 
 /** Number of palette slots, including the transparency key at index 0. */
@@ -226,7 +234,8 @@ function ramp(...names) {
  * why every ramp is an evenly-spaced perceptual run: dithering between neighbours must not show a
  * hue jump.
  * `map` is the parchment of the hidden map scroll; `seal` is its dark red ribbon and wax accent.
- * @type {Readonly<Record<'stone'|'moss'|'cobble'|'wood'|'iron'|'fire'|'arcane'|'gem'|'oil'|'gold'|'map'|'seal', Uint8Array>>}
+ * `chalk` is the player's wall lettering (§4.9).
+ * @type {Readonly<Record<'stone'|'moss'|'cobble'|'wood'|'iron'|'fire'|'arcane'|'gem'|'oil'|'gold'|'map'|'seal'|'chalk', Uint8Array>>}
  */
 export const RAMPS = Object.freeze({
   stone: ramp(
@@ -268,6 +277,7 @@ export const RAMPS = Object.freeze({
   gold: ramp('goldDark', 'goldMid', 'goldBase', 'goldLight', 'goldPale'),
   map: ramp('mapShadow', 'mapDark', 'mapMid', 'mapLight', 'mapPale'),
   seal: ramp('sealShadow', 'sealDark', 'sealMid', 'sealLight'),
+  chalk: ramp('chalkDust', 'chalkSmudge', 'chalkMid', 'chalkPale'),
 });
 
 /** Every packed colour, for O(1) "is this on-palette?" checks in tests. */

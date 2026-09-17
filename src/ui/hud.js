@@ -58,13 +58,18 @@ import {
 } from './format.js';
 import { createMapView, cycleMapMode, readMapMode } from './map.js';
 import {
+  ARROWS as NEEDLE_ARROWS,
+  ARROW_PALETTE as NEEDLE_PALETTE,
+  drawArt,
   drawGemIcon,
   drawOilIcon,
   drawPanel,
   drawTorchIcon,
+  drawUnlockIcon,
   drawWell,
   ICON_SIZE,
   strokeRect,
+  UNLOCK_ICON,
   withAlpha,
   withAlphaStep,
 } from './pixels.js';
@@ -91,14 +96,17 @@ export {
   drawPanel,
   drawPortalIcon,
   drawTorchIcon,
+  drawUnlockIcon,
   drawWell,
   fillDisc,
   fillRing,
   fitScale,
   fitScaleAt,
+  hasUnlockIcon,
   hexToRgb,
   ICON_SIZE,
   strokeRect,
+  UNLOCK_ICON,
   withAlpha,
   withAlphaStep,
 } from './pixels.js';
@@ -748,6 +756,7 @@ export function createHud(overlayCanvas, options) {
   const gemsText = createTextMemo((g, t) => formatCount(g, t));
   const depthText = createTextMemo((lv) => formatDepth(lv));
   const sizeText = createTextMemo((c, r) => formatLabyrinth(c, r));
+  const chalkText = createTextMemo((n) => '×' + n);
 
   /** @type {Pop[]} */
   const pops = new Array(MAX_POPS);
@@ -1074,6 +1083,8 @@ export function createHud(overlayCanvas, options) {
     drawFuelGauge(ctx, state, m, reduced);
     drawScorePanel(ctx, state, m);
     drawDepthPanel(ctx, state, m);
+    drawPerkChips(ctx, state, m, reduced);
+    drawLodestone(ctx, state, m, reduced);
     if (mode === 'corner') mapView.drawCorner(ctx, m, state, anim.clock, reduced);
     drawPops(ctx, m, reduced);
     drawBanner(ctx, m, reduced);
@@ -1372,6 +1383,17 @@ export function createHud(overlayCanvas, options) {
     // Under the bar: how much is left (right, where the eye goes first) and how many flasks this
     // level has cost (left) — the two numbers the refill economy is played on.
     const run = state.run;
+    // Siphon (§4.9): the stored overflow is a thin pale line along the well's floor, so the tank
+    // still reads as a tank and the reserve as "more, waiting".
+    const perks = /** @type {any} */ (state).perks;
+    if (perks && perks.siphonCap > 0 && run.reserve > 0) {
+      const reserveW = Math.max(u, Math.round((inner * Math.min(run.reserve, perks.siphonCap)) / perks.siphonCap));
+      const lineH = Math.max(1, u);
+      ctx.fillStyle = COLOR.void;
+      ctx.fillRect(barX + u, barY + barH - u - lineH - 1, inner, lineH + 1);
+      ctx.fillStyle = COLOR.oilPale;
+      ctx.fillRect(barX + u, barY + barH - u - lineH, reserveW, lineH);
+    }
     const textY = barY + barH + 2 * u;
     const size = fuelTextSize;
     // Keyed on whole seconds, the resolution `formatTime` prints at.
@@ -1524,6 +1546,103 @@ export function createHud(overlayCanvas, options) {
     drawAt(ctx, DEPTH_SEPARATOR, x, top, 'hud', size, 'hudDim');
     x += measureAt(DEPTH_SEPARATOR, 'hud', size) + DEPTH_GAP * size;
     drawAt(ctx, dims, x, top, 'hud', size, 'hudBright');
+  }
+
+  /**
+   * Bottom-left of the world view: the unlock readouts that need one (§4.9) — the chalk charges
+   * left on this level, and the Scroll Sense plaque, whose scroll glows and whose frame beats faster
+   * the nearer the unfound map scroll is. Nothing is drawn for a player without those unlocks, so the
+   * first-floor HUD is exactly the one it always was.
+   *
+   * In the world band rather than the top row: the top row is full on a phone, and a thumb on the
+   * virtual stick sits below the band, not over its corner.
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {GameState} state
+   * @param {SurfaceMetrics} m
+   * @param {boolean} reduced
+   * @returns {void}
+   */
+  function drawPerkChips(ctx, state, m, reduced) {
+    const perks = /** @type {any} */ (state).perks;
+    if (!perks) return;
+    const run = state.run;
+    const showChalk = perks.chalk > 0;
+    const showSense = perks.scrollSense > 0 && run.mapFound === false;
+    if (!showChalk && !showSense) return;
+    const u = m.u;
+    const size = m.narrow ? Math.max(1, u - 1) : u;
+    const iconW = UNLOCK_ICON * size;
+    const chipH = 2 * insetY + Math.max(iconW, heightAt('hud', size));
+    const y = m.viewY + m.viewH - 3 * u - chipH;
+    let x = m.viewX + 3 * u;
+    panelOpts.frame = 'stone';
+    panelOpts.border = border;
+    panelOpts.rivets = false;
+    if (showChalk) {
+      const charges = run.chalk > 0 ? run.chalk | 0 : 0;
+      const text = chalkText(charges);
+      const w = 2 * insetX + iconW + 2 * u + measureAt(text, 'hud', size);
+      drawPanel(ctx, x, y, w, chipH, u, panelOpts);
+      drawUnlockIcon(ctx, 'chalk', x + insetX, y + ((chipH - iconW) >> 1), size);
+      drawAt(ctx, text, x + insetX + iconW + 2 * u, y + (chipH >> 1), 'hud', size, charges > 0 ? 'hudBright' : 'hudDim', 'left', 'middle');
+      x += w + 2 * u;
+    }
+    if (showSense) {
+      // 0 out of range → 64 standing on it. Integer 64ths throughout (see `drawBanner`).
+      const sense = /** @type {any} */ (state.derived).scrollSense;
+      const near64 = Number.isFinite(sense) ? Math.max(0, Math.min(64, (sense * 64) | 0)) : 0;
+      const w = 2 * insetX + iconW;
+      drawPanel(ctx, x, y, w, chipH, u, panelOpts);
+      const beat64 = reduced ? 64 : (32 + 32 * Math.sin(anim.clock * (2 + (near64 * 9) / 64))) | 0;
+      const glow64 = (near64 * beat64) >> 6;
+      const before = ctx.globalAlpha;
+      // Out of range the scroll is a dim outline of itself; in range it brightens toward full.
+      ctx.globalAlpha = before * (0.3 + (0.7 * (near64 > glow64 ? glow64 : near64)) / 64);
+      drawUnlockIcon(ctx, 'scrollSense', x + insetX, y + ((chipH - iconW) >> 1), size);
+      ctx.globalAlpha = before;
+      if (glow64 > 4) {
+        ctx.fillStyle = withAlphaStep(COLOR.goldLight, glow64);
+        strokeRect(ctx, x, y, w, chipH, Math.max(1, border >> 1));
+      }
+    }
+  }
+
+  /**
+   * Lodestone (§4.9): once this level's map is found, a needle under the top row points toward the
+   * exit relative to where the player faces — straight up means straight ahead. Eight headings from
+   * the map's own pixel arrows: a bearing, never a route, so the maze still has to be walked.
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {GameState} state
+   * @param {SurfaceMetrics} m
+   * @param {boolean} reduced
+   * @returns {void}
+   */
+  function drawLodestone(ctx, state, m, reduced) {
+    const perks = /** @type {any} */ (state).perks;
+    if (!perks || !(perks.lodestone > 0) || state.run.mapFound !== true) return;
+    const level = state.levelData;
+    if (level === null || level === undefined || level.maze === undefined) return;
+    const p = state.player;
+    const exit = level.maze.exit;
+    const dx = exit.x + 0.5 - p.x;
+    const dy = exit.y + 0.5 - p.y;
+    if (dx * dx + dy * dy < 1) return;
+    // Screen convention: forward is up. `ARROWS` is indexed with 0 = east and +y down, so the
+    // relative bearing is turned a quarter back before it is rounded to one of eight.
+    const rel = Math.atan2(dy, dx) - p.angle - Math.PI / 2;
+    const idx = Math.round(rel / (Math.PI / 4)) & 7;
+    const u = m.u;
+    const scale = m.narrow ? Math.max(1, u - 1) : u;
+    const artW = ICON_SIZE.arrow * scale;
+    const box = artW + 2 * insetY;
+    const x = m.viewX + ((m.viewW - box) >> 1);
+    const top = m.narrow ? m.viewY + 2 * u : Math.max(m.viewY + 2 * u, 3 * u + fuelPanelH + 2 * u);
+    const bob = reduced ? 0 : Math.round(Math.sin(anim.clock * 2.4) * 0.5 * u);
+    panelOpts.frame = 'iron';
+    panelOpts.border = border;
+    panelOpts.rivets = false;
+    drawPanel(ctx, x, top, box, box, u, panelOpts);
+    drawArt(ctx, NEEDLE_ARROWS[idx], x + insetY, top + insetY + bob, scale, NEEDLE_PALETTE);
   }
 
   /**

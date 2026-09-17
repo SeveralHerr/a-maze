@@ -13,11 +13,11 @@
  * - **Physical keys, not characters.** Every keyboard table is keyed by `KeyboardEvent.code`
  *   (`KeyW`, `ArrowUp`, …) so the layout is identical on QWERTY, AZERTY, Dvorak and Colemak.
  *   `event.key` is deliberately never consulted except by the `codeFromKey` fallback below.
- * - **Actions are a 9-bit mask.** The nine `InputAction` values map to bits 0…8 (`ACTION_BIT`),
+ * - **Actions are a 10-bit mask.** The ten `InputAction` values map to bits 0…9 (`ACTION_BIT`),
  *   so an entire poll's worth of edge-triggered actions is one integer. Accumulating input from
  *   three devices into a number instead of a `Set` is what makes `poll()` allocation-free; the
  *   `Set` in `InputFrame` is filled from the mask once per poll.
- * - **Holds are slot counters.** A held key contributes to one of seven analogue "slots"
+ * - **Holds are slot counters.** A held key contributes to one of six analogue "slots"
  *   (`HOLD.*`). `input.js` keeps an `Int32Array(HOLD_COUNT)` of press counts, so `W` and `↑` held
  *   together still mean "forward = 1" and releasing one of them does not stop the player.
  * - A single physical key may appear in *both* tables and may carry several action bits: `Escape`
@@ -26,7 +26,7 @@
  *   job — the input module reports what the player did, never what it meant.
  *
  * Layout (ARCHITECTURE.md §1 "Controls"): arrows turn, `WASD` moves, `A`/`D` strafe, `Q`/`E` also
- * turn, `Shift` sprints.
+ * turn, `C` chalks the wall ahead (Chalk unlock). There is no sprint (ARCHITECTURE.md §1).
  *
  * @see ARCHITECTURE.md §4.3
  */
@@ -51,6 +51,7 @@ export const ACTIONS = Object.freeze([
   'left', // 6
   'right', // 7
   'mute', // 8
+  'chalk', // 9 — mark the wall ahead (ARCHITECTURE.md §4.9)
 ]);
 
 /** Number of distinct actions (= number of meaningful bits in an action mask). */
@@ -77,7 +78,7 @@ export const NAV_MASK = ACTION_BIT.up | ACTION_BIT.down | ACTION_BIT.left | ACTI
 /**
  * Slot indices for held (non edge-triggered) controls. Values are array indices, so they are
  * dense and start at 0.
- * @type {{FORWARD:0, BACK:1, STRAFE_L:2, STRAFE_R:3, TURN_L:4, TURN_R:5, SPRINT:6}}
+ * @type {{FORWARD:0, BACK:1, STRAFE_L:2, STRAFE_R:3, TURN_L:4, TURN_R:5}}
  */
 export const HOLD = Object.freeze({
   FORWARD: 0,
@@ -86,11 +87,10 @@ export const HOLD = Object.freeze({
   STRAFE_R: 3,
   TURN_L: 4,
   TURN_R: 5,
-  SPRINT: 6,
 });
 
 /** Number of hold slots; the size of the press-count array in `input.js`. */
-export const HOLD_COUNT = 7;
+export const HOLD_COUNT = 6;
 
 // ─── Keyboard tables ─────────────────────────────────────────────────────────────────────────
 
@@ -101,7 +101,7 @@ export const HOLD_COUNT = 7;
  * `backward` so it can never be confused with the `back` action.
  * @type {readonly string[]}
  */
-export const HOLD_NAMES = Object.freeze(['forward', 'backward', 'strafeLeft', 'strafeRight', 'turnLeft', 'turnRight', 'sprint']);
+export const HOLD_NAMES = Object.freeze(['forward', 'backward', 'strafeLeft', 'strafeRight', 'turnLeft', 'turnRight']);
 
 /**
  * A keyboard remap: `KeyboardEvent.code` → the controls that key drives, by name (a hold name from
@@ -136,8 +136,7 @@ export const DEFAULT_KEY_BINDINGS = Object.freeze({
   ArrowLeft: Object.freeze(['turnLeft', 'left']),
   KeyE: Object.freeze(['turnRight']),
   ArrowRight: Object.freeze(['turnRight', 'right']),
-  ShiftLeft: Object.freeze(['sprint']),
-  ShiftRight: Object.freeze(['sprint']),
+  KeyC: Object.freeze(['chalk']),
   Enter: Object.freeze(['confirm']),
   NumpadEnter: Object.freeze(['confirm']),
   Space: Object.freeze(['confirm']),
@@ -285,7 +284,8 @@ export const DEADZONE = 0.18;
 
 /**
  * Standard-mapping button index → action bitmask.
- * `0` A/Cross = confirm, `1` B/Circle = back, `3` Y/Triangle = mute, `8` Select/Back/View = map,
+ * `0` A/Cross = confirm, `1` B/Circle = back, `2` X/Square = chalk, `3` Y/Triangle = mute,
+ * `8` Select/Back/View = map,
  * `9` Start/Menu = pause,
  * `12…15` d-pad = menu navigation (also movement, see `GAMEPAD_BUTTON_HOLD`).
  * Sparse array: missing entries are `undefined` and treated as 0 by the caller.
@@ -294,8 +294,10 @@ export const DEADZONE = 0.18;
 export const GAMEPAD_BUTTON_ACTION = [];
 GAMEPAD_BUTTON_ACTION[0] = ACTION_BIT.confirm;
 GAMEPAD_BUTTON_ACTION[1] = ACTION_BIT.back;
-// Y rather than a shoulder or R3: LB already sprints, so a shoulder is where a thumb lands by
-// accident, and R3 clicks by accident while turning hard. A face button is a deliberate press.
+// A face button, like mute: chalk spends a charge, so it must be a deliberate press.
+GAMEPAD_BUTTON_ACTION[2] = ACTION_BIT.chalk;
+// Y rather than a shoulder or R3: a shoulder is where a thumb rests, and R3 clicks by accident while
+// turning hard. A face button is a deliberate press.
 GAMEPAD_BUTTON_ACTION[3] = ACTION_BIT.mute;
 GAMEPAD_BUTTON_ACTION[8] = ACTION_BIT.map;
 GAMEPAD_BUTTON_ACTION[9] = ACTION_BIT.pause;
@@ -307,15 +309,12 @@ Object.freeze(GAMEPAD_BUTTON_ACTION);
 
 /**
  * Standard-mapping button index → hold slot. The d-pad mirrors the arrow keys exactly (up/down
- * move, left/right turn) and both triggers plus L3 sprint, which covers every common convention.
+ * move, left/right turn). Sprint was removed (ARCHITECTURE.md §1), so shoulders, triggers and L3
+ * drive nothing.
  * Sparse array: missing entries are `undefined`.
  * @type {number[]}
  */
 export const GAMEPAD_BUTTON_HOLD = [];
-GAMEPAD_BUTTON_HOLD[4] = HOLD.SPRINT; // LB
-GAMEPAD_BUTTON_HOLD[6] = HOLD.SPRINT; // LT
-GAMEPAD_BUTTON_HOLD[7] = HOLD.SPRINT; // RT
-GAMEPAD_BUTTON_HOLD[10] = HOLD.SPRINT; // L3 (stick click)
 GAMEPAD_BUTTON_HOLD[12] = HOLD.FORWARD;
 GAMEPAD_BUTTON_HOLD[13] = HOLD.BACK;
 GAMEPAD_BUTTON_HOLD[14] = HOLD.TURN_L;
@@ -506,7 +505,7 @@ export function describeControls(tables) {
     Object.freeze({ label: 'Strafe', keys: pairRow(labelsForSlot(t, HOLD.STRAFE_L), labelsForSlot(t, HOLD.STRAFE_R)), pad: 'Left stick' }),
     Object.freeze({ label: 'Turn', keys: pairRow(labelsForSlot(t, HOLD.TURN_L), labelsForSlot(t, HOLD.TURN_R)), pad: 'Right stick' }),
     Object.freeze({ label: 'Look', keys: 'Mouse', pad: 'Right stick' }),
-    Object.freeze({ label: 'Sprint', keys: listRow(labelsForSlot(t, HOLD.SPRINT)), pad: 'Triggers / LB / L3' }),
+    Object.freeze({ label: 'Chalk', keys: listRow(labelsForAction(t, ACTION_BIT.chalk)), pad: 'X' }),
     Object.freeze({ label: 'Map', keys: listRow(labelsForAction(t, ACTION_BIT.map)), pad: 'View' }),
     Object.freeze({ label: 'Pause', keys: listRow(labelsForAction(t, ACTION_BIT.pause)), pad: 'Menu' }),
     Object.freeze({ label: 'Mute', keys: listRow(labelsForAction(t, ACTION_BIT.mute)), pad: 'Y' }),

@@ -245,8 +245,13 @@ export const MAP = Object.freeze({
    * in 17 frames (0.28 s) and costs ~4 k array reads — under 10 µs, measured.
    */
   SWEEP_BUDGET: 4096,
-  /** Reveal radius the sim uses (`WORLD.REVEAL_RADIUS`), mirrored: the local box must cover it. */
-  REVEAL_RADIUS: 3,
+  /**
+   * The widest reveal radius the sim can use, mirrored: the local box must cover it. That is the
+   * Cartographer unlock's top rank (`UNLOCK_FX.cartographer`, 5), not the base `WORLD.REVEAL_RADIUS`
+   * (3) — a box sized for the base radius would leave a maxed Cartographer's outer ring to the
+   * rolling sweep, a visible lag at the edge of what the player just saw (§4.9).
+   */
+  REVEAL_RADIUS: 5,
   /** Extra tiles of slack on the local box, for rounding and for a pickup flash. */
   BOX_SLACK: 2,
   /** Seconds between item-liveness prunes. Twice a second is imperceptible and O(live items). */
@@ -847,7 +852,7 @@ export function createMapView(options) {
       stats.rebuilds++;
     } else {
       // Local box: the reveal radius plus however far the player travelled since the last update,
-      // so a 10 fps frame or a sprint cannot leave a hole behind.
+      // so a 10 fps frame or a long step cannot leave a hole behind.
       const moved = Math.max(Math.abs(px - lastPlayerX), Math.abs(py - lastPlayerY));
       const r = MAP.REVEAL_RADIUS + Math.ceil(moved) + MAP.BOX_SLACK;
       const bx = Math.floor(px);

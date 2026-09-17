@@ -33,7 +33,7 @@ import { createRng, randomSeed } from './core/rng.js';
 
 import { createStore } from './state/store.js';
 import { createInitialState, reducer } from './state/game.js';
-import { levelParams } from './state/balance.js';
+import { UNLOCKS, levelParams } from './state/balance.js';
 import { loadPersist, savePersist } from './state/save.js';
 
 import { createInput } from './input/input.js';
@@ -64,10 +64,10 @@ const log = createLogger('main');
 /**
  * Level whose parameters build the maze the attract camera wanders on the title screen.
  *
- * 1, deliberately, now that level 1 is 16×16 cells (33×33 tiles): that is already a substantial
- * labyrinth for a camera that walks one corridor at a time, it stays under the maze client's
- * 400-cell worker threshold so the title costs no worker spin-up at boot, and it keeps the title's
- * item/torch load — the things the renderer sorts every frame — at its smallest.
+ * 1, deliberately: the lean 10×10-cell first floor is a labyrinth the attract camera turns corners
+ * in constantly, it stays under the maze client's 400-cell worker threshold so the title costs no
+ * worker spin-up at boot, and it keeps the title's item/torch load — the things the renderer sorts
+ * every frame — at its smallest.
  */
 const DEMO_LEVEL = 1;
 
@@ -117,6 +117,13 @@ const INTEGER_FIT_TOLERANCE = 0.97;
 /** Empty collections handed to the renderer while no level is loaded (never reallocated). */
 const NO_ITEMS = /** @type {import('./core/types.js').Item[]} */ ([]);
 const NO_TORCHES = /** @type {import('./core/types.js').Torch[]} */ ([]);
+const NO_MARKS = /** @type {import('./core/types.js').ChalkMark[]} */ ([]);
+
+/** Notices for the unlocks wave (§4.9). Title case, like every other HUD notice. */
+const NOTICE_EMBER = 'The Ember Rekindles';
+const NOTICE_NO_CHALK = 'Out of Chalk';
+const NOTICE_CHALK_REACH = 'No Wall Within Reach';
+const NOTICE_CHALK_LOCKED = 'Chalk - Unlock It at the Shrine';
 
 // ─── Query flags ─────────────────────────────────────────────────────────────────────────────
 
@@ -268,7 +275,10 @@ function boot() {
 
   // ── State ───────────────────────────────────────────────────────────────────────────────────
   const persisted = loadPersist();
-  const store = createStore(createInitialState(persisted.settings, persisted.best), reducer);
+  const store = createStore(
+    createInitialState(persisted.settings, persisted.best, persisted.progress),
+    reducer,
+  );
 
   /** Settings snapshot used to detect what actually changed after a `setSetting`. */
   const appliedSettings = { ...store.getState().settings };
@@ -302,6 +312,11 @@ function boot() {
       store.dispatch({ type: 'nextLevel' });
     },
     onSetting: (key, value) => store.dispatch({ type: 'setSetting', key, value }),
+    // The Shrine and the Boon (§4.9). The reducer validates both; the store subscriber persists the
+    // result from the `unlock` event, so a purchase survives a closed tab.
+    onBuy: (id) => store.dispatch({ type: 'buyUnlock', id }),
+    onClaimBoon: (id) => store.dispatch({ type: 'claimBoon', id }),
+    unlocks: UNLOCKS,
     onUiSound: (type) => {
       if (type === 'uiMove') audio.playUi('move');
       else if (type === 'uiConfirm') audio.playUi('confirm');
@@ -539,6 +554,42 @@ function boot() {
           worldFlash.a = Math.min(0.5, worldFlash.a + (gem ? 0.3 : 0.38));
           break;
         }
+        case 'chalk':
+          if (ev.ok) {
+            // A puff of chalk dust off the wall where the mark went.
+            raycaster.particles.burst(
+              PARTICLE.SPARK,
+              ev.x,
+              ev.y,
+              0.5,
+              14,
+              0.9,
+              0.5,
+              PARTICLE_COLORS.dust,
+              fxRng.next,
+            );
+          } else {
+            const perks = /** @type {any} */ (state).perks;
+            hud.notice(
+              !perks || !(perks.chalk > 0)
+                ? NOTICE_CHALK_LOCKED
+                : state.run.chalk > 0
+                  ? NOTICE_CHALK_REACH
+                  : NOTICE_NO_CHALK,
+            );
+          }
+          break;
+        case 'ember':
+          hud.notice(NOTICE_EMBER);
+          worldFlash.r = 255;
+          worldFlash.g = 170;
+          worldFlash.b = 90;
+          worldFlash.a = Math.min(0.55, worldFlash.a + 0.45);
+          break;
+        case 'unlock':
+          // Progress is the one thing a player would be furious to lose: write it now.
+          persistNow(state);
+          break;
         case 'levelComplete':
           postFlash.r = 255;
           postFlash.g = 246;
@@ -581,7 +632,10 @@ function boot() {
       // Give the cursor back the moment the player is not driving: pause, death, level complete.
       exitPointerLock();
     }
-    if (to === 'levelComplete' || to === 'gameOver') persistNow(state);
+    // Gems go into the purse as they are picked up (§4.9), so a run abandoned to the title is
+    // written too, not only one that ended.
+    // Pausing writes too: a phone that kills a backgrounded tab may never deliver `pagehide`.
+    if (to === 'levelComplete' || to === 'gameOver' || to === 'title' || to === 'paused') persistNow(state);
     if (from === 'loading' && to === 'playing') hud.reset();
   }
 
@@ -618,7 +672,7 @@ function boot() {
   function persistNow(state) {
     persistDue = false;
     lastPersistAt = state.time;
-    savePersist({ best: state.best, settings: state.settings });
+    savePersist({ best: state.best, settings: state.settings, progress: /** @type {any} */ (state).progress });
   }
 
   /**
@@ -677,14 +731,13 @@ function boot() {
    * frame so a human can still drive the page while a tool is steering it.
    * @type {InputFrame}
    */
-  const injected = { moveX: 0, moveY: 0, turn: 0, lookDX: 0, sprint: false, pressed: new Set() };
+  const injected = { moveX: 0, moveY: 0, turn: 0, lookDX: 0, pressed: new Set() };
   /** The merged frame handed to the reducer in headless mode (reused, never reallocated). */
   const mergedFrame = /** @type {InputFrame} */ ({
     moveX: 0,
     moveY: 0,
     turn: 0,
     lookDX: 0,
-    sprint: false,
     pressed: new Set(),
   });
 
@@ -699,7 +752,6 @@ function boot() {
     mergedFrame.moveY = clamp(real.moveY + injected.moveY, -1, 1);
     mergedFrame.turn = clamp(real.turn + injected.turn, -1, 1);
     mergedFrame.lookDX = real.lookDX + injected.lookDX;
-    mergedFrame.sprint = real.sprint || injected.sprint;
     const set = mergedFrame.pressed;
     set.clear();
     for (const a of real.pressed) set.add(a);
@@ -895,6 +947,10 @@ function boot() {
     flash: worldFlash,
     portalOpen: true,
     reducedMotion: false,
+    marks: NO_MARKS,
+    flame: 1,
+    oilSense: 0,
+    whisper: 0,
   };
 
   /** The tick action, reused: the reducer allocates nothing per step and neither should we. */
@@ -972,6 +1028,14 @@ function boot() {
     renderView.exit = level === null ? renderView.exit : level.maze.exit;
     renderView.time = state.time + alpha / 60;
     renderView.reducedMotion = state.settings.reducedMotion;
+    // Unlocks the world itself shows (§4.9). The attract camera on the title wanders the plain game.
+    const inRun = state.phase !== 'title' && level !== null;
+    const perks = /** @type {any} */ (state).perks;
+    const marks = /** @type {any} */ (state).marks;
+    renderView.marks = inRun && Array.isArray(marks) ? marks : NO_MARKS;
+    renderView.flame = inRun && perks ? perks.flame : 1;
+    renderView.oilSense = inRun && perks ? perks.oilSense : 0;
+    renderView.whisper = inRun && perks ? perks.whisper : 0;
 
     // Torch strength drives the light radius (§4.5). The exponent keeps the dungeon readable for
     // most of the level and then closes in hard over the last fifth, which is where the tension is.
@@ -1057,7 +1121,7 @@ function boot() {
           if (typeof partial.lookDX === 'number' && Number.isFinite(partial.lookDX)) {
             injected.lookDX += partial.lookDX;
           }
-          if (typeof partial.sprint === 'boolean') injected.sprint = partial.sprint;
+
           const pressed = /** @type {any} */ (partial).pressed;
           if (pressed) {
             const list = Array.isArray(pressed) ? pressed : Array.from(pressed);
@@ -1070,7 +1134,6 @@ function boot() {
           injected.moveY = 0;
           injected.turn = 0;
           injected.lookDX = 0;
-          injected.sprint = false;
           injected.pressed.clear();
         },
       },

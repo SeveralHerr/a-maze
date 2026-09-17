@@ -737,3 +737,248 @@ function fitScaleUnit(unit, maxWidth, maxScale, minScale) {
   if (unit <= 0) return hi;
   return clamp(Math.floor(maxWidth / unit), lo, hi);
 }
+
+// ─── Unlock icons (ARCHITECTURE.md §4.9) ─────────────────────────────────────────────────────
+
+/** Side of every unlock icon, in art pixels. */
+export const UNLOCK_ICON = 9;
+
+/** Torch-group palette: 1 void, 2 oil deep, 3 oil mid, 4 oil light, 5 oil pale, 6 wood, 7 fire hot, 8 fire core, 9 iron. */
+const PAL_TORCH = Object.freeze([
+  null,
+  COLOR.void,
+  COLOR.oilDeep,
+  COLOR.oilMid,
+  COLOR.oilLight,
+  COLOR.oilPale,
+  COLOR.woodBright,
+  COLOR.fireHot,
+  COLOR.fireCore,
+  COLOR.ironHilite,
+]);
+
+/** Sight-group palette: 1 void, 2 stone dark, 3 stone light, 4 stone hilite, 5 gold, 6 gold light, 7 fire mid, 8 fire hot, 9 parchment. */
+const PAL_SIGHT = Object.freeze([
+  null,
+  COLOR.void,
+  COLOR.stoneDark,
+  COLOR.stoneLight,
+  COLOR.stoneHilite,
+  COLOR.goldBase,
+  COLOR.goldLight,
+  COLOR.fireMid,
+  COLOR.fireHot,
+  COLOR.parchment,
+]);
+
+/** Fortune-group palette: 1 void, 2 gem deep, 3 gem mid, 4 gem bright, 5 gem pale, 6 gold, 7 gold light, 8 stone hilite, 9 stone light. */
+const PAL_FORTUNE = Object.freeze([
+  null,
+  COLOR.void,
+  COLOR.gemDeep,
+  COLOR.gemMid,
+  COLOR.gemBright,
+  COLOR.gemPale,
+  COLOR.goldBase,
+  COLOR.goldLight,
+  COLOR.stoneHilite,
+  COLOR.stoneLight,
+]);
+
+/**
+ * One 9×9 glyph per unlock, keyed by the catalogue id. Drawn in the same chunky, outlined manner as
+ * the HUD's torch, gem and flask so a Shrine row and a HUD chip speak the same visual language.
+ * @type {Readonly<Record<string, {art: Art, palette: ReadonlyArray<string|null>}>>}
+ */
+const UNLOCK_ART = Object.freeze({
+  reservoir: icon('reservoir', PAL_TORCH, [
+    '.1111111.',
+    '122222221',
+    '199999991',
+    '123344321',
+    '123455321',
+    '199999991',
+    '123344321',
+    '122222221',
+    '.1111111.',
+  ]),
+  richOil: icon('richOil', PAL_TORCH, [
+    '...161...',
+    '...121...',
+    '..12321..',
+    '.1234321.',
+    '123454321',
+    '123455321',
+    '123444321',
+    '.1233321.',
+    '..11111..',
+  ]),
+  slowWick: icon('slowWick', PAL_TORCH, [
+    '....7....',
+    '...787...',
+    '...787...',
+    '....1....',
+    '..15551..',
+    '..15451..',
+    '..15451..',
+    '..15451..',
+    '.1111111.',
+  ]),
+  ember: icon('ember', PAL_TORCH, [
+    '...8...7.',
+    '..7......',
+    '....7....',
+    '..11111..',
+    '.1277721.',
+    '127888721',
+    '127787721',
+    '.1222221.',
+    '..11111..',
+  ]),
+  siphon: icon('siphon', PAL_TORCH, [
+    '111111111',
+    '.1344431.',
+    '..13331..',
+    '...131...',
+    '...141...',
+    '..12221..',
+    '.1234321.',
+    '.1235321.',
+    '..11111..',
+  ]),
+  wideFlame: icon('wideFlame', PAL_SIGHT, [
+    '7...8...7',
+    '.7..8..7.',
+    '....8....',
+    '...787...',
+    '78.888.87',
+    '...787...',
+    '....8....',
+    '.7..8..7.',
+    '7...8...7',
+  ]),
+  cartographer: icon('cartographer', PAL_SIGHT, [
+    '111111111',
+    '199929991',
+    '192222291',
+    '199929991',
+    '122292221',
+    '199929991',
+    '192222291',
+    '199929991',
+    '111111111',
+  ]),
+  oilSense: icon('oilSense', PAL_SIGHT, [
+    '.........',
+    '..11111..',
+    '.1444441.',
+    '144787441',
+    '147888741',
+    '144787441',
+    '.1444441.',
+    '..11111..',
+    '.........',
+  ]),
+  scrollSense: icon('scrollSense', PAL_SIGHT, [
+    '.1111111.',
+    '155555551',
+    '.1999991.',
+    '.1922291.',
+    '.1999991.',
+    '.1922291.',
+    '.1999991.',
+    '155555551',
+    '.1111111.',
+  ]),
+  whisper: icon('whisper', PAL_SIGHT, [
+    '..33333..',
+    '.3111113.',
+    '311111113',
+    '317111713',
+    '311717113',
+    '311171113',
+    '311717113',
+    '317111713',
+    '333333333',
+  ]),
+  lodestone: icon('lodestone', PAL_SIGHT, [
+    '..11111..',
+    '.1444441.',
+    '144484441',
+    '144878441',
+    '144484441',
+    '144454441',
+    '144454441',
+    '.1444441.',
+    '..11111..',
+  ]),
+  chalk: icon('chalk', PAL_FORTUNE, [
+    '.......11',
+    '......181',
+    '.....1881',
+    '....18891',
+    '...18891.',
+    '..18891..',
+    '.18891...',
+    '18891....',
+    '1111.....',
+  ]),
+  magnet: icon('magnet', PAL_FORTUNE, [
+    '11.....11',
+    '181...181',
+    '161...161',
+    '161...161',
+    '1661.1661',
+    '.1666661.',
+    '..11111..',
+    '....4....',
+    '...454...',
+  ]),
+  appraiser: icon('appraiser', PAL_FORTUNE, [
+    '...111...',
+    '..14541..',
+    '.1455541.',
+    '134444431',
+    '.1343431.',
+    '..13331..',
+    '...131...',
+    '..67776..',
+    '...666...',
+  ]),
+});
+
+/**
+ * @param {string} name
+ * @param {ReadonlyArray<string|null>} palette
+ * @param {string[]} rows
+ * @returns {{art: Art, palette: ReadonlyArray<string|null>}}
+ */
+function icon(name, palette, rows) {
+  return Object.freeze({ art: compileArt(rows, name), palette });
+}
+
+/**
+ * Draw an unlock's icon. An id with no art draws nothing (a catalogue entry added without an icon
+ * must look unfinished in a harness, never borrow another unlock's glyph).
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {string} id catalogue id
+ * @param {number} x
+ * @param {number} y
+ * @param {number} scale
+ * @returns {boolean} whether anything was drawn
+ */
+export function drawUnlockIcon(ctx, id, x, y, scale) {
+  const entry = Object.prototype.hasOwnProperty.call(UNLOCK_ART, id) ? UNLOCK_ART[id] : undefined;
+  if (entry === undefined) return false;
+  drawArt(ctx, entry.art, x, y, scale, entry.palette);
+  return true;
+}
+
+/**
+ * Does this id have an icon? (For the layout audit: every shipped unlock must.)
+ * @param {string} id
+ * @returns {boolean}
+ */
+export function hasUnlockIcon(id) {
+  return Object.prototype.hasOwnProperty.call(UNLOCK_ART, id);
+}

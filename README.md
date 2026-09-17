@@ -91,11 +91,15 @@ Your torch is running out, so keep finding oil and find the way down.
 Find the glowing portal to go down a level. Your torch burns out over time, so pick up oil
 flasks to refill it and grab gems for points. Each level is a bigger maze than the last.
 
+Gems also fill a purse you keep between runs. Spend it at the **Shrine** (title, level cleared and
+game over screens) on unlocks such as a bigger tank, richer oil, a slower wick, a magnet for gems or
+chalk to mark the walls. The first time you clear a new depth, you also pick one **Boon** for free.
+
 | Key | Action |
 |---|---|
 | `WASD` / arrows | Move and turn |
 | Mouse | Look (click the game to lock the mouse) |
-| `Shift` | Sprint |
+| `C` | Chalk the wall ahead (once unlocked) |
 | `M` | Map |
 | `Esc` | Pause |
 

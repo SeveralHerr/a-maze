@@ -54,27 +54,30 @@ test('constants: the invariants the collision solver and feel depend on', () => 
 
 // ─── levelParams ─────────────────────────────────────────────────────────────────────────────
 
-test('levelParams: level 1 is a 16×16 unbraided maze with a few shortcuts and a small, fixed tank', () => {
+test('levelParams: level 1 is the lean first floor — small, unbraided, a short tank, thin pickings', () => {
   const p = levelParams(1);
-  assert.equal(p.cols, 16, 'massive mazes: level 1 is 16×16 cells = 33×33 tiles');
-  assert.equal(p.rows, 16);
+  assert.equal(p.cols, LEVEL.FIRST_CELLS, 'the first floor is 10×10 cells = 21×21 tiles');
+  assert.equal(p.rows, LEVEL.FIRST_CELLS);
   assert.equal(p.braid, 0, 'level 1 is unbraided');
   assert.equal(p.shortcuts, Math.round(p.cells / LEVEL.SHORTCUT_CELLS), 'shortcuts scale with area');
-  assert.ok(p.shortcuts >= 3 && p.shortcuts <= 8, `level 1 asks for a few shortcuts (${p.shortcuts})`);
   assert.equal(p.shortcutDetour, LEVEL.SHORTCUT_DETOUR);
   assert.equal(p.shortcutRouteKeep, LEVEL.SHORTCUT_ROUTE_KEEP);
-  assert.equal(p.fuelSeconds, FUEL.TANK_START, 'the tank, not a size-based budget');
-  assert.ok(p.fuelSeconds >= 100 && p.fuelSeconds <= 120, `a ~110 s tank (${p.fuelSeconds} s)`);
-  assert.equal(p.drain, 1, 'no extra drain before the size cap');
-  assert.ok(p.gems >= LEVEL.GEM_MIN);
-  assert.ok(p.oil >= LEVEL.OIL_MIN);
+  assert.equal(p.fuelSeconds, LEVEL.FIRST_TANK, 'its own short tank');
+  assert.ok(p.fuelSeconds < FUEL.TANK_START, 'shorter than level 2');
+  assert.equal(p.drain, 1, 'no extra drain before the ramp');
+  assert.equal(p.gems, LEVEL.FIRST_GEM_MIN, 'a handful of gems');
+  assert.equal(p.oil, LEVEL.FIRST_OIL_MIN, 'a few scatter flasks on top of the refuel chain');
+  // Level 2 is exactly where the massive-maze curve always had it.
+  const p2 = levelParams(2);
+  assert.equal(p2.cols, LEVEL.BASE_CELLS + LEVEL.GROWTH);
+  assert.ok(p2.fuelSeconds >= FUEL.TANK_START);
 });
 
 test('levelParams: the tank is independent of the maze area', () => {
   // The whole point of the new economy: 64× the area, well under 1.4× the tank.
-  const first = levelParams(1);
+  const first = { cells: LEVEL.BASE_CELLS * LEVEL.BASE_CELLS, fuelSeconds: FUEL.TANK_START };
   const capped = levelParams(CAP_LEVEL);
-  assert.equal(capped.cells / first.cells, 64, 'the cap level is 64× the area of level 1');
+  assert.equal(capped.cells / first.cells, 64, 'the cap level is 64× the area the curve starts from');
   assert.ok(capped.fuelSeconds / first.fuelSeconds < 1.4, 'the tank barely moves');
   assert.equal(capped.fuelSeconds, FUEL.TANK_END);
   // …and past the cap it stops moving entirely: difficulty comes from drain and density.
@@ -115,9 +118,12 @@ test('levelParams: the curve grows, braids and tightens monotonically, then caps
 });
 
 test('levelParams: item counts are a density over the area, hundreds of them deep down', () => {
-  const p1 = levelParams(1);
-  assert.ok(Math.abs(p1.oil - p1.cells / LEVEL.OIL_CELLS_START) <= 1, 'one flask per ~20 cells');
-  assert.ok(Math.abs(p1.gems - p1.cells / LEVEL.GEM_CELLS_START) <= 1, 'one gem per ~50 cells');
+  const p1 = levelParams(2);
+  const t2 = 1 / LEVEL.DENSITY_RAMP_LEVELS;
+  const oilCells2 = LEVEL.OIL_CELLS_START + (LEVEL.OIL_CELLS_END - LEVEL.OIL_CELLS_START) * t2;
+  const gemCells2 = LEVEL.GEM_CELLS_START + (LEVEL.GEM_CELLS_END - LEVEL.GEM_CELLS_START) * t2;
+  assert.ok(Math.abs(p1.oil - p1.cells / oilCells2) <= 1, 'one flask per ~20 cells');
+  assert.ok(Math.abs(p1.gems - p1.cells / gemCells2) <= 1, 'one gem per ~50 cells');
   const pc = levelParams(CAP_LEVEL);
   assert.ok(pc.oil > 430 && pc.oil < 530, `~482 flasks at the cap (${pc.oil})`);
   assert.ok(pc.gems > 250 && pc.gems < 300, `~273 gems at the cap (${pc.gems})`);
@@ -145,10 +151,11 @@ test('levelParams: oilTargetGap is a distance one flask can actually pay for', (
 });
 
 test('tankSeconds / drainRate / travelTiles / estimatedPathTiles: the derived curve helpers', () => {
-  assert.equal(tankSeconds(1), FUEL.TANK_START);
+  assert.equal(tankSeconds(1), LEVEL.FIRST_TANK, 'the lean first floor');
+  assert.ok(tankSeconds(2) > FUEL.TANK_START && tankSeconds(2) < FUEL.TANK_END, 'level 2 is on the curve');
   assert.equal(tankSeconds(CAP_LEVEL), FUEL.TANK_END);
   assert.equal(tankSeconds(1e6), FUEL.TANK_END);
-  assert.equal(tankSeconds(NaN), FUEL.TANK_START, 'garbage degrades to level 1');
+  assert.equal(tankSeconds(NaN), LEVEL.FIRST_TANK, 'garbage degrades to level 1');
   assert.equal(drainRate(1), 1, 'level 1 burns at exactly 1×');
   assert.equal(drainRate(LEVEL.DRAIN_RAMP_START), 1, 'the generous half of the curve is flat');
   assert.equal(
@@ -168,7 +175,8 @@ test('tankSeconds / drainRate / travelTiles / estimatedPathTiles: the derived cu
   assert.equal(travelTiles(110, 2), travelTiles(110, 1) / 2, 'drain halves the reach');
   assert.equal(travelTiles(-5), 0);
   assert.equal(travelTiles(NaN), 0);
-  assert.equal(estimatedPathTiles(1), 16 * LEVEL.PATH_TILES_PER_SIDE);
+  assert.equal(estimatedPathTiles(1), LEVEL.FIRST_CELLS * LEVEL.PATH_TILES_PER_SIDE);
+  assert.equal(estimatedPathTiles(2), (LEVEL.BASE_CELLS + LEVEL.GROWTH) * LEVEL.PATH_TILES_PER_SIDE);
   assert.ok(estimatedPathTiles(1e6) === LEVEL.MAX_CELLS * LEVEL.PATH_TILES_PER_SIDE);
 });
 
@@ -184,7 +192,7 @@ test('resolveTank: the state module owns the tank; level data may lower it, neve
 test('levelParams: garbage input degrades to level 1 instead of producing NaN', () => {
   for (const bad of [0, -5, NaN, Infinity, -Infinity, /** @type {any} */ ('7'), undefined, null]) {
     const p = levelParams(/** @type {any} */ (bad));
-    assert.equal(p.cols, LEVEL.BASE_CELLS, `level ${String(bad)} → level 1`);
+    assert.equal(p.cols, LEVEL.FIRST_CELLS, `level ${String(bad)} → level 1`);
     assert.ok(Number.isFinite(p.fuelSeconds));
   }
   assert.equal(levelParams(3.9).cols, levelParams(3).cols, 'fractional levels floor');
@@ -239,13 +247,13 @@ test('oilFuel: scales with the tank and stays inside its clamps', () => {
   }
 });
 
-test('sprint: a sprinted tile always costs more torch than a walked one', () => {
-  // Regression: FUEL.SPRINT_MULT 1.5 against PLAYER.SPRINT_MULT 1.6 made sprinting 37 % faster AND
-  // 6 % cheaper per tile, so the only trade-off in the controls ran backwards.
-  const premium = FUEL.SPRINT_MULT / PLAYER.SPRINT_MULT;
-  assert.ok(premium >= FUEL.SPRINT_TILE_PREMIUM_MIN, `fuel per sprinted tile is ${premium.toFixed(3)}× a walked one`);
-  assert.ok(FUEL.SPRINT_TILE_PREMIUM_MIN >= 1.15);
-  assert.ok(PLAYER.SPRINT_MULT > 1, 'sprint is still faster');
+test('no sprint: one walking speed, and the balance tables carry no sprint knobs', () => {
+  // Sprint was removed in the unlocks wave (ARCHITECTURE.md §1). A stray knob left behind would be a
+  // number that tunes nothing, which is how a later edit "fixes" a mechanic that no longer exists.
+  for (const table of [PLAYER, FUEL]) {
+    for (const key of Object.keys(table)) assert.ok(!/SPRINT/.test(key), `stale sprint knob ${key}`);
+  }
+  assert.ok(PLAYER.WALK_SPEED > 0);
 });
 
 test('gapSafety: headroom ramps over the size curve and never reaches 1', () => {

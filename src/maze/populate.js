@@ -140,7 +140,7 @@ import { TILE, DIR_COUNT, DIR_DX, DIR_DY, DIR_OPPOSITE, MAP_MIN_DETOUR_TILES } f
 
 // ─── Mirrored gameplay constants (see the file header) ───────────────────────────────────────
 
-/** Nominal sustained walking speed, tiles per second (no sprint). Mirrors `PLAYER.WALK_SPEED`. */
+/** Walking speed, tiles per second (the only speed there is). Mirrors `PLAYER.WALK_SPEED`. */
 const WALK_SPEED = 3.2;
 
 /** Multiplier on the direct route time for turning, acceleration and wall-hugging overhead. */

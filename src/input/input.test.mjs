@@ -99,13 +99,19 @@ test('keyboard: two keys on one slot need both releases (no stuck-then-stop)', (
   t.input.destroy();
 });
 
-test('keyboard: shift sprints, and a duplicate keydown does not double-count', () => {
+test('keyboard: C chalks, Shift does nothing, and a repeated key does not re-fire an action', () => {
   const t = setup();
+  t.keyDown('KeyC');
+  t.keyDown('KeyC', { repeat: true });
+  const f = t.input.poll();
+  assert.ok(f.pressed.has('chalk'));
+  assert.equal(/** @type {any} */ (f).sprint, undefined, 'the frame has no sprint field');
+  t.keyUp('KeyC');
+  assert.equal(t.input.poll().pressed.size, 0, 'an auto-repeat is not a second chalk');
   t.keyDown('ShiftLeft');
-  t.keyDown('ShiftLeft', { repeat: true });
-  assert.equal(t.input.poll().sprint, true);
-  t.keyUp('ShiftLeft');
-  assert.equal(t.input.poll().sprint, false, 'one keyup clears a repeated keydown');
+  const g = t.input.poll();
+  assert.equal(g.moveX + g.moveY + g.turn, 0);
+  assert.equal(g.pressed.size, 0, 'Shift is unbound');
   t.input.destroy();
 });
 
@@ -242,7 +248,7 @@ test('blur clears every held input but keeps already-queued actions', () => {
   const t = setup();
   t.keyDown('KeyW');
   t.keyDown('KeyD');
-  t.keyDown('ShiftLeft');
+  t.keyDown('KeyE');
   t.keyDown('KeyP'); // queued action, not yet polled
   t.env.window.dispatchEvent({ type: 'blur' });
 
@@ -250,7 +256,6 @@ test('blur clears every held input but keeps already-queued actions', () => {
   assert.equal(f.moveX, 0);
   assert.equal(f.moveY, 0);
   assert.equal(f.turn, 0);
-  assert.equal(f.sprint, false);
   assert.equal(f.lookDX, 0);
   assert.ok(f.pressed.has('pause'), 'a real press is not swallowed by losing focus');
 
@@ -898,7 +903,8 @@ test('gamepad: buttons are edge-triggered and d-pad moves', () => {
   assert.ok(tap([9]).has('pause'), 'Start pauses');
   assert.ok(tap([8]).has('map'), 'Back/View toggles the map');
   assert.ok(tap([3]).has('mute'), 'Y mutes');
-  assert.equal(tap([5]).size, 0, 'RB is not a mute a sprinting thumb can graze');
+  assert.equal(tap([5]).size, 0, 'RB is not a mute a resting thumb can graze');
+  assert.ok(tap([2]).has('chalk'), 'X chalks');
 
   // D-pad: up/down move, left/right turn, and they also navigate menus.
   t.env.setGamepads([fakePad({ pressed: [12] })]);
@@ -924,12 +930,13 @@ function pollPastProbe(t) {
   return f;
 }
 
-test('gamepad: triggers sprint, and a disconnected pad is ignored', () => {
+test('gamepad: triggers drive nothing, and a disconnected pad is ignored', () => {
   const t = setup();
   t.env.setGamepads([fakePad({ pressed: [7] })]);
-  assert.equal(t.input.poll().sprint, true);
+  const held = t.input.poll();
+  assert.equal(held.moveX + held.moveY + held.turn, 0, 'a held trigger no longer sprints, or does anything');
   t.env.setGamepads([null, undefined]);
-  assert.equal(t.input.poll().sprint, false);
+  t.input.poll();
   t.env.setGamepads([{ connected: false, mapping: 'standard', axes: [1, 1], buttons: [] }]);
   const f = pollPastProbe(t);
   assert.equal(f.moveX, 0, 'a disconnected pad contributes nothing');
@@ -965,19 +972,18 @@ test('gamepad: a non-standard pad cannot spin the camera (its axis 2 often rests
   u.input.destroy();
 });
 
-test('gamepad: a non-standard pad holding a button at rest cannot sprint or act forever', () => {
+test('gamepad: a non-standard pad holding a button at rest cannot act forever', () => {
   const t = setup();
-  t.env.setGamepads([fakePad({ mapping: '', pressed: [7, 9] })]);
+  t.env.setGamepads([fakePad({ mapping: '', pressed: [2, 9] })]);
   for (let i = 0; i < 30; i++) {
     const f = t.input.poll();
-    assert.equal(f.sprint, false, 'a resting trigger reported as a pressed button is not sprint');
-    assert.equal(f.pressed.size, 0);
+    assert.equal(f.pressed.size, 0, 'a button reported pressed at rest is not a press');
   }
   // Once the same control has been seen released it is a real button and behaves normally.
   t.env.setGamepads([fakePad({ mapping: '', pressed: [] })]);
   t.input.poll();
-  t.env.setGamepads([fakePad({ mapping: '', pressed: [7] })]);
-  assert.equal(t.input.poll().sprint, true);
+  t.env.setGamepads([fakePad({ mapping: '', pressed: [9] })]);
+  assert.ok(t.input.poll().pressed.has('pause'));
   t.input.destroy();
 });
 
@@ -1102,7 +1108,6 @@ test('touch: the left 40% is a dynamic-origin virtual stick', () => {
   t.env.canvas.dispatchEvent(touchEvent('touchmove', [{ id: 1, x: 100, y: 440 }]));
   f = t.input.poll();
   assert.equal(f.moveY, 1, 'a full-radius push forward is full speed');
-  assert.equal(f.sprint, false, 'full speed is not sprinting');
 
   // Beyond the ring the origin follows, so the thumb can always come back.
   t.env.canvas.dispatchEvent(touchEvent('touchmove', [{ id: 1, x: 100, y: 200 }]));
@@ -1114,51 +1119,19 @@ test('touch: the left 40% is a dynamic-origin virtual stick', () => {
   t.env.canvas.dispatchEvent(touchEvent('touchend', [{ id: 1, x: 100, y: 230 }]));
   f = t.input.poll();
   assert.equal(f.moveY, 0);
-  assert.equal(f.sprint, false);
   t.input.destroy();
 });
 
-test('touch: sprint is an outward flick, not "the thumb left the ring"', () => {
+test('touch: a fast outward flick is just walking — there is no sprint to latch', () => {
   const t = setup();
-
-  // A slow, ordinary drag across the glass — the stick's origin slides with it and the magnitude
-  // pins to 1, but the player did not ask to sprint and must not burn fuel 1.5x for walking.
-  t.env.canvas.dispatchEvent(touchEvent('touchstart', [{ id: 1, x: 100, y: 500 }]));
-  for (let y = 480; y >= 260; y -= 20) {
-    t.env.advance(120); // 20 px per 120 ms: nothing like a shove
-    t.env.canvas.dispatchEvent(touchEvent('touchmove', [{ id: 1, x: 100, y }]));
-    const f = t.input.poll();
-    assert.equal(f.sprint, false, `dragging must not sprint (y=${y})`);
-  }
-  assert.equal(t.input.poll().moveY, 1, 'but it is still full-speed walking');
-  t.env.canvas.dispatchEvent(touchEvent('touchend', [{ id: 1, x: 100, y: 260 }]));
-  t.input.poll();
-
-  // A deliberate flick: past 1.4 ring radii from where the thumb landed, inside the window.
   t.env.canvas.dispatchEvent(touchEvent('touchstart', [{ id: 2, x: 100, y: 500 }]));
   t.env.advance(80);
   t.env.canvas.dispatchEvent(touchEvent('touchmove', [{ id: 2, x: 100, y: 400 }]));
-  let f = t.input.poll();
-  assert.equal(f.sprint, true, '100 px in 80 ms is a shove');
-  assert.equal(f.moveY, 1);
-
-  // It stays latched while the thumb stays out there…
-  t.env.advance(400);
-  t.env.canvas.dispatchEvent(touchEvent('touchmove', [{ id: 2, x: 100, y: 380 }]));
-  assert.equal(t.input.poll().sprint, true);
-
-  // …and drops the moment the thumb eases back off the rim.
+  const f = t.input.poll();
+  assert.equal(f.moveY, 1, 'full speed forward');
+  assert.equal(/** @type {any} */ (f).sprint, undefined);
   t.env.canvas.dispatchEvent(touchEvent('touchmove', [{ id: 2, x: 100, y: 450 }]));
-  f = t.input.poll();
-  assert.equal(f.sprint, false, 'easing back off the rim is how you stop sprinting');
-  assert.ok(Math.abs(f.moveY) < 1, 'and the stick is no longer pinned');
-
-  // The same travel taken slowly never latches.
-  t.env.canvas.dispatchEvent(touchEvent('touchend', [{ id: 2, x: 100, y: 470 }]));
-  t.env.canvas.dispatchEvent(touchEvent('touchstart', [{ id: 3, x: 100, y: 500 }]));
-  t.env.advance(900);
-  t.env.canvas.dispatchEvent(touchEvent('touchmove', [{ id: 3, x: 100, y: 380 }]));
-  assert.equal(t.input.poll().sprint, false, 'slow travel is walking, however far it goes');
+  assert.ok(Math.abs(t.input.poll().moveY) < 1, 'easing back slows down, nothing latched');
   t.input.destroy();
 });
 
@@ -1277,12 +1250,11 @@ test('poll() reuses one frame object and one Set (no per-step allocation)', () =
 test('the frame always carries the exact contract shape', () => {
   const t = setup();
   const f = t.input.poll();
-  assert.deepEqual(Object.keys(f).sort(), ['lookDX', 'moveX', 'moveY', 'pressed', 'sprint', 'turn']);
+  assert.deepEqual(Object.keys(f).sort(), ['lookDX', 'moveX', 'moveY', 'pressed', 'turn']);
   assert.equal(typeof f.moveX, 'number');
   assert.equal(typeof f.moveY, 'number');
   assert.equal(typeof f.turn, 'number');
   assert.equal(typeof f.lookDX, 'number');
-  assert.equal(typeof f.sprint, 'boolean');
   assert.ok(f.pressed instanceof Set);
   t.input.destroy();
 });

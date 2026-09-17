@@ -1,6 +1,6 @@
 // @ts-check
 /**
- * @file On-screen touch controls: the virtual stick's visuals plus the pause / map buttons.
+ * @file On-screen touch controls: the virtual stick's visuals plus the pause / map / chalk buttons.
  *
  * Styling is CSS-in-JS (inline `cssText`) on purpose. `styles.css` is integrator territory, and a
  * control layer that ships its own look cannot be broken by an unrelated stylesheet edit; it also
@@ -10,8 +10,8 @@
  * a 1-pixel black drop shadow — i.e. the same gold-on-stone palette as the in-game lettering.
  *
  * Responsibilities kept *out* of here: no touch tracking (that is `input.js`, which owns the
- * gesture state for all devices), no game state (the overlay only reads `state.phase`, `settings.mapMode` and
- * `run.mapFound`), no
+ * gesture state for all devices), no game state (the overlay only reads `state.phase`, `settings.mapMode`,
+ * `run.mapFound`, `run.chalk` and `perks.chalk`), no
  * per-frame work (`update()` early-returns unless the phase changed, and the stick is only
  * repainted when `input.js` reports a new thumb position).
  *
@@ -23,15 +23,16 @@
 /**
  * The handle returned by {@link createTouchOverlay}.
  * @typedef {Object} TouchOverlay
- * @property {(state: {phase?: string, settings?: {mapMode?: string}, run?: {mapFound?: boolean}}|null|undefined) => void} update
+ * @property {(state: {phase?: string, settings?: {mapMode?: string}, run?: {mapFound?: boolean, chalk?: number}, perks?: {chalk?: number}}|null|undefined) => void} update
  *   Bind visibility to the game phase. Controls show only while `phase === 'playing'` (a pause or
  *   title menu draws its own buttons). The map mode only sets the bar's `data-map` styling hook;
  *   it never moves a button. While `run.mapFound === false` the bar carries `data-map-locked="1"`
- *   and the MAP button is dimmed (opacity only). Safe to call every frame: a few compares.
- * @property {(active: boolean, originX: number, originY: number, knobX: number, knobY: number, sprint?: boolean) => void} setStick
+ *   and the MAP button is dimmed (opacity only). The CHALK button exists only once the Chalk unlock
+ *   is owned (`perks.chalk > 0`, ARCHITECTURE.md §4.9) and dims at zero charges. Safe to call every
+ *   frame: a few compares.
+ * @property {(active: boolean, originX: number, originY: number, knobX: number, knobY: number) => void} setStick
  *   Move/show/hide the virtual stick. Coordinates are **CSS pixels in viewport space** (i.e. raw
- *   `Touch.clientX/clientY`), matching what `input.js` already tracks. `sprint` lights the knob up
- *   while the flick-to-sprint latch is on, so a touch player can see they are burning fuel faster.
+ *   `Touch.clientX/clientY`), matching what `input.js` already tracks.
  * @property {() => void} destroy   Remove every node and listener this overlay created.
  * @property {HTMLElement|null} element  The overlay's root node (null if the DOM was unusable).
  */
@@ -67,13 +68,13 @@ const BAR_DROP_PX = 64;
 /** MAP button opacity while the level's map scroll has not been found (§4.8). Dim, not gone. */
 const MAP_LOCKED_OPACITY = '0.4';
 
-/** Knob look while the flick-to-sprint latch is on: brighter rim and a hot glow (fuel burns 1.5×). */
-const KNOB_SPRINT_BORDER = '#ffd37a';
-const KNOB_SPRINT_BG = 'rgba(255,176,64,0.55)';
-const KNOB_SPRINT_SHADOW = 'inset 0 0 0 2px rgba(0,0,0,0.5),0 0 18px 4px rgba(255,160,40,0.6)';
+/** The thumb knob's look. */
 const KNOB_IDLE_BORDER = GOLD;
 const KNOB_IDLE_BG = 'rgba(217,164,65,0.30)';
 const KNOB_IDLE_SHADOW = 'inset 0 0 0 2px rgba(0,0,0,0.5),0 0 10px rgba(217,164,65,0.25)';
+
+/** CHALK button opacity while this level's chalk charges are spent. */
+const CHALK_EMPTY_OPACITY = '0.4';
 
 /**
  * Create the on-screen touch controls inside `root`.
@@ -84,7 +85,7 @@ const KNOB_IDLE_SHADOW = 'inset 0 0 0 2px rgba(0,0,0,0.5),0 0 10px rgba(217,164,
  *
  * @param {HTMLElement|null|undefined} root  container to append into; `#touch` in `index.html`
  * @param {Object} [opts]
- * @param {(action: InputAction) => void} [opts.onAction]  called on press with `'pause'`/`'map'`
+ * @param {(action: InputAction) => void} [opts.onAction]  called on press with `'pause'`/`'map'`/`'chalk'`
  * @param {Document} [opts.document]  injectable document (Node tests pass a fake)
  * @returns {TouchOverlay}
  */
@@ -262,6 +263,10 @@ export function createTouchOverlay(root, opts) {
 
   const mapBtn = makeButton('MAP', 'map');
   const pauseBtn = makeButton('PAUSE', 'pause');
+  // Before MAP, so adding it never moves the two buttons a thumb already knows (see BAR_DROP_PX).
+  const chalkBtn = makeButton('CHALK', 'chalk');
+  chalkBtn.style.display = 'none';
+  bar.appendChild(chalkBtn);
   bar.appendChild(mapBtn);
   bar.appendChild(pauseBtn);
 
@@ -274,7 +279,8 @@ export function createTouchOverlay(root, opts) {
   let visible = true; // visible until the first update() binds us to a phase
   let mapAttr = ''; // last `data-map` written
   let mapLocked = false; // last `data-map-locked` state written
-  let knobSprint = false;
+  let chalkShown = false; // last CHALK visibility written
+  let chalkEmpty = false; // last CHALK dimming written
   let stickShown = false;
   let ringX = NaN;
   let ringY = NaN;
@@ -321,6 +327,20 @@ export function createTouchOverlay(root, opts) {
         mapBtn.style.opacity = locked ? MAP_LOCKED_OPACITY : '';
       }
 
+      // Chalk (§4.9): the button appears once the unlock is owned and dims when the level's
+      // charges are spent — it still fires, so main.js can say why nothing was drawn.
+      const perks = state ? /** @type {any} */ (state).perks : null;
+      const hasChalk = !!perks && perks.chalk > 0;
+      if (hasChalk !== chalkShown) {
+        chalkShown = hasChalk;
+        chalkBtn.style.display = hasChalk ? '' : 'none';
+      }
+      const empty = hasChalk && !!run && run.chalk === 0;
+      if (empty !== chalkEmpty) {
+        chalkEmpty = empty;
+        chalkBtn.style.opacity = empty ? CHALK_EMPTY_OPACITY : '';
+      }
+
       // Anything that is not the playing phase is a menu, and menus own the screen: hiding the
       // buttons there prevents a stray tap from re-pausing an already paused game.
       const show = !state || typeof state.phase !== 'string' ? true : state.phase === 'playing';
@@ -330,16 +350,8 @@ export function createTouchOverlay(root, opts) {
       if (!show) setStickShown(false);
     },
 
-    setStick(active, originX, originY, kx, ky, sprint) {
+    setStick(active, originX, originY, kx, ky) {
       if (destroyed) return;
-      const hot = active === true && sprint === true && visible;
-      if (hot !== knobSprint) {
-        // Written only on a change of the latch, so a touchmove adds no style writes.
-        knobSprint = hot;
-        knob.style.borderColor = hot ? KNOB_SPRINT_BORDER : KNOB_IDLE_BORDER;
-        knob.style.background = hot ? KNOB_SPRINT_BG : KNOB_IDLE_BG;
-        knob.style.boxShadow = hot ? KNOB_SPRINT_SHADOW : KNOB_IDLE_SHADOW;
-      }
       if (!active || !visible) {
         setStickShown(false);
         return;

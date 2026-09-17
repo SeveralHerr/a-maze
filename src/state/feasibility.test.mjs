@@ -425,7 +425,7 @@ function reducerWalk(level, seed, wander) {
   reducer(s, { type: 'newGame', seed });
   s.level = level;
   reducer(s, { type: 'levelReady', data });
-  const input = { moveX: 0, moveY: 0, turn: 0, lookDX: 0, sprint: false };
+  const input = { moveX: 0, moveY: 0, turn: 0, lookDX: 0 };
   const tick = { type: 'tick', dt: 1 / 60, input };
   const tank = s.run.fuelMax;
   let wp = 0;
@@ -492,7 +492,12 @@ test('tension: the torch runs measurably lower deep in the curve, and every walk
     }
     return { avgMin: sum / runs, cues };
   }
-  const EARLY = [1, 2];
+  // Level 1 is the lean first floor (unlocks wave, `LEVEL.FIRST_*`): deliberately tight, so it is
+  // held to "every walk wins" only, and the generous band the depth trend is measured from is the
+  // start of the real size curve, levels 2–3.
+  band([1], FUEL.WANDER);
+  band([1], 1);
+  const EARLY = [2, 3];
   const DEEP = [10, 11, 12];
   const early2 = band(EARLY, FUEL.WANDER);
   const deep2 = band(DEEP, FUEL.WANDER);
@@ -504,7 +509,10 @@ test('tension: the torch runs measurably lower deep in the curve, and every walk
       `path only: ${early1.avgMin.toFixed(3)} → ${deep1.avgMin.toFixed(3)} (${deep1.cues} cues)`,
   );
   assert.ok(
-    deep2.avgMin <= early2.avgMin - 0.12,
+    // 0.08 rather than 0.12 since the band moved from levels 1–2 to 2–3 (the old 16×16 level 1 was
+    // the most generous level in the game; measured at the same seeds: 0.705 → 0.609). The path-only
+    // walker below, the player a thinner economy kills first, still has to show the full 0.12.
+    deep2.avgMin <= early2.avgMin - 0.08,
     `a wandering player's lowest tank must fall with depth: ${early2.avgMin.toFixed(3)} → ${deep2.avgMin.toFixed(3)}`,
   );
   assert.ok(

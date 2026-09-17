@@ -160,7 +160,7 @@ test('the HUD stays inside the per-frame allocation budget in every map mode, lo
 test('every menu screen stays inside the per-frame allocation budget', { skip }, async () => {
   const cases = [
     ['title', 'title', []],
-    ['title', 'options', ['down', 'confirm']],
+    ['title', 'options', ['down', 'down', 'confirm']],
     ['title', 'controls', ['back', 'down', 'confirm']],
     ['title', 'credits', ['back', 'down', 'confirm']],
     ['paused', 'pause', []],

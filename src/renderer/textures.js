@@ -88,6 +88,8 @@ const BAYER = Float32Array.from(
  * @property {Texture[]} oil        4 bob frames
  * @property {Texture[]} sparkle    4 frames, emissive
  * @property {Texture[]} map        1 frame: the hidden map scroll (§4.8), solid, not emissive
+ * @property {Texture[]} chalk      {@link CHALK_VARIANTS} wall decals: the word A-MAZE scrawled big and
+ *   diagonally in chalk (§4.9). Index 0 = bare wall; drawn over a wall face, never as a sprite
  */
 
 /** Scratch mask reused by the wall painter (mortar map). Painting is single-threaded and
@@ -1179,6 +1181,114 @@ function paintSparkle(frame, stipple) {
   return buf;
 }
 
+// ─── Chalk lettering (ARCHITECTURE.md §4.9) ────────────────────────────────────────────────────
+
+/** How many differently slanted A-MAZE scrawls the set carries. */
+export const CHALK_VARIANTS = 8;
+
+/**
+ * The chalk hand: five-by-seven capitals for the only word the player ever writes. Upright,
+ * uniform strokes — a chalk stick has no thick and thin — with the M's middle stroke dropped to the
+ * baseline the way it is written fast.
+ * @type {Readonly<Record<string, ReadonlyArray<string>>>}
+ */
+const CHALK_GLYPHS = Object.freeze({
+  A: Object.freeze(['.###.', '#...#', '#...#', '#####', '#...#', '#...#', '#...#']),
+  '-': Object.freeze(['.....', '.....', '.....', '.###.', '.....', '.....', '.....']),
+  M: Object.freeze(['#...#', '##.##', '#.#.#', '#.#.#', '#...#', '#...#', '#...#']),
+  Z: Object.freeze(['#####', '....#', '...#.', '..#..', '.#...', '#....', '#####']),
+  E: Object.freeze(['#####', '#....', '#....', '####.', '#....', '#....', '#####']),
+});
+
+/** The word. */
+const CHALK_WORD = 'A-MAZE';
+/** Texels per glyph pixel: big enough to read across a corridor, small enough to fit the slant. */
+const CHALK_SCALE = 2;
+/** Glyph advance in texels (5 pixels × scale + a 2-texel gap, so M and A never touch). */
+const CHALK_ADVANCE = 5 * CHALK_SCALE + 2;
+
+/**
+ * Paint one A-MAZE scrawl: the word rotated to a random diagonal (36–45° either way, which is as
+ * shallow as the 70-texel line can lie and still fit the 64-texel face), each letter nudged off the
+ * baseline like handwriting, the strokes broken where chalk skips on stone, and a little powder
+ * around them. Index 0 is bare wall.
+ * @param {number} seed
+ * @returns {Uint8Array}
+ */
+function paintChalk(seed) {
+  const buf = new Uint8Array(AREA);
+  const rng = createRng(seed);
+  const slant = rng.range(36, 45) * (Math.PI / 180) * (rng.chance(0.5) ? -1 : 1);
+  const cos = Math.cos(slant);
+  const sin = Math.sin(slant);
+  const cx = 32 + rng.range(-0.5, 0.5);
+  const cy = 32 + rng.range(-0.5, 0.5);
+  const textW = CHALK_WORD.length * CHALK_ADVANCE - 1;
+  const textH = 7 * CHALK_SCALE;
+  /** Per-letter baseline wobble, in texels. */
+  const wobble = new Float32Array(CHALK_WORD.length);
+  for (let i = 0; i < wobble.length; i++) wobble[i] = rng.range(-1.2, 1.2);
+
+  // Pass 1: the stroke mask, sampled back through the rotation (nearest texel, so every stroke is a
+  // solid run two texels thick at any slant).
+  const core = new Uint8Array(AREA);
+  for (let y = 0; y < SIZE; y++) {
+    for (let x = 0; x < SIZE; x++) {
+      const dx = x + 0.5 - cx;
+      const dy = y + 0.5 - cy;
+      const u = dx * cos + dy * sin + textW / 2;
+      const v = -dx * sin + dy * cos + textH / 2;
+      // Four sub-samples half a texel apart: a stroke sampled at one point per texel broke into
+      // stairs at a slant ("A-MAZE" read as "A-HAPZE" up close); any hit inks the texel, which
+      // thickens every stroke by about half a texel and keeps it continuous.
+      for (let k = 0; k < 4; k++) {
+        const su = u + (k & 1) * 0.5 - 0.25;
+        const sv = v + ((k >> 1) & 1) * 0.5 - 0.25;
+        if (su < 0 || su >= textW) continue;
+        const letter = Math.floor(su / CHALK_ADVANCE);
+        const lx = su - letter * CHALK_ADVANCE;
+        if (letter < 0 || letter >= CHALK_WORD.length || lx >= 5 * CHALK_SCALE) continue;
+        const lv = sv - wobble[letter];
+        if (lv < 0 || lv >= textH) continue;
+        const rows = CHALK_GLYPHS[CHALK_WORD.charAt(letter)];
+        if (rows[Math.floor(lv / CHALK_SCALE)].charCodeAt(Math.floor(lx / CHALK_SCALE)) === 35) {
+          core[(y << 6) | x] = 1;
+          break;
+        }
+      }
+    }
+  }
+
+  // Pass 2: tone. The heart of a stroke is pale, a stroke skips here and there, and its broken edge
+  // smudges into powder. Nothing is drawn away from the letters: a mark must read as writing, and
+  // specks across the whole face read as a dirty texture instead.
+  for (let y = 0; y < SIZE; y++) {
+    for (let x = 0; x < SIZE; x++) {
+      const i = (y << 6) | x;
+      if (core[i] === 1) {
+        const r = rng.next();
+        buf[i] = r < 0.03 ? C.chalkSmudge : r < 0.22 ? C.chalkMid : C.chalkPale;
+        continue;
+      }
+      let near = 0;
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -1; ox <= 1; ox++) {
+          const nx = x + ox;
+          const ny = y + oy;
+          if (nx < 0 || ny < 0 || nx >= SIZE || ny >= SIZE) continue;
+          near += core[(ny << 6) | nx];
+        }
+      }
+      if (near > 0) {
+        const r = rng.next();
+        if (r < 0.14) buf[i] = C.chalkSmudge;
+        else if (r < 0.2) buf[i] = C.chalkDust;
+      }
+    }
+  }
+  return buf;
+}
+
 // ─── Assembly ──────────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -1282,5 +1392,11 @@ export function createTextures(seed = 0xa11a2e) {
   /** @type {Texture[]} */
   const map = [finish(paintMap(s('map')), null, false)];
 
-  return { seed: usedSeed, size: SIZE, wall, floor, ceiling, torch, portal, gem, oil, sparkle, map };
+  // The player's chalk marks (§4.9): every variant a different slant and hand.
+  const chalkSeed = s('chalk');
+  /** @type {Texture[]} */
+  const chalk = [];
+  for (let v = 0; v < CHALK_VARIANTS; v++) chalk.push(finish(paintChalk((chalkSeed + v * 0x9e3779b9) >>> 0), null, false));
+
+  return { seed: usedSeed, size: SIZE, wall, floor, ceiling, torch, portal, gem, oil, sparkle, map, chalk };
 }

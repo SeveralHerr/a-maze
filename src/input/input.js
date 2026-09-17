@@ -134,31 +134,6 @@ const STICK_ZONE_FRACTION = 0.4;
 /** Deadzone for the virtual stick. Smaller than a gamepad's: a thumb has no spring return. */
 const TOUCH_DEADZONE = 0.12;
 
-/**
- * Sprint on touch is an **outward flick**, not a deflection threshold.
- *
- * The stick's origin slides (see {@link updateStick}), so *any* drag past the ring pins the
- * magnitude at exactly 1 — a thumb dragged naturally across the glass would otherwise sprint
- * permanently and burn fuel 1.5× with no way to walk except holding inside a moving 60 px window.
- * Instead: travel this multiple of the ring radius away from the point the thumb **landed**,
- * within {@link TOUCH_SPRINT_FLICK_MS}, and sprint latches; bring the thumb back inside the ring
- * (relative to that same landing point) and it unlatches. Sprint becomes a decision again.
- */
-const TOUCH_SPRINT_FLICK_RATIO = 1.4;
-
-/**
- * Milliseconds the flick above must complete in. Long enough for a deliberate shove (a thumb
- * covers ~85 px in well under a fifth of a second), short enough that slowly dragging the stick
- * around while exploring never trips it.
- */
-const TOUCH_SPRINT_FLICK_MS = 260;
-
-/**
- * Deflection the thumb must keep to stay sprinting once the flick has latched it. Easing back off
- * the rim drops to a walk, which is the same gesture a stick-and-trigger player would make.
- */
-const TOUCH_SPRINT_HOLD = 0.9;
-
 /** Seconds a menu direction must be held before it starts repeating. */
 const NAV_REPEAT_DELAY_S = 0.42;
 
@@ -322,7 +297,7 @@ export function createInput(canvasEl, opts) {
   /** @type {Set<InputAction>} */
   const pressed = new Set();
   /** @type {InputFrame} */
-  const frame = { moveX: 0, moveY: 0, turn: 0, lookDX: 0, sprint: false, pressed };
+  const frame = { moveX: 0, moveY: 0, turn: 0, lookDX: 0, pressed };
 
   // ── Device state ──────────────────────────────────────────────────────────────────────────
   /** Press counts per hold slot: two keys bound to the same slot must both be released to stop. */
@@ -345,12 +320,6 @@ export function createInput(canvasEl, opts) {
   let stickOriginY = 0;
   let stickX = 0; // normalised -1..1, right positive
   let stickY = 0; // normalised -1..1, forward positive
-  /** Where the thumb first landed (the sliding origin moves; this does not) and when. */
-  let stickDownX = 0;
-  let stickDownY = 0;
-  let stickDownMs = 0;
-  /** Latched by an outward flick; see {@link TOUCH_SPRINT_FLICK_RATIO}. */
-  let stickSprint = false;
   let lookId = -1;
   let lookLastX = 0;
   /**
@@ -399,7 +368,6 @@ export function createInput(canvasEl, opts) {
   let padMoveX = 0;
   let padMoveY = 0;
   let padTurn = 0;
-  let padSprint = false;
 
   let lastPollMs = now();
   let destroyed = false;
@@ -763,8 +731,7 @@ export function createInput(canvasEl, opts) {
     stickId = -1;
     stickX = 0;
     stickY = 0;
-    stickSprint = false;
-    if (overlay) overlay.setStick(false, 0, 0, 0, 0, false);
+    if (overlay) overlay.setStick(false, 0, 0, 0, 0);
   }
 
   /**
@@ -790,31 +757,11 @@ export function createInput(canvasEl, opts) {
     const ny = dy / STICK_RADIUS_PX;
     const deflection = radialDeadzone(nx, ny, TOUCH_DEADZONE, stickScratch);
 
-    // Sprint latches on a shove and holds while the thumb stays out at the rim.
-    //
-    // It is judged against the point the thumb LANDED on, which the sliding origin above has by
-    // then left behind — that displacement is the only part of the gesture the rim clamp does not
-    // throw away, so it is the only place "the player shoved forward" can honestly be read from.
-    // Deflection alone cannot say it: past the ring the deflection is *always* exactly 1.
-    if (stickSprint) {
-      if (deflection < TOUCH_SPRINT_HOLD) stickSprint = false;
-    } else {
-      const tdx = x - stickDownX;
-      const tdy = y - stickDownY;
-      const travel = Math.sqrt(tdx * tdx + tdy * tdy);
-      if (
-        travel >= STICK_RADIUS_PX * TOUCH_SPRINT_FLICK_RATIO &&
-        now() - stickDownMs <= TOUCH_SPRINT_FLICK_MS
-      ) {
-        stickSprint = true;
-      }
-    }
-
     stickX = stickScratch[0];
     // Screen Y grows downward; forward is up the screen.
     stickY = -stickScratch[1];
     if (overlay) {
-      overlay.setStick(true, stickOriginX, stickOriginY, stickOriginX + dx, stickOriginY + dy, stickSprint);
+      overlay.setStick(true, stickOriginX, stickOriginY, stickOriginX + dx, stickOriginY + dy);
     }
   }
 
@@ -841,10 +788,6 @@ export function createInput(canvasEl, opts) {
         stickId = t.identifier;
         stickOriginX = t.clientX;
         stickOriginY = t.clientY;
-        stickDownX = t.clientX;
-        stickDownY = t.clientY;
-        stickDownMs = now();
-        stickSprint = false;
         updateStick(t.clientX, t.clientY);
       } else {
         if (lookId !== -1) continue;
@@ -972,9 +915,6 @@ export function createInput(canvasEl, opts) {
       case HOLD.TURN_R:
         padTurn += 1;
         break;
-      case HOLD.SPRINT:
-        padSprint = true;
-        break;
       default:
         break;
     }
@@ -1060,7 +1000,6 @@ export function createInput(canvasEl, opts) {
     padMoveX = 0;
     padMoveY = 0;
     padTurn = 0;
-    padSprint = false;
 
     if (!nav || typeof nav.getGamepads !== 'function') {
       updateNavRepeat(0, dt);
@@ -1185,7 +1124,7 @@ export function createInput(canvasEl, opts) {
                 ? 1
                 : 0;
         // Same guard as the axes, for the same reason: an unmapped pad whose resting trigger reads
-        // as "button 6 pressed" would otherwise sprint forever. A button counts only once it has
+        // as "button 6 pressed" would otherwise act forever. A button counts only once it has
         // been observed released at least once.
         if (!down) padBtnLive[i] = 1;
         const trusted = padStandard || padBtnLive[i] === 1;
@@ -1241,7 +1180,6 @@ export function createInput(canvasEl, opts) {
     frame.moveX = clamp(kx + padMoveX + stickX, -1, 1);
     frame.moveY = clamp(ky + padMoveY + stickY, -1, 1);
     frame.turn = clamp(kt + padTurn, -1, 1);
-    frame.sprint = hold[HOLD.SPRINT] > 0 || padSprint || stickSprint;
 
     frame.lookDX = clamp(lookAccum, -MAX_LOOK_PER_POLL, MAX_LOOK_PER_POLL);
     lookAccum = 0;
