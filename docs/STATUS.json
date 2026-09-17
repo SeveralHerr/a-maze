@@ -1,8 +1,8 @@
 {
- "updated": "2026-09-17T12:23:25.294Z",
- "iteration": 18,
+ "updated": "2026-09-17T12:43:29.840Z",
+ "iteration": 19,
  "passThreshold": 8.5,
- "wave": "calm-auto",
+ "wave": "auto-corners",
  "waves": {
   "0-scaffold": {
    "status": "done",
@@ -979,6 +979,12 @@
    "updated": "2026-09-17T12:23:25.294Z",
    "wave": "calm-auto",
    "summary": "Auto Explore walks like the title camera (calm), burns oil at its pace, and has an on-screen AUTO button (HUD, touch bar, pause menu)."
+  },
+  {
+   "iteration": 19,
+   "updated": "2026-09-17T12:43:29.840Z",
+   "wave": "auto-corners",
+   "summary": "Auto Explore aims by pure pursuit (AUTO.PURSUIT 1.1 tiles along the route): it turns before a corner instead of walking at the far wall and pivoting. Corner overshoot past centre median +0.15 -> -0.07 tiles; wall-contact steps 0.27% -> 0.10%; gated in autopilot.test.mjs."
   }
  ],
  "openIssues": [

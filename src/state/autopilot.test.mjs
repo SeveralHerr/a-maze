@@ -210,6 +210,44 @@ test('it moves like the title camera: title-screen pace, no snapping turns, few 
   assert.ok(speedSum / steps > 0.6, 'but it does keep walking');
 });
 
+test('turns before a corner rather than walking at the wall beyond it', () => {
+  // For every L-turn walked, how far the body got past the corner tile's centre along the direction
+  // it came in. Measured before pursuit steering (aim past the waypoint, turn on arrival): median
+  // +0.15, p90 +0.19 — it carried on toward the far wall and pivoted there. Pursuit: ≈ −0.07 / −0.03.
+  const past = [];
+  for (const [level, seed] of [[1, 1], [5, 2], [20, 3], [5, 4], [20, 5], [10, 6]]) {
+    const s = playing(level, seed);
+    const ap = createAutopilot();
+    const w = s.levelData.maze.width;
+    let cur = -1;
+    let inX = 0;
+    let inY = 0;
+    let far = -1;
+    drive(s, ap, 90, (st) => {
+      const tx = Math.floor(st.player.x);
+      const ty = Math.floor(st.player.y);
+      if (ty * w + tx !== cur) {
+        if (cur >= 0) {
+          const outX = tx - (cur % w);
+          const outY = ty - ((cur / w) | 0);
+          if ((inX !== 0 || inY !== 0) && outX * inX + outY * inY === 0) past.push(far);
+          inX = outX;
+          inY = outY;
+        }
+        cur = ty * w + tx;
+        far = -1;
+      }
+      far = Math.max(far, (st.player.x - tx - 0.5) * inX + (st.player.y - ty - 0.5) * inY);
+    });
+  }
+  past.sort((a, b) => a - b);
+  assert.ok(past.length > 100, `only ${past.length} corners walked`);
+  const median = past[past.length >> 1];
+  const p90 = past[Math.floor(past.length * 0.9)];
+  assert.ok(median < 0, `median ${median.toFixed(3)} tiles past the corner centre`);
+  assert.ok(p90 < 0.05, `p90 ${p90.toFixed(3)} tiles past the corner centre`);
+});
+
 test('the torch burns at the pilot’s pace only on steps the pilot drove', () => {
   assert.ok(Math.abs(AUTO_DRAIN_SCALE - ATTRACT.SPEED / PLAYER.WALK_SPEED) < 1e-12);
   const burn = (/** @type {boolean} */ auto) => {

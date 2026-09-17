@@ -390,6 +390,12 @@ export const AUTO = Object.freeze({
    * second at a dead end, and that is not being stuck.
    */
   STUCK_STEPS: 150,
+  /**
+   * Pure-pursuit reach in tiles: the pilot aims at the point this far from the body along its route's
+   * centre line, so a corner pulls the aim round it and the turn begins before the corner instead of
+   * at the far wall.
+   */
+  PURSUIT: 1.1,
   /** Minimum steps between two plans that were not forced by finishing a route (bounds the BFS). */
   REPLAN_COOLDOWN_STEPS: 12,
   /** Seconds the level-complete tally is shown before Auto Explore descends on its own. */

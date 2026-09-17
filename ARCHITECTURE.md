@@ -1075,9 +1075,13 @@ greedy toward the exit's position over `SEEK_CHOICES` candidates.
 - **It moves like the title camera** (`step(state, out, dt)`), for watching rather than racing, and
   reads the `ATTRACT` table directly so the two cannot drift: cruise `ATTRACT.SPEED` (1.7 tiles/s, about
   half walking pace) scaled by `cos(err)^SPEED_FALLOFF` and eased at `SPEED_EASE_RATE`; a commanded
-  turn rate `err × TURN_GAIN` capped at `TURN_RATE` and eased at `TURN_EASE_RATE`; an aim point
-  `LOOKAHEAD` tiles past the waypoint along its leg plus the `SWAY` idle yaw; waypoints passed `ARRIVE`
-  early along the leg (the `attractArrived` rule). Written out as the player's axes
+  turn rate `err × TURN_GAIN` capped at `TURN_RATE` and eased at `TURN_EASE_RATE`, plus the `SWAY`
+  idle yaw. Unlike the title camera it aims by **pure pursuit**: the furthest point on the route's
+  centre-line polyline `AUTO.PURSUIT` (1.1) tiles from the body, so a corner pulls the aim round it and
+  the turn starts before the corner (the older past-the-waypoint aim walked on toward the far wall and
+  pivoted there: median 0.15 tiles past the corner centre, now ≈ −0.07; `autopilot.test.mjs` gates
+  median < 0, p90 < 0.05). Waypoints are passed `ARRIVE` early along the leg (the `attractArrived`
+  rule) or on stepping onto the next waypoint's tile, since a cut corner may never meet that rule. Written out as the player's axes
   (`turn = rate / PLAYER.TURN_SPEED`, `moveY = speed / PLAYER.WALK_SPEED`). Eased speed and rate
   survive a replan (a new goal bends the walk rather than stopping it); `interrupt()` resets them.
   Measured on level 3: turn reversals ~65 → ~11 a minute, peak angular acceleration 124 → ≤ 12 rad/s²,

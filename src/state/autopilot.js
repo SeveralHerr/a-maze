@@ -22,8 +22,8 @@
  * urgency, and borrows its numbers from `ATTRACT` directly so the two cannot drift apart: cruise
  * at `ATTRACT.SPEED` (about half the walking pace), a commanded turn rate capped at
  * `ATTRACT.TURN_RATE` and eased at `TURN_EASE_RATE`, a speed that falls off with the heading error
- * and eases at `SPEED_EASE_RATE`, an aim point `LOOKAHEAD` tiles along the leg, waypoints passed
- * `ARRIVE` early, and the same slow sway. Speed and turn rate survive a replan, so a new goal bends
+ * and eases at `SPEED_EASE_RATE`, waypoints passed `ARRIVE` early, and the same slow sway. The aim
+ * is its own: pure pursuit, `AUTO.PURSUIT` tiles along the route, so it turns before a corner. Speed and turn rate survive a replan, so a new goal bends
  * the path instead of stopping the walk. The torch still drains in real time, so the slower pace
  * costs oil per tile — a deliberate trade for a watching mode.
  *
@@ -132,6 +132,9 @@ export function createAutopilot() {
     turnRate: 0,
     /** Eased forward speed the pilot is commanding, tiles/s. */
     speed: 0,
+    /** This step's pursuit aim point (tiles), written by `aimAt`. */
+    aimX: 0,
+    aimY: 0,
   };
 
   /** Forget the eased motion, so the next drive starts gently from a standstill. @returns {void} */
@@ -172,6 +175,59 @@ export function createAutopilot() {
     }
     if (Math.floor(x) !== tx || Math.floor(y) !== ty) return false;
     return (x - cx) * legX + (y - cy) * legY >= -ATTRACT.ARRIVE;
+  }
+
+  /**
+   * Pure-pursuit aim point, written to `s.aimX/aimY`: the furthest point along the route's
+   * centre-line polyline (the current leg, then the waypoints after it) that lies `AUTO.PURSUIT`
+   * tiles from the body. On a straight run that is a point ahead on the centre line; as a corner
+   * comes within reach the point slides round it, so the turn begins *before* the corner and the
+   * body arcs through it — rather than walking at the far wall and pivoting there. Near the goal the
+   * aim settles on the goal's centre. O(1): only the few legs within reach are looked at.
+   * @param {number} x
+   * @param {number} y
+   * @param {Int32Array} r
+   * @param {number} w
+   * @returns {void}
+   */
+  function aimAt(x, y, r, w) {
+    const L = AUTO.PURSUIT;
+    const last = Math.min(s.routeLen - 1, s.routeStep + Math.ceil(L) + 2);
+    let from = legFrom(r);
+    // Fallback when the body is off the polyline by more than L: the current waypoint's centre.
+    s.aimX = (r[s.routeStep] % w) + 0.5;
+    s.aimY = ((r[s.routeStep] / w) | 0) + 0.5;
+    for (let k = s.routeStep; k <= last; k++) {
+      const to = r[k];
+      const bx = (to % w) + 0.5;
+      const by = ((to / w) | 0) + 0.5;
+      if (from < 0) {
+        from = to;
+        continue;
+      }
+      const ax = (from % w) + 0.5;
+      const ay = ((from / w) | 0) + 0.5;
+      const dx = bx - ax;
+      const dy = by - ay;
+      from = to;
+      if (dx === 0 && dy === 0) continue;
+      // |A + t·d − p| = L on a unit leg: t² + 2t(q·d) + |q|² − L² = 0, q = A − p; the larger root.
+      const qx = ax - x;
+      const qy = ay - y;
+      const qd = qx * dx + qy * dy;
+      const disc = qd * qd - (qx * qx + qy * qy) + L * L;
+      if (disc < 0) continue;
+      const t = -qd + Math.sqrt(disc);
+      if (t < 0) continue;
+      if (t >= 1) {
+        // The leg's end is within reach; the aim lies further on (or is the route's end).
+        s.aimX = bx;
+        s.aimY = by;
+      } else {
+        s.aimX = ax + t * dx;
+        s.aimY = ay + t * dy;
+      }
+    }
   }
 
   /** @returns {void} */
@@ -457,25 +513,24 @@ export function createAutopilot() {
       const maze = /** @type {LevelData} */ (state.levelData).maze;
       const w = maze.width;
       const r = /** @type {Int32Array} */ (route);
-      // Pass waypoints the way the title camera does (`attractArrived` in sim.js): a tile on a leg
-      // counts as reached a little *before* its centre, so the turn starts early and rounds the
-      // corner instead of overshooting toward the far wall.
-      while (s.routeStep < s.routeLen && arrived(p.x, p.y, r[s.routeStep], legFrom(r), w)) s.routeStep++;
+      // Pass waypoints the title camera's way (`attractArrived` in sim.js), or on stepping onto the
+      // next waypoint's tile: the pursuit aim below cuts corners, so the body can leave a corner tile
+      // without ever standing `ARRIVE` short of its centre.
+      while (
+        s.routeStep < s.routeLen &&
+        (arrived(p.x, p.y, r[s.routeStep], legFrom(r), w) ||
+          (s.routeStep + 1 < s.routeLen && Math.floor(p.x) === r[s.routeStep + 1] % w && Math.floor(p.y) === ((r[s.routeStep + 1] / w) | 0)))
+      ) {
+        s.routeStep++;
+      }
 
       // No route (nothing to do, or the goal was just reached): coast to a stop rather than halting.
       let want = 0;
       let command = 0;
       if (s.routeStep < s.routeLen) {
-        const i = r[s.routeStep];
-        const from = legFrom(r);
-        const legX = (i % w) - (from % w);
-        const legY = ((i / w) | 0) - ((from / w) | 0);
-        // Aim a little past the waypoint along the leg, so a straight corridor does not re-aim at
-        // every tile — the title camera's LOOKAHEAD, and its slow idle sway.
-        const ax = (i % w) + 0.5 + legX * ATTRACT.LOOKAHEAD;
-        const ay = ((i / w) | 0) + 0.5 + legY * ATTRACT.LOOKAHEAD;
+        aimAt(p.x, p.y, r, w);
         const sway = Math.sin(state.time * TAU * ATTRACT.SWAY_HZ) * ATTRACT.SWAY_AMP;
-        const err = angleDiff(p.angle, Math.atan2(ay - p.y, ax - p.x) + sway);
+        const err = angleDiff(p.angle, Math.atan2(s.aimY - p.y, s.aimX - p.x) + sway);
         command = clamp(err * ATTRACT.TURN_GAIN, -ATTRACT.TURN_RATE, ATTRACT.TURN_RATE);
         const align = Math.cos(err);
         want = align > 0 ? ATTRACT.SPEED * Math.pow(align, ATTRACT.SPEED_FALLOFF) : 0;
