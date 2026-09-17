@@ -33,9 +33,9 @@ import {
 } from './bindings.js';
 
 test('ACTIONS covers the contract vocabulary exactly once', () => {
-  const expected = ['confirm', 'back', 'pause', 'map', 'up', 'down', 'left', 'right', 'mute', 'chalk'];
+  const expected = ['confirm', 'back', 'pause', 'map', 'up', 'down', 'left', 'right', 'mute', 'chalk', 'auto'];
   assert.deepEqual([...ACTIONS], expected);
-  assert.equal(ACTION_COUNT, 10);
+  assert.equal(ACTION_COUNT, 11);
   assert.equal(new Set(ACTIONS).size, ACTIONS.length);
 });
 

@@ -354,6 +354,56 @@ export const SCORE = Object.freeze({
 // ─── Attract mode (title screen camera) ──────────────────────────────────────────────────────
 
 /**
+ * Auto Explore (ARCHITECTURE.md §4.10): the autopilot that plays a level on its own through the real
+ * input path. It explores fog-of-war frontiers at random, grabs what it has *seen* (never an item on
+ * a tile it has not revealed), refuels when the tank runs low and heads for the exit once it has
+ * wandered for a rolled share of the level's par time.
+ */
+export const AUTO = Object.freeze({
+  /** Tank fraction below which the nearest known oil flask outranks everything else. */
+  REFUEL_AT: 0.5,
+  /** Tank fraction below which a seen flask within `ITEM_DETOUR` is picked up on the way. */
+  TOPUP_AT: 0.75,
+  /** Hysteresis above `REFUEL_AT` at which a refuel trip is abandoned (the tank is fine again). */
+  REFUEL_HYSTERESIS: 0.15,
+  /** Tank fraction below which, with no known flask, the exit (if seen) is taken at once. */
+  DESPERATE_AT: 0.2,
+  /** Path tiles a seen gem or the map scroll may be off the way to still be worth a detour. */
+  ITEM_DETOUR: 14,
+  /** Nearest frontier tiles the planner collects before choosing among the tied ones. */
+  FRONTIER_CHOICES: 6,
+  /** Path tiles within the nearest frontier's distance that count as a tie, chosen between at random. */
+  FRONTIER_TIE: 2,
+  /** Frontier tiles collected once the pilot is searching toward the unseen exit. */
+  SEEK_CHOICES: 48,
+  /** Weight of the straight-line tiles still to the exit when searching toward it. */
+  SEEK_WEIGHT: 1.5,
+  /**
+   * Share of the level's par time spent exploring before the exit (once seen) becomes the goal,
+   * rolled per level between MIN and MAX so no two floors are walked the same way.
+   */
+  EXPLORE_PAR_MIN: 0.2,
+  EXPLORE_PAR_MAX: 0.8,
+  /** Steps without movement before the route is thrown away and planned again. */
+  STUCK_STEPS: 45,
+  /** Minimum steps between two plans that were not forced by finishing a route (bounds the BFS). */
+  REPLAN_COOLDOWN_STEPS: 12,
+  /** Squared distance (tiles²) at which a waypoint counts as passed. */
+  WAYPOINT_R2: 0.16,
+  /** Proportional turn gain on the heading error (the value is a turn axis in [-1, 1]). */
+  TURN_GAIN: 2.6,
+  /** cos(heading error) above which the pilot walks at full speed, and above which it creeps. */
+  WALK_ALIGN: 0.35,
+  CREEP_ALIGN: -0.2,
+  /** Forward axis while creeping round a sharp corner. */
+  CREEP: 0.45,
+  /** Seconds the level-complete tally is shown before Auto Explore descends on its own. */
+  NEXT_LEVEL_DELAY: 4,
+  /** Seconds into the clear before Auto Explore descends past boon cards that opened themselves. */
+  BOON_DELAY: 12,
+});
+
+/**
  * The title-screen camera that wanders the demo maze. It walks corridor centre to corridor
  * centre, so it can never scrape a wall; the only thing that has to feel good is the turning.
  */
@@ -844,6 +894,9 @@ export const SETTING_SPEC = Object.freeze({
   // On by default: the itch.io embed is a small iframe, and a first-person maze played through a
   // letterbox is a worse game. Only acted on when embedded (see `src/input/fullscreen.js`).
   fullscreen: Object.freeze({ kind: 'boolean', def: true }),
+  // Auto Explore (§4.10): the autopilot walks the level. Persisted, so an idle player who left it on
+  // comes back to it on; the HUD shows an AUTO tag whenever it is driving.
+  autoExplore: Object.freeze({ kind: 'boolean', def: false }),
 });
 
 /**
@@ -904,6 +957,7 @@ export function defaultSettings() {
     reducedMotion: /** @type {boolean} */ (SETTING_SPEC.reducedMotion.def),
     invertLook: /** @type {boolean} */ (SETTING_SPEC.invertLook.def),
     fullscreen: /** @type {boolean} */ (SETTING_SPEC.fullscreen.def),
+    autoExplore: /** @type {boolean} */ (SETTING_SPEC.autoExplore.def),
   };
 }
 

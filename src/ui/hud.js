@@ -579,6 +579,9 @@ const FRAME_BORDERS = 2;
 /** Between the depth and the labyrinth size on the depth plaque. */
 const DEPTH_SEPARATOR = '·';
 
+/** The Auto Explore plaque's text (§4.10). */
+const AUTO_TEXT = 'AUTO';
+
 /** Font pixels either side of that separator — a glyph's worth, so "3 · 24×24" never reads "3·24". */
 const DEPTH_GAP = 4;
 
@@ -1084,6 +1087,7 @@ export function createHud(overlayCanvas, options) {
     drawScorePanel(ctx, state, m);
     drawDepthPanel(ctx, state, m);
     drawPerkChips(ctx, state, m, reduced);
+    drawAutoChip(ctx, state, m, reduced);
     drawLodestone(ctx, state, m, reduced);
     if (mode === 'corner') mapView.drawCorner(ctx, m, state, anim.clock, reduced);
     drawPops(ctx, m, reduced);
@@ -1605,6 +1609,34 @@ export function createHud(overlayCanvas, options) {
         strokeRect(ctx, x, y, w, chipH, Math.max(1, border >> 1));
       }
     }
+  }
+
+  /**
+   * Auto Explore (§4.10): while the autopilot has the level, a small AUTO plaque sits at the bottom
+   * centre of the world band, breathing slowly, so a player who walks back to the screen knows at a
+   * glance that nobody is at the keys.
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {GameState} state
+   * @param {SurfaceMetrics} m
+   * @param {boolean} reduced
+   * @returns {void}
+   */
+  function drawAutoChip(ctx, state, m, reduced) {
+    if (state.settings === undefined || state.settings.autoExplore !== true || state.phase !== 'playing') return;
+    const u = m.u;
+    const size = m.narrow ? Math.max(1, u - 1) : u;
+    const chipH = 2 * insetY + heightAt('hud', size);
+    const w = 2 * insetX + measureAt(AUTO_TEXT, 'hud', size);
+    const x = m.viewX + ((m.viewW - w) >> 1);
+    const y = m.viewY + m.viewH - 3 * u - chipH;
+    panelOpts.frame = 'stone';
+    panelOpts.border = border;
+    panelOpts.rivets = false;
+    drawPanel(ctx, x, y, w, chipH, u, panelOpts);
+    const before = ctx.globalAlpha;
+    if (!reduced) ctx.globalAlpha = before * (0.7 + 0.3 * Math.sin(anim.clock * 2.4));
+    drawAt(ctx, AUTO_TEXT, x + (w >> 1), y + (chipH >> 1), 'hud', size, 'hudGold', 'center', 'middle');
+    ctx.globalAlpha = before;
   }
 
   /**

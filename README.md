@@ -101,9 +101,14 @@ chalk to mark the walls. The first time you clear a new depth, you also pick one
 | Mouse | Look (click the game to lock the mouse) |
 | `C` | Chalk the wall ahead (once unlocked) |
 | `M` | Map |
+| `O` | Auto Explore: the game walks the maze on its own (also in Options) |
 | `Esc` | Pause |
 
 Gamepad and touch controls work too.
+
+Deep runs don't have to be abandoned: **Save & Quit** from the pause menu (or after clearing a
+depth) and pick it up later with **Continue** on the title screen. The game also saves when you
+pause or switch away, and the save is gone once that run's torch goes out.
 
 ## Run it locally
 

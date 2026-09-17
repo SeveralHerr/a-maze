@@ -1,8 +1,8 @@
 {
- "updated": "2026-09-17T03:13:28.482Z",
- "iteration": 15,
+ "updated": "2026-09-17T03:59:11.005Z",
+ "iteration": 16,
  "passThreshold": 8.5,
- "wave": "tilesets",
+ "wave": "auto-and-saves",
  "waves": {
   "0-scaffold": {
    "status": "done",
@@ -643,6 +643,10 @@
     "Grotto wall mass pattern is not vertically periodic, so the bottom row of masses can end in a short straight edge (walls do not need vertical tiling).",
     "Ceiling seams remain where a north-south corridor tile meets a transposed east-west one (junctions); not covered by the seam gate."
    ]
+  },
+  "auto-and-saves": {
+   "status": "done",
+   "notes": "Auto Explore + saved runs (ARCHITECTURE.md §4.10). src/state/autopilot.js: fog-honest random explorer driving the real InputFrame (BFS only on replan, grow-only typed arrays, nearest-frontier with random ties, refuel/top-up from SEEN flasks, exit after a rolled 0.2-0.8x par or when seen and low; greedy toward the exit past that). Settings.autoExplore + Options row, O key (InputAction auto, bit 10), HUD AUTO plaque, auto-descend 4 s into the tally, blur/pointer-lock loss do not pause while it drives. src/state/runsave.js + save.js loadRun/saveRun/clearRun (key amaze.run.v1): mid-level snapshots (pose, per-level run fields, taken/explored bitsets base64, marks, tile-hash fingerprint; ~11.5 kB at the cap) and level-clear checkpoints; continueRun action (title only) + levelReady applyMid with fingerprint refusal -> fresh level with totals. Saved on pause, level clear, pagehide, Save & Quit; cleared on game over, Abandon Run, New Descent. Menus: title Continue/New Descent (+ Keep It/Start Over confirm, SAVED RUN line), pause Save & Quit/Abandon Run, level complete Save & Quit (no abandon row: a 4th row dropped the expedition strip at 1280x720). Verified: npm test 42/42 files (764 tests), stress --quick OK, headless Chrome on the worktree: O toggles auto (34 tiles in 12 s), Esc saves, reload -> Enter continues at the identical pose/fuel/items, abandon clears, auto-descend fires 4.05 s after a clear with a depth-2 checkpoint, zero console errors."
   }
  },
  "modules": {
@@ -939,6 +943,12 @@
    "updated": "2026-09-17T03:13:28.482Z",
    "wave": "more-shortcuts",
    "summary": "Playtest asked for more shortcuts three times, the last \"especially as they get higher\". Shortcut knobs now ramp over the size curve (level 1 -> CAP_LEVEL): cells per shortcut 8 -> 4, detour 6 -> 4 cells, route keep 0.85 -> 0.70 (shipped before this wave: 24 / 12 / 0.85, flat). At 8/6/0.85 the route guard was binding on every floor from 3 up. Placed at seed 1337 went 3->6 on floor 1 and 683->1935 at the cap at 8/6; the ramp measures 1991->3555 at 128x128 (2 seeds, before braid). Gate fix in feasibility.test: reducerWalk walkers never entered the <=3-tile side pocket the refuel chain places flasks in, so they only won while flasks landed on the path; denser loops broke that (level 11: path-only seed 529782, then the 2x wanderer seed 110866) although walkRefuelChain reported ok. Walkers now fetch a pocket flask when the tank is below POCKET_GRAB_FRACTION 0.35 (a player who notices the torch getting low). Both every-walk-wins and no-early-alarm assertions stay intact. Lowest tank 2x: 0.599 -> 0.483; path only 0.615 -> 0.445. npm test 40/40; validate-mazes (full) 117306 mazes OK, worst reserve 62.8%; stress (full) OK. Also: sconce plate decal removed (textures back to b96f506). Open: map scroll detour outside [4, gap/4] on levels 1,19,21,24,26,28,29 (informational, not a gate)."
+  },
+  {
+   "iteration": 16,
+   "updated": "2026-09-17T03:59:11.005Z",
+   "wave": "auto-and-saves",
+   "summary": "Added Auto Explore (O key / Options; autopilot in src/state/autopilot.js) and save/continue for runs (Save & Quit, Continue; src/state/runsave.js, amaze.run.v1). Contract §4.10. All gates green; browser-verified on the auto-and-saves worktree."
   }
  ],
  "openIssues": [
@@ -957,6 +967,9 @@
   "Unlocks balance: a fully upgraded character keeps the lowest tank at 0.63-0.80 on levels 1-4 (base 0.27-0.60), so the torch clock barely matters early for a veteran. Intended power curve per the design ask, but consider capping combined torch multipliers or ramping drain with best depth.",
   "The Shrine list hides rank pips on wide layouts when the longest name leaves no pip column (they show in the detail plaque and on phones).",
   "tools/verify.mjs does not yet drive the Shrine, the Boon or chalk; they are covered by unit/layout tests and logs/shots-unlocks.mjs, logs/shot-chalk.mjs, logs/critic-unlocks.mjs scratch scripts.",
-  "Progress persistence is last-writer-wins across two open tabs."
+  "Progress persistence is last-writer-wins across two open tabs.",
+  "Auto Explore is a fog-bound random explorer: in Node it clears early floors reliably but usually runs out of oil somewhere past depth ~10 (it wanders further than the 2.0x feasibility model). Fine for watching; a smarter pilot would need a memory of passed flasks or path-following toward the exit.",
+  "perf.test.mjs \"transient garbage\" is flaky on main too: turning in place measures 6.64 B/tick in ~2 of 8 runs (threshold 2). Pre-existing, not caused by the auto/saves change.",
+  "A save is tied to the generator: after a deploy that changes maze generation, a mid-level save starts its level fresh (totals kept). A checkpoint save is unaffected."
  ]
 }

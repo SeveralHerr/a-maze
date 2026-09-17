@@ -37,6 +37,7 @@
 
 import { clamp, damp } from '../core/math.js';
 import { createLogger } from '../core/log.js';
+import { applyMid, sanitizeRunSave } from './runsave.js';
 import {
   BOB,
   SETTING_KEYS,
@@ -208,6 +209,9 @@ export function reducer(state, action) {
     case 'newGame':
       applyNewGame(state, a.seed);
       return;
+    case 'continueRun':
+      applyContinueRun(state, a.save);
+      return;
     case 'levelReady':
       applyLevelReady(state, a.data);
       return;
@@ -370,7 +374,47 @@ function applyNewGame(state, rawSeed) {
     typeof rawSeed === 'number' && Number.isFinite(rawSeed) ? rawSeed >>> 0 : state.seed >>> 0;
   state.seed = seed;
   state.level = 1;
+  resetRun(state);
+  // `newBest` is measured against the record this run started with (see sim.recordBest).
+  state.sim.runBestScore = state.best.score;
+  setPhase(state, 'loading');
+}
 
+/**
+ * Pick a saved run back up (ARCHITECTURE.md §4.10). Only from the title, and only for a save that
+ * sanitises. The run's totals are restored now; the level is built by main.js exactly as for a
+ * descent, and `levelReady` puts a mid-level snapshot back onto it (see `applyLevelReady`).
+ * @param {State} state
+ * @param {unknown} rawSave
+ * @returns {void}
+ */
+function applyContinueRun(state, rawSave) {
+  if (state.phase !== 'title') return;
+  const save = sanitizeRunSave(rawSave);
+  if (save === null) {
+    log.warn('continueRun ignored: malformed save');
+    return;
+  }
+  state.seed = save.seed;
+  state.level = save.level;
+  resetRun(state);
+  const run = state.run;
+  run.score = save.totals.score;
+  run.totalTime = save.totals.totalTime;
+  run.distance = save.totals.distance;
+  run.bestCombo = save.totals.bestCombo;
+  state.sim.runBestScore = save.runBest;
+  state.sim.resume = save;
+  setPhase(state, 'loading');
+}
+
+/**
+ * Zero the run (score, counters, perks snapshot, offer, marks, sim scratch) for a run starting at
+ * `state.level`. Shared by `newGame` and `continueRun`; neither changes the phase here.
+ * @param {State} state
+ * @returns {void}
+ */
+function resetRun(state) {
   const run = state.run;
   run.score = 0;
   run.gems = 0;
@@ -397,11 +441,9 @@ function applyNewGame(state, rawSeed) {
 
   resetSimScratch(state.sim);
   state.sim.rng = null;
-  // `newBest` is measured against the record this run started with (see sim.recordBest).
-  state.sim.runBestScore = state.best.score;
+  state.sim.resume = null;
 
   state.derived.lowFuel = false;
-  setPhase(state, 'loading');
 }
 
 // ─── levelReady ──────────────────────────────────────────────────────────────────────────────
@@ -490,6 +532,10 @@ function applyLevelReady(state, data) {
   }
   const level = /** @type {LevelData} */ (data);
   const maze = level.maze;
+  // A saved run being continued (§4.10). Taken before `resetSimScratch`, and consumed either way:
+  // one save is applied to exactly one level install.
+  const resume = phase === 'loading' ? state.sim.resume : null;
+  state.sim.resume = null;
 
   state.levelData = level;
   // Sized to the new maze; allocated together with levelData so the pair is always consistent.
@@ -550,6 +596,12 @@ function applyLevelReady(state, data) {
   state.sim.flaskBase = oilFuel(fuel);
   state.sim.rng = null;
   placePlayerAtStart(state);
+  if (resume !== null && resume.mid !== null && resume.level === state.level) {
+    // A mismatch (the generator changed since the save) leaves the level as freshly installed: the
+    // run's totals survive and the floor starts over, which is the most a save can promise.
+    // (A low tank restored this way re-sounds the low-fuel cue once: a fair reminder on resuming.)
+    if (!applyMid(state, resume.mid)) log.warn('saved level does not match the level built; starting it fresh');
+  }
   revealAround(state);
   updateDerived(state);
   setPhase(state, 'playing');

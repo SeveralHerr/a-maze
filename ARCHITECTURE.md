@@ -83,7 +83,9 @@ tree is served locally (`npm run serve`) and uploaded to itch.io by CI.
   the incentive tips from "get out fast" to "explore" as the labyrinth grows.
 - **Controls:** WASD/arrows move + turn, mouse look (always live while playing; pointer lock when captured, plain mouse movement otherwise — it sums with arrow-key turning). **There is no sprint**
   (removed in the unlocks wave: one walking speed, so the torch is the only clock). C chalks the
-  wall ahead once the Chalk unlock is owned (pad X, touch CHALK button). M cycles the map **off → corner → full** (once this level's map scroll is found), Esc/P pause, Enter/Space confirm. Touch: left
+  wall ahead once the Chalk unlock is owned (pad X, touch CHALK button). M cycles the map **off → corner → full** (once this level's map scroll is found), O toggles
+**Auto Explore** (§4.10), Esc/P pause, Enter/Space confirm. A run can be **saved and continued**
+(pause → Save & Quit, title → Continue; §4.10). Touch: left
   virtual stick move, right half drag to turn, tap buttons for pause/map. Gamepad: standard mapping.
 - **Feedback cues:** head bob, footstep sounds synced to bob, wall-bump thud + tiny camera
   shake, gem sparkle particles + chime + score pop, fuel pickup whoosh + light flare, low-fuel
@@ -400,7 +402,8 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   `{type:'pause'}` · `{type:'resume'}` · `{type:'nextLevel'}` · `{type:'toTitle'}` ·
   `{type:'setSetting', key, value}` · `{type:'debugWin'}` (headless tools only) ·
   `{type:'buyUnlock', id}` (title | levelComplete | gameOver; needs the purse and a rank to buy) ·
-  `{type:'claimBoon', id}` (levelComplete with an open offer naming `id`) — §4.9.
+  `{type:'claimBoon', id}` (levelComplete with an open offer naming `id`) — §4.9 ·
+  `{type:'continueRun', save}` (title only; picks a saved run back up) — §4.10.
   `createInitialState(settings?, best?, progress?)` takes the persisted progress as a third argument.
 - Phase machine: `title --newGame--> loading --levelReady--> playing <--pause/resume--> paused`;
   `playing --exit reached--> levelComplete --nextLevel--> loading`; `playing --fuel 0--> gameOver --toTitle--> title`.
@@ -914,7 +917,8 @@ the safe-area insets instead, so a notch never sits on the fuel gauge. After siz
 `hud.surface.setViewRect(...)` (overlay-relative CSS px) before `hud.resize`/`menus.resize`, so the UI
 lays out around the world band without measuring the DOM itself.
 
-**Focus:** losing window focus or the tab being hidden while `playing` dispatches `pause`; the
+**Focus:** losing window focus or the tab being hidden while `playing` dispatches `pause` (focus and
+pointer-lock loss excepted while Auto Explore drives — §4.10); the
 cursor is hidden only while the pointer is locked (`body.locked`).
 
 **Fullscreen** _(itch.io embed)_: browsers only honour `requestFullscreen` inside a user gesture, so
@@ -933,7 +937,7 @@ leaves fullscreen without delivering the key, exactly like pointer lock). Turnin
 setting off exits fullscreen. `shutdown()` destroys the controller.
 
 `?headless=1` (or `?debug=1`) exposes
-`window.__game = { ready, state(), dispatch(action), subscribe(fn), stepOnce(n), stats(), renderStats(), audioStats(), screen(), mapMode(), errors, input:{inject(partialFrame), clear()} }`
+`window.__game = { ready, state(), dispatch(action), subscribe(fn), stepOnce(n), stats(), renderStats(), audioStats(), screen(), mapMode(), autopilot(), savedRun(), errors, input:{inject(partialFrame), clear()} }`
 (`screen()` is `menus.screen()` and `mapMode()` is `hud.mapMode(settings)`: a tool driving the menus
 through the real input path has no other way to tell whether a keypress landed, and "the options
 screen opened" is the kind of thing a gate should assert rather than assume)
@@ -1053,8 +1057,81 @@ the scroll-sense pulse and the lodestone needle; main.js raises notices for `emb
 `audio.js` voices `chalk` (a scrape), `ember` (a rekindle) and `unlock` (a chime).
 `touch-overlay.js` shows a CHALK button only while `state.perks.chalk > 0`.
 
+### 4.10 Auto Explore and saved runs _(cross-module seam)_
+
+**Auto Explore — `src/state/autopilot.js`.** `createAutopilot() → { step(state, out:{moveX,moveY,turn}) → boolean, interrupt(), reset(), info() → {goal, tile, route, plans} }`.
+An autopilot that plays through the **real input path**: main.js hands its axes to the reducer on
+the ordinary `tick`, so collision, fuel, pickups and the exit apply exactly as for a player. It lives
+in `src/state` because it is pure and Node-testable (it imports `core/rng`, `maze/constants` and
+`balance`). It plays the **fog honestly** — it only targets items on explored tiles. A plan is one
+BFS over floor tiles from the player collecting, nearest first: a seen oil flask when the tank is
+below `AUTO.REFUEL_AT` (and any seen flask within `ITEM_DETOUR` below `TOPUP_AT`), a seen gem or map
+scroll within `AUTO.ITEM_DETOUR`, and frontier tiles (explored floor with an unexplored floor
+neighbour). Goal order: oil (when wanted) → exit (once seen and the level has been wandered for a
+rolled `EXPLORE_PAR_MIN…MAX` × par, or the tank is below `DESPERATE_AT`) → nearby item → nearest
+frontier, ties within `FRONTIER_TIE` tiles broken by `createRng(seed ^ level·φ).fork('auto')`. Past the
+wander budget with the exit still unseen (or low on oil with none in sight) the frontier choice turns
+greedy toward the exit's position over `SEEK_CHOICES` candidates. Steering is proportional
+(`TURN_GAIN`, walk/creep by heading alignment), skipping waypoints within `WAYPOINT_R2`.
+- **Cost:** O(1) per step. The BFS is O(tiles) and runs only on a **replan** — route finished, goal
+  item taken, frontier goal uncovered, the tank crossing `REFUEL_AT` (an edge, not a level), exit
+  budget reached, or `STUCK_STEPS` without moving — and non-forced replans wait
+  `REPLAN_COOLDOWN_STEPS`. Buffers are grow-only `Int32Array`s with a generation stamp (no clearing);
+  `autopilot.test.mjs` asserts nothing survives a GC across 30 000 steps and hundreds of plans at the cap.
+- **Honest limit:** a fog-bound random explorer clears early floors reliably but, measured in Node,
+  usually runs out of oil somewhere past depth ~10: it wanders further than the 2.0× feasibility
+  model the flask chain is built for. It is a way to watch the game, not a solver.
+- **Setting & controls:** `Settings.autoExplore` (boolean, default false, persisted) with an Options
+  row; the `auto` `InputAction` (bit 10) on **O** toggles it in play with a HUD notice. `hud.js` draws a
+  breathing **AUTO** plaque at the bottom centre of the world band while it drives.
+- **main.js:** `driveAuto(frame, state)` substitutes a reused `autoFrame` while `autoExplore` and
+  `playing`; any real move/turn/look input that step is used instead and calls `interrupt()` (the
+  player can always take over); action presses pass through. `applySettings` calls `interrupt()`
+  whenever `autoExplore` changes, however it was switched. On `levelComplete` it dispatches
+  `nextLevel` after `AUTO.NEXT_LEVEL_DELAY` s on the tally (`'complete'`) or `AUTO.BOON_DELAY` s on
+  boon cards that opened themselves (`'boon'` — with Reduced Motion they open before the tally delay);
+  never from the Shrine or a dialog. An unclaimed boon is forfeited as usual (§4.9). While it drives, window **blur and pointer-lock
+  loss do not pause** (a player stepping back to watch); a hidden tab and leaving fullscreen still do.
+
+**Saved runs — `src/state/runsave.js` + `save.js`.** A run can be put down and picked up again. A
+level is not stored: `(params, seed)` rebuilds it (§4.4), so a save records only what play changed.
+`RunSave = {v:1, seed, level, mazeSeed|null, runBest, totals:{score, totalTime, distance, bestCombo}, mid|null}`.
+- **Mid-level** (`snapshotMidLevel(state)`, from `playing`/`paused`): `mid = {w, h, items, hash, x, y,
+  angle, fuel, gems, levelTime, refuels, chalk, reserve, emberUsed, mapFound, taken, explored, marks}` —
+  `taken` and `explored` are one bit per item/tile, base64 (`encodeBits`/`decodeBits`), `hash` is
+  FNV-1a of the tiles (`tileHash`). ~11.5 kB of JSON at the 257×257 cap.
+- **Checkpoint** (`snapshotCheckpoint(state)`, from `levelComplete`): `level + 1`, `mid: null`,
+  `mazeSeed: null` — the next depth is built fresh.
+- `sanitizeRunSave(raw) → RunSave|null` rebuilds every field or rejects; `summarizeRunSave → {level, score, mid}|null`.
+- **Storage:** `loadRun() / saveRun(save) / clearRun()` under its own key **`amaze.run.v1`**, separate
+  from `amaze.v1` so a quota error on a big save can never cost the settings/progress record. Same
+  defensive contract as `loadPersist` (absent/throwing/corrupt storage → null/false).
+- **Action** `{type:'continueRun', save}` — **title only**; a save that does not sanitise is ignored.
+  Resets the run like `newGame`, restores `seed`, `level`, the totals and `sim.runBestScore`, parks the
+  save in `sim.resume` and enters `loading`. The next `levelReady` in `loading` consumes `sim.resume`:
+  after the normal install it calls `applyMid(state, mid)`, which **refuses** (and the level starts
+  fresh with the totals intact) unless width, height, item count and tile hash all match and the pose
+  is on floor — the case of a generator that changed between save and load. Fuel is clamped to the
+  (possibly Shrine-grown) tank.
+- **main.js** keeps a cached `savedSummary` for the menus and writes/clears through `writeRun`/`dropRun`:
+  **save** on `playing → paused` (blur and a hidden tab both pause, so a closed tab keeps its run), on
+  `levelComplete` (checkpoint), on `pagehide` while `playing`/`paused`, and on the menus' *Save & Quit*
+  (which only leaves for the title when the write succeeded; otherwise it stays and raises a notice);
+  **clear** on `gameOver`, on *Abandon Run*, and on a *New Descent* from the title. `onContinue` reloads
+  the save from storage, sets `resumeMazeSeed = save.mazeSeed` (used by that level's first build only;
+  a salted retry builds a different maze and falls back to fresh), and dispatches `continueRun`.
+- **Menus:** callbacks `onContinue`, `onSaveQuit`, `savedRun() → {level, score}|null`. With a save the
+  title rows are *Continue · New Descent · Shrine · Options · Controls · Credits* (Continue selected),
+  the record line reads `SAVED RUN · DEPTH n · score`, and New Descent opens the confirm dialog
+  (*Keep It* / *Start Over*, note `YOUR SAVED RUN ENDS HERE`). Pause is *Resume · Options · Controls ·
+  Save & Quit · Abandon Run* (Abandon keeps the existing confirm). Level complete is *(Choose a Boon ·)
+  Descend · Shrine · Save & Quit* — no abandon there, which also keeps the expedition strip on the panel
+  at 1280×720; Escape on the tally moves the cursor to Save & Quit, and Save & Quit shows a waiting boon
+  first, like Descend.
+- `window.__game` additionally exposes `autopilot()` (= `autopilot.info()`) and `savedRun()`.
+
 ## 5. Quality gates (automated)
-- `npm test` — every `src/*/*.test.mjs` (node:test) in its own process (**729 tests in 39 files**).
+- `npm test` — every `src/*/*.test.mjs` (node:test) in its own process (**764 tests in 42 files**).
   Two of those files, `src/state/perf.test.mjs` and `src/state/feasibility.test.mjs`, import
   `src/maze` as a **test-only** dependency: the §2 runtime rule is unchanged (`src/state` still
   imports only `src/maze/constants.js` at runtime), but a feasibility proof over fake mazes would

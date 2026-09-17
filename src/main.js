@@ -33,8 +33,10 @@ import { createRng, randomSeed } from './core/rng.js';
 
 import { createStore } from './state/store.js';
 import { createInitialState, reducer } from './state/game.js';
-import { UNLOCKS, WORLD, levelParams } from './state/balance.js';
-import { loadPersist, savePersist } from './state/save.js';
+import { AUTO, UNLOCKS, WORLD, levelParams } from './state/balance.js';
+import { clearRun, loadPersist, loadRun, savePersist, saveRun } from './state/save.js';
+import { snapshotCheckpoint, snapshotMidLevel, summarizeRunSave } from './state/runsave.js';
+import { createAutopilot } from './state/autopilot.js';
 
 import { createInput } from './input/input.js';
 import { CONTROL_HINTS } from './input/bindings.js';
@@ -126,6 +128,11 @@ const NOTICE_EMBER = 'The Ember Rekindles';
 const NOTICE_NO_CHALK = 'Out of Chalk';
 const NOTICE_CHALK_REACH = 'No Wall Within Reach';
 const NOTICE_CHALK_LOCKED = 'Chalk - Unlock It at the Shrine';
+/** Notices for Auto Explore (§4.10). */
+const NOTICE_AUTO_ON = 'Auto Explore On';
+const NOTICE_AUTO_OFF = 'Auto Explore Off';
+/** Shown when Save & Quit cannot reach storage, so the run stays open instead of being lost. */
+const NOTICE_SAVE_FAILED = 'Could Not Save - Storage Blocked';
 
 // ─── Query flags ─────────────────────────────────────────────────────────────────────────────
 
@@ -284,6 +291,39 @@ function boot() {
     reducer,
   );
 
+  // ── Saved run (§4.10) ─────────────────────────────────────────────────────────────────────
+  /**
+   * What the title's Continue row offers, cached so the menus can ask every frame for free. Kept in
+   * step with storage by {@link writeRun} and {@link dropRun}, the only two writers.
+   * @type {{level:number, score:number, mid:boolean}|null}
+   */
+  let savedSummary = summarizeRunSave(loadRun());
+  /**
+   * The exact maze seed of a continued mid-level save, used by the first build of that level only. A
+   * retry (salted) builds a different maze, whose fingerprint then refuses the snapshot, and the
+   * level starts fresh with the run's totals — the documented fallback.
+   * @type {number|null}
+   */
+  let resumeMazeSeed = null;
+
+  /**
+   * Store a snapshot as the saved run. O(tiles) at the size cap: only on a pause, a level clear or
+   * the page going away, never per step.
+   * @param {import('./state/runsave.js').RunSave|null} save
+   * @returns {boolean} true when it reached storage
+   */
+  function writeRun(save) {
+    if (save === null || !saveRun(save)) return false;
+    savedSummary = summarizeRunSave(save);
+    return true;
+  }
+
+  /** Forget the saved run (the run ended, was abandoned, or a new one replaced it). @returns {void} */
+  function dropRun() {
+    clearRun();
+    savedSummary = null;
+  }
+
   /** Settings snapshot used to detect what actually changed after a `setSetting`. */
   const appliedSettings = { ...store.getState().settings };
   /** Volume restored by the mute toggle. */
@@ -330,13 +370,50 @@ function boot() {
       autoFullscreen();
       audio.unlock(); // we are inside a real user gesture here, which is the only place this works
       hud.reset();
+      // A new run replaces the saved one; the menus asked first when there was one to lose (§4.10).
+      if (savedSummary !== null && store.getState().phase === 'title') dropRun();
       store.dispatch({ type: 'newGame', seed: FORCED_SEED === null ? randomSeed() : FORCED_SEED });
     },
+    onContinue: () => {
+      autoFullscreen();
+      audio.unlock();
+      const save = loadRun();
+      if (save === null) {
+        // Storage lost it since boot (cleared in another tab, quota eviction): the row goes away.
+        savedSummary = null;
+        return;
+      }
+      hud.reset();
+      resumeMazeSeed = save.mazeSeed;
+      store.dispatch({ type: 'continueRun', save });
+      if (store.getState().phase !== 'loading') resumeMazeSeed = null;
+    },
+    savedRun: () => savedSummary,
     onResume: () => {
       autoFullscreen();
       store.dispatch({ type: 'resume' });
     },
-    onQuit: () => store.dispatch({ type: 'toTitle' }),
+    // Abandon (and a game-over's Title): the run is gone, so is its save.
+    onQuit: () => {
+      if (store.getState().phase !== 'title') dropRun();
+      store.dispatch({ type: 'toTitle' });
+    },
+    onSaveQuit: () => {
+      const st = store.getState();
+      const saved =
+        st.phase === 'paused'
+          ? writeRun(snapshotMidLevel(st))
+          : st.phase === 'levelComplete'
+            ? writeRun(snapshotCheckpoint(st))
+            : false;
+      // Storage refused (blocked in an embed, quota, private mode): leaving now would silently throw
+      // the run away — or leave an older save behind to be continued by mistake. Stay, and say why.
+      if (!saved) {
+        hud.notice(NOTICE_SAVE_FAILED);
+        return;
+      }
+      store.dispatch({ type: 'toTitle' });
+    },
     onNextLevel: () => {
       autoFullscreen();
       store.dispatch({ type: 'nextLevel' });
@@ -469,7 +546,9 @@ function boot() {
     loadWait = 0;
     pendingLevel = null;
     pendingToken = -1;
-    const seed = (seedForLevel(st.seed, level) + (salt || 0)) >>> 0;
+    const seed =
+      salt === undefined && resumeMazeSeed !== null ? resumeMazeSeed : (seedForLevel(st.seed, level) + (salt || 0)) >>> 0;
+    resumeMazeSeed = null;
     mazeClient.build(levelParams(level), seed).then(
       (data) => {
         if (token !== buildToken) return; // a newer request superseded this one
@@ -666,6 +745,11 @@ function boot() {
     // written too, not only one that ended.
     // Pausing writes too: a phone that kills a backgrounded tab may never deliver `pagehide`.
     if (to === 'levelComplete' || to === 'gameOver' || to === 'title' || to === 'paused') persistNow(state);
+    // The saved run (§4.10) follows the run: every pause is a save point (blur and a hidden tab both
+    // pause, so a closed tab keeps its descent), a clear checkpoints the next depth, a death ends it.
+    if (from === 'playing' && to === 'paused') writeRun(snapshotMidLevel(state));
+    else if (to === 'levelComplete') writeRun(snapshotCheckpoint(state));
+    else if (to === 'gameOver') dropRun();
     if (from === 'loading' && to === 'playing') hud.reset();
   }
 
@@ -746,6 +830,10 @@ function boot() {
     appliedSettings.minimap = settings.minimap;
     appliedSettings.mapMode = settings.mapMode;
     appliedSettings.reducedMotion = settings.reducedMotion;
+    // However Auto Explore was switched (the O key or the Options row), a route planned before the
+    // switch describes where the player *was*: drop it, so the pilot plans from where they are now.
+    if (settings.autoExplore !== appliedSettings.autoExplore) autopilot.interrupt();
+    appliedSettings.autoExplore = settings.autoExplore;
     // Mark rather than write: `step()` flushes at most twice a second, which collapses a whole
     // slider drag — and the map hotkey's two dispatches (`mapMode` + the legacy `minimap` mirror)
     // — into one storage write.
@@ -793,6 +881,32 @@ function boot() {
     return mergedFrame;
   }
 
+  // ─── Auto Explore (§4.10) ─────────────────────────────────────────────────────────────────
+
+  const autopilot = createAutopilot();
+  /** The frame handed to the reducer while the autopilot drives (reused, never reallocated). */
+  const autoFrame = /** @type {InputFrame} */ ({ moveX: 0, moveY: 0, turn: 0, lookDX: 0, pressed: new Set() });
+
+  /**
+   * Let the autopilot drive this step when Auto Explore is on. The player can always take over: any
+   * movement, turn or look input this step is used as-is and the pilot drops its route, planning
+   * afresh once the controls are let go. Action presses (pause, map, chalk…) always pass through.
+   * @param {InputFrame} real the polled frame
+   * @param {GameState} state
+   * @returns {InputFrame}
+   */
+  function driveAuto(real, state) {
+    if (state.settings.autoExplore !== true || state.phase !== 'playing') return real;
+    if (real.moveX !== 0 || real.moveY !== 0 || real.turn !== 0 || real.lookDX !== 0) {
+      autopilot.interrupt();
+      return real;
+    }
+    autopilot.step(state, autoFrame);
+    autoFrame.lookDX = 0;
+    autoFrame.pressed = real.pressed;
+    return autoFrame;
+  }
+
   /**
    * Hotkeys that belong to the composition root rather than to a menu: pause, minimap and mute.
    * Only consulted when `menus.handleInput` did not consume the frame (i.e. during play).
@@ -822,6 +936,11 @@ function boot() {
       const on = state.settings.volume > 0;
       if (on) mutedVolume = state.settings.volume;
       store.dispatch({ type: 'setSetting', key: 'volume', value: on ? 0 : mutedVolume });
+    }
+    if (pressed.has('auto')) {
+      const next = state.settings.autoExplore !== true;
+      store.dispatch({ type: 'setSetting', key: 'autoExplore', value: next });
+      hud.notice(next ? NOTICE_AUTO_ON : NOTICE_AUTO_OFF);
     }
   }
 
@@ -928,7 +1047,15 @@ function boot() {
   const autoPause = () => {
     if (store.getState().phase === 'playing') store.dispatch({ type: 'pause' });
   };
-  listen(globalThis, 'blur', autoPause);
+  /**
+   * Losing focus or the pointer while Auto Explore drives is a player stepping back to watch, not
+   * one who stopped driving: keep going. A hidden tab still pauses (the loop stops anyway, and the
+   * pause is the save point that keeps the run if the tab is then closed).
+   */
+  const focusPause = () => {
+    if (store.getState().settings.autoExplore !== true) autoPause();
+  };
+  listen(globalThis, 'blur', focusPause);
   listen(doc, 'visibilitychange', () => {
     if (doc.hidden) autoPause();
   });
@@ -941,7 +1068,7 @@ function boot() {
     // Losing the pointer while playing means the player stopped driving: pause — unless our own
     // fullscreen transition took it. A real Esc during that window also leaves fullscreen, and that
     // change pauses on its own below; input.js re-acquires the lock, and free mouse look covers the gap.
-    if (!locked && performance.now() - fullscreenRequestMs > FULLSCREEN_LOCK_GRACE_MS) autoPause();
+    if (!locked && performance.now() - fullscreenRequestMs > FULLSCREEN_LOCK_GRACE_MS) focusPause();
   });
   // Fullscreen changes the window size (relayout), and Esc leaves it without delivering the key to
   // the page — the same trap as pointer lock above, so leaving it while playing pauses too.
@@ -992,14 +1119,30 @@ function boot() {
    * @returns {void}
    */
   function step(dt) {
-    const frame = pollFrame();
+    const polled = pollFrame();
     const state = store.getState();
     // Menus consume navigation on every menu screen and return false during play and loading.
-    if (!menus.handleInput(frame, state)) handleHotkeys(frame, state);
+    if (!menus.handleInput(polled, state)) handleHotkeys(polled, state);
 
     tickAction.dt = dt;
-    tickAction.input = frame;
+    tickAction.input = driveAuto(polled, store.getState());
     store.dispatch(tickAction);
+
+    // Auto Explore carries on down: once the cleared depth's tally has had its moment, descend. From
+    // the tally, or from the boon cards — which open themselves `BOON_HOLD_S` after the tally, and with
+    // Reduced Motion that is before NEXT_LEVEL_DELAY — after a longer grace so a player who is
+    // watching can still pick one. Never out from under the Shrine or a dialog. An unclaimed boon is
+    // forfeited for this run only; the depth offers one again later (§4.9).
+    const after = store.getState();
+    if (after.settings.autoExplore === true && after.phase === 'levelComplete') {
+      const screen = menus.screen();
+      if (
+        (screen === 'complete' && after.phaseTime >= AUTO.NEXT_LEVEL_DELAY) ||
+        (screen === 'boon' && after.phaseTime >= AUTO.BOON_DELAY)
+      ) {
+        store.dispatch({ type: 'nextLevel' });
+      }
+    }
 
     // Settings written during this step (or the last few) go to storage here, off the pointer
     // event that produced them.
@@ -1137,6 +1280,9 @@ function boot() {
       // of thing a gate should assert rather than assume.
       screen: () => menus.screen(),
       mapMode: () => hud.mapMode(store.getState().settings),
+      // Auto Explore's current goal and plan count, and the saved run the title offers (§4.10).
+      autopilot: () => autopilot.info(),
+      savedRun: () => savedSummary,
       errors,
       input: {
         /**
@@ -1190,6 +1336,7 @@ function boot() {
     shutDown = true;
     try {
       persistNow(store.getState());
+      saveLiveRun();
     } catch {
       // Storage may be gone already; a lost preference must not take the teardown with it.
     }
@@ -1222,10 +1369,21 @@ function boot() {
     }
   }
 
+  /**
+   * Save a run that is mid-level as the page goes away (§4.10). A page closed without a blur (a
+   * scripted close, a crash-free kill with focus) would otherwise resume from the last pause.
+   * @returns {void}
+   */
+  function saveLiveRun() {
+    const st = store.getState();
+    if (st.phase === 'playing' || st.phase === 'paused') writeRun(snapshotMidLevel(st));
+  }
+
   listen(globalThis, 'pagehide', (/** @type {PageTransitionEvent} */ ev) => {
     if (ev && ev.persisted) {
       // Bound for the bfcache: keep the machine intact, just make the durable copy current.
       if (persistDue) persistNow(store.getState());
+      saveLiveRun();
       return;
     }
     shutdown();

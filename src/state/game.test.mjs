@@ -909,7 +909,7 @@ test('setSetting: validates, clamps and ignores nonsense in every phase', () => 
   assert.equal(/** @type {any} */ (s.settings).hack, undefined);
   reducer(s, /** @type {any} */ ({ type: 'setSetting', key: 42, value: 1 }));
   reducer(s, /** @type {any} */ ({ type: 'setSetting' }));
-  assert.equal(Object.keys(s.settings).length, 9);
+  assert.equal(Object.keys(s.settings).length, 10);
 });
 
 test('setSetting: fullscreen defaults on and takes only boolean-shaped values', () => {

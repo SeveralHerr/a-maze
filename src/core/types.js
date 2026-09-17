@@ -127,7 +127,7 @@
 /**
  * Edge-triggered semantic actions (menu navigation and toggles).
  * `chalk` marks the wall ahead (§4.9).
- * @typedef {'confirm'|'back'|'pause'|'map'|'up'|'down'|'left'|'right'|'mute'|'chalk'} InputAction
+ * @typedef {'confirm'|'back'|'pause'|'map'|'up'|'down'|'left'|'right'|'mute'|'chalk'|'auto'} InputAction
  */
 
 /**
@@ -176,6 +176,7 @@
  * @property {boolean} invertLook
  * @property {boolean} fullscreen     go fullscreen on the gesture that starts/resumes a run when the
  *   game is embedded (itch.io iframe); default true (ARCHITECTURE.md §4.3 `fullscreen.js`)
+ * @property {boolean} autoExplore   the autopilot plays the level (ARCHITECTURE.md §4.10); default false
  */
 
 /**

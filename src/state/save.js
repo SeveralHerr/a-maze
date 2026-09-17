@@ -19,6 +19,7 @@
 
 import { createLogger } from '../core/log.js';
 import { defaultProgress, defaultSettings, sanitizeBest, sanitizeProgress, sanitizeSettings } from './balance.js';
+import { sanitizeRunSave } from './runsave.js';
 
 /** @typedef {import('../core/types.js').Settings} Settings */
 /** @typedef {import('../core/types.js').BestScore} BestScore */
@@ -164,6 +165,87 @@ export function savePersist(data, storage) {
   } catch (err) {
     // Quota exceeded / storage disabled mid-session: the game carries on, unsaved.
     log.warn('persist failed', err);
+    return false;
+  }
+}
+
+// ─── Saved runs (ARCHITECTURE.md §4.10) ──────────────────────────────────────────────────────
+
+/**
+ * Storage key for the one saved run. Separate from `PERSIST_KEY` on purpose: the run save is tens of
+ * kilobytes at the size cap and is rewritten on every pause, and the settings/progress record must
+ * never be lost to a quota error on it (or parsed through it at boot).
+ */
+export const RUN_KEY = 'amaze.run.v1';
+
+/**
+ * Upper bound on a saved run, in characters. The cap level's save is ~11.5 kB; the generator's
+ * 4096² limit would be ~2.8 MB, far past anything the level curve builds.
+ */
+const MAX_RUN_CHARS = 3 * 1024 * 1024;
+
+/**
+ * Load the saved run, if there is a valid one.
+ * @param {StorageLike|null} [storage]
+ * @returns {import('./runsave.js').RunSave|null}
+ */
+export function loadRun(storage) {
+  const store = storage === undefined ? getDefaultStorage() : storage;
+  if (store === null || typeof store.getItem !== 'function') return null;
+  /** @type {string|null} */
+  let raw = null;
+  try {
+    raw = store.getItem(RUN_KEY);
+  } catch (err) {
+    log.debug('run read failed', err);
+    return null;
+  }
+  if (typeof raw !== 'string' || raw.length === 0 || raw.length > MAX_RUN_CHARS) return null;
+  try {
+    return sanitizeRunSave(JSON.parse(raw));
+  } catch (err) {
+    log.warn('saved run is not valid JSON; ignoring it', err);
+    return null;
+  }
+}
+
+/**
+ * Write the saved run (replacing any previous one). The save is sanitised first, so an in-memory
+ * snapshot that is somehow malformed is refused rather than stored.
+ * @param {unknown} save a `RunSave` from `snapshotMidLevel` / `snapshotCheckpoint`
+ * @param {StorageLike|null} [storage]
+ * @returns {boolean} true when it was written
+ */
+export function saveRun(save, storage) {
+  const store = storage === undefined ? getDefaultStorage() : storage;
+  if (store === null || typeof store.setItem !== 'function') return false;
+  const clean = sanitizeRunSave(save);
+  if (clean === null) {
+    log.warn('saveRun refused a malformed snapshot');
+    return false;
+  }
+  try {
+    store.setItem(RUN_KEY, JSON.stringify(clean));
+    return true;
+  } catch (err) {
+    log.warn('run save failed', err);
+    return false;
+  }
+}
+
+/**
+ * Delete the saved run (the run ended, or a new one replaced it).
+ * @param {StorageLike|null} [storage]
+ * @returns {boolean} true when the key was removed
+ */
+export function clearRun(storage) {
+  const store = storage === undefined ? getDefaultStorage() : storage;
+  if (store === null || typeof store.removeItem !== 'function') return false;
+  try {
+    store.removeItem(RUN_KEY);
+    return true;
+  } catch (err) {
+    log.warn('run clear failed', err);
     return false;
   }
 }

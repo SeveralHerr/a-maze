@@ -13,7 +13,7 @@
  * - **Physical keys, not characters.** Every keyboard table is keyed by `KeyboardEvent.code`
  *   (`KeyW`, `ArrowUp`, …) so the layout is identical on QWERTY, AZERTY, Dvorak and Colemak.
  *   `event.key` is deliberately never consulted except by the `codeFromKey` fallback below.
- * - **Actions are a 10-bit mask.** The ten `InputAction` values map to bits 0…9 (`ACTION_BIT`),
+ * - **Actions are an 11-bit mask.** The eleven `InputAction` values map to bits 0…10 (`ACTION_BIT`),
  *   so an entire poll's worth of edge-triggered actions is one integer. Accumulating input from
  *   three devices into a number instead of a `Set` is what makes `poll()` allocation-free; the
  *   `Set` in `InputFrame` is filled from the mask once per poll.
@@ -52,6 +52,7 @@ export const ACTIONS = Object.freeze([
   'right', // 7
   'mute', // 8
   'chalk', // 9 — mark the wall ahead (ARCHITECTURE.md §4.9)
+  'auto', // 10 — toggle Auto Explore (ARCHITECTURE.md §4.10)
 ]);
 
 /** Number of distinct actions (= number of meaningful bits in an action mask). */
@@ -146,6 +147,7 @@ export const DEFAULT_KEY_BINDINGS = Object.freeze({
   KeyM: Object.freeze(['map']),
   Tab: Object.freeze(['map']),
   KeyN: Object.freeze(['mute']),
+  KeyO: Object.freeze(['auto']),
 });
 
 /**
@@ -509,6 +511,7 @@ export function describeControls(tables) {
     Object.freeze({ label: 'Map', keys: listRow(labelsForAction(t, ACTION_BIT.map)), pad: 'View' }),
     Object.freeze({ label: 'Pause', keys: listRow(labelsForAction(t, ACTION_BIT.pause)), pad: 'Menu' }),
     Object.freeze({ label: 'Mute', keys: listRow(labelsForAction(t, ACTION_BIT.mute)), pad: 'Y' }),
+    Object.freeze({ label: 'Auto Explore', keys: listRow(labelsForAction(t, ACTION_BIT.auto)), pad: '—' }),
     Object.freeze({ label: 'Confirm', keys: listRow(labelsForAction(t, ACTION_BIT.confirm)), pad: 'A' }),
     Object.freeze({ label: 'Back', keys: listRow(labelsForAction(t, ACTION_BIT.back)), pad: 'B' }),
   ]);

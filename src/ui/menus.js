@@ -191,12 +191,26 @@ const TITLE_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
   { id: 'credits', label: 'Credits', kind: 'action' },
 ]);
 
-/** Pause screen. */
+/**
+ * Title screen while a saved run waits (§4.10): Continue is the first row and the one selected, so a
+ * reflexive Enter picks the descent back up rather than starting over it.
+ */
+const TITLE_SAVED_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
+  { id: 'continue', label: 'Continue', kind: 'action' },
+  { id: 'descend', label: 'New Descent', kind: 'action' },
+  { id: 'shrine', label: 'Shrine', kind: 'action' },
+  { id: 'options', label: 'Options', kind: 'action' },
+  { id: 'controls', label: 'Controls', kind: 'action' },
+  { id: 'credits', label: 'Credits', kind: 'action' },
+]);
+
+/** Pause screen. Save & Quit is the way out that keeps the run (§4.10); Abandon asks first. */
 const PAUSE_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
   { id: 'resume', label: 'Resume', kind: 'action' },
   { id: 'options', label: 'Options', kind: 'action' },
   { id: 'controls', label: 'Controls', kind: 'action' },
-  { id: 'quit', label: 'Quit to Title', kind: 'action' },
+  { id: 'savequit', label: 'Save & Quit', kind: 'action' },
+  { id: 'quit', label: 'Abandon Run', kind: 'action' },
 ]);
 
 /**
@@ -228,6 +242,8 @@ const OPTION_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
   },
   { id: 'reducedMotion', label: 'Reduced Motion', kind: 'toggle', key: 'reducedMotion' },
   { id: 'invertLook', label: 'Invert Look', kind: 'toggle', key: 'invertLook' },
+  // The autopilot walks the level for you (§4.10); also on the O key in play.
+  { id: 'autoExplore', label: 'Auto Explore', kind: 'toggle', key: 'autoExplore' },
   // Only acted on inside an embed (main.js, ARCHITECTURE.md §4.7); off also leaves fullscreen.
   { id: 'fullscreen', label: 'Fullscreen', kind: 'toggle', key: 'fullscreen' },
   { id: 'back', label: 'Back', kind: 'back' },
@@ -244,10 +260,16 @@ const CONTROLS_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
 ]);
 
 /** Level-complete screen. */
+/**
+ * Level-complete screen. Leaving a cleared depth keeps the run as a checkpoint (§4.10), so the one way
+ * out is Save & Quit and there is nothing to confirm; a player who wants the run gone starts a New
+ * Descent from the title, which asks. (A fourth row here also pushed the expedition strip off the
+ * panel at 1280×720.)
+ */
 const COMPLETE_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
   { id: 'next', label: 'Descend', kind: 'action' },
   { id: 'shrine', label: 'Shrine', kind: 'action' },
-  { id: 'quit', label: 'Quit to Title', kind: 'action' },
+  { id: 'savequit', label: 'Save & Quit', kind: 'action' },
 ]);
 
 /** Level-complete screen while a boon waits to be chosen (§4.9): the boon is the first row. */
@@ -255,7 +277,7 @@ const COMPLETE_BOON_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
   { id: 'boon', label: 'Choose a Boon', kind: 'action' },
   { id: 'next', label: 'Descend', kind: 'action' },
   { id: 'shrine', label: 'Shrine', kind: 'action' },
-  { id: 'quit', label: 'Quit to Title', kind: 'action' },
+  { id: 'savequit', label: 'Save & Quit', kind: 'action' },
 ]);
 
 /** Game-over screen. */
@@ -304,9 +326,9 @@ const SHRINE_NOT_OWNED = 'Not yet owned';
 const SHRINE_MASTERED = 'Mastered';
 
 /**
- * "Abandon the descent?" — the confirmation behind every *Quit to Title* that would throw a live run
- * away (pause and level complete; a game-over run is already over, so its Title row goes straight
- * there). The safe answer is the first row and the one selected on entry, and `back` means it too:
+ * "Abandon the descent?" — the confirmation behind pause's *Abandon Run*, the one row that throws a
+ * live run away (a cleared depth only offers Save & Quit, §4.10; a game-over run is already over, so
+ * its Title row goes straight there). The safe answer is the first row and the one selected on entry, and `back` means it too:
  * a reflexive Escape, Enter, Escape can never cost a thirty-minute descent.
  */
 const CONFIRM_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
@@ -319,6 +341,17 @@ const CONFIRM_HEADING = 'Abandon the descent?';
 const CONFIRM_TOP = 'Abandon';
 const CONFIRM_BOTTOM = 'the descent?';
 
+/**
+ * "Start over?" — shown when New Descent would overwrite a saved run (§4.10). Same dialog as the
+ * abandon confirmation, same safe first row.
+ */
+const REPLACE_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
+  { id: 'stay', label: 'Keep It', kind: 'back' },
+  { id: 'newrun', label: 'Start Over', kind: 'action' },
+]);
+/** Its note: what starting over costs. */
+const CONFIRM_NOTE_SAVED = 'YOUR SAVED RUN ENDS HERE';
+
 /** End-screen headings, whole and split (see `fitHeading`). */
 const HEADING_CLEARED = 'Cleared';
 const HEADING_OUT = 'Your torch has gone out';
@@ -326,8 +359,6 @@ const HEADING_OUT_TOP = 'Your torch';
 const HEADING_OUT_BOTTOM = 'has gone out';
 /** Its note, from pause. */
 const CONFIRM_NOTE_RUN = 'YOUR RUN ENDS HERE';
-/** Its note, from a cleared depth (the tally screen). */
-const CONFIRM_NOTE_CLEARED = 'NO FURTHER DESCENT';
 
 /**
  * One unlock as the menus need it. The authority is `UNLOCKS` in `src/state/balance.js`; `src/ui`
@@ -386,6 +417,8 @@ const NO_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([]);
 /** Every screen by id. */
 const SCREENS = Object.freeze({
   title: Object.freeze({ id: 'title', items: TITLE_ITEMS }),
+  titleSaved: Object.freeze({ id: 'title', items: TITLE_SAVED_ITEMS }),
+  replace: Object.freeze({ id: 'confirm', items: REPLACE_ITEMS }),
   pause: Object.freeze({ id: 'pause', items: PAUSE_ITEMS }),
   options: Object.freeze({ id: 'options', items: OPTION_ITEMS }),
   credits: Object.freeze({ id: 'credits', items: CREDITS_ITEMS }),
@@ -763,6 +796,10 @@ const PICK_PALETTE = Object.freeze([
  * @property {() => void} [onNewGame]    start a run (title "Descend", game-over "Try Again")
  * @property {() => void} [onResume]     leave the pause screen
  * @property {() => void} [onQuit]       abandon the run and return to the title
+ * @property {() => void} [onSaveQuit]   keep the run as a saved run and return to the title (§4.10)
+ * @property {() => void} [onContinue]   pick the saved run back up (title "Continue")
+ * @property {() => ({level:number, score:number}|null)} [savedRun] the saved run waiting on the
+ *   title, or null. Asked each frame on the title, so it must be a cheap read of a cached value.
  * @property {(key:keyof Settings, value:number|boolean) => void} [onSetting]
  * @property {() => void} [onNextLevel]  descend after a level-complete tally
  * @property {(type:'uiMove'|'uiConfirm'|'uiBack'|'uiDeny') => void} [onUiSound]
@@ -883,6 +920,7 @@ export function createMenus(overlayCanvas, callbacks) {
   // a new string each time even when the text is identical to the last frame's. These memos key on
   // the (already integer) inputs, so a screen that is standing still allocates no strings at all.
   const bestMemo = createTextMemo((score, level) => 'BEST ' + formatInt(score) + '  ·  DEPTH ' + level);
+  const savedMemo = createTextMemo((level, score) => 'SAVED RUN  ·  DEPTH ' + level + '  ·  ' + formatInt(score));
   const statusMemo = createTextMemo((level, score) => 'DEPTH ' + level + '  ·  ' + formatInt(score));
   const pauseDetailMemo = createTextMemo((sec, pct) =>
     pct >= 0 ? 'TIME ' + formatClock(sec) + '  ·  MAPPED ' + pct + '%' : 'TIME ' + formatClock(sec),
@@ -957,8 +995,25 @@ export function createMenus(overlayCanvas, callbacks) {
     if (sub === 'credits') return SCREENS.credits;
     if (sub === 'controls') return SCREENS.controls;
     if (sub === 'confirm') return SCREENS.confirm;
+    if (sub === 'replace') return SCREENS.replace;
     if (sub === 'shrine') return shrineScreen;
     return null;
+  }
+
+  /**
+   * The saved run the composition root reports, or null (§4.10). A throwing or missing callback is
+   * "no saved run", so the title can never lose its menu to it.
+   * @returns {{level:number, score:number}|null}
+   */
+  function savedSummary() {
+    if (typeof cb.savedRun !== 'function') return null;
+    try {
+      const s = cb.savedRun();
+      return s !== null && typeof s === 'object' && Number.isFinite(s.level) && Number.isFinite(s.score) ? s : null;
+    } catch (err) {
+      log.error('savedRun threw', err);
+      return null;
+    }
   }
 
   /**
@@ -969,7 +1024,8 @@ export function createMenus(overlayCanvas, callbacks) {
   function screenFor(state) {
     switch (state.phase) {
       case 'title':
-        return subScreen() === null ? SCREENS.title : /** @type {Screen} */ (subScreen());
+        if (subScreen() !== null) return /** @type {Screen} */ (subScreen());
+        return savedSummary() === null ? SCREENS.title : SCREENS.titleSaved;
       case 'paused':
         return subScreen() === null ? SCREENS.pause : /** @type {Screen} */ (subScreen());
       case 'loading':
@@ -1055,7 +1111,7 @@ export function createMenus(overlayCanvas, callbacks) {
     savedIndex[currentScreenId] = index;
     sub = id;
     // The confirmation always opens on its safe answer; every other sub-screen remembers its row.
-    if (id === 'confirm') savedIndex[id] = 0;
+    if (id === 'confirm' || id === 'replace') savedIndex[id] = 0;
     index = savedIndex[id] !== undefined ? savedIndex[id] : 0;
   }
 
@@ -1135,9 +1191,35 @@ export function createMenus(overlayCanvas, callbacks) {
 
     switch (item.id) {
       case 'descend':
+        sound('uiConfirm');
+        // Starting over a saved run discards it: ask first (§4.10).
+        if (screen.id === 'title' && savedSummary() !== null) {
+          openSub('replace');
+          return true;
+        }
+        invoke(cb.onNewGame, 'onNewGame');
+        return true;
       case 'retry':
         sound('uiConfirm');
         invoke(cb.onNewGame, 'onNewGame');
+        return true;
+      case 'newrun':
+        sound('uiConfirm');
+        closeSub();
+        invoke(cb.onNewGame, 'onNewGame');
+        return true;
+      case 'continue':
+        sound('uiConfirm');
+        invoke(cb.onContinue, 'onContinue');
+        return true;
+      case 'savequit':
+        sound('uiConfirm');
+        // Same guard as quitting: a free boon is shown, not silently forfeited.
+        if (screen.id === 'complete' && boonIdAt(state, 0) !== '') {
+          openSub('boon');
+          return true;
+        }
+        invoke(cb.onSaveQuit, 'onSaveQuit');
         return true;
       case 'options':
         sound('uiConfirm');
@@ -1428,11 +1510,12 @@ export function createMenus(overlayCanvas, callbacks) {
         invoke(cb.onResume, 'onResume');
       } else if (screen.id === 'complete') {
         // Escape is the pause key, and players hit it by reflex. On the screen that celebrates a
-        // cleared depth it must never abandon the run: it finishes the tally if one is rolling and
-        // puts the cursor on "Quit to Title" — leaving still takes a deliberate confirm, and then
-        // the abandon dialog.
+        // cleared depth it must never leave by itself: it finishes the tally if one is rolling and
+        // puts the cursor on "Save & Quit" — leaving still takes a deliberate confirm.
         if (!tallyDone) finishTally(state);
-        const quitRow = rowOf(screen, 'quit');
+        // Save & Quit, the way out that keeps the run (§4.10); a screen without one falls back to quit.
+        const saveRow = rowOf(screen, 'savequit');
+        const quitRow = saveRow >= 0 ? saveRow : rowOf(screen, 'quit');
         if (quitRow >= 0 && index !== quitRow) {
           index = quitRow;
           sound('uiMove');
@@ -2165,7 +2248,14 @@ export function createMenus(overlayCanvas, callbacks) {
     const footH = heightAt('hud', footScale);
     const footY = m.h - 3 * u;
     const best = state.best;
-    const bestText = best !== undefined && best.score > 0 ? bestMemo(best.score, best.level) : '';
+    const saved = savedSummary();
+    // A saved run (§4.10) takes the record's line: it is what Continue will pick back up.
+    const bestText =
+      saved !== null
+        ? savedMemo(saved.level, Math.floor(saved.score))
+        : best !== undefined && best.score > 0
+          ? bestMemo(best.score, best.level)
+          : '';
     // The record is a line of information, never a rival to the menu: a phone's ×2 menu words have a
     // 20-row cap height and a full-unit HUD line there is 21 rows, so the narrow layout drops a step.
     const bestScale =
@@ -2342,8 +2432,11 @@ export function createMenus(overlayCanvas, callbacks) {
     const headScale = fitHeading(CONFIRM_HEADING, CONFIRM_TOP, CONFIRM_BOTTOM, headW, Math.max(2, u + 1), m.narrow);
     const headSplit = headingSplits(CONFIRM_HEADING, headW, headScale);
     const headH = headingHeight(headScale, headSplit, u);
-    const status = statusMemo(state.level, Math.floor(state.run.score));
-    const note = state.phase === 'levelComplete' ? CONFIRM_NOTE_CLEARED : CONFIRM_NOTE_RUN;
+    // The replace dialog (§4.10) talks about the saved run, not the title's demo state.
+    const saved = screen === SCREENS.replace ? savedSummary() : null;
+    const status =
+      saved !== null ? statusMemo(saved.level, Math.floor(saved.score)) : statusMemo(state.level, Math.floor(state.run.score));
+    const note = screen === SCREENS.replace ? CONFIRM_NOTE_SAVED : CONFIRM_NOTE_RUN;
     const noteScale = Math.min(
       fitScaleAt(status, panelW - 12 * u, 'hud', u),
       fitScaleAt(note, panelW - 12 * u, 'hud', u),

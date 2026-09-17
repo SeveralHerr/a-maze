@@ -147,6 +147,8 @@ const BASE_PERKS = Object.freeze(computePerks(null));
  * @property {number} atTurnVel    attract camera's smoothed turn rate, rad/s
  * @property {number} atSpeed      attract camera's smoothed forward speed, tiles/s
  * @property {Rng|null} rng        attract-mode wander stream (seeded from the demo maze)
+ * @property {import('./runsave.js').RunSave|null} resume  a saved run waiting for its level
+ *   (`continueRun` sets it, the next `levelReady` in `loading` consumes it — §4.10)
  */
 
 /**
@@ -237,6 +239,7 @@ export function createSimScratch() {
     atTurnVel: 0,
     atSpeed: 0,
     rng: null,
+    resume: null,
   };
 }
 

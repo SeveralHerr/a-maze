@@ -134,9 +134,10 @@ function press(action) {
 
 /**
  * Menus wired to recording callbacks.
+ * @param {{level:number, score:number}|null} [saved] what `savedRun` reports
  * @returns {{menus:any, log:string[], settings:Array<[string, any]>}}
  */
-function harness() {
+function harness(saved = null) {
   /** @type {string[]} */
   const log = [];
   /** @type {Array<[string, any]>} */
@@ -145,6 +146,9 @@ function harness() {
     onNewGame: () => log.push('newGame'),
     onResume: () => log.push('resume'),
     onQuit: () => log.push('quit'),
+    onSaveQuit: () => log.push('saveQuit'),
+    onContinue: () => log.push('continue'),
+    savedRun: () => saved,
     onNextLevel: () => log.push('nextLevel'),
     onSetting: (k, v) => {
       settings.push([String(k), v]);
@@ -206,20 +210,24 @@ test('pause: back resumes, and the rows do what they say', () => {
   assert.ok(log.includes('resume'));
 
   log.length = 0;
-  // Rows: Resume, Options, Controls, Quit to Title.
+  // Rows: Resume, Options, Controls, Save & Quit, Abandon Run.
   menus.handleInput(press('down'), state);
   menus.handleInput(press('down'), state);
-  menus.handleInput(press('down'), state); // Quit to Title
+  menus.handleInput(press('down'), state); // Save & Quit
+  menus.handleInput(press('confirm'), state);
+  assert.deepEqual(log.filter((e) => e === 'saveQuit'), ['saveQuit'], 'Save & Quit needs no dialog');
+  log.length = 0;
+  menus.handleInput(press('down'), state); // Abandon Run
   menus.handleInput(press('confirm'), state);
   menus.render(state);
-  assert.equal(log.includes('quit'), false, 'Quit to Title asks first');
+  assert.equal(log.includes('quit'), false, 'Abandon Run asks first');
   assert.equal(menus.screen(), 'confirm');
   // The dialog opens on its safe answer: a second Enter keeps the run.
   menus.handleInput(press('confirm'), state);
   menus.render(state);
   assert.equal(menus.screen(), 'pause');
   assert.equal(log.includes('quit'), false);
-  // Back on Quit to Title (the row is remembered), then Abandon.
+  // Back on Abandon Run (the row is remembered), then Abandon.
   menus.handleInput(press('confirm'), state);
   menus.handleInput(press('down'), state);
   menus.handleInput(press('confirm'), state);
@@ -235,7 +243,7 @@ test('the abandon dialog: back and the first row both keep the run', () => {
   const { menus, log } = harness();
   const state = makeState('paused');
   menus.render(state);
-  for (let i = 0; i < 3; i++) menus.handleInput(press('down'), state);
+  for (let i = 0; i < 4; i++) menus.handleInput(press('down'), state);
   menus.handleInput(press('confirm'), state);
   menus.render(state);
   assert.equal(menus.screen(), 'confirm');
@@ -332,14 +340,14 @@ test('level complete: confirm skips the tally, then descends', () => {
 
   log.length = 0;
   menus.handleInput(press('down'), state);
-  menus.handleInput(press('down'), state);
+  menus.handleInput(press('down'), state); // Save & Quit
   menus.handleInput(press('confirm'), state);
+  assert.deepEqual(log.filter((e) => e === 'saveQuit'), ['saveQuit'], 'Save & Quit from a cleared depth');
+  // Save & Quit is the last row: a cleared depth has no way to throw the run away.
+  menus.handleInput(press('down'), state);
   menus.render(state);
-  assert.equal(menus.screen(), 'confirm', 'Quit to Title from a cleared depth asks first');
-  assert.equal(log.includes('quit'), false);
-  menus.handleInput(press('down'), state);
   menus.handleInput(press('confirm'), state);
-  assert.ok(log.includes('quit'));
+  assert.equal(log.includes('quit'), false);
 });
 
 test('Escape on level complete never abandons the run', () => {
@@ -356,15 +364,15 @@ test('Escape on level complete never abandons the run', () => {
     assert.equal(log.includes('quit'), false, 'no single keypress quits from the tally');
     assert.equal(menus.screen(), 'complete');
   }
-  // The first Escape finished the tally and moved the cursor onto Quit to Title: confirm now opens
-  // the dialog rather than descending.
+  // The first Escape finished the tally and moved the cursor onto Save & Quit, the exit that keeps
+  // the run: confirm now saves rather than descending, and nothing abandons.
+  log.length = 0;
   menus.handleInput(press('confirm'), state);
   menus.render(state);
-  assert.equal(menus.screen(), 'confirm');
-  assert.equal(log.includes('nextLevel'), false);
+  assert.deepEqual(log.filter((e) => e === 'saveQuit'), ['saveQuit']);
+  assert.equal(log.includes('nextLevel') || log.includes('quit'), false);
 
-  // Cancelling returns to the finished tally — it must not roll again.
-  menus.handleInput(press('back'), state);
+  // The tally stayed finished: it must not roll again.
   state.time = 0.35;
   menus.render(state);
   assert.equal(menus.screen(), 'complete');
@@ -393,7 +401,7 @@ test('the next level-complete screen opens on Descend, whatever was selected las
   const { menus, log } = harness();
   const state = makeState('levelComplete');
   menus.render(state);
-  menus.handleInput(press('back'), state); // finish the tally, cursor to Quit to Title
+  menus.handleInput(press('back'), state); // finish the tally, cursor to Save & Quit
   menus.render(state);
   state.phase = 'loading';
   state.time = 2;
@@ -1120,4 +1128,69 @@ test('boon: opens itself after the tally, claims the chosen card, and Descend ne
   assert.equal(menus.screen(), 'complete');
   menus.handleInput(press('confirm'), state);
   assert.ok(log.includes('nextLevel'), 'with the boon claimed, Descend descends');
+});
+
+test('title with a saved run: Continue first, and New Descent asks before overwriting it (§4.10)', () => {
+  const { menus, log } = harness({ level: 12, score: 34567 });
+  const state = makeState('title');
+  menus.render(state);
+  menus.handleInput(press('confirm'), state);
+  assert.deepEqual(log.filter((e) => e === 'continue' || e === 'newGame'), ['continue'], 'Enter continues');
+
+  log.length = 0;
+  menus.handleInput(press('down'), state); // New Descent
+  menus.handleInput(press('confirm'), state);
+  menus.render(state);
+  assert.equal(menus.screen(), 'confirm', 'starting over a saved run asks first');
+  assert.equal(log.includes('newGame'), false);
+  // Safe answer first: Enter keeps the saved run.
+  menus.handleInput(press('confirm'), state);
+  menus.render(state);
+  assert.equal(menus.screen(), 'title');
+  assert.equal(log.includes('newGame'), false);
+  // Escape cancels too.
+  menus.handleInput(press('confirm'), state);
+  menus.handleInput({ pressed: new Set(['back', 'pause']) }, state);
+  menus.render(state);
+  assert.equal(menus.screen(), 'title');
+  assert.equal(log.includes('newGame'), false);
+  // Start Over does start a new run, exactly once.
+  menus.handleInput(press('confirm'), state);
+  menus.handleInput(press('down'), state);
+  menus.handleInput(press('confirm'), state);
+  menus.render(state);
+  assert.deepEqual(log.filter((e) => e === 'newGame'), ['newGame']);
+  assert.equal(menus.screen(), 'title');
+});
+
+test('title without a saved run keeps its original rows, and a throwing savedRun is "none"', () => {
+  const { menus, log } = harness(null);
+  const state = makeState('title');
+  menus.render(state);
+  menus.handleInput(press('confirm'), state);
+  assert.deepEqual(log.filter((e) => e === 'continue' || e === 'newGame'), ['newGame'], 'Descend starts at once');
+
+  const throwing = createMenus(null, {
+    onNewGame: () => log.push('newGame2'),
+    savedRun: () => {
+      throw new Error('boom');
+    },
+  });
+  throwing.render(state);
+  throwing.handleInput(press('confirm'), state);
+  assert.ok(log.includes('newGame2'));
+});
+
+test('Save & Quit on a cleared depth shows a waiting boon first, like Descend and Abandon', () => {
+  const { menus, log } = harness();
+  const state = /** @type {any} */ (makeState('levelComplete'));
+  state.offer = { open: true, level: 3, ids: ['deepTank'] };
+  menus.render(state);
+  menus.handleInput(press('confirm'), state); // skip the tally
+  // Rows: Choose a Boon, Descend, Shrine, Save & Quit.
+  for (let i = 0; i < 3; i++) menus.handleInput(press('down'), state);
+  menus.handleInput(press('confirm'), state);
+  menus.render(state);
+  assert.equal(menus.screen(), 'boon');
+  assert.equal(log.includes('saveQuit'), false);
 });
