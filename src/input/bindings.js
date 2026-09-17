@@ -13,7 +13,7 @@
  * - **Physical keys, not characters.** Every keyboard table is keyed by `KeyboardEvent.code`
  *   (`KeyW`, `ArrowUp`, …) so the layout is identical on QWERTY, AZERTY, Dvorak and Colemak.
  *   `event.key` is deliberately never consulted except by the `codeFromKey` fallback below.
- * - **Actions are an 11-bit mask.** The eleven `InputAction` values map to bits 0…10 (`ACTION_BIT`),
+ * - **Actions are a 12-bit mask.** The twelve `InputAction` values map to bits 0…11 (`ACTION_BIT`),
  *   so an entire poll's worth of edge-triggered actions is one integer. Accumulating input from
  *   three devices into a number instead of a `Set` is what makes `poll()` allocation-free; the
  *   `Set` in `InputFrame` is filled from the mask once per poll.
@@ -53,6 +53,7 @@ export const ACTIONS = Object.freeze([
   'mute', // 8
   'chalk', // 9 — mark the wall ahead (ARCHITECTURE.md §4.9)
   'auto', // 10 — toggle Auto Explore (ARCHITECTURE.md §4.10)
+  'attack', // 11 — swing the sword (New Descent, ARCHITECTURE.md §4.11)
 ]);
 
 /** Number of distinct actions (= number of meaningful bits in an action mask). */
@@ -138,9 +139,13 @@ export const DEFAULT_KEY_BINDINGS = Object.freeze({
   KeyE: Object.freeze(['turnRight']),
   ArrowRight: Object.freeze(['turnRight', 'right']),
   KeyC: Object.freeze(['chalk']),
+  KeyF: Object.freeze(['attack']),
   Enter: Object.freeze(['confirm']),
   NumpadEnter: Object.freeze(['confirm']),
-  Space: Object.freeze(['confirm']),
+  // Space is both, the way Escape is both `back` and `pause`: `menus.handleInput` returns false
+  // during play, so `confirm` is dead there and the swing has the key every player reaches for.
+  // Consumers disambiguate by phase, exactly as §4.3 says.
+  Space: Object.freeze(['confirm', 'attack']),
   Escape: Object.freeze(['back', 'pause']),
   Backspace: Object.freeze(['back']),
   KeyP: Object.freeze(['pause']),
@@ -301,6 +306,9 @@ GAMEPAD_BUTTON_ACTION[2] = ACTION_BIT.chalk;
 // Y rather than a shoulder or R3: a shoulder is where a thumb rests, and R3 clicks by accident while
 // turning hard. A face button is a deliberate press.
 GAMEPAD_BUTTON_ACTION[3] = ACTION_BIT.mute;
+// The right trigger swings. Not the bumper (5): that one is deliberately left unbound so a grazed
+// shoulder cannot fire anything, which is the same rule that keeps mute off the shoulders.
+GAMEPAD_BUTTON_ACTION[7] = ACTION_BIT.attack;
 GAMEPAD_BUTTON_ACTION[8] = ACTION_BIT.map;
 GAMEPAD_BUTTON_ACTION[9] = ACTION_BIT.pause;
 GAMEPAD_BUTTON_ACTION[12] = ACTION_BIT.up;
@@ -507,6 +515,7 @@ export function describeControls(tables) {
     Object.freeze({ label: 'Strafe', keys: pairRow(labelsForSlot(t, HOLD.STRAFE_L), labelsForSlot(t, HOLD.STRAFE_R)), pad: 'Left stick' }),
     Object.freeze({ label: 'Turn', keys: pairRow(labelsForSlot(t, HOLD.TURN_L), labelsForSlot(t, HOLD.TURN_R)), pad: 'Right stick' }),
     Object.freeze({ label: 'Look', keys: 'Mouse', pad: 'Right stick' }),
+    Object.freeze({ label: 'Attack', keys: listRow(labelsForAction(t, ACTION_BIT.attack)), pad: 'RT' }),
     Object.freeze({ label: 'Chalk', keys: listRow(labelsForAction(t, ACTION_BIT.chalk)), pad: 'X' }),
     Object.freeze({ label: 'Map', keys: listRow(labelsForAction(t, ACTION_BIT.map)), pad: 'View' }),
     Object.freeze({ label: 'Pause', keys: listRow(labelsForAction(t, ACTION_BIT.pause)), pad: 'Menu' }),

@@ -33,9 +33,9 @@ import {
 } from './bindings.js';
 
 test('ACTIONS covers the contract vocabulary exactly once', () => {
-  const expected = ['confirm', 'back', 'pause', 'map', 'up', 'down', 'left', 'right', 'mute', 'chalk', 'auto'];
+  const expected = ['confirm', 'back', 'pause', 'map', 'up', 'down', 'left', 'right', 'mute', 'chalk', 'auto', 'attack'];
   assert.deepEqual([...ACTIONS], expected);
-  assert.equal(ACTION_COUNT, 11);
+  assert.equal(ACTION_COUNT, 12);
   assert.equal(new Set(ACTIONS).size, ACTIONS.length);
 });
 
@@ -85,7 +85,9 @@ test('keyboard layout matches the design: arrows turn, WASD moves, A/D strafe, Q
 
 test('action keys match the contract (confirm/back/pause/map/mute/nav)', () => {
   assert.equal(KEY_ACTION_MASK.Enter, ACTION_BIT.confirm);
-  assert.equal(KEY_ACTION_MASK.Space, ACTION_BIT.confirm);
+  // Space is both, the way Escape is: menus read `confirm`, New Descent reads `attack` (§4.11).
+  assert.equal(KEY_ACTION_MASK.Space, ACTION_BIT.confirm | ACTION_BIT.attack);
+  assert.equal(KEY_ACTION_MASK.KeyF, ACTION_BIT.attack);
   assert.equal(KEY_ACTION_MASK.Backspace, ACTION_BIT.back);
   assert.equal(KEY_ACTION_MASK.KeyP, ACTION_BIT.pause);
   assert.equal(KEY_ACTION_MASK.KeyM, ACTION_BIT.map);
@@ -128,7 +130,9 @@ test('gamepad standard mapping: A/B/Start/Back and the d-pad', () => {
   assert.equal(GAMEPAD_BUTTON_HOLD[14], HOLD.TURN_L);
   for (const b of [4, 6, 7, 10]) assert.equal(GAMEPAD_BUTTON_HOLD[b], undefined, `button ${b} no longer sprints`);
   assert.equal(GAMEPAD_BUTTON_ACTION[2], ACTION_BIT.chalk, 'X chalks');
-  // Unbound buttons must read as undefined, never as 0 (= slot FORWARD).
+  assert.equal(GAMEPAD_BUTTON_ACTION[7], ACTION_BIT.attack, 'right trigger swings');
+  // Unbound buttons must read as undefined, never as 0 (= slot FORWARD). Button 5 stays unbound on
+  // purpose: a grazed shoulder must not fire anything (same rule that keeps mute off the shoulders).
   assert.equal(GAMEPAD_BUTTON_HOLD[3], undefined);
   assert.equal(GAMEPAD_BUTTON_ACTION[5], undefined);
   // Mute is reachable from a pad (Y / Triangle), and never from a shoulder a thumb grazes.

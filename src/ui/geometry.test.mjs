@@ -97,6 +97,8 @@ function settle(menus, state, seconds) {
  * @param {(state:any) => void} [tweak]
  * @returns {{boxes:import('./layout-audit.test-util.mjs').LayoutBox[], menus:any, state:any}}
  */
+const TITLE_ROWS = ['New Descent', 'Classic Descent', 'Options', 'Controls', 'Credits'];
+
 function screenBoxes(vp, screen, tweak) {
   const menus = menusAt(vp);
   const phase =
@@ -380,7 +382,7 @@ test('title on a portrait phone: wordmark above the world band, menu below it, n
     const mark = boxes.find((b) => b.kind === 'art');
     assert.ok(mark !== undefined, `${vp.name}: the wordmark is drawn`);
     assert.ok(mark.y + mark.h <= bandTop, `${vp.name}: wordmark ends at ${mark.y + mark.h}, band at ${bandTop}`);
-    for (const label of ['Descend', 'Options', 'Controls', 'Credits']) {
+    for (const label of TITLE_ROWS) {
       const row = boxes.find((b) => b.kind === 'text' && b.label === label);
       assert.ok(row !== undefined, `${vp.name}: ${label}`);
       assert.ok(row.y >= bandBottom, `${vp.name}: ${label} at ${row.y} sits in the deck below ${bandBottom}`);
@@ -404,8 +406,8 @@ test('title: the menu outranks the record line and the footer at every viewport'
   for (const vp of VIEWPORTS) {
     const { boxes } = screenBoxes(vp, 'title');
     const texts = boxes.filter((b) => b.kind === 'text');
-    const menu = texts.filter((b) => ['Descend', 'Options', 'Controls', 'Credits'].includes(b.label));
-    assert.equal(menu.length, 4, `${vp.name}: four menu rows`);
+    const menu = texts.filter((b) => TITLE_ROWS.includes(b.label));
+    assert.equal(menu.length, TITLE_ROWS.length, `${vp.name}: every title row`);
     const menuCap = Math.min(...menu.map(capOf));
     for (const label of [/^BEST /, /^v0\./, /^©/]) {
       const line = texts.find((b) => label.test(b.label));
@@ -427,9 +429,9 @@ test('title: the menu is one size whether or not a best score has been saved', (
       const { boxes } = screenBoxes(vp, 'title', (s) => {
         if (fresh) s.best = { score: 0, level: 0 };
       });
-      const menu = boxes.filter((b) => b.kind === 'text' && ['Descend', 'Options', 'Controls', 'Credits'].includes(b.label));
+      const menu = boxes.filter((b) => b.kind === 'text' && TITLE_ROWS.includes(b.label));
       const sub = boxes.find((b) => b.kind === 'text' && b.label === 'The Torchlit Descent');
-      assert.ok(sub !== undefined && menu.length === 4, `${vp.name}: subtitle and menu drawn`);
+      assert.ok(sub !== undefined && menu.length === TITLE_ROWS.length, `${vp.name}: subtitle and menu drawn`);
       if (!isPortrait(vp)) {
         for (const row of menu) assert.ok(row.unit <= sub.unit, `${vp.name}: "${row.label}" ×${row.unit} over a ×${sub.unit} subtitle`);
       }
@@ -530,7 +532,9 @@ function unlockState(phase) {
 
 test('shrine and boon: clean at every viewport, scrolled or not, with the longest shipped strings', () => {
   for (const vp of VIEWPORTS) {
-    for (const [screen, phase, downs] of [['shrine', 'title', 0], ['shrine', 'title', 12], ['boon', 'levelComplete', 0]]) {
+    // The Shrine is reached from game over now, not the title (§4.11); `down, confirm` lands on it
+    // there exactly as it used to on the title.
+    for (const [screen, phase, downs] of [['shrine', 'gameOver', 0], ['shrine', 'gameOver', 12], ['boon', 'levelComplete', 0]]) {
       const menus = createMenus(drawableCanvas(vp.w, vp.h), { unlocks: UNLOCK_FIXTURE });
       menus.resize(vp.w, vp.h, vp.dpr);
       if (isPortrait(vp)) menus.surface.setViewRect(...portraitBand(vp.w, vp.h));

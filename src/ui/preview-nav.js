@@ -52,7 +52,9 @@ const PHASE_FOR = Object.freeze({
   options: 'title',
   controls: 'title',
   credits: 'title',
-  shrine: 'title',
+  // The Shrine left the title with the modes wave (§4.11) — it lives inside a mode now. Game over
+  // is one of the two screens it is still reached from, and the one with no tally to sit through.
+  shrine: 'gameOver',
   pause: 'paused',
   confirm: 'paused',
   loading: 'loading',
@@ -63,6 +65,19 @@ const PHASE_FOR = Object.freeze({
 
 /** Rows a walk will try before giving up (the title's longest list is six). */
 const MAX_WALK_ROWS = 8;
+
+/**
+ * Screens whose menu is walked **upward from the last row** rather than downward from the first.
+ *
+ * WHY: on the title, every row that is safe for a harness to press (Options, Controls, Credits) is
+ * at the BOTTOM, and every row that is not (the two mode rows, Continue) is at the top — and the top
+ * is where rows get added. Counting down from row 0 meant hard-coding how many dangerous rows there
+ * are, which is the exact staleness this file exists to prevent: it was `1` until New Descent made
+ * it `2` (or `3` with a saved run), and the walk quietly started a run on the way to Options.
+ * Counting up from the end is stable against anything added above, because navigation wraps.
+ * @type {ReadonlyArray<string>}
+ */
+const WALK_UPWARD = Object.freeze(['title']);
 
 /**
  * Put the menus on a screen, the way a player would reach it.
@@ -101,6 +116,15 @@ export function reachScreen(menus, state, name, frameWith) {
 }
 
 /**
+ * Is this screen walked upward from its last row? See {@link WALK_UPWARD}.
+ * @param {string} id
+ * @returns {boolean}
+ */
+function upward(id) {
+  return WALK_UPWARD.indexOf(id) >= 0;
+}
+
+/**
  * Walk a list from `first`, confirming each row in turn until one opens `want`.
  *
  * Rows are found by **what they open**, never by a remembered position: the step counts a harness
@@ -116,8 +140,14 @@ export function reachScreen(menus, state, name, frameWith) {
  */
 function walkTo(menus, state, want, frameWith, first) {
   const home = menus.screen();
-  for (let row = first; row < MAX_WALK_ROWS; row++) {
-    for (let i = 0; i < row; i++) menus.handleInput(frameWith('down'), state);
+  // On the title the safe rows are the last ones, so the walk counts UP from the end instead of
+  // down from the top (see WALK_UPWARD). Navigation wraps, so `up` from anywhere reaches them.
+  const up = upward(home);
+  const step = /** @type {InputAction} */ (up ? 'up' : 'down');
+  const back = /** @type {InputAction} */ (up ? 'down' : 'up');
+  const start = up ? 1 : first;
+  for (let row = start; row < MAX_WALK_ROWS; row++) {
+    for (let i = 0; i < row; i++) menus.handleInput(frameWith(step), state);
     menus.handleInput(frameWith('confirm'), state);
     menus.render(state);
     if (menus.screen() === want) return menus.screen();
@@ -126,7 +156,7 @@ function walkTo(menus, state, want, frameWith, first) {
       menus.handleInput(frameWith('back'), state);
       menus.render(state);
     }
-    for (let i = 0; i < row; i++) menus.handleInput(frameWith('up'), state);
+    for (let i = 0; i < row; i++) menus.handleInput(frameWith(back), state);
     menus.render(state);
   }
   return menus.screen();

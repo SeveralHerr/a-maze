@@ -127,7 +127,7 @@
 /**
  * Edge-triggered semantic actions (menu navigation and toggles).
  * `chalk` marks the wall ahead (§4.9).
- * @typedef {'confirm'|'back'|'pause'|'map'|'up'|'down'|'left'|'right'|'mute'|'chalk'|'auto'} InputAction
+ * @typedef {'confirm'|'back'|'pause'|'map'|'up'|'down'|'left'|'right'|'mute'|'chalk'|'auto'|'attack'} InputAction
  */
 
 /**
@@ -163,6 +163,60 @@
 /** @typedef {'title'|'loading'|'playing'|'paused'|'levelComplete'|'gameOver'} Phase */
 
 /**
+ * Which game the run is (ARCHITECTURE.md §4.11). `'classic'` is Classic Descent — everything
+ * §1–§4.10 describes, unchanged. `'combat'` is New Descent: the same labyrinth with two enemy types
+ * and a sword, and no Auto Explore.
+ *
+ * It is deliberately **not** a `Settings` key: it belongs to the run, is chosen by the title row
+ * that starts it, and travels in the `RunSave`.
+ * @typedef {'classic'|'combat'} Mode
+ */
+
+/**
+ * One mode's persisted record and purse (§4.11). The two never mix: `GameState.best` and
+ * `GameState.progress` are live references into the profile of the mode being played.
+ * @typedef {{best:BestScore, progress:Progress}} Profile
+ */
+
+/** @typedef {'crawler'|'wraith'} EnemyKind */
+
+/**
+ * An enemy's state machine (§4.11). `dead` slots stay in the pool until the corpse timer frees them.
+ * @typedef {0|1|2|3|4|5|6} EnemyState  0 idle · 1 chase · 2 windUp · 3 strike · 4 recover · 5 stagger · 6 dead
+ */
+
+/**
+ * One enemy in New Descent (§4.11). Pooled: `GameState.enemies` is a fixed-capacity array of these
+ * objects, reused across levels and runs, so a level change re-seeds slots rather than allocating.
+ * @typedef {Object} Enemy
+ * @property {number} id             stable within a level (its pool slot)
+ * @property {EnemyKind} kind
+ * @property {number} x              world position, tiles
+ * @property {number} y              world position, tiles
+ * @property {number} px             previous-step x, for render interpolation
+ * @property {number} py             previous-step y, for render interpolation
+ * @property {number} angle          facing, radians (same convention as `Player.angle`)
+ * @property {number} hp
+ * @property {number} hpMax
+ * @property {EnemyState} st
+ * @property {number} t              seconds spent in `st`
+ * @property {number} cool           seconds until it may open another attack
+ * @property {number} anim           gait phase, radians — advanced by distance walked, like head bob
+ * @property {number} lkx            x the player was last seen at
+ * @property {number} lky            y the player was last seen at
+ * @property {number} hunt           seconds left of walking to `lkx/lky` after losing sight
+ * @property {number} hurt           0..1 hit flash, decays
+ * @property {number} damage         damage one of its hits does on this level
+ * @property {boolean} awake         the player has been noticed
+ */
+
+/**
+ * The player's sword (§4.11). `st`: 0 idle · 1 windUp · 2 strike · 3 recover; `hits` is how many
+ * enemies the open swing has already touched, so a strike window resolves exactly once.
+ * @typedef {{st:0|1|2|3, t:number, hits:number}} AttackState
+ */
+
+/**
  * Persisted user preferences.
  * @typedef {Object} Settings
  * @property {number} volume         0..1
@@ -194,7 +248,9 @@
  * `mapFound` is true once this level's map scroll is picked up (or the level has none); the map is
  * locked until then (ARCHITECTURE.md §4.8). `chalk` = chalk charges left this level, `reserve` = siphon
  * seconds stored, `emberUsed` = this level's ember has rekindled the torch (§4.9).
- * @typedef {{score:number, gems:number, gemsTotal:number, fuel:number, fuelMax:number, levelTime:number, totalTime:number, levelScore:number, bestCombo:number, refuels:number, distance:number, mapFound:boolean, chalk:number, reserve:number, emberUsed:boolean}} RunStats
+ * `hp`/`hpMax` are the player's health in New Descent (§4.11) and are 0 in Classic Descent;
+ * `kills` counts enemies felled this run; `iframes` is the invulnerability left after a hit.
+ * @typedef {{score:number, gems:number, gemsTotal:number, fuel:number, fuelMax:number, levelTime:number, totalTime:number, levelScore:number, bestCombo:number, refuels:number, distance:number, mapFound:boolean, chalk:number, reserve:number, emberUsed:boolean, hp:number, hpMax:number, kills:number, iframes:number}} RunStats
  */
 
 /**
@@ -204,13 +260,20 @@
 
 /**
  * Values recomputed every step for renderer/hud/audio (the `GameState.derived` shape).
- * @typedef {{exitDist:number, nearExit:number, lowFuel:boolean, scrollSense:number}} Derived
+ * `threat` is 0..1, the nearest awake enemy's proximity — always 0 in Classic Descent (§4.11).
+ * @typedef {{exitDist:number, nearExit:number, lowFuel:boolean, scrollSense:number, threat:number}} Derived
  */
 
 /**
  * The single authoritative game state, owned and mutated in place by the store.
  * @typedef {Object} GameState
  * @property {Phase} phase
+ * @property {Mode} mode              which mode this run is (§4.11)
+ * @property {{classic:Profile, combat:Profile}} profiles  per-mode record and purse (§4.11);
+ *   `best` and `progress` below are LIVE REFERENCES into `profiles[mode]`
+ * @property {Enemy[]} enemies        live enemies this level — pooled, capacity `COMBAT.MAX_ENEMIES`,
+ *   always empty in Classic Descent (§4.11)
+ * @property {AttackState} attack     the player's sword (§4.11)
  * @property {number} time            total sim seconds since boot (monotonic)
  * @property {number} phaseTime       seconds since phase changed
  * @property {number} level           1-based
@@ -236,14 +299,17 @@
  *   | {type:'lowFuel'} | {type:'gameOver', score:number, newBest:boolean} | {type:'phase', from:Phase, to:Phase}
  *   | {type:'uiMove'} | {type:'uiConfirm'}
  *   | {type:'chalk', ok:boolean, x:number, y:number} | {type:'ember', seconds:number}
- *   | {type:'unlock', id:string, rank:number, boon:boolean}} GameEvent
+ *   | {type:'unlock', id:string, rank:number, boon:boolean}
+ *   | {type:'swing', hit:boolean}
+ *   | {type:'enemyHit', kind:EnemyKind, x:number, y:number, damage:number, killed:boolean}
+ *   | {type:'playerHit', kind:EnemyKind, damage:number, x:number, y:number}} GameEvent
  */
 
 // ─── Cross-seam shapes mirrored from §4.2 / §4.5 ─────────────────────────────────────────────
 
 /**
  * Store actions (ARCHITECTURE.md §4.2). `setSetting` is keyed by a `Settings` property name.
- * @typedef {{type:'tick', dt:number, input:InputFrame, auto?:boolean} | {type:'newGame', seed:number} | {type:'levelReady', data:LevelData}
+ * @typedef {{type:'tick', dt:number, input:InputFrame, auto?:boolean} | {type:'newGame', seed:number, mode?:Mode} | {type:'levelReady', data:LevelData}
  *   | {type:'pause'} | {type:'resume'} | {type:'nextLevel'} | {type:'toTitle'}
  *   | {type:'setSetting', key:keyof Settings, value:number|boolean|string} | {type:'debugWin'}
  *   | {type:'buyUnlock', id:string} | {type:'claimBoon', id:string} | {type:'continueRun', save:unknown}} Action
@@ -272,6 +338,9 @@
  * @property {number} [flame]         × the player torch radius (Wide Flame, default 1)
  * @property {number} [oilSense]      flasks within this many tiles draw through walls (default 0)
  * @property {number} [whisper]       dead-end branch depth to darken (default 0 = off)
+ * @property {Enemy[]} [enemies]      live enemies to billboard (New Descent, §4.11; empty otherwise)
+ * @property {{st:number, phase:number, kick:number}|null} [weapon]  the first-person sword: its
+ *   state, 0..1 progress through that state, and a 0..1 recoil — null draws nothing (§4.11)
  */
 
 // ─── Core module shapes (re-exported for one-stop type imports) ──────────────────────────────

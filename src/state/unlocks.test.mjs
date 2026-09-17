@@ -183,6 +183,10 @@ test('progress: persisted progress is sanitised, never trusted', () => {
 
 test('shrine: buying spends the purse, raises the rank and the perks, and emits unlock', () => {
   const s = createInitialState(undefined, undefined, { purse: 50, ranks: {}, boonLevel: 0 });
+  // The Shrine is no longer open from the title (§4.11): it lives inside a mode now, so a purchase
+  // made before a mode was chosen would spend whichever purse happened to be live. Game over is one
+  // of the two screens it IS open from.
+  s.phase = 'gameOver';
   reducer(s, { type: 'buyUnlock', id: 'reservoir' });
   assert.equal(s.progress.purse, 35);
   assert.equal(s.progress.ranks.reservoir, 1);

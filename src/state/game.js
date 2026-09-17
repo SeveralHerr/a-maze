@@ -37,16 +37,18 @@
 
 import { createLogger } from '../core/log.js';
 import { applyMid, sanitizeRunSave } from './runsave.js';
+import { resetLevelCombat, resetRunCombat, spawnEnemies } from './combat.js';
 import {
   BOB,
   SETTING_KEYS,
   SIM,
+  coerceMode,
   coerceSetting,
+  sanitizeProfiles,
   computePerks,
   drainRate,
   oilFuel,
   resolveTank,
-  sanitizeBest,
   sanitizeProgress,
   sanitizeSettings,
   unlockCost,
@@ -90,7 +92,7 @@ const log = createLogger('state');
  * escapes the synchronous reducer call.
  * @type {SimInput}
  */
-const _input = { moveX: 0, moveY: 0, turn: 0, lookDX: 0, chalk: false, auto: false };
+const _input = { moveX: 0, moveY: 0, turn: 0, lookDX: 0, chalk: false, attack: false, auto: false };
 
 /**
  * Phases from which `newGame` is honoured. See the phase-machine note in the file header.
@@ -105,11 +107,13 @@ const NEW_GAME_FROM = Object.freeze(['title', 'gameOver', 'levelComplete', 'paus
 const TO_TITLE_FROM = Object.freeze(['gameOver', 'levelComplete', 'paused']);
 
 /**
- * Phases in which the Shrine is open for `buyUnlock` (ARCHITECTURE.md §4.9): the title and the two
- * end screens. Never mid-level — a purchase changes the perks, and perks are fixed for a level.
+ * Phases in which the Shrine is open for `buyUnlock` (ARCHITECTURE.md §4.9): the two end screens.
+ * Never mid-level — a purchase changes the perks, and perks are fixed for a level. And no longer the
+ * title either (§4.11): the Shrine lives inside a mode now, and a purchase made before a mode has
+ * been chosen would spend whichever purse happened to be live.
  * @type {ReadonlyArray<string>}
  */
-const SHRINE_FROM = Object.freeze(['title', 'levelComplete', 'gameOver']);
+const SHRINE_FROM = Object.freeze(['levelComplete', 'gameOver']);
 
 /**
  * Build a fresh `GameState`.
@@ -120,13 +124,25 @@ const SHRINE_FROM = Object.freeze(['title', 'levelComplete', 'gameOver']);
  * @param {unknown} [settings] persisted settings, or undefined for factory defaults
  * @param {unknown} [best] persisted best score, or undefined for a clean slate
  * @param {unknown} [progress] persisted unlocks and purse (§4.9), or undefined for none
+ * @param {unknown} [profiles] the per-mode `{classic, combat}` record block (§4.11). Omitted, the
+ *   flat `best`/`progress` above are folded into the classic profile and combat starts empty —
+ *   which is exactly what a record written before the modes wave means.
  * @returns {State} a state in phase `title` with no level loaded (a valid `GameState`)
  */
-export function createInitialState(settings, best, progress) {
-  const sanitizedBest = sanitizeBest(best);
-  const sanitizedProgress = sanitizeProgress(progress);
+export function createInitialState(settings, best, progress, profiles) {
+  // The two profiles are the source of truth; `best` and `progress` below are live references into
+  // the one being played (§4.11), so every consumer written against them is unchanged.
+  const allProfiles = sanitizeProfiles(profiles, { best, progress });
+  const mode = /** @type {import('../core/types.js').Mode} */ ('classic');
+  const sanitizedBest = allProfiles[mode].best;
+  const sanitizedProgress = allProfiles[mode].progress;
   return {
     phase: 'title',
+    mode,
+    profiles: allProfiles,
+    // Pooled, and empty until a combat level is installed (§4.11).
+    enemies: [],
+    attack: { st: 0, t: 0, hits: 0 },
     time: 0,
     phaseTime: 0,
     level: 1,
@@ -161,6 +177,11 @@ export function createInitialState(settings, best, progress) {
       // live and the end screens show both.
       refuels: 0,
       distance: 0,
+      // New Descent (§4.11). `hpMax` of 0 is what every consumer reads as "this mode has no health".
+      hp: 0,
+      hpMax: 0,
+      kills: 0,
+      iframes: 0,
       // No level is loaded yet, so there is no scroll to find; `levelReady` sets it (§4.8).
       mapFound: true,
       // Unlocks wave (§4.9): chalk charges left, siphon reserve, and this level's ember spent.
@@ -170,7 +191,7 @@ export function createInitialState(settings, best, progress) {
     },
     best: sanitizedBest,
     settings: sanitizeSettings(settings),
-    derived: { exitDist: Infinity, nearExit: 0, lowFuel: false, scrollSense: 0 },
+    derived: { exitDist: Infinity, nearExit: 0, lowFuel: false, scrollSense: 0, threat: 0 },
     progress: sanitizedProgress,
     perks: computePerks(sanitizedProgress.ranks),
     offer: { open: false, level: 0, ids: [] },
@@ -217,7 +238,7 @@ export function reducer(state, action) {
       return;
     }
     case 'newGame':
-      applyNewGame(state, a.seed);
+      applyNewGame(state, a.seed, a.mode);
       return;
     case 'continueRun':
       applyContinueRun(state, a.save);
@@ -301,6 +322,7 @@ function readInput(src) {
     _input.turn = 0;
     _input.lookDX = 0;
     _input.chalk = false;
+    _input.attack = false;
     return _input;
   }
   const f = /** @type {Record<string, unknown>} */ (src);
@@ -325,7 +347,9 @@ function readInput(src) {
           : look
       : 0;
   const pressed = /** @type {any} */ (f.pressed);
-  _input.chalk = pressed !== null && typeof pressed === 'object' && typeof pressed.has === 'function' && pressed.has('chalk') === true;
+  const hasSet = pressed !== null && typeof pressed === 'object' && typeof pressed.has === 'function';
+  _input.chalk = hasSet && pressed.has('chalk') === true;
+  _input.attack = hasSet && pressed.has('attack') === true;
   return _input;
 }
 
@@ -374,12 +398,15 @@ function applyTick(state, rawInput, auto) {
  * `levelReady` swaps both atomically.
  * @param {State} state
  * @param {unknown} rawSeed
+ * @param {unknown} [rawMode] the mode the title row picked (§4.11); omitted keeps the current one
  * @returns {void}
  */
-function applyNewGame(state, rawSeed) {
+function applyNewGame(state, rawSeed, rawMode) {
   if (NEW_GAME_FROM.indexOf(state.phase) < 0) return;
-  // Restarting from pause abandons a live run; fold it into `best` before the run is reset.
+  // Restarting from pause abandons a live run; fold it into `best` before the run is reset — and
+  // into the profile of the mode it was played in, which is why the mode is switched AFTER this.
   if (state.phase === 'paused') recordBest(state);
+  if (rawMode !== undefined) setMode(state, coerceMode(rawMode));
 
   const seed =
     typeof rawSeed === 'number' && Number.isFinite(rawSeed) ? rawSeed >>> 0 : state.seed >>> 0;
@@ -406,6 +433,9 @@ function applyContinueRun(state, rawSave) {
     log.warn('continueRun ignored: malformed save');
     return;
   }
+  // The mode comes back before anything else: the profile it selects is what `resetRun` snapshots
+  // the perks from, and main.js builds the level for it straight after this dispatch (§4.11).
+  setMode(state, save.mode);
   state.seed = save.seed;
   state.level = save.level;
   resetRun(state);
@@ -441,6 +471,9 @@ function resetRun(state) {
   run.chalk = 0;
   run.reserve = 0;
   run.emberUsed = false;
+  // New Descent (§4.11): full health, no kills, no enemies until a level is installed. Health is a
+  // RUN resource, not a per-level one — that is what makes a descent a descent.
+  resetRunCombat(state);
   // A run's perks are the ranks owned when it starts (the Shrine is closed mid-run anyway).
   refreshPerks(state);
   closeOffer(state);
@@ -607,6 +640,10 @@ function applyLevelReady(state, data) {
   state.sim.flaskBase = oilFuel(fuel);
   state.sim.rng = null;
   placePlayerAtStart(state);
+  // New Descent (§4.11). Both are no-ops in Classic Descent, and both run once per level rather
+  // than per step: `spawnEnemies` is O(count) with a bounded try budget, never a scan of the tiles.
+  resetLevelCombat(state);
+  spawnEnemies(state);
   if (resume !== null && resume.mid !== null && resume.level === state.level) {
     // A mismatch (the generator changed since the save) leaves the level as freshly installed: the
     // run's totals survive and the floor starts over, which is the most a save can promise.
@@ -620,6 +657,27 @@ function applyLevelReady(state, data) {
 }
 
 // ─── Unlocks (ARCHITECTURE.md §4.9) ──────────────────────────────────────────────────────────
+
+/**
+ * Switch the live mode and re-point `best` and `progress` at that mode's profile (§4.11).
+ *
+ * This is the whole of the per-mode split: there is exactly one live `progress` object and one live
+ * `best` at any moment, and they belong to the mode being played — so a gem picked up in New Descent
+ * cannot reach the Classic purse, and no consumer had to learn that modes exist.
+ * @param {State} state
+ * @param {import('../core/types.js').Mode} mode
+ * @returns {void}
+ */
+export function setMode(state, mode) {
+  if (!state.profiles || !state.profiles.classic || !state.profiles.combat) {
+    state.profiles = sanitizeProfiles(null, { best: state.best, progress: state.progress });
+  }
+  state.mode = mode;
+  const profile = state.profiles[mode];
+  state.best = profile.best;
+  state.progress = profile.progress;
+  refreshPerks(state);
+}
 
 /**
  * Recompute `state.perks` from `state.progress.ranks`, in place. A state built by hand without the

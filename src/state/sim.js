@@ -70,6 +70,14 @@ import {
 } from '../core/math.js';
 import { createRng } from '../core/rng.js';
 import {
+  combatDt,
+  installPrimitives,
+  isPlayerDead,
+  healOnOil,
+  startAttack,
+  stepCombat,
+} from './combat.js';
+import {
   ATTRACT,
   BOB,
   BUMP,
@@ -113,6 +121,7 @@ const BASE_PERKS = Object.freeze(computePerks(null));
  * @property {number} turn    keyboard/stick turn −1..1 (right +)
  * @property {number} lookDX  mouse/touch yaw delta in radians for this step
  * @property {boolean} [chalk] the `chalk` action was pressed this step (ARCHITECTURE.md §4.9)
+ * @property {boolean} [attack] the `attack` action was pressed this step (New Descent, §4.11)
  * @property {boolean} [auto]  Auto Explore wrote this step's axes (§4.10): the torch burns at
  *   `AUTO_DRAIN_SCALE` — its calm pace over the walking pace — so oil per tile matches normal play
  */
@@ -1020,6 +1029,9 @@ function takeItem(state, it) {
   // The refuel tally is a per-level statistic (§3 RunStats): on a labyrinth that takes 7–22 flasks
   // to cross, "how many times did I refill" is the number that describes the level.
   run.refuels++;
+  // New Descent (§4.11): a flask mends as well as refuels, so the placement guarantee of §1 is also
+  // the promise that the floor can be survived. A no-op in Classic Descent.
+  healOnOil(state);
   state.events.push({ type: 'pickup', kind: 'oil', x: it.x, y: it.y, value: run.fuel - before });
 }
 
@@ -1067,6 +1079,9 @@ export function updateDerived(state) {
   }
   const run = state.run;
   d.lowFuel = run.fuelMax > 0 && run.fuel <= run.fuelMax * FUEL.LOW_FRACTION;
+  // `threat` is owned by `combat.js` and only ever written there; Classic Descent never runs that
+  // code, so it is pinned to 0 here rather than left holding whatever a previous combat run left.
+  if (state.mode !== 'combat') d.threat = 0;
 }
 
 // ─── Placement ───────────────────────────────────────────────────────────────────────────────
@@ -1387,6 +1402,20 @@ export function stepPlayingBody(state, input) {
   // ── Chalk ────────────────────────────────────────────────────────────────────────────────
   if (input.chalk === true) chalkWall(state);
 
+  // ── Combat (New Descent, §4.11) ──────────────────────────────────────────────────────────
+  // After the player has moved, so an enemy reacts to where they actually ended up this step; before
+  // the drain and the exit test, so a blow landing on the frame the level ends still lands.
+  //
+  // Gated on the mode HERE rather than inside `stepCombat`, and `dt` travels in a typed-array slot
+  // rather than as an argument: a Classic Descent step must not so much as make the call. Both are
+  // the boxing rule this file's header describes, and `perf.test.mjs` measured 8 B/tick of garbage
+  // on a classic step from the version that called through and returned.
+  if (state.mode === 'combat') {
+    if (input.attack === true) startAttack(state);
+    combatDt[0] = dt;
+    stepCombat(state);
+  }
+
   // ── Fuel ─────────────────────────────────────────────────────────────────────────────────
   // Auto Explore walks at the title camera's pace, about half the walking speed; a torch burning at
   // the full rate would make every tile cost twice the oil the level's flask chain is built for.
@@ -1416,6 +1445,13 @@ export function stepPlayingBody(state, input) {
   const exy = maze.exit.y + 0.5 - p.y;
   if (exx * exx + exy * exy <= WORLD.EXIT_RADIUS * WORLD.EXIT_RADIUS) {
     completeLevel(state);
+    updateDerived(state);
+    return;
+  }
+  // Health runs out the same way the torch does — through `endRun`, so one code path ends a run and
+  // the score summary, the record and the saved run all behave identically however it ended.
+  if (isPlayerDead(state)) {
+    endRun(state);
     updateDerived(state);
     return;
   }
@@ -1723,5 +1759,10 @@ export function startAttract(state) {
   pickAttractTarget(state, true);
   updateDerived(state);
 }
+
+// New Descent's enemies obey the player's collision and sight rules by calling the player's own
+// solvers. The binding is installed from here rather than imported there, because `combat.js` is
+// imported by this file — see the note on `installPrimitives` (ARCHITECTURE.md §4.11).
+installPrimitives(hasLineOfSight, moveCircleIO);
 
 export { BLOCKED_X, BLOCKED_Y };

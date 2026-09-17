@@ -206,7 +206,9 @@ test('the Shrine and the Boon stay inside the budget too (the busiest screens th
     for (const screen of ['shrine', 'boon']) {
       const menus = createMenus(drawableCanvas(w, h), { unlocks: UNLOCK_FIXTURE });
       menus.resize(w, h, dpr);
-      const state = /** @type {any} */ (playingState(screen === 'boon' ? 'levelComplete' : 'title'));
+      // The Shrine is reached from game over now, not the title (§4.11): `down, confirm` lands on
+      // it there just as it used to on the title (Try Again, Shrine, Title).
+      const state = /** @type {any} */ (playingState(screen === 'boon' ? 'levelComplete' : 'gameOver'));
       state.progress = { purse: 140, ranks: { reservoir: 2, chalk: 1 }, boonLevel: 0 };
       state.offer =
         screen === 'boon'

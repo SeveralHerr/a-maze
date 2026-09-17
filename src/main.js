@@ -33,7 +33,7 @@ import { createRng, randomSeed } from './core/rng.js';
 
 import { createStore } from './state/store.js';
 import { createInitialState, reducer } from './state/game.js';
-import { AUTO, UNLOCKS, WORLD, levelParams } from './state/balance.js';
+import { AUTO, COMBAT, UNLOCKS, WORLD, levelParams } from './state/balance.js';
 import { clearRun, loadPersist, loadRun, savePersist, saveRun } from './state/save.js';
 import { snapshotCheckpoint, snapshotMidLevel, summarizeRunSave } from './state/runsave.js';
 import { createAutopilot } from './state/autopilot.js';
@@ -46,6 +46,7 @@ import { createMazeClient } from './maze/client.js';
 import { createRaycaster } from './renderer/raycaster.js';
 import { createTextures } from './renderer/textures.js';
 import { createTilesetTextures, tilesetIndexById, tilesetIndexForLevel } from './renderer/tilesets/index.js';
+import { SWORD_FRAMES, createCombatTextures } from './renderer/enemies.js';
 import { createPost } from './renderer/post.js';
 import { PARTICLE, PARTICLE_COLORS } from './renderer/particles.js';
 
@@ -122,6 +123,7 @@ const INTEGER_FIT_TOLERANCE = 0.97;
 const NO_ITEMS = /** @type {import('./core/types.js').Item[]} */ ([]);
 const NO_TORCHES = /** @type {import('./core/types.js').Torch[]} */ ([]);
 const NO_MARKS = /** @type {import('./core/types.js').ChalkMark[]} */ ([]);
+const NO_ENEMIES = /** @type {any[]} */ ([]);
 
 /** Notices for the unlocks wave (§4.9). Title case, like every other HUD notice. */
 const NOTICE_EMBER = 'The Ember Rekindles';
@@ -287,7 +289,9 @@ function boot() {
   // ── State ───────────────────────────────────────────────────────────────────────────────────
   const persisted = loadPersist();
   const store = createStore(
-    createInitialState(persisted.settings, persisted.best, persisted.progress),
+    // `profiles` is the per-mode block (§4.11); `best`/`progress` are still handed over so a record
+    // written before the modes wave migrates into the classic profile.
+    createInitialState(persisted.settings, persisted.best, persisted.progress, persisted.profiles),
     reducer,
   );
 
@@ -357,6 +361,27 @@ function boot() {
     tilesetShown = -1;
     syncTileset(1);
   }
+  /**
+   * New Descent's creature and sword art (§4.11), painted **lazily** — the first time a combat run
+   * needs it, on the loading screen where a ~100 ms paint is invisible — and then kept for the
+   * session. A Classic Descent session never calls this at all, which is the whole reason the art
+   * is not part of `createTextures`.
+   * @type {import('./renderer/enemies.js').CombatTextures|null}
+   */
+  let combatTextures = null;
+
+  /**
+   * Make sure the renderer has the combat art if this run needs it, and does not if it does not.
+   * One identity compare per level install, never per frame.
+   * @param {string} mode
+   * @returns {void}
+   */
+  function syncCombatArt(mode) {
+    if (mode !== 'combat') return;
+    if (combatTextures === null) combatTextures = createCombatTextures(keepTextures.seed);
+    raycaster.setCombatTextures(combatTextures);
+  }
+
   const post = createPost(postRoot);
   const hud = createHud(overlay);
   const audio = createAudio({ volume: appliedSettings.volume, music: appliedSettings.music });
@@ -366,13 +391,19 @@ function boot() {
     // Fullscreen is asked for FIRST in the three rows that put the player back in the maze: the
     // request must land while the gesture's transient activation is still fresh, before a dispatch
     // whose subscribers (level build, pointer-lock release) could take long enough to matter.
-    onNewGame: () => {
+    // The title's two rows hand over which mode they start (§4.11); anything else (Try Again)
+    // repeats the mode the run that just ended was in.
+    onNewGame: (mode) => {
       autoFullscreen();
       audio.unlock(); // we are inside a real user gesture here, which is the only place this works
       hud.reset();
       // A new run replaces the saved one; the menus asked first when there was one to lose (§4.10).
       if (savedSummary !== null && store.getState().phase === 'title') dropRun();
-      store.dispatch({ type: 'newGame', seed: FORCED_SEED === null ? randomSeed() : FORCED_SEED });
+      store.dispatch({
+        type: 'newGame',
+        seed: FORCED_SEED === null ? randomSeed() : FORCED_SEED,
+        mode: mode === 'combat' ? 'combat' : 'classic',
+      });
     },
     onContinue: () => {
       autoFullscreen();
@@ -446,7 +477,11 @@ function boot() {
     // drifting across the page is someone watching, not steering.
     shouldLockPointer: () => {
       const st = store.getState();
-      return st.phase === 'playing' && st.settings.autoExplore !== true;
+      if (st.phase !== 'playing') return false;
+      // New Descent always wants the pointer: a locked click is the swing (§4.3, §4.11), and the
+      // Auto Explore release below does not apply to a mode that has no autopilot.
+      if (/** @type {any} */ (st).mode === 'combat') return true;
+      return st.settings.autoExplore !== true;
     },
     touchRoot: /** @type {HTMLElement|null} */ (touchRoot),
   });
@@ -695,6 +730,31 @@ function boot() {
             );
           }
           break;
+        case 'enemyHit': {
+          // A puff at the wound, brighter and longer when it was the killing blow. No world flash:
+          // the flash path belongs to pickups, and using both for one event doubles the brightness
+          // (§4.5 "two flash paths").
+          raycaster.particles.burst(
+            PARTICLE.SPARK,
+            ev.x,
+            ev.y,
+            0.5,
+            ev.killed ? 26 : 12,
+            ev.killed ? 2.2 : 1.4,
+            0.6,
+            ev.kind === 'wraith' ? PARTICLE_COLORS.spark : PARTICLE_COLORS.ember,
+            fxRng.next,
+          );
+          break;
+        }
+        case 'playerHit':
+          // The page flash, not the world one: this happened TO the player, so it belongs over
+          // everything the way a game over does, and the HUD's health panel flashes with it.
+          postFlash.r = 150;
+          postFlash.g = 26;
+          postFlash.b = 20;
+          postFlash.a = Math.min(0.5, postFlash.a + 0.34);
+          break;
         case 'ember':
           hud.notice(NOTICE_EMBER);
           worldFlash.r = 255;
@@ -742,6 +802,9 @@ function boot() {
   function onPhaseChange(from, to, state) {
     if (to === 'loading') {
       loadRetries = 0;
+      // Before the build, so the ~100 ms paint lands inside `MIN_LOAD_S` rather than on the first
+      // frame of play (§4.11). A no-op in Classic Descent, and after the first combat floor.
+      syncCombatArt(/** @type {any} */ (state).mode);
       requestLevel();
     }
     if (to !== 'playing') {
@@ -793,7 +856,14 @@ function boot() {
   function persistNow(state) {
     persistDue = false;
     lastPersistAt = state.time;
-    savePersist({ best: state.best, settings: state.settings, progress: /** @type {any} */ (state).progress });
+    savePersist({
+      best: state.best,
+      settings: state.settings,
+      progress: /** @type {any} */ (state).progress,
+      // Both purses, not just the live one: a Shrine purchase in New Descent has to survive a
+      // session that ends in Classic Descent (§4.11).
+      profiles: /** @type {any} */ (state).profiles,
+    });
   }
 
   /**
@@ -908,6 +978,9 @@ function boot() {
    * @returns {InputFrame}
    */
   function driveAuto(real, state, dt) {
+    // New Descent has no Auto Explore (§4.11): the setting is ignored rather than cleared, so a
+    // player who turned it on in Classic Descent still has it on in Classic Descent.
+    if (/** @type {any} */ (state).mode === 'combat') return real;
     if (state.settings.autoExplore !== true || state.phase !== 'playing') return real;
     if (real.moveX !== 0 || real.moveY !== 0 || real.turn !== 0 || real.lookDX !== 0) {
       autopilot.interrupt();
@@ -949,8 +1022,9 @@ function boot() {
       if (on) mutedVolume = state.settings.volume;
       store.dispatch({ type: 'setSetting', key: 'volume', value: on ? 0 : mutedVolume });
     }
-    // The O key, and the touch bar's AUTO button (which emits the same action).
-    if (pressed.has('auto')) toggleAuto();
+    // The O key, and the touch bar's AUTO button (which emits the same action). Not in New Descent,
+    // which has no autopilot — the key does nothing rather than toggling an invisible setting.
+    if (pressed.has('auto') && /** @type {any} */ (state).mode !== 'combat') toggleAuto();
   }
 
   /**
@@ -978,15 +1052,30 @@ function boot() {
     if (!ev || store.getState().phase !== 'playing') return;
     const t = performance.now();
     if (ev.type === 'pointerdown') {
-      if (ev.button !== 0 || !hud.hitAuto(ev.clientX, ev.clientY)) return;
-      autoPressUntil = t + 600;
-      toggleAuto();
+      // The ATTACK plaque (§4.11) is taken here too, and first: it is the button a New Descent
+      // player presses constantly, and it must not reach `input.js` as a look-drag or a lock request.
+      if (ev.button === 0 && hud.hitAttack(ev.clientX, ev.clientY)) {
+        autoPressUntil = t + 600;
+        attackPressed = true;
+      } else if (ev.button !== 0 || !hud.hitAuto(ev.clientX, ev.clientY)) {
+        return;
+      } else {
+        autoPressUntil = t + 600;
+        toggleAuto();
+      }
     } else if (t > autoPressUntil) {
       return;
     }
     ev.stopPropagation();
     if (ev.cancelable) ev.preventDefault();
   };
+
+  /**
+   * Set by a press on the HUD's ATTACK plaque, consumed by the next `step` as an ordinary `attack`
+   * edge — so a tap on the plaque, the F key and a locked mouse click are indistinguishable to the
+   * simulation, which is the only way the three can stay in step.
+   */
+  let attackPressed = false;
   for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'touchstart', 'touchend']) {
     listen(globalThis, type, onAutoButton, { capture: true, passive: false });
   }
@@ -1100,7 +1189,11 @@ function boot() {
    * pause is the save point that keeps the run if the tab is then closed).
    */
   const focusPause = () => {
-    if (store.getState().settings.autoExplore !== true) autoPause();
+    const st = store.getState();
+    // Only a watching player (Auto Explore driving) keeps going through a blur. New Descent has no
+    // autopilot, so losing focus there is always someone who stopped playing — and being chewed on
+    // while the window is behind another one is the unfairest death the mode could offer.
+    if (/** @type {any} */ (st).mode === 'combat' || st.settings.autoExplore !== true) autoPause();
   };
   listen(globalThis, 'blur', focusPause);
   listen(doc, 'visibilitychange', () => {
@@ -1155,7 +1248,67 @@ function boot() {
     flame: 1,
     oilSense: 0,
     whisper: 0,
+    enemies: NO_ENEMIES,
+    weapon: null,
   };
+
+  /**
+   * The single weapon view block (New Descent, §4.11), mutated in place like the render view itself.
+   * @type {{st:number, frame:number, phase:number, kick:number}}
+   */
+  const weaponState = { st: 0, frame: 0, phase: 0, kick: 0, sweep: 0 };
+
+  /**
+   * Which sword frame this moment of the swing shows, and how much recoil goes with it.
+   *
+   * The eight painted poses are laid over the attack state machine rather than run on their own
+   * clock, so the frame on screen is always the frame the simulation is actually in — a wind-up the
+   * player can read is only a fair telegraph if it lasts exactly as long as the wind-up does.
+   * @param {GameState} state
+   * @returns {{st:number, frame:number, phase:number, kick:number}}
+   */
+  function weaponView(state) {
+    const atk = /** @type {any} */ (state).attack;
+    const st = atk ? atk.st | 0 : 0;
+    const t = atk ? atk.t : 0;
+    const S = COMBAT.SWING;
+    let phase = 0;
+    let frame = 0;
+    let kick = 0;
+    // How far across the screen the cut travels, 0..1. The painted poses cannot carry this on their
+    // own: the blade is already at the edge of its 64-texel card at full roll, so sweeping it
+    // further inside the card clips the point off. Sliding the whole card left is what turns a
+    // raised blade into a cut that crosses the view.
+    let sweep = 0;
+    // `kick` is SIGNED: negative drops the weapon back out of the way, positive drives it up into
+    // the view. The first pass made it 0..1 and the renderer always pushed DOWN, so the strike —
+    // the one frame the player is looking at — shoved the blade off the bottom of the screen.
+    if (st === 1) {
+      // Wind-up: poses 1→2, the blade drawn back and down. This is the telegraph, and it earns the
+      // strike that follows by getting out of the way first.
+      phase = S.WIND_UP > 0 ? clamp01(t / S.WIND_UP) : 1;
+      frame = phase < 0.5 ? 1 : 2;
+      kick = -0.45 * phase;
+    } else if (st === 2) {
+      // Strike: poses 3→4, the two fast frames with the motion smear on them, driven up and across.
+      phase = S.STRIKE > 0 ? clamp01(t / S.STRIKE) : 1;
+      frame = phase < 0.5 ? 3 : 4;
+      kick = 1;
+      sweep = 0.35 + 0.65 * phase;
+    } else if (st === 3) {
+      // Recover: poses 5→7 settling back to rest, and the lift decays with them.
+      phase = S.RECOVER > 0 ? clamp01(t / S.RECOVER) : 1;
+      frame = phase < 0.34 ? 5 : phase < 0.7 ? 6 : 7;
+      kick = 1 - phase;
+      sweep = (1 - phase) * 0.8;
+    }
+    weaponState.st = st;
+    weaponState.frame = frame < SWORD_FRAMES ? frame : SWORD_FRAMES - 1;
+    weaponState.phase = phase;
+    weaponState.kick = kick;
+    weaponState.sweep = sweep;
+    return weaponState;
+  }
 
   /** The tick action, reused: the reducer allocates nothing per step and neither should we. */
   const tickAction = { type: 'tick', dt: 0, input: /** @type {InputFrame|null} */ (null), auto: false };
@@ -1167,6 +1320,11 @@ function boot() {
    */
   function step(dt) {
     const polled = pollFrame();
+    // A press on the HUD's ATTACK plaque this frame (§4.11), merged in as a real edge.
+    if (attackPressed) {
+      attackPressed = false;
+      polled.pressed.add('attack');
+    }
     const state = store.getState();
     // Menus consume navigation on every menu screen and return false during play and loading.
     if (!menus.handleInput(polled, state)) handleHotkeys(polled, state);
@@ -1258,6 +1416,11 @@ function boot() {
     renderView.flame = inRun && perks ? perks.flame : 1;
     renderView.oilSense = inRun && perks ? perks.oilSense : 0;
     renderView.whisper = inRun && perks ? perks.whisper : 0;
+    // New Descent (§4.11). The title's attract camera wanders the plain game, so both are empty
+    // there and the enemy pass and the weapon pass return on their first line.
+    const foes = /** @type {any} */ (state).enemies;
+    renderView.enemies = inRun && Array.isArray(foes) ? foes : NO_ENEMIES;
+    renderView.weapon = inRun && /** @type {any} */ (state).mode === 'combat' ? weaponView(state) : null;
 
     // Torch strength drives the light radius (§4.5). The exponent keeps the dungeon readable for
     // most of the level and then closes in hard over the last fifth, which is where the tension is.
@@ -1268,8 +1431,9 @@ function boot() {
     syncTileset(state.phase === 'title' ? 1 : state.level);
     raycaster.render(renderView);
 
-    // Touch devices get the AUTO button in the touch bar; the HUD's is for a mouse (§4.10).
+    // Touch devices get these in the touch bar; the HUD's plaques are for a mouse (§4.10, §4.11).
     hud.setAutoButton(!input.isTouch);
+    hud.setAttackButton(!input.isTouch);
     hud.render(state, loop.stats(), alpha);
     menus.render(state);
 

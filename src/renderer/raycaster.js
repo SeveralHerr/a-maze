@@ -75,6 +75,7 @@ import {
 } from './textures.js';
 import { createParticles, PARTICLE, PARTICLE_COLORS } from './particles.js';
 import { createSpriteIndex } from './sprite-index.js';
+import { ENEMY_ART, ENEMY_FRAMES, ENEMY_POSE, enemyFrameIndex } from './enemies.js';
 
 // ─── Tunables ──────────────────────────────────────────────────────────────────────────────────
 
@@ -614,6 +615,55 @@ const WALL_VARIANT = Uint8Array.of(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 
 /** Stand-ins for a view with no items/torches, so the index never sees `null` or a fresh `[]`. */
 const EMPTY_ITEMS = /** @type {import('../core/types.js').Item[]} */ ([]);
 const EMPTY_TORCHES = /** @type {import('../core/types.js').Torch[]} */ ([]);
+/** Handed to the enemy pass while no level is loaded, or in Classic Descent. Never reallocated. */
+const EMPTY_ENEMIES = /** @type {any[]} */ ([]);
+
+/**
+ * Yaw views a creature's art carries, mirrored from `enemies.js` so the frame arithmetic below is a
+ * local constant rather than a property read per sprite. `enemies.test.mjs` asserts the two agree.
+ */
+const ENEMY_VIEWS_LOCAL = 6;
+
+/** Seconds a corpse stays on the cobbles before it stops being drawn. Mirrors `COMBAT.CORPSE_SECONDS`. */
+const CORPSE_FADE = 1.1;
+
+/**
+ * Each creature's billboard height in tiles, and the world offset that stands its painted floor row
+ * on the actual floor — derived from `ENEMY_ART` with the map scroll's formula (see
+ * `MAP_SPRITE_VOFF`), so the art and the placement can never drift apart.
+ */
+const CRAWLER_SPRITE_SCALE = ENEMY_ART.crawler.scale;
+const CRAWLER_SPRITE_VOFF = 0.5 - (CRAWLER_SPRITE_SCALE * (ENEMY_ART.crawler.floorRow + 1 - TEX / 2)) / TEX;
+const WRAITH_SPRITE_SCALE = ENEMY_ART.wraith.scale;
+const WRAITH_SPRITE_VOFF = 0.5 - (WRAITH_SPRITE_SCALE * (ENEMY_ART.wraith.floorRow + 1 - TEX / 2)) / TEX;
+
+/** Pixels the held weapon rises and falls with the head bob, and swings across it. */
+const WEAPON_BOB = 5;
+const WEAPON_SWAY = 3;
+
+/**
+ * Where the weapon card sits: its left edge `WEAPON_RIGHT` of a card-width in from the right, its
+ * top `WEAPON_BOTTOM` of a card-height up from the bottom. Under 1 on both, so the grip and the hand
+ * run off the corner and only the blade is in frame — which is what a held weapon looks like.
+ */
+const WEAPON_RIGHT = 0.82;
+const WEAPON_BOTTOM = 0.86;
+
+/** Fraction of a card-height the strike drives the weapon up the screen (see `kick`). */
+const WEAPON_LIFT = 0.13;
+
+/** Fraction of a card-width the strike carries the weapon ACROSS the screen (see `sweep`). */
+const WEAPON_SWEEP = 0.3;
+
+/**
+ * How lit the sword stays on an empty torch.
+ *
+ * High — 0.6, not the 0.42 of the first pass. The blade is held a hand's length from the eye, so it
+ * is the best-lit thing in the frame whatever the corridor is doing; shading it like a wall thirty
+ * tiles away made it a grey stick that disappeared into the floor. It still dims with the torch, so
+ * it is plainly part of the same scene.
+ */
+const WEAPON_MIN_LIGHT = 0.6;
 
 // ─── Lookup-table construction ─────────────────────────────────────────────────────────────────
 
@@ -819,6 +869,9 @@ function tnoise(t, seed) {
  * @property {ParticleSystem} particles           effect pool; main.js spawns pickup bursts here
  * @property {TextureSet} textures                the painted set in use
  * @property {(set:TextureSet) => void} setTextures
+ * @property {(set:import('./enemies.js').CombatTextures|null) => void} setCombatTextures  New
+ *   Descent's creature and sword art (§4.11), held beside `textures` so the per-floor tileset swap
+ *   never carries it; null forgets it
  * @property {() => Float32Array} depth           per-column wall distance from the last frame
  * @property {() => {n:number, x:Float32Array, y:Float32Array}} lights  wall torches lighting the
  *   last frame (reused object and arrays; diagnostic)
@@ -1007,6 +1060,29 @@ export function createRaycaster(canvas, options) {
   // Rebuilt only when the level changes (see `syncIndexes`); every frame after that, the light and
   // sprite passes walk buckets near the camera instead of the whole level.
   const itemIndex = createSpriteIndex();
+
+  /**
+   * New Descent's enemies (ARCHITECTURE.md §4.11).
+   *
+   * Unlike the item and torch indexes this one is **rebuilt every frame**, because its points move.
+   * That is legal here and only here: the population is capped at `COMBAT.MAX_ENEMIES` (40) by the
+   * simulation, not by the level, so the rebuild is O(40) whatever the maze measures — and
+   * `sprite-index.js` allocates only above its previous high-water mark, so after the first combat
+   * floor it allocates nothing at all.
+   */
+  const enemyIndex = createSpriteIndex();
+  /** @type {any[]} */
+  let idxEnemies = EMPTY_ENEMIES;
+  const readEnemyX = (/** @type {number} */ i) => idxEnemies[i].x;
+  const readEnemyY = (/** @type {number} */ i) => idxEnemies[i].y;
+
+  /**
+   * The combat art (`enemies.js`), installed by `setCombatTextures`. Held **beside** `textures`
+   * rather than merged into a `TextureSet`, so the per-floor tileset swap never has to carry it and
+   * a set painted once survives every floor.
+   * @type {import('./enemies.js').CombatTextures|null}
+   */
+  let combat = null;
   const torchIndex = createSpriteIndex();
   /** @type {import('../core/types.js').Item[]} */
   let idxItems = EMPTY_ITEMS;
@@ -1193,6 +1269,15 @@ export function createRaycaster(canvas, options) {
     const maze = view.maze;
     const items = view.items || EMPTY_ITEMS;
     const torches = view.torches || EMPTY_TORCHES;
+    // Enemies move, so their index is rebuilt every frame — see the note on `enemyIndex`. Skipped
+    // entirely when there are none, which is every frame of a Classic Descent.
+    const enemies = /** @type {any} */ (view).enemies;
+    idxEnemies = Array.isArray(enemies) ? enemies : EMPTY_ENEMIES;
+    if (idxEnemies.length > 0) {
+      enemyIndex.build(idxEnemies.length, readEnemyX, readEnemyY, maze.width, maze.height);
+    } else if (enemyIndex.count !== 0) {
+      enemyIndex.build(0, readEnemyX, readEnemyY, maze.width, maze.height);
+    }
     if (
       maze === idxMaze &&
       items === idxItems &&
@@ -2549,6 +2634,8 @@ export function createRaycaster(canvas, options) {
       }
     }
 
+    gatherEnemies(view, time);
+
     const exit = view.exit;
     if (exit) {
       const ex = exit.x + 0.5;
@@ -2587,6 +2674,97 @@ export function createRaycaster(canvas, options) {
         j--;
       }
       sprOrder[j + 1] = v;
+    }
+  }
+
+  /**
+   * Queue the live enemies (New Descent, ARCHITECTURE.md §4.11).
+   *
+   * Walks the enemy spatial index exactly as the item pass walks its own, so the cost tracks what is
+   * near the camera rather than how many the floor holds — and the population is capped at 40 by the
+   * simulation in the first place, so this is O(1) in the level twice over.
+   * @param {RenderView} view
+   * @param {number} time seconds
+   * @returns {void}
+   */
+  function gatherEnemies(view, time) {
+    if (combat === null) return;
+    const list = idxEnemies;
+    if (list.length === 0 || enemyIndex.count === 0) return;
+    const far2 = SPRITE_FAR * SPRITE_FAR;
+    if (!queryCells(enemyIndex, camX, camY, SPRITE_FAR)) return;
+    const cellStart = enemyIndex.cellStart;
+    const entries = enemyIndex.entries;
+    const epx = enemyIndex.px;
+    const epy = enemyIndex.py;
+    const cols = enemyIndex.cols;
+    for (let cy = qy0; cy <= qy1; cy++) {
+      const rowBase = cy * cols;
+      const kEnd = cellStart[rowBase + qx1 + 1];
+      for (let k = cellStart[rowBase + qx0]; k < kEnd; k++) {
+        const dx = epx[k] - camX;
+        const dy = epy[k] - camY;
+        const d2 = dx * dx + dy * dy;
+        if (d2 > far2) continue;
+        const e = list[entries[k]];
+        if (e === undefined) continue;
+        const frames = e.kind === 'wraith' ? combat.wraith : combat.crawler;
+        if (!frames || frames.length === 0) continue;
+        // A corpse lies there for `CORPSE_SECONDS` and then stops being drawn at all.
+        const dead = e.st === 6;
+        if (dead && e.t > CORPSE_FADE) continue;
+        if (!inFrustum(dx, dy)) continue;
+
+        // Which pose. A creature that is winding up, striking, staggering or dying has its own
+        // front-on frame; anything else walks, and the gait is read straight off the enemy's own
+        // `anim` phase, which the simulation advances by distance covered — so a monster pressed
+        // against a wall stops walking on the spot exactly as the player's head bob does.
+        let frame;
+        if (dead) {
+          frame = enemyFrameIndex(0, e.t < CORPSE_FADE * 0.35 ? ENEMY_POSE.DIE_A : ENEMY_POSE.DIE_B);
+        } else if (e.st === 2) {
+          frame = enemyFrameIndex(0, ENEMY_POSE.WIND);
+        } else if (e.st === 3) {
+          frame = enemyFrameIndex(0, ENEMY_POSE.STRIKE);
+        } else if (e.st === 5) {
+          frame = enemyFrameIndex(0, ENEMY_POSE.STAGGER);
+        } else {
+          // The view is the angle from the creature's own facing to the ray back to the camera, so
+          // view 0 is "looking at the player" whatever direction either of them is pointing.
+          const rel = Math.atan2(-dy, -dx) - e.angle;
+          const v = Math.round((rel / (Math.PI * 2)) * ENEMY_VIEWS_LOCAL);
+          const gait = (e.anim / (Math.PI * 2)) * ENEMY_FRAMES;
+          frame = enemyFrameIndex(v, -1, gait | 0);
+        }
+        const tex = frames[frame] || frames[0];
+
+        const d = Math.sqrt(d2);
+        dbl[D_X] = e.x;
+        dbl[D_Y] = e.y;
+        illumFlat(allLights, lightN);
+        dbl[D_DIST] = d;
+        let lvl = levelFx(1);
+        // A creature that has just been hit flashes: the shade is pinned bright for a fraction of a
+        // second. It is the only feedback that a swing connected when the thing is at the edge of
+        // the torch pool, and at 240p it has to be a value change, not a colour change.
+        const hurt = e.hurt > 0 ? e.hurt : 0;
+        if (hurt > 0) {
+          const lit = (LEVEL_MAX * (0.55 + 0.45 * hurt)) * FX_ONE;
+          if (lvl < lit) lvl = lit;
+        }
+        // The wraith is cold by construction: it takes none of the sconce's amber, the way a gem
+        // does not. The crawler takes it like the cobbles do, which is half of what tells them apart.
+        const warm = e.kind === 'wraith' ? 0 : illumWarmFx;
+        // World size and floor line come from the ART (`ENEMY_ART`), not from a literal here: the
+        // vertical offset is derived from the card's floor row with the same formula the map scroll
+        // uses, so moving a creature's origin row cannot leave it hovering or buried.
+        const wraithKind = e.kind === 'wraith';
+        const scale = wraithKind ? WRAITH_SPRITE_SCALE : CRAWLER_SPRITE_SCALE;
+        const vOff = wraithKind ? WRAITH_SPRITE_VOFF : CRAWLER_SPRITE_VOFF;
+        // A dying creature sinks as it fades, so a corpse settles onto the cobbles.
+        const sink = dead ? Math.min(1, e.t / CORPSE_FADE) * 0.12 : 0;
+        addSprite(e.x, e.y, tex, scale, vOff + sink, lvl, warm, d2, -1, 0);
+      }
     }
   }
 
@@ -2728,6 +2906,85 @@ export function createRaycaster(canvas, options) {
       if (any) drawn++;
     }
     return drawn;
+  }
+
+  // ── First-person weapon (New Descent, ARCHITECTURE.md §4.11) ───────────────────────────────
+
+  /**
+   * Blit the sword over the finished frame.
+   *
+   * A screen-space pass, not a billboard: the weapon is in the player's hands, so it has no world
+   * position, no depth and no z-test — it is simply in front of everything. It is drawn after the
+   * sprites and the particles and before the flash, so a pickup's tint washes over the blade too.
+   *
+   * The scale is a whole number of framebuffer pixels per texel, which is what keeps the sword on
+   * the same pixel grid as the walls behind it; at 240 rows that is 3×, and the card is anchored to
+   * the bottom-right corner so the grip runs off the screen exactly as a held weapon should.
+   * @param {RenderView} view
+   * @returns {number} 1 when it drew, 0 otherwise
+   */
+  function renderWeapon(view) {
+    if (combat === null) return 0;
+    const weapon = /** @type {any} */ (view).weapon;
+    if (!weapon) return 0;
+    const frames = combat.sword;
+    if (!frames || frames.length === 0) return 0;
+    let fi = weapon.frame | 0;
+    if (fi < 0) fi = 0;
+    else if (fi >= frames.length) fi = frames.length - 1;
+    const tex = frames[fi];
+    const ind = tex.indices;
+    const stip = tex.stipple;
+
+    // Integer scale: at least 2, and as close to a third of the buffer height as fits.
+    let scale = Math.max(2, Math.round(height / 84));
+    const size = TEX * scale;
+    // Anchored bottom-right, pushed off both edges so the hand is out of frame, plus the recoil the
+    // attack state asks for and the bob the walk already has.
+    // Signed: negative is the wind-up dropping back, positive is the strike driving up (see
+    // main.js `weaponView`). Clamped both ways so a malformed view cannot fling the card off-screen.
+    const kick = Number.isFinite(weapon.kick) ? (weapon.kick > 1 ? 1 : weapon.kick < -1 ? -1 : weapon.kick) : 0;
+    const bobPx = Math.sin(view.player.bob || 0) * (view.player.bobAmp || 0) * WEAPON_BOB;
+    const swayPx = Math.cos((view.player.bob || 0) * 0.5) * (view.player.bobAmp || 0) * WEAPON_SWAY;
+    // How far off each edge the card is pushed. The sword art sits in the card's lower right, and
+    // the card is then anchored to the screen's lower right, so the two offsets compound: the first
+    // pass pushed by 0.78/0.86 and left only the blade's tip in frame. These put the whole blade on
+    // screen with the grip and the hand running off the corner, which is what a held weapon looks like.
+    const sweep = Number.isFinite(weapon.sweep) ? (weapon.sweep > 1 ? 1 : weapon.sweep < 0 ? 0 : weapon.sweep) : 0;
+    const left = Math.round(width - size * WEAPON_RIGHT + swayPx - sweep * WEAPON_SWEEP * size);
+    const top = Math.round(height - size * WEAPON_BOTTOM + bobPx - kick * WEAPON_LIFT * size);
+
+    // The blade is lit by the player's own torch, so it dims with the oil left exactly as the walls
+    // in front of it do — a sword that stayed bright while the dungeon went dark would float.
+    const light = Number.isFinite(view.light) ? (view.light < 0 ? 0 : view.light > 1 ? 1 : view.light) : 1;
+    let level = ((WEAPON_MIN_LIGHT + (1 - WEAPON_MIN_LIGHT) * light) * LEVEL_MAX) | 0;
+    if (level < 0) level = 0;
+    else if (level > LEVEL_MAX) level = LEVEL_MAX;
+    const base = level << 8;
+
+    const x0 = left < 0 ? 0 : left;
+    const x1 = left + size > width ? width : left + size;
+    const y0 = top < 0 ? 0 : top;
+    const y1 = top + size > height ? height : top + size;
+    for (let x = x0; x < x1; x++) {
+      const tx = ((x - left) / scale) | 0;
+      if (tx < 0 || tx >= TEX) continue;
+      let pi = y0 * width + x;
+      for (let y = y0; y < y1; y++) {
+        const ty = ((y - top) / scale) | 0;
+        if (ty >= 0 && ty < TEX) {
+          const ti = (ty << 6) | tx;
+          const idx = ind[ti];
+          // Index 0 is the transparency key; a stippled texel (the motion smear) drops every other
+          // screen pixel, exactly like the flame halo and the Oil Sense ghost.
+          if (idx !== 0 && !(stip !== null && stip[ti] === 1 && ((x + y) & 1) === 0)) {
+            buf[pi] = colormap[base | idx];
+          }
+        }
+        pi += width;
+      }
+    }
+    return 1;
   }
 
   // ── Flash ───────────────────────────────────────────────────────────────────────────────────
@@ -2908,6 +3165,7 @@ export function createRaycaster(canvas, options) {
     partCam.invDet = 1 / (planeX * dirY - dirX * planeY);
     partCam.horizon = horizon;
     const partsDrawn = particles.draw(buf, width, height, zbuf, partCam);
+    renderWeapon(view);
 
     const flash = view.flash;
     if (flash && flash.a > 0.004) {
@@ -2938,6 +3196,19 @@ export function createRaycaster(canvas, options) {
    * @param {TextureSet} set
    * @returns {void}
    */
+  /**
+   * Install New Descent's creature and sword art (`enemies.js`, §4.11).
+   *
+   * Held beside the tileset's `TextureSet`, so a set painted once on the first combat floor survives
+   * every floor and a Classic Descent session never receives one at all. Passing null forgets it,
+   * which is what stops a mode switch drawing monsters that are no longer in the state.
+   * @param {import('./enemies.js').CombatTextures|null} set
+   * @returns {void}
+   */
+  function setCombatTextures(set) {
+    combat = set && Array.isArray(set.sword) && set.sword.length > 0 ? set : null;
+  }
+
   function setTextures(set) {
     if (!set || !set.wall || set.wall.length === 0) return;
     textures = set;
@@ -3022,6 +3293,7 @@ export function createRaycaster(canvas, options) {
       return textures;
     },
     setTextures,
+    setCombatTextures,
     depth,
     lights,
     dispose,

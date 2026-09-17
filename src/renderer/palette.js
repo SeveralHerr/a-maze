@@ -186,6 +186,25 @@ const SHARED_ENTRIES = /** @type {ReadonlyArray<readonly [string, number, boolea
   ['chalkSmudge', 0xa7a398], // a stroke's broken edge
   ['chalkMid', 0xd5d1c5], // the body of a stroke
   ['chalkPale', 0xf4f0e3], // where the chalk bit hardest
+
+  // ── New Descent (§4.11). Appended, so no existing index moves. ──────────────────────────────
+  // The two creatures are separated on the WARM/COOL axis rather than by hue alone, because at 240p
+  // under a guttering torch that is the only difference a player can read at corridor distance: the
+  // crawler takes the firelight like the cobbles do, the wraith refuses it.
+  ['chitinShadow', 0x1b0f0a], // under the carapace, and the outline
+  ['chitinDark', 0x3a2014],
+  ['chitinMid', 0x5e3720], // the body
+  ['chitinLight', 0x8a5430],
+  ['chitinPale', 0xb8793f], // the wet highlight along the shell's ridge
+  ['shroudShadow', 0x14161f], // the hollow of the hood — the darkest thing in the game
+  ['shroudDark', 0x2a3040],
+  ['shroudMid', 0x4a5468], // the robe
+  ['shroudLight', 0x7d8798],
+  ['shroudPale', 0xb9c2cd], // the one cold highlight on a shoulder
+  // Two bright steps on top of the existing `iron` ramp: a blade has to out-shine every wall in the
+  // frame or it reads as a grey stick held in front of the camera.
+  ['steelPale', 0xcdd6e0],
+  ['steelGlint', 0xf2f6fb],
 ]);
 
 /**
@@ -313,6 +332,11 @@ export const RAMPS = Object.freeze({
   map: ramp('mapShadow', 'mapDark', 'mapMid', 'mapLight', 'mapPale'),
   seal: ramp('sealShadow', 'sealDark', 'sealMid', 'sealLight'),
   chalk: ramp('chalkDust', 'chalkSmudge', 'chalkMid', 'chalkPale'),
+  // New Descent (§4.11). `steel` extends `iron` rather than replacing it, so the sword and the
+  // dungeon's ironwork stay the same metal — it is just polished.
+  chitin: ramp('chitinShadow', 'chitinDark', 'chitinMid', 'chitinLight', 'chitinPale'),
+  shroud: ramp('shroudShadow', 'shroudDark', 'shroudMid', 'shroudLight', 'shroudPale'),
+  steel: ramp('ironShadow', 'ironDark', 'ironBase', 'ironLight', 'ironHilite', 'steelPale', 'steelGlint'),
 });
 
 /** Every packed colour, for O(1) "is this on-palette?" checks in tests. */

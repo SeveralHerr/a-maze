@@ -183,27 +183,44 @@ const MAX_CHOICE_VALUES = 4;
  * @typedef {{id:string, items:ReadonlyArray<MenuItem>}} Screen
  */
 
-/** Title screen. */
+/**
+ * Title screen (ARCHITECTURE.md §4.11).
+ *
+ * **The two modes are the first two rows and nothing sits above them.** That is the whole point of
+ * the screen: the first decision is which game you are playing, and every other row is settings.
+ * The Shrine is gone from here — it belongs inside a mode now, because each mode has its own purse
+ * and a Shrine reached before a mode was chosen would spend whichever one happened to be live.
+ */
 const TITLE_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
-  { id: 'descend', label: 'Descend', kind: 'action' },
-  { id: 'shrine', label: 'Shrine', kind: 'action' },
+  { id: 'descendCombat', label: 'New Descent', kind: 'action' },
+  { id: 'descendClassic', label: 'Classic Descent', kind: 'action' },
   { id: 'options', label: 'Options', kind: 'action' },
   { id: 'controls', label: 'Controls', kind: 'action' },
   { id: 'credits', label: 'Credits', kind: 'action' },
 ]);
 
 /**
- * Title screen while a saved run waits (§4.10): Continue is the first row and the one selected, so a
+ * Title screen while a saved run waits (§4.10). Continue sits **below** the two modes rather than
+ * above them (§4.11 puts nothing above those), but it is still the row the cursor starts on, so a
  * reflexive Enter picks the descent back up rather than starting over it.
  */
 const TITLE_SAVED_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
+  { id: 'descendCombat', label: 'New Descent', kind: 'action' },
+  { id: 'descendClassic', label: 'Classic Descent', kind: 'action' },
   { id: 'continue', label: 'Continue', kind: 'action' },
-  { id: 'descend', label: 'New Descent', kind: 'action' },
-  { id: 'shrine', label: 'Shrine', kind: 'action' },
   { id: 'options', label: 'Options', kind: 'action' },
   { id: 'controls', label: 'Controls', kind: 'action' },
   { id: 'credits', label: 'Credits', kind: 'action' },
 ]);
+
+/**
+ * Row each screen's cursor starts on, by screen object, when nothing is remembered for it.
+ *
+ * Only the saved title needs one: §4.11 puts the two mode rows at the top and nothing above them,
+ * so "the row a reflexive Enter picks" is Continue at row 2 rather than row 0 (§4.10).
+ * @type {Map<Screen, number>}
+ */
+const START_ROW = new Map();
 
 /**
  * Pause screen. Save & Quit is the way out that keeps the run (§4.10); Abandon asks first. The
@@ -223,6 +240,12 @@ const PAUSE_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
 const PAUSE_AUTO_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ (
   PAUSE_ITEMS.map((item) => (item.id === 'auto' ? { id: 'auto', label: 'Stop Auto Explore', kind: 'action' } : item))
 );
+
+/**
+ * Pause screen in New Descent (§4.11): the same rows without Auto Explore, which does not exist in
+ * this mode. Dropped rather than disabled — a row that can never be chosen is worse than no row.
+ */
+const PAUSE_COMBAT_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ (PAUSE_ITEMS.filter((item) => item.id !== 'auto'));
 
 /**
  * Options screen. The ranges mirror `SETTING_SPEC` in `src/state/balance.js` (see the file
@@ -254,7 +277,16 @@ const OPTION_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
   { id: 'reducedMotion', label: 'Reduced Motion', kind: 'toggle', key: 'reducedMotion' },
   { id: 'invertLook', label: 'Invert Look', kind: 'toggle', key: 'invertLook' },
   // The autopilot walks the level for you (§4.10); also on the O key in play.
-  { id: 'autoExplore', label: 'Auto Explore', kind: 'toggle', key: 'autoExplore' },
+  // New Descent has no autopilot (§4.11), so the row greys out while a combat run is in progress.
+  // It is left on the screen rather than removed because the setting is global and still applies to
+  // Classic Descent — hiding it from inside one mode would read as having lost it.
+  {
+    id: 'autoExplore',
+    label: 'Auto Explore',
+    kind: 'toggle',
+    key: 'autoExplore',
+    enabled: (state) => /** @type {any} */ (state).mode !== 'combat',
+  },
   // Only acted on inside an embed (main.js, ARCHITECTURE.md §4.7); off also leaves fullscreen.
   { id: 'fullscreen', label: 'Fullscreen', kind: 'toggle', key: 'fullscreen' },
   { id: 'back', label: 'Back', kind: 'back' },
@@ -459,6 +491,7 @@ const SCREENS = Object.freeze({
   forfeitQuit: Object.freeze({ id: 'confirm', items: FORFEIT_QUIT_ITEMS }),
   pause: Object.freeze({ id: 'pause', items: PAUSE_ITEMS }),
   pauseAuto: Object.freeze({ id: 'pause', items: PAUSE_AUTO_ITEMS }),
+  pauseCombat: Object.freeze({ id: 'pause', items: PAUSE_COMBAT_ITEMS }),
   options: Object.freeze({ id: 'options', items: OPTION_ITEMS }),
   credits: Object.freeze({ id: 'credits', items: CREDITS_ITEMS }),
   controls: Object.freeze({ id: 'controls', items: CONTROLS_ITEMS }),
@@ -470,6 +503,9 @@ const SCREENS = Object.freeze({
   loading: Object.freeze({ id: 'loading', items: NO_ITEMS }),
   none: Object.freeze({ id: 'none', items: NO_ITEMS }),
 });
+
+// The saved title opens on Continue (see START_ROW).
+START_ROW.set(SCREENS.titleSaved, 2);
 
 /** `drawPanel` options per screen, built once instead of as a literal per frame. */
 const PANEL_PAUSE = Object.freeze({ frame: /** @type {const} */ ('stone'), alpha: 0.86 });
@@ -969,12 +1005,28 @@ export function createMenus(overlayCanvas, callbacks) {
   /** @type {Record<string, number>} */
   const savedIndex = Object.create(null);
   /**
+   * The item list each remembered index was measured against.
+   *
+   * Two screens can share an id and NOT share their rows — the title is `title` whether or not a run
+   * is saved, and the saved variant has an extra row in the middle — so an index remembered for one
+   * describes a different row in the other. Keying the memory on the row list as well as the id is
+   * what makes "go back to where you were" mean a row rather than a number.
+   * @type {Record<string, ReadonlyArray<MenuItem>>}
+   */
+  const savedItems = Object.create(null);
+  /**
    * Set when the boon was left with *Decide Later* (or back) on this level-complete visit: the next
    * Descend or Save & Quit then asks before forfeiting it, instead of reopening the cards (§4.9).
    */
   let boonDeferred = false;
   /** What the forfeit dialog proceeds with: 'next' or 'savequit'. */
   let pendingLeave = '';
+  /**
+   * Which mode the title row the player pressed starts (§4.11). Remembered across the *Start Over?*
+   * dialog, so confirming it begins the mode they actually chose rather than the last one played.
+   * @type {import('../core/types.js').Mode}
+   */
+  let pendingMode = 'classic';
   /** Phase seen on the previous render, to detect transitions. */
   let lastPhase = '';
   /** Screen id seen on the previous render. */
@@ -1143,6 +1195,8 @@ export function createMenus(overlayCanvas, callbacks) {
         return savedSummary() === null ? SCREENS.title : SCREENS.titleSaved;
       case 'paused':
         if (subScreen() !== null) return /** @type {Screen} */ (subScreen());
+        // New Descent has no Auto Explore row at all (§4.11); Classic's second row still switches it.
+        if (/** @type {any} */ (state).mode === 'combat') return SCREENS.pauseCombat;
         return state.settings !== undefined && state.settings.autoExplore === true ? SCREENS.pauseAuto : SCREENS.pause;
       case 'loading':
         return SCREENS.loading;
@@ -1226,6 +1280,7 @@ export function createMenus(overlayCanvas, callbacks) {
    */
   function openSub(id) {
     savedIndex[currentScreenId] = index;
+    savedItems[currentScreenId] = currentScreenItems;
     sub = id;
     const target = subScreenId(id);
     // A dialog always opens on its safe answer; every other sub-screen remembers its row.
@@ -1243,6 +1298,7 @@ export function createMenus(overlayCanvas, callbacks) {
     // Leaving the cards without claiming one is a decision to decide later (§4.9).
     if (sub === 'boon') boonDeferred = true;
     savedIndex[subScreenId(sub)] = index;
+    savedItems[subScreenId(sub)] = currentScreenItems;
     sub = null;
     index = savedIndex[currentBaseId] !== undefined ? savedIndex[currentBaseId] : 0;
     indexOwner = currentBaseId;
@@ -1250,6 +1306,9 @@ export function createMenus(overlayCanvas, callbacks) {
 
   /** Id of the screen drawn last frame (used by openSub/closeSub for the index memory). */
   let currentScreenId = 'title';
+  /** That screen's row list, so a remembered index can be matched to the rows it counted. */
+  /** @type {ReadonlyArray<MenuItem>} */
+  let currentScreenItems = TITLE_ITEMS;
   /** Id of the base screen (title, pause or level complete) under any open sub-screen. */
   let currentBaseId = 'title';
 
@@ -1263,6 +1322,7 @@ export function createMenus(overlayCanvas, callbacks) {
    */
   function noteScreen(state, screen) {
     currentScreenId = screen.id;
+    currentScreenItems = screen.items;
     currentBaseId =
       state.phase === 'paused'
         ? 'pause'
@@ -1276,7 +1336,13 @@ export function createMenus(overlayCanvas, callbacks) {
     // would draw it moves the new screen's selection rather than being overwritten by it.
     lastScreen = screen.id;
     anim.enterT = 0;
-    if (indexOwner !== screen.id) index = savedIndex[screen.id] !== undefined ? savedIndex[screen.id] : 0;
+    if (indexOwner !== screen.id) {
+      // A remembered index only means anything if it was measured against THESE rows (see
+      // `savedItems`); otherwise the screen falls back to its own start row.
+      const remembered = savedItems[screen.id] === screen.items ? savedIndex[screen.id] : undefined;
+      const start = START_ROW.get(screen);
+      index = remembered !== undefined ? remembered : start !== undefined ? start : 0;
+    }
     indexOwner = screen.id;
     const count = syncEnabled(screen, state);
     if (count > 0 && (index >= count || index < 0 || !rowEnabled[index])) index = menuStep(rowEnabled, -1, 1, count);
@@ -1345,23 +1411,30 @@ export function createMenus(overlayCanvas, callbacks) {
     }
 
     switch (item.id) {
-      case 'descend':
+      case 'descendCombat':
+      case 'descendClassic': {
         sound('uiConfirm');
+        // Which mode the row starts (§4.11). Remembered until the dialog below is answered, so the
+        // confirm path starts the mode the player actually pressed rather than the last one.
+        pendingMode = item.id === 'descendCombat' ? 'combat' : 'classic';
         // Starting over a saved run discards it: ask first (§4.10).
         if (screen.id === 'title' && savedSummary() !== null) {
           openSub('replace');
           return true;
         }
-        invoke(cb.onNewGame, 'onNewGame');
+        invoke(cb.onNewGame, 'onNewGame', pendingMode);
         return true;
+      }
       case 'retry':
         sound('uiConfirm');
-        invoke(cb.onNewGame, 'onNewGame');
+        // Try Again replays the mode the run that just ended was in, which is the only mode the
+        // game-over screen is talking about.
+        invoke(cb.onNewGame, 'onNewGame', /** @type {any} */ (state).mode === 'combat' ? 'combat' : 'classic');
         return true;
       case 'newrun':
         sound('uiConfirm');
         closeSub();
-        invoke(cb.onNewGame, 'onNewGame');
+        invoke(cb.onNewGame, 'onNewGame', pendingMode);
         return true;
       case 'continue':
         sound('uiConfirm');

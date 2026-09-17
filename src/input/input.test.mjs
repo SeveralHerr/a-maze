@@ -161,7 +161,11 @@ test('every action is reachable from the keyboard with the documented keys', () 
     t.keyUp(code);
     return set;
   };
-  assert.deepEqual([...press('Space')], ['confirm']);
+  // Space carries both meanings, the way Escape does: menus read `confirm`, New Descent reads
+  // `attack` (ARCHITECTURE.md §4.11). The consumer disambiguates by phase.
+  const space = press('Space');
+  assert.ok(space.has('confirm') && space.has('attack'));
+  assert.deepEqual([...press('KeyF')], ['attack']);
   assert.deepEqual([...press('Backspace')], ['back']);
   assert.deepEqual([...press('KeyP')], ['pause']);
   assert.deepEqual([...press('Tab')], ['map']);

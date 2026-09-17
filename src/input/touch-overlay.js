@@ -73,6 +73,10 @@ const KNOB_IDLE_BORDER = GOLD;
 const KNOB_IDLE_BG = 'rgba(217,164,65,0.30)';
 const KNOB_IDLE_SHADOW = 'inset 0 0 0 2px rgba(0,0,0,0.5),0 0 10px rgba(217,164,65,0.25)';
 
+/** The ATTACK button is larger than the rest of the bar: it is pressed constantly, not occasionally. */
+const ATTACK_FONT = '15px system-ui, sans-serif';
+const ATTACK_PAD = '14px 20px';
+
 /** CHALK button opacity while this level's chalk charges are spent. */
 const CHALK_EMPTY_OPACITY = '0.4';
 
@@ -276,10 +280,18 @@ export function createTouchOverlay(root, opts) {
   // Auto Explore (§4.10), leftmost for the same reason. Always shown in play; lit while it drives.
   const autoBtn = makeButton('AUTO', 'auto');
   autoBtn.style.opacity = AUTO_OFF_OPACITY;
+  // The sword (New Descent, ARCHITECTURE.md §4.11). Rightmost and bigger than the rest: it is the
+  // one button pressed constantly rather than occasionally, and on a phone the right end of the bar
+  // is where the thumb already rests. Hidden outside New Descent, where AUTO takes its place.
+  const attackBtn = makeButton('ATTACK', 'attack');
+  attackBtn.style.display = 'none';
+  attackBtn.style.fontSize = ATTACK_FONT;
+  attackBtn.style.padding = ATTACK_PAD;
   bar.appendChild(autoBtn);
   bar.appendChild(chalkBtn);
   bar.appendChild(mapBtn);
   bar.appendChild(pauseBtn);
+  bar.appendChild(attackBtn);
 
   layer.appendChild(ring);
   layer.appendChild(knob);
@@ -293,6 +305,7 @@ export function createTouchOverlay(root, opts) {
   let chalkShown = false; // last CHALK visibility written
   let chalkEmpty = false; // last CHALK dimming written
   let autoLit = false; // last AUTO lit state written
+  let combatShown = false; // last ATTACK visibility (and AUTO hiding) written
   let stickShown = false;
   let ringX = NaN;
   let ringY = NaN;
@@ -351,6 +364,15 @@ export function createTouchOverlay(root, opts) {
       if (empty !== chalkEmpty) {
         chalkEmpty = empty;
         chalkBtn.style.opacity = empty ? CHALK_EMPTY_OPACITY : '';
+      }
+
+      // New Descent (§4.11): the sword appears and Auto Explore goes away entirely, because the
+      // mode has no autopilot. One DOM write on the mode change, never per frame.
+      const combat = !!state && /** @type {any} */ (state).mode === 'combat';
+      if (combat !== combatShown) {
+        combatShown = combat;
+        attackBtn.style.display = combat ? '' : 'none';
+        autoBtn.style.display = combat ? 'none' : '';
       }
 
       // Auto Explore (§4.10): lit while it drives. Opacity and outline only — never a position change.

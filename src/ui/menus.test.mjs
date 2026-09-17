@@ -703,8 +703,9 @@ test('the abandon dialog always opens on Keep Going, even after a replace dialog
   const { menus, log } = harness({ level: 4, score: 900 });
   const state = makeState('title');
   menus.render(state);
-  // New Descent → the replace dialog; move to "Start Over" and leave without pressing it.
-  menus.handleInput(press('down'), state);
+  // A mode row → the replace dialog; move to "Start Over" and leave without pressing it. The cursor
+  // starts on Continue (§4.11 puts the two mode rows above it), so the mode rows are UP from there.
+  menus.handleInput(press('up'), state);
   menus.handleInput(press('confirm'), state);
   menus.render(state);
   assert.equal(menus.screen(), 'confirm');
@@ -739,13 +740,16 @@ test('title rows: the gap between two labels belongs to the nearer of them', () 
   } finally {
     setLayoutProbe(null);
   }
-  const shrine = boxes.find((b) => b.kind === 'text' && b.label === 'Shrine');
-  const options = boxes.find((b) => b.kind === 'text' && b.label === 'Options');
-  assert.ok(shrine !== undefined && options !== undefined, 'both rows were laid out');
+  // Two adjacent rows that each OPEN a screen, so a click on either is observable through
+  // `screen()`. The Shrine was the upper one until it left the title with the modes wave (§4.11);
+  // Options and Controls are the neighbouring pair now.
+  const upper = boxes.find((b) => b.kind === 'text' && b.label === 'Options');
+  const lower = boxes.find((b) => b.kind === 'text' && b.label === 'Controls');
+  assert.ok(upper !== undefined && lower !== undefined, 'both rows were laid out');
   const m = menus.surface.metrics;
   const toClientY = (/** @type {number} */ uiY) => ((uiY + 0.5) * m.px * m.cssH) / m.devH;
   const toClientX = (/** @type {number} */ uiX) => ((uiX + 0.5) * m.px * m.cssW) / m.devW;
-  const mid = (shrine.y + shrine.h + options.y) / 2;
+  const mid = (upper.y + upper.h + lower.y) / 2;
   const x = toClientX(Math.round(m.w / 2));
   /** @param {number} uiY @returns {string} */
   const clickAt = (uiY) => {
@@ -759,9 +763,9 @@ test('title rows: the gap between two labels belongs to the nearer of them', () 
     fresh.render(st);
     return fresh.screen();
   };
-  assert.equal(clickAt(Math.floor(mid) - 1), 'shrine', 'just above the midpoint is still Shrine');
-  assert.equal(clickAt(Math.ceil(mid) + 1), 'options', 'just below it is Options');
-  assert.equal(clickAt(options.y - 1), 'options', 'a pixel over the "Options" ink is Options');
+  assert.equal(clickAt(Math.floor(mid) - 1), 'options', 'just above the midpoint is still Options');
+  assert.equal(clickAt(Math.ceil(mid) + 1), 'controls', 'just below it is Controls');
+  assert.equal(clickAt(lower.y - 1), 'controls', 'a pixel over the "Controls" ink is Controls');
 });
 
 test('options: clicking a word of the Map row writes THAT value, not the next one', () => {
@@ -1207,8 +1211,10 @@ function unlockHarness(phase, purse, ranks) {
   return { menus, state, log };
 }
 
-test('shrine: reached from the title, buys what the purse can pay for, refuses the rest', () => {
-  const { menus, state, log } = unlockHarness('title', 20, { chalk: 1 });
+test('shrine: reached from game over, buys what the purse can pay for, refuses the rest', () => {
+  // The Shrine left the title with the modes wave (§4.11); game over is one of the two screens it is
+  // reached from, and `down` lands on it there exactly as it used to on the title.
+  const { menus, state, log } = unlockHarness('gameOver', 20, { chalk: 1 });
   menus.render(state);
   menus.handleInput(press('down'), state); // Shrine
   menus.handleInput(press('confirm'), state);
@@ -1226,7 +1232,7 @@ test('shrine: reached from the title, buys what the purse can pay for, refuses t
   assert.equal(log.filter((e) => e === 'sfx:uiDeny').length, 2);
   menus.handleInput(press('back'), state);
   menus.render(state);
-  assert.equal(menus.screen(), 'title');
+  assert.equal(menus.screen(), 'gameover');
 });
 
 test('shrine: open from level complete and game over too', () => {
@@ -1327,7 +1333,9 @@ test('boon: Decide Later really defers — the next Descend confirms, then goes 
   }
 });
 
-test('title with a saved run: Continue first, and New Descent asks before overwriting it (§4.10)', () => {
+test('title with a saved run: Continue is selected, and a mode row asks before overwriting it', () => {
+  // §4.11 puts the two mode rows at the top and nothing above them, so Continue is no longer row 0 —
+  // but it is still the row the cursor starts on, so a reflexive Enter picks the descent back up.
   const { menus, log } = harness({ level: 12, score: 34567 });
   const state = makeState('title');
   menus.render(state);
@@ -1335,7 +1343,8 @@ test('title with a saved run: Continue first, and New Descent asks before overwr
   assert.deepEqual(log.filter((e) => e === 'continue' || e === 'newGame'), ['continue'], 'Enter continues');
 
   log.length = 0;
-  menus.handleInput(press('down'), state); // New Descent
+  menus.handleInput(press('up'), state); // Classic Descent
+  menus.handleInput(press('up'), state); // New Descent
   menus.handleInput(press('confirm'), state);
   menus.render(state);
   assert.equal(menus.screen(), 'confirm', 'starting over a saved run asks first');

@@ -1561,7 +1561,7 @@ export function finish(indices, stipple, emissive) {
  * @param {boolean} emissive
  * @returns {Texture}
  */
-function finishStippled(paint, emissive) {
+export function finishStippled(paint, emissive) {
   const stipple = new Uint8Array(AREA);
   const indices = paint(stipple);
   let used = false;

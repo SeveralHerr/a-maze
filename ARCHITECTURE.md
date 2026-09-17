@@ -214,7 +214,8 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
  * @property {number} turn            keyboard/stick turn -1..1 (right +), scaled by dt in sim
  * @property {number} lookDX          accumulated mouse/touch yaw delta in radians since last poll (already sensitivity-scaled)
  * @property {Set<InputAction>} pressed   edge-triggered this poll   (no `sprint`: removed, §1)
- * @typedef {'confirm'|'back'|'pause'|'map'|'up'|'down'|'left'|'right'|'mute'|'chalk'} InputAction
+ * @typedef {'confirm'|'back'|'pause'|'map'|'up'|'down'|'left'|'right'|'mute'|'chalk'|'auto'|'attack'} InputAction
+ *   `auto` is bit 10 (§4.10), `attack` bit 11 — the sword swing of New Descent (§4.11)
  */
 /**
  * @typedef {Object} Player
@@ -228,6 +229,8 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
  */
 /**
  * @typedef {'title'|'loading'|'playing'|'paused'|'levelComplete'|'gameOver'} Phase
+ * @typedef {'classic'|'combat'} Mode                 which game mode this run is (§4.11)
+ * @typedef {{best:BestScore, progress:Progress}} Profile   one mode's saved record and purse (§4.11)
  * @typedef {'off'|'corner'|'full'} MapMode           the three-state map (§4.6)
  * @typedef {Object} Settings
  * @property {number} volume 0..1  @property {number} music 0..1  @property {number} sensitivity 0.2..3
@@ -239,6 +242,15 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
  *   (default true; §4.3 `fullscreen.js`, §4.7). Turning it off also leaves fullscreen.
  * @typedef {Object} GameState
  * @property {Phase} phase
+ * @property {Mode} mode              which mode this run is (§4.11). `'classic'` is the game as
+ *   §1–§4.10 describe it; `'combat'` is New Descent. Not a setting and not persisted as a
+ *   preference — it is chosen by the title row that starts the run and stored in the `RunSave`.
+ * @property {{classic:Profile, combat:Profile}} profiles  per-mode record and purse (§4.11).
+ *   `state.best` and `state.progress` are LIVE REFERENCES into `profiles[mode]`, so every consumer
+ *   written against them is unchanged and the two purses can never mix.
+ * @property {Enemy[]} enemies        live enemies this level (empty in `'classic'`) — a pooled,
+ *   fixed-capacity array (`COMBAT.MAX_ENEMIES`), never reallocated per level (§4.11)
+ * @property {{st:number, t:number, hits:number}} attack   the player's sword state (§4.11)
  * @property {number} time            total sim seconds since boot (monotonic)
  * @property {number} phaseTime       seconds since phase changed
  * @property {number} level           1-based
@@ -259,7 +271,8 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
  *   `sim.recordBest` on a level clear, on game over, and when a paused run is abandoned through
  *   `toTitle` or `newGame` — abandoning a run keeps its score.
  * @property {Settings} settings
- * @property {{exitDist:number, nearExit:number, lowFuel:boolean}} derived   recomputed each step for renderer/hud/audio
+ * @property {{exitDist:number, nearExit:number, lowFuel:boolean, threat:number}} derived   recomputed each step for renderer/hud/audio
+ *   (`threat` is 0..1, the nearest awake enemy's proximity — 0 outside `'combat'`, §4.11)
  *   (`exitDist` is Infinity and `nearExit` 0 while no level is loaded — an honest "unknown")
  * @property {Progress} progress       persisted meta progression (§4.9): `{purse, ranks, boonLevel}`
  * @property {Perks} perks             flat numbers derived from `progress.ranks` (§4.9), read-only outside src/state
@@ -283,7 +296,11 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
  *   | {type:'lowFuel'} | {type:'gameOver', score:number, newBest:boolean} | {type:'phase', from:Phase, to:Phase}
  *   | {type:'uiMove'} | {type:'uiConfirm'}
  *   | {type:'chalk', ok:boolean, x:number, y:number} | {type:'ember', seconds:number}
- *   | {type:'unlock', id:string, rank:number, boon:boolean} } GameEvent
+ *   | {type:'unlock', id:string, rank:number, boon:boolean}
+ *   | {type:'swing', hit:boolean}
+ *   | {type:'enemyHit', kind:EnemyKind, x:number, y:number, damage:number, killed:boolean}
+ *   | {type:'playerHit', kind:EnemyKind, damage:number, x:number, y:number} } GameEvent
+ *   (the last three: New Descent, §4.11 — never emitted in `'classic'`)
  */
 ```
 
@@ -410,7 +427,7 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   mismatch, oversized payload) degrades to factory defaults rather than throwing. All three take an
   optional trailing `storage` argument so tests can inject a fake. (DOM-optional: no-ops in Node.)
 - **Actions** (`Action` union):
-  `{type:'tick', dt, input:InputFrame, auto?:boolean}` (`auto`: Auto Explore drove this step — §4.10) · `{type:'newGame', seed}` · `{type:'levelReady', data:LevelData}` ·
+  `{type:'tick', dt, input:InputFrame, auto?:boolean}` (`auto`: Auto Explore drove this step — §4.10) · `{type:'newGame', seed, mode?:Mode}` (the mode the title row picked — §4.11; omitted keeps the current one) · `{type:'levelReady', data:LevelData}` ·
   `{type:'pause'}` · `{type:'resume'}` · `{type:'nextLevel'}` · `{type:'toTitle'}` ·
   `{type:'setSetting', key, value}` · `{type:'debugWin'}` (headless tools only) ·
   `{type:'buyUnlock', id}` (title | levelComplete | gameOver; needs the purse and a rank to buy) ·
@@ -634,6 +651,12 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   stippled edge (the flask's `oil` frame therefore carries a stipple mask; Oil Sense's ghost skips
   stippled texels). `textures.js` uses it to render the oil flask and the wall
   sconce into ordinary sprite frames; nothing here runs per frame. Imports nothing.
+- `enemies.js` _(modes wave, §4.11)_ — `createCombatTextures(seed) → CombatTextures` plus
+  `ENEMY_VIEWS`, `ENEMY_FRAMES`, `ENEMY_POSE` and `enemyFrameIndex(view, pose)`. The two creatures
+  and the sword, modelled with `models.js` and rasterised into ordinary 64×64 sprite frames. **Not
+  part of `createTextures`**: it is painted lazily the first time a combat run needs it and installed
+  with `raycaster.setCombatTextures(set)`, so a Classic Descent session never pays for it and the
+  per-floor tileset swap is untouched. Deterministic and Node-safe, like `textures.js`.
 - `sprite-index.js` — `createSpriteIndex(cell = INDEX_CELL) → SpriteIndex` with
   `build(count, readX, readY, tilesW, tilesH)` and the public typed arrays `cellStart` / `entries` /
   `px` / `py` plus `cell` / `cols` / `rows` / `count`. A uniform-grid (counting-sort) bucketing of a
@@ -700,7 +723,8 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
     wall). Reused object and live arrays, exactly like `depth()`; **diagnostic only**, no consumer
     in main.js — it is the seam the nearest-8 equivalence test needs.
 - `RenderView` = `{ player:{x,y,angle,bob,bobAmp,shake}, maze:Maze, items:Item[], torches:Torch[], exit:Vec2, time:number, light:number /*0..1 torch strength*/, flash:{r,g,b,a}, portalOpen:boolean, reducedMotion:boolean, marks:ChalkMark[], flame:number /*torch radius ×*/, oilSense:number /*tiles*/, whisper:number /*dead-end depth, 0 off*/ }`
-  (the last four are the unlocks wave, §4.9; omitted fields mean "no unlock")
+  plus `enemies:Enemy[]` and `weapon:{st,phase,kick}|null` (New Descent, §4.11; empty/null in Classic)
+  (`marks`/`flame`/`oilSense`/`whisper` are the unlocks wave, §4.9; omitted fields mean "no unlock")
   — built once by main.js and mutated in place. `time` is the sim clock in seconds: it drives every
   animation and is differenced internally for particle timing, so pausing the sim freezes effects.
 - `post.js` — `createPost(rootEl) → { set({scanlines?, vignette?, lowFuelPulse?, flash?, iris?}), resize(cssW, cssH, internalH), destroy() }`
@@ -754,6 +778,9 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
 - `map.js` — the **three-state map** (the massive-maze replacement for the minimap). Exports `MAP`,
   `MAP_MODES`, `MAP_MODE_LABEL`, `MapMode`, `normalizeMapMode`, `nextMapMode`, `mapModeFromSettings`,
   `readMapMode`, `setMapMode`, `cycleMapMode`, `resetMapMode`, `createMapView`, `paintTiles`,
+  (`drawCorner` takes a trailing `corner` of `'br'` (default, Classic) or `'tr'` (New Descent, where
+  the bottom right belongs to the attack button — §4.11); `MAP.CORNER_TOP_GAP` is the clearance it
+  leaves under the score plaque),
   `countExplored`, `chooseFullScale(cols, rows, boxW, boxH, out?)`, `fitBeats(a, b)`,
   `cornerWindow(px, py, span, mw, mh, out, pad?)`.
   - **OFF → CORNER → FULL**, cycled by the existing `map` action. CORNER is a 25-tile (19 on a phone)
@@ -1263,6 +1290,185 @@ level is not stored: `(params, seed)` rebuilds it (§4.4), so a save records onl
   first, like Descend — or, after a *Decide Later*, the forfeit confirm (§4.9).
 - `window.__game` additionally exposes `autopilot()` (= `autopilot.info()`) and `savedRun()`.
 
+### 4.11 Game modes — Classic Descent and New Descent _(modes wave — cross-module seam)_
+
+The game ships **two modes**, chosen from the title screen and never mixed:
+
+| mode | `state.mode` | what it is |
+|------|--------------|------------|
+| Classic Descent | `'classic'` | everything §1–§4.10 describes, unchanged. No enemies, no weapon, Auto Explore available. |
+| New Descent | `'combat'` | the same labyrinth with **two enemy types** and a **sword**. No Auto Explore. |
+
+**The mode is a property of the run, not a setting.** It is not in `Settings` and it is not persisted
+as a preference: it is chosen by the title row that starts the run, carried on `GameState.mode`, and
+saved inside the `RunSave`. `state.mode` while in `title` is whatever the last run used (`'classic'`
+on a fresh profile) and means nothing — the title's own rows are the only way to pick one.
+
+**Classic Descent must not regress.** Every number, every event and every draw call in §1–§4.10 is
+reached by exactly the same code path in `'classic'` as before this wave; the mode is read as an
+early-out at the head of the new work (`if (state.mode !== 'combat') return`), never as a branch
+threaded through an existing hot loop. `combat.test.mjs` and `game.test.mjs` both pin that a classic
+step emits no combat event and allocates no enemy.
+
+#### Profiles: each mode owns its purse, its ranks and its record
+
+```js
+/** @typedef {'classic'|'combat'} Mode */
+/** @typedef {{best:BestScore, progress:Progress}} Profile */
+```
+
+- `GameState` gains `mode:Mode` and `profiles:{classic:Profile, combat:Profile}`.
+- **`state.best` and `state.progress` stay exactly where they were** — they are *live references*
+  into `profiles[state.mode]`, re-pointed by `setMode` (on `newGame`, `continueRun` and boot).
+  Every existing consumer (the HUD's record line, the Shrine, `recordBest`, `savePersist`) is
+  untouched, and it is impossible for a gem picked up in one mode to reach the other purse, because
+  there is only ever one live `progress` object and it belongs to the mode being played.
+- `balance.js` gains `defaultProfiles()` and `sanitizeProfiles(src) → {classic, progress…}`;
+  `sanitizeProgress` / `sanitizeBest` are unchanged and are what it is built from.
+- **Persistence is additive inside payload version 1** (§4.2 `save.js`), exactly like `progress`
+  was: the record gains `modes:{classic:{best,progress}, combat:{best,progress}}`, and the legacy
+  flat `best`/`progress` keys are **still written** as a mirror of the classic profile. A record from
+  before this wave has no `modes`, so `loadPersist` folds its flat `best`/`progress` into
+  `modes.classic` and starts `modes.combat` empty — an existing player keeps their purse, their
+  ranks and their high score, and finds New Descent at rank zero. A record written by this build and
+  read by an older one still finds the flat keys it expects. `loadPersist()` therefore returns
+  `{best, settings, progress, profiles}`, where `best`/`progress` remain the classic profile's, so
+  no existing caller changes.
+
+#### The Shrine moves inside the modes
+
+The Shrine is **removed from the title screen**. It is reached only from within a mode — the
+level-complete and game-over screens, which is where a purse that mode earned is spent. `SHRINE_FROM`
+drops `'title'` accordingly, so `buyUnlock` dispatched from the title is ignored rather than
+silently spending the last-played mode's purse.
+
+#### New Descent: the two enemies
+
+`src/state/combat.js` owns every enemy. It is pure and Node-testable (it imports `core/math`,
+`core/rng`, `maze/constants` and `balance`, exactly like `autopilot.js`).
+
+```js
+/** @typedef {'crawler'|'wraith'} EnemyKind */
+/**
+ * @typedef {Object} Enemy
+ * @property {number} id            stable within a level (its pool slot)
+ * @property {EnemyKind} kind
+ * @property {number} x @property {number} y        world position, tiles
+ * @property {number} px @property {number} py      previous-step values, for render interpolation
+ * @property {number} angle         facing, radians (same convention as Player)
+ * @property {number} hp @property {number} hpMax
+ * @property {EnemyState} st        see below
+ * @property {number} t             seconds spent in `st`
+ * @property {number} cool          seconds until it may attack again
+ * @property {number} anim          gait phase, radians — advanced by distance walked, like head bob
+ * @property {number} lkx @property {number} lky    last position the player was seen at
+ * @property {number} hurt          0..1 hit flash, decays
+ */
+/** @typedef {0|1|2|3|4|5|6} EnemyState  0 idle · 1 chase · 2 windUp · 3 strike · 4 recover · 5 stagger · 6 dead */
+```
+
+| | `crawler` | `wraith` |
+|---|---|---|
+| read | low, wide, many-legged; skitters | tall, narrow, hooded; drifts |
+| palette | warm chitin (`RAMPS.chitin`) | cold pale shroud (`RAMPS.shroud`) |
+| numbers | `COMBAT.CRAWLER` | `COMBAT.WRAITH` |
+| behaviour | fast, short reach, light hit, short recovery | slow, long reach, heavy hit, long telegraph |
+
+Everything above lives in `balance.js`'s frozen `COMBAT` table: `MAX_ENEMIES` (40), `WAKE_TILES`,
+`LOSE_TILES`, `PLAYER_HP`, `HEAL_PER_OIL`, `KILL_SCORE`, `DENSITY_START`/`DENSITY_END` (enemies per
+100 cells, ramped to `CAP_LEVEL`), `SWING` and the two per-kind blocks (`hp`, `speed`, `radius`,
+`reach`, `damage`, `windUp`, `strike`, `recover`, `stagger`, `score`). `combatParams(level) →
+{count, hpMult, damageMult}` is the per-level curve, and it is the **only** thing that scales with
+depth — the flask chain and the tank are untouched, so §1's placement guarantee is exactly as valid
+in New Descent as in Classic.
+
+**Enemies never pathfind.** A BFS per enemy per replan would be O(tiles) × O(enemies), which §6
+forbids. Instead an awake enemy **seeks with wall sliding**: it steers toward the player (or, with no
+line of sight, toward `lkx/lky` and then idles), and its move goes through the same `moveCircle`
+solver the player uses, so a corridor wall turns it down the corridor. One `hasLineOfSight` DDA per
+awake enemy per step, bounded by `WORLD.LOS_MAX_CELLS`. That is a dumber hunter than a pathfinder and
+deliberately so: in a corridor maze the corridor *is* the path, and a monster that solves the
+labyrinth to reach you is not a monster a torch-lit corridor game wants.
+
+**Cost per step is O(awake enemies), and `MAX_ENEMIES` is a constant.** Enemies outside
+`COMBAT.WAKE_TILES` cost one squared-distance test and nothing else; the pool is a fixed-capacity
+array of reused objects allocated once per run (`ensureEnemyPool`), so a level change re-seeds slots
+rather than allocating. Nothing here is O(items), O(tiles) or O(level).
+
+**The player's sword.** `state.attack = {st, t, hits}` (`st`: 0 idle · 1 windUp · 2 strike · 3
+recover). `startAttack(state)` opens a swing when idle and the phase is `playing`; the strike window
+resolves **once**, against every enemy inside `SWING.REACH` tiles and within `SWING.ARC` radians of
+the view, requiring line of sight. `run.hp` / `run.hpMax` are the player's health (0 outside
+`'combat'`); reaching 0 ends the run through the same `endRun` as a dead torch — so the torch is
+still the clock and a monster is what makes the clock hurt. An oil flask also mends
+`COMBAT.HEAL_PER_OIL`, so the existing economy is the healing economy too.
+
+**Events** (§3 `GameEvent`): `{type:'swing', hit:boolean}`, `{type:'enemyHit', kind, x, y, damage,
+killed}`, `{type:'playerHit', kind, damage, x, y}`. `derived` gains `threat` (0..1, nearest awake
+enemy's proximity) for audio and the post stack.
+
+#### Renderer
+
+- `RenderView` gains `enemies:Enemy[]` (`NO_ENEMIES` outside combat) and
+  `weapon:{st:number, phase:number, kick:number}|null`.
+- **Enemies go through the sprite spatial index like everything else.** `raycaster.js` holds a third
+  `createSpriteIndex()` and **rebuilds it every frame** — which is legal precisely because the
+  population is capped at `COMBAT.MAX_ENEMIES` (40) rather than by the level: the rebuild is
+  O(enemies) with a constant bound, it allocates nothing above the first level's high-water mark
+  (§4.5 allocation contract), and the gather pass then queries it with the identical
+  `queryCells(…, SPRITE_FAR)` walk the items use. The item and torch indexes keep their
+  rebuild-on-level-change rule; only the enemy index is per-frame, and only because its points move.
+- **`src/renderer/enemies.js`** paints the combat art, and is **not** part of `createTextures`:
+  `createCombatTextures(seed) → CombatTextures {crawler:Texture[], wraith:Texture[], sword:Texture[],
+  ENEMY_VIEWS, ENEMY_FRAMES}` is called lazily, the first time a combat run needs it, and cached by
+  main.js. A Classic Descent session never pays for it. Both creatures are **modelled** with
+  `models.js` and rasterised per view (`ENEMY_VIEWS` = 5 yaws over the full turn, mirrored for the
+  other half) × per gait frame (`ENEMY_FRAMES` = 4), plus a wind-up, a strike, a stagger and two
+  death frames. Frame index: `enemyFrameIndex(view, pose)`, exported so the renderer and its test
+  agree on one formula.
+- `raycaster.setCombatTextures(set)` installs them; they are held **beside** `textures`, not merged
+  into a `TextureSet`, so the per-floor tileset swap (§4.5) is untouched and a set painted once
+  survives every floor.
+- **The weapon is a screen-space pass**, `renderWeapon(view)`, run after the sprites and the
+  particles and before the flash: one 64×64 sword frame blitted at an integer scale into the
+  bottom-right of the framebuffer, offset by the swing's kick and lunge, shaded through the same
+  colormap row the player's torch produces, alpha-keyed on palette index 0. No z-test (it is in
+  front of everything), no allocation, and it draws nothing when `view.weapon` is null.
+
+#### UI
+
+- `hud.js` — in `'combat'` it additionally draws a **health bar** under the fuel gauge (the same
+  panel language, `RAMPS.blood`), and an **ATTACK** plaque at the **bottom right** of the world band
+  (`hud.hitAttack(clientX, clientY)`, `hud.setAttackButton(on)` — main.js suppresses it on touch,
+  where the touch bar owns it). The **AUTO button is never drawn in `'combat'`**, key hint included.
+- **The corner map moves to the top right in `'combat'`** — tucked under the score panel — because
+  the bottom right now belongs to the attack button. In `'classic'` it stays exactly where it was
+  (bottom right). `map.js` `drawCorner` gains a `corner` argument (`'br'` default, `'tr'`), and
+  `MAP.CORNER_TOP_GAP` is the clearance it leaves for the score plaque.
+- `menus.js` — the title is **New Descent · Classic Descent**, then *Continue* when a run is saved,
+  then Options · Controls · Credits. **Nothing sits above the two mode rows**, and the Shrine row is
+  gone from the title. `onNewGame(mode)` carries the mode. Starting either mode while a save exists
+  raises the existing *Start Over?* confirm. The pause screen drops its *Auto Explore* row in
+  `'combat'`, and the Options screen's Auto Explore toggle is disabled there.
+- `audio.js` — voices `swing`, `enemyHit`, `playerHit` and a kill; `derived.threat` rides the drone.
+- `touch-overlay.js` — an **ATTACK** button, rightmost and larger than the rest, shown only while
+  `state.mode === 'combat'`; the AUTO button is hidden there.
+
+#### Saved runs
+
+`RunSave` gains `mode:Mode` (absent ⇒ `'classic'`, so every existing save still loads), and a
+combat `mid` gains `foes:number[]` — four numbers per live enemy (`kindIndex`, `x*64|0`, `y*64|0`,
+`hp`), so a 40-enemy floor costs ~160 numbers. `applyMid` restores them when the level fingerprint
+matches and simply leaves the freshly spawned set alone when `foes` is absent. `continueRun` sets
+the mode before the level is requested, so the right profile is live before the first `levelReady`.
+
+#### Auto Explore is off in New Descent
+
+`Settings.autoExplore` is **ignored** in `'combat'`: `main.js`'s `driveAuto` returns the real frame,
+the `auto` action is swallowed, `shouldLockPointer()` no longer consults the setting, and both
+buttons and the pause row are hidden. The setting itself is left alone — a player who turns it on in
+Classic still has it on in Classic.
+
 ## 5. Quality gates (automated)
 - `npm test` — every `src/*/*.test.mjs` (node:test) in its own process (**808 tests in 44 files** —
   core 86, input 101, maze 94, renderer 111, state 183, ui 233).
@@ -1376,4 +1582,14 @@ level is not stored: `(params, seed)` rebuilds it (§4.4), so a save records onl
 - Audio is never heard before a gesture, and the console is silent in production: both are hard
   gates in `tools/verify.mjs`, because a game that chatters in the console or autoplays reads as
   broken.
+- **Two modes, one game.** New Descent (§4.11) is the same generator, the same torch economy and
+  the same placement guarantee with enemies and a sword added on top — not a second game sharing a
+  menu. The alternative (a combat-tuned level curve) would have forked `populate.js` and with it the
+  refuel proof that §1 rests on; instead `combatParams(level)` scales only the enemies, and
+  `levelParams` never learns the mode exists. The cost is that a New Descent floor is a Classic floor
+  you have to fight across, which is exactly the intent: the torch is still the clock.
+- **Enemies are capped, not level-scaled.** `COMBAT.MAX_ENEMIES` is 40 whatever the maze measures, so
+  every per-step and per-frame enemy pass is O(1) in the level — the §6 invariant above holds by
+  construction rather than by care. It is also why the renderer may rebuild the enemy spatial index
+  every frame while the item and torch indexes are rebuilt only on a level change.
 - itch.io target `severalherr/a-maze:html5`, deployed from `main` after the quality gate passes.

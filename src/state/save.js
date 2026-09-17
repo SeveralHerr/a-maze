@@ -18,7 +18,15 @@
  */
 
 import { createLogger } from '../core/log.js';
-import { defaultProgress, defaultSettings, sanitizeBest, sanitizeProgress, sanitizeSettings } from './balance.js';
+import {
+  defaultProfiles,
+  defaultProgress,
+  defaultSettings,
+  sanitizeBest,
+  sanitizeProfiles,
+  sanitizeProgress,
+  sanitizeSettings,
+} from './balance.js';
 import { sanitizeRunSave } from './runsave.js';
 
 /** @typedef {import('../core/types.js').Settings} Settings */
@@ -36,8 +44,11 @@ import { sanitizeRunSave } from './runsave.js';
 
 /**
  * What is persisted, and what `loadPersist` always returns (fully populated, always valid).
- * @typedef {{best: BestScore, settings: Settings, progress: Progress}} Persist
+ * `profiles` is the per-mode block (§4.11); `best` and `progress` are the **classic** profile's,
+ * kept as top-level fields so every caller written before the modes wave is unchanged.
+ * @typedef {{best: BestScore, settings: Settings, progress: Progress, profiles: {classic: Profile, combat: Profile}}} Persist
  */
+/** @typedef {import('../core/types.js').Profile} Profile */
 
 const log = createLogger('save');
 
@@ -48,12 +59,12 @@ export const PERSIST_KEY = 'amaze.v1';
 export const PERSIST_VERSION = 1;
 
 /**
- * Upper bound on the serialised payload, in characters. The real record is ~550 chars with every
- * unlock listed; anything
+ * Upper bound on the serialised payload, in characters. The real record is ~1.4 kB with every
+ * unlock listed in both mode profiles (§4.11); anything
  * this large is corruption or someone else's data under our key, and parsing it is a waste of a
  * frame during boot.
  */
-const MAX_PAYLOAD_CHARS = 4096;
+const MAX_PAYLOAD_CHARS = 8192;
 
 /**
  * The ambient `localStorage`, or `null` when there is none or touching it throws.
@@ -80,7 +91,15 @@ export function getDefaultStorage() {
  * @returns {Persist}
  */
 export function defaultPersist() {
-  return { best: { score: 0, level: 0 }, settings: defaultSettings(), progress: defaultProgress() };
+  const profiles = defaultProfiles();
+  // `best`/`progress` ARE the classic profile's objects, not copies: a caller that mutates one sees
+  // it in the other, which is the same live-reference rule `GameState` follows (§4.11).
+  return {
+    best: profiles.classic.best,
+    settings: defaultSettings(),
+    progress: profiles.classic.progress,
+    profiles,
+  };
 }
 
 /**
@@ -128,9 +147,12 @@ export function loadPersist(storage) {
     log.info('persisted record version mismatch; using defaults');
     return out;
   }
-  out.best = sanitizeBest(rec.best);
   out.settings = sanitizeSettings(rec.settings);
-  out.progress = sanitizeProgress(rec.progress);
+  // A record from before the modes wave has no `modes` block, so its flat `best`/`progress` become
+  // the classic profile and New Descent starts empty — an existing player keeps everything (§4.11).
+  out.profiles = sanitizeProfiles(rec.modes, { best: rec.best, progress: rec.progress });
+  out.best = out.profiles.classic.best;
+  out.progress = out.profiles.classic.progress;
   return out;
 }
 
@@ -140,8 +162,10 @@ export function loadPersist(storage) {
  * The record is sanitised before writing, so a corrupted in-memory state cannot be laundered into
  * storage; the write itself is wrapped because quota errors are routine in private-browsing modes.
  *
- * @param {{best?: unknown, settings?: unknown, progress?: unknown}|null|undefined} data typically
- *   `{best, settings, progress}`; an omitted `progress` keeps the progress already stored
+ * @param {{best?: unknown, settings?: unknown, progress?: unknown, profiles?: unknown}|null|undefined} data
+ *   typically `{best, settings, progress, profiles}`. An omitted `profiles` keeps what is stored,
+ *   for the same reason an omitted `progress` always has: a save path that only meant to store a
+ *   setting must not wipe a purse.
  * @param {StorageLike|null} [storage] storage to write to; defaults to `localStorage` when present
  * @returns {boolean} true when the record was written
  */
@@ -150,14 +174,39 @@ export function savePersist(data, storage) {
   if (store === null || typeof store.setItem !== 'function') return false;
 
   const src = data === null || typeof data !== 'object' ? {} : data;
-  // A caller that does not mention progress keeps what is stored: writing empty progress would wipe
-  // a player's purse and unlocks from any save path that only meant to store a setting.
-  const progress = src.progress === undefined ? loadPersist(store).progress : sanitizeProgress(src.progress);
+
+  // ── Which of the two shapes the caller is speaking ──────────────────────────────────────────
+  // `profiles` (§4.11) is authoritative when it is given: `GameState.best` and `.progress` are live
+  // references INTO it, and in New Descent they are the combat profile's — so folding them into
+  // `classic` because they arrived as flat keys would write one mode's purse over the other's.
+  // Without it, the caller is speaking the pre-modes shape and its flat keys ARE the classic
+  // profile, so they are folded in. Either way the record ends up self-consistent, which is what
+  // makes `loadPersist` free to read the `modes` block and ignore the mirror.
+  let profiles;
+  let best;
+  let progress;
+  if (src.profiles !== undefined) {
+    profiles = sanitizeProfiles(src.profiles, null);
+    best = profiles.classic.best;
+    progress = profiles.classic.progress;
+  } else {
+    // A caller that mentions neither keeps what is stored: writing empty progress would wipe a
+    // player's purse and unlocks from any save path that only meant to store a setting.
+    const stored = loadPersist(store);
+    profiles = stored.profiles;
+    best = src.best === undefined ? stored.best : sanitizeBest(src.best);
+    progress = src.progress === undefined ? stored.progress : sanitizeProgress(src.progress);
+    profiles.classic.best = best;
+    profiles.classic.progress = progress;
+  }
   const record = {
     v: PERSIST_VERSION,
-    best: sanitizeBest(src.best),
+    // The flat keys are still written, as a mirror of the classic profile: a record written by this
+    // build and read by an older one finds exactly the shape it expects (§4.11).
+    best,
     settings: sanitizeSettings(src.settings),
     progress,
+    modes: profiles,
   };
   try {
     store.setItem(PERSIST_KEY, JSON.stringify(record));

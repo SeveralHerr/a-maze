@@ -26,6 +26,8 @@
  */
 
 import { TILE } from '../maze/constants.js';
+import { coerceMode } from './balance.js';
+import { ENEMY_KINDS, ST_DEAD as FOE_DEAD } from './combat.js';
 
 /** @typedef {import('../core/types.js').GameState} GameState */
 /** @typedef {import('../core/types.js').LevelData} LevelData */
@@ -39,6 +41,13 @@ const MAX_LEVEL = 100000;
 
 /** Most chalk marks a save may carry (a level's charges are single digits). */
 const MAX_MARKS = 512;
+
+/**
+ * Most enemies a save may carry (New Descent, §4.11). Deliberately `COMBAT.MAX_ENEMIES` spelled out
+ * rather than imported: this is a **storage** bound, and it must not move when the gameplay cap is
+ * retuned — a save written at a higher cap has to stay readable by the build that lowered it.
+ */
+const MAX_FOES = 256;
 
 /** Largest map a save may describe, in tiles (the cap is 257×257; 4096² is the generator's limit). */
 const MAX_TILES = 4096 * 4096;
@@ -73,12 +82,19 @@ const MAX_TILES = 4096 * 4096;
  * @property {string} taken      items[i].taken, one bit each, base64
  * @property {string} explored   explored[i] !== 0, one bit each, base64
  * @property {Array<[number, number, number, number]>} marks  chalk marks as [x, y, face, seed]
+ * @property {number} hp         player health (New Descent, §4.11; 0 in Classic Descent)
+ * @property {number} kills      enemies felled this run
+ * @property {number[]} foes     four numbers per live enemy - kind index, x*64, y*64, hp - so a
+ *   40-enemy floor costs ~160 numbers. Empty in Classic Descent, and an absent or rejected list
+ *   simply leaves the freshly spawned set alone rather than refusing the whole save
  */
 
 /**
  * A saved run.
  * @typedef {Object} RunSave
  * @property {number} v           RUN_SAVE_VERSION
+ * @property {import('../core/types.js').Mode} mode  which mode this run is (§4.11). A save written
+ *   before the modes wave has no `mode` and loads as `'classic'`, which is what it was.
  * @property {number} seed        run seed (uint32)
  * @property {number} level       the depth continue loads
  * @property {number|null} mazeSeed  the exact maze seed of a mid-level save; null for a checkpoint
@@ -213,6 +229,7 @@ export function snapshotMidLevel(state) {
   const marks = Array.isArray(state.marks) ? state.marks : [];
   return {
     v: RUN_SAVE_VERSION,
+    mode: coerceMode(state.mode),
     seed: state.seed >>> 0,
     level: state.level,
     mazeSeed: maze.seed >>> 0,
@@ -237,8 +254,33 @@ export function snapshotMidLevel(state) {
       taken: encodeBits((i) => items[i].taken === true, items.length),
       explored: encodeBits((i) => explored[i] !== 0, explored.length),
       marks: marks.slice(0, MAX_MARKS).map((m) => /** @type {[number, number, number, number]} */ ([m.x, m.y, m.face, m.seed])),
+      hp: run.hp > 0 ? run.hp : 0,
+      kills: run.kills > 0 ? run.kills : 0,
+      foes: encodeFoes(state),
     },
   };
+}
+
+/**
+ * Pack the live enemies into a flat number list: kind index, x and y in 64ths of a tile, and hit
+ * points - four numbers each (ARCHITECTURE.md §4.11). Positions are quantised because a sixty-fourth
+ * of a tile is finer than a monster's silhouette, and a full double per coordinate would triple the
+ * list for nothing. Dead slots are skipped, so a cleared floor saves an empty list.
+ * @param {Readonly<GameState>} state
+ * @returns {number[]}
+ */
+function encodeFoes(state) {
+  /** @type {number[]} */
+  const out = [];
+  const list = /** @type {any[]} */ (/** @type {any} */ (state).enemies);
+  if (!Array.isArray(list)) return out;
+  for (let i = 0; i < list.length && out.length < MAX_FOES * 4; i++) {
+    const e = list[i];
+    if (!e || e.st === FOE_DEAD || !(e.hp > 0)) continue;
+    const kind = ENEMY_KINDS.indexOf(e.kind);
+    out.push(kind < 0 ? 0 : kind, Math.round(e.x * 64), Math.round(e.y * 64), Math.round(e.hp));
+  }
+  return out;
 }
 
 /**
@@ -249,6 +291,7 @@ export function snapshotMidLevel(state) {
 export function snapshotCheckpoint(state) {
   return {
     v: RUN_SAVE_VERSION,
+    mode: coerceMode(state.mode),
     seed: state.seed >>> 0,
     level: state.level + 1,
     mazeSeed: null,
@@ -306,6 +349,8 @@ export function sanitizeRunSave(raw) {
   /** @type {RunSave} */
   const out = {
     v: RUN_SAVE_VERSION,
+    // Absent means classic: every save written before the modes wave describes a classic run (§4.11).
+    mode: coerceMode(r.mode),
     seed,
     level,
     mazeSeed: null,
@@ -343,9 +388,13 @@ function sanitizeMid(raw) {
   const refuels = int(m.refuels, 0, 1e9);
   const chalk = int(m.chalk, 0, 1e6);
   const reserve = num(m.reserve, 0, 1e6);
+  // New Descent (§4.11). Absent in a classic save and in every save written before the modes wave,
+  // so these degrade to zero rather than rejecting the record.
+  const hp = m.hp === undefined ? 0 : num(m.hp, 0, 1e6);
+  const kills = m.kills === undefined ? 0 : int(m.kills, 0, 1e9);
   if (
     x === null || y === null || angle === null || fuel === null || gems === null || levelTime === null ||
-    refuels === null || chalk === null || reserve === null
+    refuels === null || chalk === null || reserve === null || hp === null || kills === null
   ) {
     return null;
   }
@@ -365,6 +414,23 @@ function sanitizeMid(raw) {
     if (mx === null || my === null || face === null || mseed === null) return null;
     marks.push([mx, my, face, mseed]);
   }
+  /** @type {number[]} */
+  const foes = [];
+  if (Array.isArray(m.foes) && m.foes.length <= MAX_FOES * 4 && m.foes.length % 4 === 0) {
+    for (let i = 0; i < m.foes.length; i += 4) {
+      const kind = int(m.foes[i], 0, ENEMY_KINDS.length - 1);
+      const fx = int(m.foes[i + 1], 0, w * 64);
+      const fy = int(m.foes[i + 2], 0, h * 64);
+      const fhp = int(m.foes[i + 3], 1, 1e6);
+      // One malformed entry drops the enemy list, not the save: the floor then starts with the
+      // monsters it would have had anyway, which is a fair fallback and never a broken one.
+      if (kind === null || fx === null || fy === null || fhp === null) {
+        foes.length = 0;
+        break;
+      }
+      foes.push(kind, fx, fy, fhp);
+    }
+  }
   return {
     w, h, items, hash, x, y, angle, fuel, gems, levelTime, refuels, chalk, reserve,
     emberUsed: m.emberUsed === true,
@@ -372,6 +438,9 @@ function sanitizeMid(raw) {
     taken: m.taken,
     explored: m.explored,
     marks,
+    hp,
+    kills,
+    foes,
   };
 }
 
@@ -445,10 +514,58 @@ export function applyMid(state, mid) {
   run.reserve = perks ? Math.min(mid.reserve, perks.siphonCap) : mid.reserve;
   run.emberUsed = mid.emberUsed;
   run.mapFound = mid.mapFound;
+  // New Descent (§4.11): health is a run resource, so it comes back with the run. A classic save,
+  // or one that predates the mode, leaves the freshly reset values alone.
+  if (run.hpMax > 0 && mid.hp > 0) run.hp = Math.min(mid.hp, run.hpMax);
+  if (mid.kills > 0) run.kills = mid.kills;
+  applyFoes(state, mid);
 
   /** @type {ChalkMark[]} */
   const marks = [];
   for (const [x, y, face, seed] of mid.marks) marks.push({ x, y, face: /** @type {0|1|2|3} */ (face), seed });
   state.marks = marks;
   return true;
+}
+
+/**
+ * Put the saved enemies back onto the level `levelReady` has just spawned (§4.11).
+ *
+ * The pool is already the right size for this depth, so this rewrites the leading `foes.length / 4`
+ * slots and kills the rest: a floor saved half-cleared comes back half-cleared. An empty or absent
+ * list leaves the fresh spawn alone, which is the documented fallback for a classic save or one
+ * written before the modes wave.
+ * @param {GameState} state
+ * @param {MidLevel} mid
+ * @returns {void}
+ */
+function applyFoes(state, mid) {
+  const list = /** @type {any[]} */ (/** @type {any} */ (state).enemies);
+  if (!Array.isArray(list) || list.length === 0) return;
+  const foes = mid.foes;
+  if (!Array.isArray(foes) || foes.length === 0) return;
+  const n = Math.min(list.length, foes.length >> 2);
+  for (let i = 0; i < n; i++) {
+    const e = list[i];
+    e.kind = ENEMY_KINDS[foes[i * 4]] || 'crawler';
+    e.x = foes[i * 4 + 1] / 64;
+    e.y = foes[i * 4 + 2] / 64;
+    e.px = e.x;
+    e.py = e.y;
+    e.hpMax = Math.max(e.hpMax, foes[i * 4 + 3]);
+    e.hp = Math.min(e.hpMax, foes[i * 4 + 3]);
+    e.st = 0;
+    e.t = 0;
+    e.cool = 0;
+    e.hunt = 0;
+    e.hurt = 0;
+    e.awake = false;
+  }
+  // Everything past what the save recorded had already been killed.
+  for (let i = n; i < list.length; i++) {
+    const e = list[i];
+    e.st = FOE_DEAD;
+    e.hp = 0;
+    e.t = 1e3;
+    e.awake = false;
+  }
 }

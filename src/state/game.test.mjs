@@ -196,7 +196,18 @@ test('createInitialState: a clean, valid, contract-shaped state', () => {
     chalk: 0,
     reserve: 0,
     emberUsed: false,
+    // New Descent (§4.11). `hpMax` 0 is what every consumer reads as "this mode has no health".
+    hp: 0,
+    hpMax: 0,
+    kills: 0,
+    iframes: 0,
   });
+  assert.equal(s.mode, 'classic', 'a fresh state is Classic Descent until a title row says otherwise');
+  assert.deepEqual(s.enemies, []);
+  assert.deepEqual(s.attack, { st: 0, t: 0, hits: 0 });
+  // `best` and `progress` are live references into the mode's profile, not copies (§4.11).
+  assert.equal(s.best, s.profiles.classic.best);
+  assert.equal(s.progress, s.profiles.classic.progress);
   assert.deepEqual(s.offer, { open: false, level: 0, ids: [] });
   assert.deepEqual(s.marks, []);
   assert.equal(s.progress.purse, 0);

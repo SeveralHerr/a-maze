@@ -631,7 +631,15 @@ export function createInput(canvasEl, opts) {
     mouseInUse = true;
     // A deliberate press is also the player telling us to try again after we gave up.
     autoLockFails = 0;
-    if (isLocked() || !shouldLockPointer()) return;
+    // A locked pointer means the mouse is inside the world, so a click is a swing (New Descent,
+    // ARCHITECTURE.md §4.11). Emitted as the ordinary `attack` edge, so the sim cannot tell a mouse
+    // from the F key, and only while locked — an unlocked click is aiming at a menu or the HUD, and
+    // that same press is what takes the lock in the first place.
+    if (isLocked()) {
+      pendingMask |= ACTION_BIT.attack | 0;
+      return;
+    }
+    if (!shouldLockPointer()) return;
     if (now() - pressLockMs < PRESS_LOCK_DEDUPE_MS) return;
     pressLockMs = now();
     requestPointerLock();

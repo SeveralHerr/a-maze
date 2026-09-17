@@ -1418,3 +1418,206 @@ export function revealBudget(radius) {
   const extra = Math.max(0, Math.floor(radius) - WORLD.REVEAL_RADIUS);
   return WORLD.REVEAL_BUDGET + 4 * extra;
 }
+
+// ─── Modes and New Descent (ARCHITECTURE.md §4.11) ───────────────────────────────────────────
+
+/** @typedef {import('../core/types.js').Mode} Mode */
+/** @typedef {import('../core/types.js').Profile} Profile */
+/** @typedef {import('../core/types.js').EnemyKind} EnemyKind */
+
+/**
+ * The two modes, in the order the title screen lists them. `'combat'` is New Descent (the one with
+ * the monsters), `'classic'` is the game every section above this one describes.
+ * @type {ReadonlyArray<Mode>}
+ */
+export const MODES = Object.freeze(/** @type {Mode[]} */ (['combat', 'classic']));
+
+/**
+ * Coerce anything into a mode. Garbage becomes `'classic'`, which is the mode a record written
+ * before this wave describes and the one that cannot surprise a returning player.
+ * @param {unknown} v
+ * @returns {Mode}
+ */
+export function coerceMode(v) {
+  return v === 'combat' ? 'combat' : 'classic';
+}
+
+/**
+ * A fresh, empty profile pair — one record and purse per mode (ARCHITECTURE.md §4.11).
+ * @returns {{classic: Profile, combat: Profile}}
+ */
+export function defaultProfiles() {
+  return {
+    classic: { best: { score: 0, level: 0 }, progress: defaultProgress() },
+    combat: { best: { score: 0, level: 0 }, progress: defaultProgress() },
+  };
+}
+
+/**
+ * Build a legal profile pair from anything.
+ *
+ * `legacy` is the flat pre-modes record (`{best, progress}`), used **only** when `src` carries no
+ * block for classic: a player who descended before New Descent existed keeps their purse, their
+ * ranks and their high score in Classic, and starts New Descent at zero (§4.11).
+ * @param {unknown} src the stored `modes` block, or anything at all
+ * @param {{best?:unknown, progress?:unknown}|null} [legacy] the flat keys from the same record
+ * @returns {{classic: Profile, combat: Profile}} a fresh object
+ */
+export function sanitizeProfiles(src, legacy) {
+  const out = defaultProfiles();
+  const obj = src !== null && typeof src === 'object' ? /** @type {Record<string, unknown>} */ (src) : null;
+  const modes = /** @type {Mode[]} */ (['classic', 'combat']);
+  for (let i = 0; i < modes.length; i++) {
+    const mode = modes[i];
+    const raw = obj === null ? undefined : obj[mode];
+    if (raw !== null && typeof raw === 'object') {
+      const rec = /** @type {Record<string, unknown>} */ (raw);
+      out[mode].best = sanitizeBest(rec.best);
+      out[mode].progress = sanitizeProgress(rec.progress);
+    } else if (mode === 'classic' && legacy !== undefined && legacy !== null) {
+      // No `modes` block: this is a record from before the modes wave, and everything it holds is
+      // the classic profile. Combat stays empty — which is the honest answer, not a loss.
+      out.classic.best = sanitizeBest(legacy.best);
+      out.classic.progress = sanitizeProgress(legacy.progress);
+    }
+  }
+  return out;
+}
+
+/**
+ * Enemies, the sword and the player's health — every number New Descent adds (§4.11).
+ *
+ * Nothing here touches the torch economy: `levelParams` never sees the mode, so the flask chain and
+ * the placement guarantee of §1 are identical in both modes. The only thing that scales with depth
+ * is the enemy population and their hit points, through {@link combatParams}.
+ */
+export const COMBAT = Object.freeze({
+  /**
+   * Hard cap on live enemies, whatever the maze measures.
+   *
+   * THIS IS THE NUMBER §6 RESTS ON. Every per-step and per-frame enemy pass is O(this), so it is
+   * O(1) in the level — which is what lets the renderer rebuild the enemy spatial index every frame
+   * while the item and torch indexes are rebuilt only on a level change. 40 is about as many as a
+   * 128×128 floor can hold without the corridors reading as a queue.
+   */
+  MAX_ENEMIES: 40,
+
+  /** Enemies per 100 cells on level 1, and at `CAP_LEVEL` — the whole population ramp. */
+  DENSITY_START: 2.6,
+  DENSITY_END: 0.55,
+
+  /** Tiles at which a sleeping enemy notices the player, and at which a hunting one gives up. */
+  WAKE_TILES: 13,
+  LOSE_TILES: 21,
+
+  /** Seconds an enemy that has lost sight keeps walking toward where the player last was. */
+  HUNT_SECONDS: 3.5,
+
+  /** Tiles from the maze start that the spawner keeps clear, so a floor never opens in an ambush. */
+  SPAWN_CLEAR_TILES: 9,
+
+  /** The player's health in New Descent. Not a second timer: the torch is still the clock. */
+  PLAYER_HP: 100,
+
+  /** Health an oil flask also mends, so the existing economy is the healing economy (§4.11). */
+  HEAL_PER_OIL: 9,
+
+  /** Seconds of invulnerability after a hit lands, so two enemies cannot delete a player at once. */
+  IFRAMES: 0.55,
+
+  /** Camera shake added by taking a hit, 0..1. */
+  HIT_SHAKE: 0.7,
+
+  /** Score for a kill, multiplied by the depth and the kind's `score` weight (like a gem). */
+  KILL_SCORE: 45,
+
+  /** Hit points and damage multipliers at `CAP_LEVEL` (1 at level 1, linear in between). */
+  HP_MULT_END: 2.4,
+  DAMAGE_MULT_END: 1.75,
+
+  /** Seconds a killed enemy's body stays on screen before its slot is freed. */
+  CORPSE_SECONDS: 1.1,
+
+  /**
+   * The player's sword. A swing is windUp → strike → recover; the strike window resolves once,
+   * against everything inside `REACH` and within `ARC` radians of the view with line of sight.
+   * The whole swing is 0.44 s, which is fast enough that fighting is a rhythm rather than a queue.
+   */
+  SWING: Object.freeze({
+    WIND_UP: 0.1,
+    STRIKE: 0.08,
+    RECOVER: 0.26,
+    REACH: 1.55,
+    /** Half-angle of the cut, radians (~46° each way — generous, because a 240p sword is chunky). */
+    ARC: 0.8,
+    DAMAGE: 24,
+    /** Extra damage against an enemy that is already winding up: rewards interrupting a telegraph. */
+    PUNISH: 10,
+  }),
+
+  /**
+   * The crawler: low, wide and quick. It closes fast, hits lightly and recovers fast, so it is the
+   * one that punishes standing still — but a single swing staggers it out of its own wind-up.
+   */
+  CRAWLER: Object.freeze({
+    hp: 30,
+    speed: 2.55,
+    radius: 0.3,
+    /** Distance at which it may open an attack, centre to centre. */
+    reach: 1.0,
+    damage: 9,
+    windUp: 0.34,
+    strike: 0.12,
+    recover: 0.62,
+    stagger: 0.28,
+    score: 1,
+  }),
+
+  /**
+   * The wraith: tall, slow and heavy. It telegraphs for over half a second and reaches further than
+   * the sword does, so it is the one you have to step around rather than trade with.
+   */
+  WRAITH: Object.freeze({
+    hp: 56,
+    speed: 1.32,
+    radius: 0.34,
+    reach: 1.3,
+    damage: 18,
+    windUp: 0.6,
+    strike: 0.16,
+    recover: 1.05,
+    stagger: 0.42,
+    score: 2,
+  }),
+});
+
+/**
+ * The enemy curve for a depth (§4.11). Together with `enemyStats` this is the only place in the
+ * game that knows New Descent has monsters in it.
+ * @param {number} level 1-based
+ * @returns {{count:number, hpMult:number, damageMult:number}}
+ */
+export function combatParams(level) {
+  const lv = Number.isFinite(level) && level > 1 ? Math.floor(level) : 1;
+  // The same 0→1 ramp the rest of the curve uses: level 1 to the size cap, flat past it.
+  const t = CAP_LEVEL > 1 ? clamp((lv - 1) / (CAP_LEVEL - 1), 0, 1) : 0;
+  const cells = levelParams(lv).cells;
+  // Density FALLS with depth while the area grows: a 128×128 floor still ends up with far more
+  // monsters than a 16×16 one, but not 64× more, and `MAX_ENEMIES` catches the rest.
+  const density = lerp(COMBAT.DENSITY_START, COMBAT.DENSITY_END, t);
+  const count = clamp(Math.round((cells * density) / 100), 1, COMBAT.MAX_ENEMIES);
+  return {
+    count,
+    hpMult: lerp(1, COMBAT.HP_MULT_END, t),
+    damageMult: lerp(1, COMBAT.DAMAGE_MULT_END, t),
+  };
+}
+
+/**
+ * The tuning block for one enemy kind.
+ * @param {EnemyKind} kind
+ * @returns {typeof COMBAT.CRAWLER}
+ */
+export function enemyStats(kind) {
+  return kind === 'wraith' ? COMBAT.WRAITH : COMBAT.CRAWLER;
+}

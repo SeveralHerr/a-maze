@@ -246,6 +246,12 @@ export const MAP = Object.freeze({
   CORNER_TILES_NARROW: 19,
   /** Minimum UI pixels per tile in the corner window — below 2 the walls stop reading. */
   CORNER_MIN_ZOOM: 2,
+  /**
+   * UI units of air between the score plaque and a top-right corner window (New Descent, §4.11).
+   * One unit: enough that the two panels read as separate plaques, little enough that the map still
+   * hangs off the top row rather than floating in the middle of the view.
+   */
+  CORNER_TOP_GAP: 1,
   /** Maximum, so the window does not become a magnifying glass on a 4 K display. */
   CORNER_MAX_ZOOM: 6,
   /**
@@ -991,9 +997,14 @@ export function createMapView(options) {
    * @param {GameState} state
    * @param {number} clock
    * @param {boolean} reduced reduced motion
+   * @param {'br'|'tr'} [corner] which corner to sit in. `'br'` (the default) is Classic Descent's
+   *   bottom right; `'tr'` is New Descent's top right, where it moves to leave the bottom right for
+   *   the attack button (ARCHITECTURE.md §4.11).
+   * @param {number} [topGap] UI pixels of clearance to leave above a `'tr'` window, so it tucks
+   *   under the score plaque instead of behind it
    * @returns {number} the box height in UI pixels, 0 when nothing was drawn
    */
-  function drawCorner(ctx, m, state, clock, reduced) {
+  function drawCorner(ctx, m, state, clock, reduced, corner, topGap) {
     if (tileCanvas === null || levelRef === null || levelRef !== state.levelData) return 0;
     const t0 = timing ? now() : 0;
     const u = m.u;
@@ -1012,7 +1023,12 @@ export function createMapView(options) {
     const chrome = frame * FRAME_BORDERS;
     const box = size + chrome * 2;
     const bx = m.w - pad - box;
-    const by = m.h - pad - box;
+    // Top right tucks under whatever the caller says is already up there (the score plaque); bottom
+    // right is unchanged, down to the pixel, so Classic Descent's layout cannot have moved.
+    const by =
+      corner === 'tr'
+        ? (Number.isFinite(topGap) && /** @type {number} */ (topGap) > 0 ? /** @type {number} */ (topGap) : pad) + MAP.CORNER_TOP_GAP * u
+        : m.h - pad - box;
 
     // Stone, not iron: on a phone the corner map sits on the black control deck below the world,
     // where an iron frame (#2f343d) is invisible. The stone bevel's highlight reads on both the

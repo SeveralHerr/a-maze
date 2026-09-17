@@ -582,6 +582,18 @@ const DEPTH_SEPARATOR = '·';
 /** The Auto Explore plaque's text (§4.10). */
 const AUTO_TEXT = 'AUTO';
 
+/** The ATTACK plaque's label (New Descent, ARCHITECTURE.md §4.11). */
+const ATTACK_TEXT = 'ATTACK';
+
+/** Height of the health bar's well, in UI units. Half the fuel gauge's: it is the second instrument. */
+const HEALTH_BAR_UNITS = 3;
+
+/** How fast the health bar eases toward the real value, 1/s. */
+const HEALTH_EASE_RATE = 9;
+
+/** Seconds the health panel's edge flashes white after a hit lands. */
+const HEALTH_FLASH_S = 0.28;
+
 /**
  * What the plaque becomes while the mouse is captured: the key that does the same thing. A locked
  * cursor cannot be aimed at a button, so a drawn one is clutter that cannot be clicked.
@@ -774,6 +786,18 @@ export function createHud(overlayCanvas, options) {
   const autoRect = new Float64Array(4);
   /** Pointer mapping scratch for `hitAuto`. */
   const autoPtr = new Float64Array(2);
+  /** The ATTACK button's rectangle (New Descent, §4.11), same convention as `autoRect`. */
+  const attackRect = new Float64Array(4);
+  /** Pointer mapping scratch for `hitAttack`. */
+  const attackPtr = new Float64Array(2);
+  /** Whether the ATTACK button may be drawn (main.js suppresses it on touch, where the bar owns it). */
+  let attackButtonEnabled = true;
+  /** This frame's clamped delta, written by `advance` and read by the draw pass. */
+  let lastDt = 0;
+  /** Health shown on the bar, eased toward `run.hp` so a hit drains rather than jumps. */
+  let shownHp = -1;
+  /** `anim.clock` of the last time health actually fell — drives the bar's alarm flash. */
+  let hurtAt = -1e9;
   /** Whether the AUTO button may be drawn at all (`setAutoButton`; main.js turns it off on touch). */
   let autoButtonEnabled = true;
   /** `anim.clock` when the Auto Explore key hint appeared; −1 while it is not showing. */
@@ -974,6 +998,9 @@ export function createHud(overlayCanvas, options) {
     if (!(dt >= 0) || dt > MAX_FRAME_DT) dt = dt > MAX_FRAME_DT ? MAX_FRAME_DT : 0;
     anim.lastTime = now;
     anim.clock += dt;
+    // The clamped frame delta, kept for the draw pass: the health bar eases against it (§4.11), and
+    // re-deriving it there would mean a second `state.time` read that could disagree by a frame.
+    lastDt = dt;
 
     const run = state.run;
 
@@ -1056,8 +1083,9 @@ export function createHud(overlayCanvas, options) {
    * @returns {void}
    */
   function render(state, frameStats, alpha) {
-    // The Auto Explore button is only clickable in a frame that drew it (see `drawAutoButton`).
+    // A button is only clickable in a frame that drew it (see `drawAutoButton` / `drawAttackButton`).
     autoRect[2] = 0;
+    attackRect[2] = 0;
     const ctx = surface.beginFrame();
     if (ctx === null || state === null || typeof state !== 'object') return;
 
@@ -1102,6 +1130,10 @@ export function createHud(overlayCanvas, options) {
       // why the measurement above is separate from the drawing.
       mapView.drawFull(ctx, m, state, anim.clock, reduced, 3 * m.u + fuelPanelW, 3 * m.u + fuelPanelH);
       drawFuelGauge(ctx, state, m, reduced);
+      // Health stays on the full map too, for exactly the reason the fuel gauge does: the question
+      // the map screen has to keep answering is "can I afford to stand here reading this", and in
+      // New Descent something can walk up to you while you trace a corridor with your eye (§4.11).
+      drawHealthBar(ctx, state, m, reduced);
       // No score pops over the full map: the player opened a diagram in order to read it, and a
       // pop is drawn at the *centre* of the screen, straight across the corridors they are
       // tracing. The gauge is the one readout the argument above keeps. A banner is the exception:
@@ -1116,9 +1148,17 @@ export function createHud(overlayCanvas, options) {
     drawScorePanel(ctx, state, m);
     drawDepthPanel(ctx, state, m);
     drawPerkChips(ctx, state, m, reduced);
+    // New Descent (§4.11). Both return immediately in Classic Descent, so the classic HUD draws
+    // exactly the calls it always drew.
+    drawHealthBar(ctx, state, m, reduced);
+    drawAttackButton(ctx, state, m, reduced);
     drawAutoButton(ctx, state, m, reduced);
     drawLodestone(ctx, state, m, reduced);
-    if (mode === 'corner') mapView.drawCorner(ctx, m, state, anim.clock, reduced);
+    // The corner map moves to the TOP right in New Descent, because the bottom right is where the
+    // attack button lives (§4.11). In Classic Descent it stays exactly where it was.
+    if (mode === 'corner') {
+      mapView.drawCorner(ctx, m, state, anim.clock, reduced, isCombat(state) ? 'tr' : 'br', 3 * m.u + fuelPanelH);
+    }
     drawPops(ctx, m, reduced);
     drawBanner(ctx, m, reduced);
     if (isDebug()) drawDebug(ctx, state, m, frameStats === undefined ? null : frameStats);
@@ -1672,7 +1712,9 @@ export function createHud(overlayCanvas, options) {
   function drawAutoButton(ctx, state, m, reduced) {
     // Touch devices and narrow layouts use the AUTO button in the touch bar instead: a phone's world
     // band is ~130 UI px wide, where the bottom centre belongs to the unlock chips and score pops.
-    if (!autoButtonEnabled || m.narrow || state.settings === undefined || state.phase !== 'playing') {
+    // New Descent has no Auto Explore at all (§4.11): no button, and no key hint either — a hint for
+    // a key that does nothing is worse than no hint.
+    if (!autoButtonEnabled || m.narrow || state.settings === undefined || state.phase !== 'playing' || isCombat(state)) {
       autoHintAt = -1;
       return;
     }
@@ -1731,6 +1773,155 @@ export function createHud(overlayCanvas, options) {
     autoRect[1] = y;
     autoRect[2] = w;
     autoRect[3] = chipH;
+  }
+
+  /**
+   * Is this state a New Descent run (ARCHITECTURE.md §4.11)?
+   *
+   * Tested through `run.hpMax` as well as the mode, because `hpMax` of 0 is what every consumer
+   * reads as "this mode has no health" — a state built by hand without a mode (an old fixture, a
+   * preview harness) then behaves as Classic Descent rather than drawing an empty health bar.
+   * @param {GameState} state
+   * @returns {boolean}
+   */
+  function isCombat(state) {
+    return /** @type {any} */ (state).mode === 'combat' && state.run !== undefined && state.run.hpMax > 0;
+  }
+
+  /**
+   * The player's health, under the fuel gauge (New Descent, §4.11).
+   *
+   * Deliberately the *same* panel language as the fuel gauge and deliberately below it: the torch is
+   * still the clock and health is the thing the monsters spend, so the gauge that has governed the
+   * game since level 1 keeps the top-left corner and the new one hangs off it. The bar eases toward
+   * the real value so a hit reads as a drain rather than as a number changing, and the panel edge
+   * flashes on the frame it falls — which is the feedback that says "that hit landed on YOU" when
+   * the creature that threw it is off the edge of the torch pool.
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {GameState} state
+   * @param {SurfaceMetrics} m
+   * @param {boolean} reduced
+   * @returns {void}
+   */
+  function drawHealthBar(ctx, state, m, reduced) {
+    if (!isCombat(state)) {
+      shownHp = -1;
+      return;
+    }
+    const run = state.run;
+    const u = m.u;
+    if (shownHp < 0) shownHp = run.hp;
+    if (run.hp < shownHp - 0.01) hurtAt = anim.clock;
+    // Eased in both directions: a flask's mend climbs as visibly as a claw's bite falls.
+    shownHp += (run.hp - shownHp) * Math.min(1, lastDt * HEALTH_EASE_RATE);
+    if (Math.abs(run.hp - shownHp) < 0.4) shownHp = run.hp;
+
+    const frac = run.hpMax > 0 ? Math.max(0, Math.min(1, shownHp / run.hpMax)) : 0;
+    const pad = 3 * u;
+    const w = fuelPanelW;
+    const h = 2 * insetY + HEALTH_BAR_UNITS * u;
+    const x = pad;
+    const y = pad + fuelPanelH + u;
+    panelOpts.frame = 'stone';
+    panelOpts.border = border;
+    panelOpts.rivets = false;
+    drawPanel(ctx, x, y, w, h, u, panelOpts);
+
+    const bx = x + insetX;
+    const by = y + insetY;
+    const bw = w - 2 * insetX;
+    const bh = h - 2 * insetY;
+    drawWell(ctx, bx, by, bw, bh, u);
+    const fill = Math.round(bw * frac);
+    if (fill > 0) {
+      // Three bands so the bar reads at a glance without a number: full is a clean red, a third is
+      // the colour of trouble, and the last sliver pulses.
+      ctx.fillStyle = frac > 0.55 ? COLOR.alarm : frac > 0.28 ? COLOR.fireEmber : COLOR.fireDeep;
+      ctx.fillRect(bx, by, fill, bh);
+      // A lit top edge, exactly like the fuel bar's, so the two read as the same instrument.
+      ctx.fillStyle = frac > 0.28 ? COLOR.fireHot : COLOR.fireEmber;
+      ctx.fillRect(bx, by, fill, Math.max(1, u >> 1));
+    }
+    // Quarter graduations, matching the fuel gauge's.
+    ctx.fillStyle = COLOR.void;
+    for (let k = 1; k < 4; k++) {
+      const gx = bx + Math.round((bw * k) / 4);
+      ctx.fillRect(gx, by, Math.max(1, u >> 1), bh);
+    }
+
+    const hurt = anim.clock - hurtAt;
+    if (hurt < HEALTH_FLASH_S) {
+      const before = ctx.globalAlpha;
+      if (!reduced) ctx.globalAlpha = before * (1 - hurt / HEALTH_FLASH_S);
+      ctx.fillStyle = COLOR.white;
+      strokeRect(ctx, x, y, w, h, Math.max(1, border >> 1));
+      ctx.globalAlpha = before;
+    } else if (frac <= 0.28 && !reduced) {
+      // A low-health alarm on the panel edge, the twin of the low-tank one above it.
+      const before = ctx.globalAlpha;
+      ctx.globalAlpha = before * (0.45 + 0.4 * Math.sin(anim.clock * 5.5));
+      ctx.fillStyle = COLOR.alarm;
+      strokeRect(ctx, x, y, w, h, Math.max(1, border >> 1));
+      ctx.globalAlpha = before;
+    }
+  }
+
+  /**
+   * The ATTACK plaque, bottom right of the world band (New Descent, §4.11).
+   *
+   * Bottom RIGHT rather than the AUTO button's bottom centre, and it is why the corner map moved to
+   * the top right: a thumb reaching the bottom right of a phone is the most comfortable reach there
+   * is, and on a desktop it sits under the hand that is already on the mouse. Unlike AUTO it is
+   * drawn **while the pointer is locked** — a locked click is itself a swing (§4.3), so the plaque
+   * is a label for a control that is live rather than a target that cannot be hit.
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {GameState} state
+   * @param {SurfaceMetrics} m
+   * @param {boolean} reduced
+   * @returns {void}
+   */
+  function drawAttackButton(ctx, state, m, reduced) {
+    if (!attackButtonEnabled || !isCombat(state) || state.phase !== 'playing') return;
+    const u = m.u;
+    const size = m.narrow ? Math.max(1, u - 1) : u;
+    const atk = /** @type {any} */ (state).attack;
+    const swinging = atk !== undefined && atk !== null && atk.st !== 0;
+    const padX = insetX + 2 * u;
+    const chipH = 2 * insetY + 3 * u + heightAt('hud', size);
+    const w = 2 * padX + measureAt(ATTACK_TEXT, 'hud', size);
+    const x = m.viewX + m.viewW - 3 * u - w;
+    void reduced;
+    const y = m.viewY + m.viewH - 3 * u - chipH;
+    panelOpts.frame = 'stone';
+    panelOpts.border = border;
+    panelOpts.rivets = false;
+    drawPanel(ctx, x, y, w, chipH, u, panelOpts);
+    const before = ctx.globalAlpha;
+    // Lit while the swing is actually running, so the button is also the weapon's cooldown readout.
+    if (swinging) {
+      ctx.fillStyle = COLOR.goldLight;
+      strokeRect(ctx, x, y, w, chipH, Math.max(1, border >> 1));
+    }
+    drawAt(ctx, ATTACK_TEXT, x + (w >> 1), y + (chipH >> 1), 'hud', size, swinging ? 'hudBright' : 'hudGold', 'center', 'middle');
+    ctx.globalAlpha = before;
+    attackRect[0] = x;
+    attackRect[1] = y;
+    attackRect[2] = w;
+    attackRect[3] = chipH;
+  }
+
+  /**
+   * Is a pointer at these client coordinates over the ATTACK button drawn last frame?
+   * @param {number} clientX
+   * @param {number} clientY
+   * @returns {boolean}
+   */
+  function hitAttack(clientX, clientY) {
+    if (!(attackRect[2] > 0) || !Number.isFinite(clientX) || !Number.isFinite(clientY)) return false;
+    if (!surface.fromClient(clientX, clientY, attackPtr)) return false;
+    const x = attackPtr[0];
+    const y = attackPtr[1];
+    return x >= attackRect[0] && x < attackRect[0] + attackRect[2] && y >= attackRect[1] && y < attackRect[1] + attackRect[3];
   }
 
   /**
@@ -1926,6 +2117,11 @@ export function createHud(overlayCanvas, options) {
     hitAuto,
     setAutoButton(on) {
       autoButtonEnabled = on === true;
+    },
+    // New Descent's attack plaque (§4.11), the same pair as the AUTO button's.
+    hitAttack,
+    setAttackButton(on) {
+      attackButtonEnabled = on === true;
     },
     dispose,
   };
