@@ -163,8 +163,8 @@ function clampSeconds(seconds) {
 // ─── Labels ──────────────────────────────────────────────────────────────────────────────────
 
 /**
- * `"3 / 12"` — collected out of total. The spaces are deliberate: at HUD size the slash sits
- * tight against the digits without them.
+ * `"3/12"` — collected out of total, with no spaces around the slash: at the massive-maze item
+ * counts ("12/820") the gem readout has to fit a phone's score panel.
  * @param {number} n
  * @param {number} total
  * @returns {string}

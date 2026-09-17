@@ -71,6 +71,8 @@ import {
   drawOilIcon,
   drawPanel,
   drawPortalIcon,
+  fillDisc,
+  fillRing,
   hexToRgb,
   ICON_SIZE,
   withAlpha,
@@ -87,6 +89,12 @@ const log = createLogger('ui/map');
 
 /** 45°, the player arrow's heading step. */
 const QUARTER_TURN = Math.PI / 4;
+
+/** The legend's name for the player marker. */
+const YOU_LABEL = 'YOU';
+
+/** Heading the legend's player swatch points in: north (index 6 of `ARROWS`, which starts east). */
+const YOU_OCTANT = 6;
 
 /** The player arrow's blink tone: the outline and body swapped (see `drawPlayerArrow`). */
 const ARROW_PALETTE_INVERTED = Object.freeze([null, COLOR.fireCore, COLOR.void]);
@@ -288,8 +296,7 @@ const PAINT = Object.freeze({
   GEM: 2,
   OIL: 3,
   EXIT: 4,
-  START: 5,
-  PATH: 6,
+  PATH: 5,
 });
 
 /**
@@ -305,7 +312,10 @@ const RASTER_COLORS = Object.freeze([
   { hex: COLOR.gemBright, a: 255 }, // GEM
   { hex: COLOR.oilLight, a: 255 }, // OIL
   { hex: COLOR.arcPale, a: 255 }, // EXIT
-  { hex: COLOR.goldLight, a: 255 }, // START
+  // There is deliberately no START colour. It was gold (#e8c24a), and at 1–4 device pixels a tile
+  // that is indistinguishable from an oil flask (#f0b040) — a gold square the legend could not
+  // explain, which read as a flask at the entrance. The player marker says where you are; where you
+  // came in is not a question the map needs to answer.
   { hex: '#8d8170', a: 240 }, // PATH — a floor tile you have actually stood on (unused reserve)
 ]);
 
@@ -351,7 +361,6 @@ const ITEM_OIL = 2;
  * @param {Uint8Array} explored the fog-of-war grid
  * @param {Uint8Array|null} itemLayer per-tile item code, or null for none
  * @param {number} exitIdx tile index of the exit (−1 for none)
- * @param {number} startIdx tile index of the start (−1 for none)
  * @param {Int32Array} bounds length ≥ 4, in/out dirty rect `[x0,y0,x1,y1]`; an empty rect is
  *   `[mw, mh, -1, -1]` and is expanded in place
  * @returns {number} how many pixels were painted
@@ -368,7 +377,6 @@ export function paintTiles(
   explored,
   itemLayer,
   exitIdx,
-  startIdx,
   bounds,
 ) {
   const lx = x0 < 0 ? 0 : x0;
@@ -382,7 +390,7 @@ export function paintTiles(
     for (let tx = lx; tx <= hx; tx++) {
       const idx = row + tx;
       if (explored[idx] === 0 || out32[idx] !== 0) continue;
-      out32[idx] = colorFor(idx, tiles, itemLayer, exitIdx, startIdx);
+      out32[idx] = colorFor(idx, tiles, itemLayer, exitIdx);
       painted++;
       if (tx < bounds[0]) bounds[0] = tx;
       if (ty < bounds[1]) bounds[1] = ty;
@@ -399,10 +407,9 @@ export function paintTiles(
  * @param {Uint8Array} tiles
  * @param {Uint8Array|null} itemLayer
  * @param {number} exitIdx
- * @param {number} startIdx
  * @returns {number} packed RGBA (never 0, so it doubles as "painted")
  */
-function colorFor(idx, tiles, itemLayer, exitIdx, startIdx) {
+function colorFor(idx, tiles, itemLayer, exitIdx) {
   if (idx === exitIdx) return PACKED[PAINT.EXIT];
   if (tiles[idx] !== 0) return PACKED[PAINT.WALL];
   if (itemLayer !== null) {
@@ -410,7 +417,6 @@ function colorFor(idx, tiles, itemLayer, exitIdx, startIdx) {
     if (it === ITEM_GEM) return PACKED[PAINT.GEM];
     if (it === ITEM_OIL) return PACKED[PAINT.OIL];
   }
-  if (idx === startIdx) return PACKED[PAINT.START];
   return PACKED[PAINT.FLOOR];
 }
 
@@ -597,7 +603,6 @@ export function createMapView(options) {
   let liveItems = [];
   let liveCount = 0;
   let exitIdx = -1;
-  let startIdx = -1;
 
   let explored = 0;
   let sweepCursor = 0;
@@ -704,7 +709,6 @@ export function createMapView(options) {
 
     levelRef = level;
     exitIdx = maze.exit.y * w + maze.exit.x;
-    startIdx = maze.start.y * w + maze.start.x;
     explored = 0;
     sweepCursor = 0;
     cellStamp = -1;
@@ -776,7 +780,7 @@ export function createMapView(options) {
       // so `tile32[idx] !== 0` stays exactly equivalent to "counted as explored".
       itemLayer[idx] = ITEM_NONE;
       if (tile32[idx] !== 0) {
-        tile32[idx] = colorFor(idx, tiles, itemLayer, exitIdx, startIdx);
+        tile32[idx] = colorFor(idx, tiles, itemLayer, exitIdx);
         markDirty(idx % mw, (idx / mw) | 0);
       }
     }
@@ -844,7 +848,7 @@ export function createMapView(options) {
     const stale = lastUpdate < 0 || clock - lastUpdate > MAP.STALE_AFTER || clock < lastUpdate;
     if (needsFullScan || stale) {
       stats.painted += paintTiles(
-        tile32, mw, mh, 0, 0, mw - 1, mh - 1, tiles, grid, itemLayer, exitIdx, startIdx, dirty,
+        tile32, mw, mh, 0, 0, mw - 1, mh - 1, tiles, grid, itemLayer, exitIdx, dirty,
       );
       stats.scanned += mw * mh;
       explored += stats.painted;
@@ -859,7 +863,7 @@ export function createMapView(options) {
       const by = Math.floor(py);
       const before = stats.painted;
       stats.painted += paintTiles(
-        tile32, mw, mh, bx - r, by - r, bx + r, by + r, tiles, grid, itemLayer, exitIdx, startIdx, dirty,
+        tile32, mw, mh, bx - r, by - r, bx + r, by + r, tiles, grid, itemLayer, exitIdx, dirty,
       );
       const span = 2 * r + 1;
       stats.scanned += span * span;
@@ -875,7 +879,7 @@ export function createMapView(options) {
       while (budget-- > 0) {
         if (cursor >= total) cursor = 0;
         if (grid[cursor] !== 0 && tile32[cursor] === 0) {
-          tile32[cursor] = colorFor(cursor, tiles, itemLayer, exitIdx, startIdx);
+          tile32[cursor] = colorFor(cursor, tiles, itemLayer, exitIdx);
           markDirty(cursor % mw, (cursor / mw) | 0);
           explored++;
           stats.painted++;
@@ -1147,9 +1151,13 @@ export function createMapView(options) {
     const headY = under ? Math.max(margin, gB + 2 * u) : margin;
     const headSize = headerScale(head, mapped, m.w - hx - margin, u);
     const headH = heightAt('hud', headSize);
-    const legendSize = legendScale(m, state, u);
+    // Never louder than the header over the map: on a phone two lines would buy the legend a size the
+    // one-line header above it cannot have, and the key to the map outshouted what the map is.
+    fitLegend(m, state, u, headSize);
+    const legendSize = legendFit.size;
     const legendH = heightAt('hud', legendSize);
-    const legendY = m.h - margin - legendH;
+    // One line, or two on a phone: the swatches, then the exit distance (or the close hint) under them.
+    const legendY = m.h - margin - legendFit.lines * legendH - (legendFit.lines - 1) * 2 * u;
     const boxTop = headY + headH + 3 * u;
     const boxH = legendY - 3 * u - boxTop - frame * 2;
     // The side margin is paid in **device** pixels, not in UI pixels. A 3-UI-pixel margin costs
@@ -1179,6 +1187,8 @@ export function createMapView(options) {
     let rail = false;
     let railLeft = 0;
     let railRight = 0;
+    let railWDev = 0;
+    let railHDev = 0;
     if (!m.narrow) {
       // The left rail is already as wide as the gauge above it, so the close hint lives at its foot
       // rather than widening the legend rail on the other side of the map.
@@ -1191,12 +1201,13 @@ export function createMapView(options) {
       );
       railLeft = Math.max(gR, margin + textW) + 4 * u;
       railRight = legendColumnWidth(state, railSize, u) + margin + 4 * u;
-      const railWDev = (m.w - railLeft - railRight - frame * 2) * dev;
-      const railHDev = (m.h - margin * 2 - frame * 2) * dev;
+      railWDev = (m.w - railLeft - railRight - frame * 2) * dev;
+      railHDev = (m.h - margin * 2 - frame * 2) * dev;
       // Both rails must actually hold their text: four lines under the gauge plus the close hint
-      // at the foot on the left, three legend rows plus the distance line on the right.
+      // at the foot on the left; on the right four legend rows (gems, flasks, you, the exit) and the
+      // distance line under the last of them.
       const leftFits = gB + 4 * u + 4 * (railLineH + 2 * u) + 2 * u + railLineH <= m.h - margin;
-      const rightFits = margin + u + 3 * legendRowPitch(railSize, u) + railLineH <= m.h - margin;
+      const rightFits = margin + u + 3 * legendRowPitch(railSize, u) + 2 * railLineH + 2 * u <= m.h - margin;
       if (railWDev >= 16 * dev && railHDev >= 16 * dev && leftFits && rightFits) {
         chooseFullScale(maze.cols, maze.rows, railWDev, railHDev, railFit);
         rail = !stripsOk || fitBeats(railFit, stackFit);
@@ -1210,10 +1221,28 @@ export function createMapView(options) {
     const fit = rail ? railFit : stackFit;
     const drawW = fit.w;
     const drawH = fit.h;
+
+    // ── Markers, sized on the device grid ──
+    // The markers are the reason the map is opened, so they are sized in device pixels with a floor,
+    // never in tiles alone: at the 128×128 cap a tile is 2 device pixels on a desktop, and a player
+    // arrow "four tiles wide" was an 8-pixel sliver, the exit a 4-pixel dot.
+    /** Raster pixels per tile (device pixels). A cell is two tiles wide in the tile grid. */
+    const perTile = fit.res === 'tile' ? fit.scale : fit.scale / 2;
+    const arm = clamp(Math.round(perTile * 8), 8 * dev, 20 * dev);
+    const marker = clamp(Math.round(perTile * 4), 9 * dev, 16 * dev);
+    // Inset. The start is always tile (1, 1) and the exit is the farthest cell, usually on the far
+    // edge, so both markers sit on the raster's outermost tiles — and a clip at the raster's edge cut
+    // them to a quarter. The raster is set in from the frame by the reach of the exit's crosshair
+    // arms (which covers the player's arrow and halo too), paid only out of the room the integer fit
+    // left over: the inset never costs a device pixel per tile.
+    const reach = Math.max(arm, (marker >> 1) + 2 * dev);
+    const insetX = clamp(Math.floor(((rail ? railWDev : boxWDev) - drawW) / 2), 0, reach);
+    const insetY = clamp(Math.floor(((rail ? railHDev : boxH * dev) - drawH) / 2), 0, reach);
+
     // The frame is drawn on the UI grid around the device-space raster, so it is the enclosing
     // whole number of UI pixels; the raster is then centred inside it.
-    const panelW = Math.ceil(drawW / dev) + frame * 2;
-    const panelH = Math.ceil(drawH / dev) + frame * 2;
+    const panelW = Math.ceil((drawW + 2 * insetX) / dev) + frame * 2;
+    const panelH = Math.ceil((drawH + 2 * insetY) / dev) + frame * 2;
     let px = 0;
     let py = 0;
     if (rail) {
@@ -1238,29 +1267,22 @@ export function createMapView(options) {
     // Raster space: identity transform, offset by the surface's letterbox origin, so one unit is
     // one device pixel. Everything inside the frame is drawn here and the UI transform is put back
     // immediately afterwards — `menus.render()` and the rest of the HUD depend on it.
-    const ox = (px + frame) * dev;
-    const oy = (py + frame) * dev;
-    // `save`/`restore` brackets it, which also puts the UI transform back, and a clip rectangle
-    // keeps the exit crosshair — whose arms reach well past the tile it marks — inside the frame
-    // instead of drawing a stray line across the legend.
+    const ox = (px + frame) * dev + (((panelW - frame * 2) * dev - drawW) >> 1);
+    const oy = (py + frame) * dev + (((panelH - frame * 2) * dev - drawH) >> 1);
+    // `save`/`restore` brackets it, which also puts the UI transform back. The clip is the panel's
+    // **outer** edge: a marker on a tile the inset could not fully clear (a phone whose fit left no
+    // room) runs onto the stone frame instead of being cut off, and the crosshair's arms still never
+    // draw a stray line across the legend.
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, m.originX, m.originY);
     ctx.beginPath();
-    ctx.rect(ox, oy, panelW * dev - frame * 2 * dev, panelH * dev - frame * 2 * dev);
+    ctx.rect(px * dev, py * dev, panelW * dev, panelH * dev);
     ctx.clip();
 
-    /** Raster pixels per tile, for placing the live markers (device pixels). */
-    let perTileX = 0;
-    let perTileY = 0;
     if (fit.res === 'tile') {
       ctx.drawImage(tileCanvas, 0, 0, mw, mh, ox, oy, drawW, drawH);
-      perTileX = fit.scale;
-      perTileY = fit.scale;
     } else if (ensureCellRaster(maze.cols, maze.rows) && cellCanvas !== null) {
       ctx.drawImage(cellCanvas, 0, 0, cellCols, cellRows, ox, oy, drawW, drawH);
-      // A cell is two tiles wide in the tile grid, so a tile is half a cell pixel.
-      perTileX = fit.scale / 2;
-      perTileY = fit.scale / 2;
     } else {
       ctx.restore();
       if (timing) stats.drawMs = now() - t0;
@@ -1271,23 +1293,25 @@ export function createMapView(options) {
     // crosshair** — at one pixel per cell a two-pixel dot in a 128-pixel field of noise is
     // genuinely impossible to find, and finding the exit is the entire point of opening the map.
     if (state.explored !== null && state.explored[exitIdx] !== 0) {
-      const exx = ox + (maze.exit.x - (fit.res === 'cell' ? 1 : 0)) * perTileX;
-      const exy = oy + (maze.exit.y - (fit.res === 'cell' ? 1 : 0)) * perTileY;
+      const exx = ox + (maze.exit.x - (fit.res === 'cell' ? 1 : 0)) * perTile;
+      const exy = oy + (maze.exit.y - (fit.res === 'cell' ? 1 : 0)) * perTile;
       const pulse = reduced ? 1 : 0.55 + 0.45 * Math.sin(clock * 4);
       // A crosshair first, always: a few bright pixels somewhere in a 66 000-tile field are
       // invisible, and "where is the way out" is the question the map exists to answer. The arms
       // reach out of the maze texture, so the eye finds them from across the screen.
-      const arm = clamp(Math.round(perTileX * 8), 8 * dev, 20 * dev);
       const thick = Math.max(2, Math.round(dev));
       // Dark backing first: the map's floor is a light warm grey, so a thin cyan line alone would
       // half disappear into it. Two passes cost four fills and make the marker read on any ground.
       ctx.fillStyle = withAlpha(COLOR.void, 0.85);
       ctx.fillRect(Math.round(exx - arm), Math.round(exy - thick), arm * 2, thick * 2);
       ctx.fillRect(Math.round(exx - thick), Math.round(exy - arm), thick * 2, arm * 2);
-      ctx.fillStyle = withAlphaStep(COLOR.arcCyan, ((0.35 + 0.65 * pulse) * 64) | 0);
+      // Never dimmer than 60 %: the arms are what the eye catches first, so they do not fade out.
+      ctx.fillStyle = withAlphaStep(COLOR.arcCyan, ((0.6 + 0.4 * pulse) * 64) | 0);
       ctx.fillRect(Math.round(exx - arm), Math.round(exy - thick / 2), arm * 2, thick);
       ctx.fillRect(Math.round(exx - thick / 2), Math.round(exy - arm), thick, arm * 2);
-      const glyph = Math.max(1, Math.round(perTileX * 4));
+      // The glyph has a device-pixel floor too (7 art pixels at `dev` each): on the cap's 2-pixel
+      // tiles it was a 7-device-pixel speck.
+      const glyph = Math.max(Math.round(perTile * 4), ICON_SIZE.portal * dev);
       if (glyph >= ICON_SIZE.portal) {
         const s = Math.max(1, Math.floor(glyph / ICON_SIZE.portal));
         drawPortalIcon(
@@ -1298,32 +1322,33 @@ export function createMapView(options) {
         );
       } else {
         ctx.fillStyle = withAlphaStep(COLOR.arcPale, (pulse * 64) | 0);
-        const s = Math.max(2 * dev, Math.round(perTileX * 2));
+        const s = Math.max(2 * dev, Math.round(perTile * 2));
         ctx.fillRect(Math.round(exx - s / 2), Math.round(exy - s / 2), s, s);
       }
     }
 
-    // Player.
+    // Player: a dark halo that lifts the arrow off the maze texture, a ring that pulses outward from
+    // it so the eye finds it from across the screen (held still under reduced motion), and the arrow.
     const p = state.player;
-    const ax = ox + (p.x - (fit.res === 'cell' ? 1 : 0)) * perTileX;
-    const ay = oy + (p.y - (fit.res === 'cell' ? 1 : 0)) * perTileY;
-    // The marker is sized in absolute pixels, not in tiles: at 12 device pixels per tile a
-    // "five tiles wide" arrow would be a 60-pixel cream blot over the corner of the map.
-    drawPlayerArrow(
-      ctx,
-      Math.round(ax * 2),
-      Math.round(ay * 2),
-      (Math.round(p.angle / QUARTER_TURN) & 7) >>> 0,
-      clamp(Math.round(perTileX * 4), 6 * dev, 14 * dev),
-      !reduced && clock % 1.1 >= 0.82,
-    );
+    const ax2 = Math.round((ox + (p.x - (fit.res === 'cell' ? 1 : 0)) * perTile) * 2);
+    const ay2 = Math.round((oy + (p.y - (fit.res === 'cell' ? 1 : 0)) * perTile) * 2);
+    const pcx = ax2 >> 1;
+    const pcy = ay2 >> 1;
+    const halo = (marker >> 1) + dev;
+    ctx.fillStyle = withAlphaStep(COLOR.void, 44);
+    fillDisc(ctx, pcx, pcy, halo, dev);
+    // Pulse phase in 64ths of a 1.2 s cycle: an integer, so nothing fractional crosses a call.
+    const phase64 = reduced ? 16 : ((clock * 53.3) | 0) & 63;
+    ctx.fillStyle = withAlphaStep(COLOR.fireCore, reduced ? 40 : ((64 - phase64) * 7) >> 3);
+    fillRing(ctx, pcx, pcy, halo + dev + ((phase64 * 6 * dev) >> 6), dev);
+    drawPlayerArrow(ctx, ax2, ay2, (Math.round(p.angle / QUARTER_TURN) & 7) >>> 0, marker, !reduced && clock % 1.1 >= 0.82);
 
     // Back to the UI grid (and out of the clip) before anything else draws.
     ctx.restore();
 
     // ── Legend ──
     if (rail) drawLegendColumn(ctx, m, state, m.w - railRight + 4 * u, margin, railSize);
-    else drawLegend(ctx, m, state, margin, legendY, legendSize);
+    else drawLegend(ctx, m, state, margin, legendY, legendSize, legendFit.lines);
     if (timing) stats.drawMs = now() - t0;
   }
 
@@ -1411,48 +1436,78 @@ export function createMapView(options) {
     return exitMemo(Math.round(d));
   }
 
+  /** The legend strip's fit, filled by {@link fitLegend}: text scale and one or two lines. */
+  const legendFit = { size: 1, lines: 1 };
+
   /**
-   * The text scale the legend strip can afford.
+   * Fit the legend strip: the largest text scale, up to `u`, at which it fits the width on one line
+   * — or, on a narrow surface, on two (the swatches, then the distance or close hint under them).
    *
    * Measured, not guessed: at u = 3 on a phone the full strip is nearly twice the width of the
-   * screen, and a legend that overlaps itself is worse than no legend.
+   * screen, and a legend that overlaps itself is worse than no legend. A portrait phone's map is
+   * width-bound, so the second line costs it nothing; a wide surface keeps one line, because there
+   * the height is what the map is fitted to.
    * @param {any} m
    * @param {GameState} state
    * @param {number} u
-   * @returns {number} an integer scale ≥ 1
+   * @param {number} maxSize the largest scale allowed (the header's)
+   * @returns {void}
    */
-  function legendScale(m, state, u) {
+  function fitLegend(m, state, u, maxSize) {
+    const room = m.w - 6 * u;
     // Widths have two parts: text and icons (linear in `size`) and the `u`-based gaps (which are
-    // not), so the fit is solved by trying the sizes — `u` is at most 6, so this is at most six
-    // measurements of four short strings.
-    for (let size = Math.max(1, u); size > 1; size--) {
-      if (legendWidth(state, size, u) <= m.w - 6 * u) return size;
+    // not), so the fit is solved by trying the sizes — `u` is at most 6, so this is at most a dozen
+    // measurements of five short strings.
+    for (let size = Math.max(1, Math.min(u, maxSize)); size >= 1; size--) {
+      const swatches = legendSwatchesWidth(state, size, u);
+      const right = measureAt(legendRightText(state), 'hud', size);
+      if (swatches + 5 * u + right <= room) {
+        legendFit.size = size;
+        legendFit.lines = 1;
+        return;
+      }
+      if (m.narrow && swatches <= room && right <= room) {
+        legendFit.size = size;
+        legendFit.lines = 2;
+        return;
+      }
     }
-    return 1;
+    legendFit.size = 1;
+    legendFit.lines = m.narrow ? 2 : 1;
   }
 
   /**
-   * Width of the legend strip at a given text scale.
+   * Width of the legend's swatches (gems, flasks, the exit while unseen, you) at a text scale, gaps
+   * between them included and none after the last.
    * @param {GameState} state
    * @param {number} size
    * @param {number} u
    * @returns {number} UI pixels
    */
-  function legendWidth(state, size, u) {
+  function legendSwatchesWidth(state, size, u) {
     const run = state.run;
-    const seen = exitSeen(state);
     let w = ICON_SIZE.gem * size + 2 * u + measureAt(gemsMemo(run.gems, run.gemsTotal), 'hud', size) + 5 * u;
     w += ICON_SIZE.oilW * size + 2 * u + measureAt('OIL', 'hud', size) + 5 * u;
-    if (!seen) {
+    if (!exitSeen(state)) {
       w += ICON_SIZE.portal * size + 2 * u + measureAt('EXIT', 'hud', size) + 5 * u;
     }
-    w += measureAt(seen ? exitText(state) : closeHint(), 'hud', size);
+    w += ICON_SIZE.arrow * size + 2 * u + measureAt(YOU_LABEL, 'hud', size);
     return w;
   }
 
   /**
-   * The legend strip under the full map: what the colours mean, plus the number a player in a
-   * 16 000-cell labyrinth actually wants — how far away the exit is.
+   * The strip's right-hand text: the distance to the exit once it has been seen, how to close the
+   * map before then.
+   * @param {GameState} state
+   * @returns {string}
+   */
+  function legendRightText(state) {
+    return exitSeen(state) ? exitText(state) : closeHint();
+  }
+
+  /**
+   * The legend strip under the full map: what the colours and markers mean, plus the number a
+   * player in a 16 000-cell labyrinth actually wants — how far away the exit is.
    *
    * The EXIT swatch is shown only while the exit has *not* been found: once it has, the distance
    * readout on the right says the same thing better, and the two together overflow a phone.
@@ -1462,9 +1517,10 @@ export function createMapView(options) {
    * @param {number} x left edge
    * @param {number} y top edge
    * @param {number} size text scale
+   * @param {number} lines 1, or 2 to put the right-hand text on a line of its own (see `fitLegend`)
    * @returns {void}
    */
-  function drawLegend(ctx, m, state, x, y, size) {
+  function drawLegend(ctx, m, state, x, y, size, lines) {
     const u = m.u;
     const iconScale = Math.max(1, size);
     let cx = x;
@@ -1472,20 +1528,28 @@ export function createMapView(options) {
     const seen = exitSeen(state);
 
     const gemText = gemsMemo(run.gems, run.gemsTotal);
-    const rightText = seen ? exitText(state) : closeHint();
-    const rightX = m.w - x - measureAt(rightText, 'hud', size);
-    // Even at size 1 the whole strip can be wider than a phone ("12/273" plus a "MAP TO CLOSE" hint
-    // on a 195-pixel surface overprinted EXIT with the hint). Something then gives way rather than
-    // overlapping: the close hint while the exit is unseen (the MAP button says the same thing),
-    // the OIL swatch once the distance readout — the reason to open the map — needs the room.
-    const gemW = ICON_SIZE.gem * iconScale + 2 * u + measureAt(gemText, 'hud', size);
-    const oilW = ICON_SIZE.oilW * iconScale + 2 * u + measureAt('OIL', 'hud', size);
-    const exitW = seen ? 0 : 5 * u + ICON_SIZE.portal * iconScale + 2 * u + measureAt('EXIT', 'hud', size);
-    const crowded = x + gemW + 5 * u + oilW + exitW + 3 * u > rightX;
-    const showOil = !(crowded && seen);
-    const showRight = !(crowded && !seen);
+    const rightText = legendRightText(state);
+    const rightY = lines > 1 ? y + heightAt('hud', size) + 2 * u : y;
+    // Even at size 1 a very small surface can be too narrow for the whole strip. Something then gives
+    // way rather than overlapping: the YOU swatch first (the arrow on the map explains itself), then
+    // — on one line — the close hint while the exit is unseen (the MAP button says the same thing),
+    // then the OIL swatch; the exit distance, the reason to open the map, is never dropped.
+    let limit = lines > 1 ? m.w - x : m.w - x - measureAt(rightText, 'hud', size) - 3 * u;
+    let end = x + legendSwatchesWidth(state, size, u);
+    let showYou = true;
+    let showOil = true;
+    let showRight = true;
+    if (end > limit) {
+      showYou = false;
+      end -= 5 * u + ICON_SIZE.arrow * iconScale + 2 * u + measureAt(YOU_LABEL, 'hud', size);
+    }
+    if (end > limit && lines === 1 && !seen) {
+      showRight = false;
+      limit = m.w - x;
+    }
+    if (end > limit) showOil = false;
 
-    // Gems, then flasks, then the exit — the order they matter in.
+    // Gems, then flasks, then the exit, then you — the order they are looked for in.
     drawGemIcon(ctx, cx, y, iconScale);
     cx += ICON_SIZE.gem * iconScale + 2 * u;
     drawAt(ctx, gemText, cx, y, 'hud', size, 'hudGem');
@@ -1502,9 +1566,16 @@ export function createMapView(options) {
       drawPortalIcon(ctx, cx, y, iconScale);
       cx += ICON_SIZE.portal * iconScale + 2 * u;
       drawAt(ctx, 'EXIT', cx, y, 'hud', size, 'hudBright');
+      cx += measureAt('EXIT', 'hud', size) + 5 * u;
     }
 
-    if (showRight) drawAt(ctx, rightText, m.w - x, y, 'hud', size, seen ? 'hudBright' : 'hudDim', 'right');
+    if (showYou) {
+      drawArt(ctx, ARROWS[YOU_OCTANT], cx, y, iconScale, ARROW_PALETTE);
+      cx += ICON_SIZE.arrow * iconScale + 2 * u;
+      drawAt(ctx, YOU_LABEL, cx, y, 'hud', size, 'hudBright');
+    }
+
+    if (showRight) drawAt(ctx, rightText, m.w - x, rightY, 'hud', size, seen ? 'hudBright' : 'hudDim', 'right');
   }
 
   /**
@@ -1526,11 +1597,11 @@ export function createMapView(options) {
    */
   function legendColumnWidth(state, size, u) {
     const run = state.run;
-    const icon = Math.max(ICON_SIZE.gem, ICON_SIZE.oilW, ICON_SIZE.portal) * Math.max(1, size) + 2 * u;
+    const icon = Math.max(ICON_SIZE.gem, ICON_SIZE.oilW, ICON_SIZE.portal, ICON_SIZE.arrow) * Math.max(1, size) + 2 * u;
     // Every label sits right of the icon column, the distance included, so the rail is exactly as
     // wide as its longest label: "12/273" or "1,240m" — never "EXIT 1,240m" on one line.
     let w = measureAt(gemsMemo(run.gems, run.gemsTotal), 'hud', size);
-    w = Math.max(w, measureAt('EXIT', 'hud', size));
+    w = Math.max(w, measureAt('EXIT', 'hud', size), measureAt(YOU_LABEL, 'hud', size));
     if (exitSeen(state)) w = Math.max(w, measureAt(distText(state), 'hud', size));
     return icon + w;
   }
@@ -1546,8 +1617,9 @@ export function createMapView(options) {
   }
 
   /**
-   * The legend as a column down the right rail: gems, flasks and the exit swatch, with the distance
-   * to the exit under the swatch once the exit has been seen.
+   * The legend as a column down the right rail: gems, flasks, the player marker and the exit swatch,
+   * with the distance to the exit under the swatch once the exit has been seen (the exit is last so
+   * that line has the rail below it to itself).
    * @param {CanvasRenderingContext2D} ctx
    * @param {any} m
    * @param {GameState} state
@@ -1563,7 +1635,7 @@ export function createMapView(options) {
     const seen = exitSeen(state);
     const pitch = legendRowPitch(size, u);
     // Icons share one column so the labels line up whatever each icon's own width is.
-    const textX = x + Math.max(ICON_SIZE.gem, ICON_SIZE.oilW, ICON_SIZE.portal) * iconScale + 2 * u;
+    const textX = x + Math.max(ICON_SIZE.gem, ICON_SIZE.oilW, ICON_SIZE.portal, ICON_SIZE.arrow) * iconScale + 2 * u;
     let ry = y + u;
 
     drawGemIcon(ctx, x, ry, iconScale);
@@ -1572,6 +1644,10 @@ export function createMapView(options) {
 
     drawOilIcon(ctx, x, ry - u, iconScale);
     drawAt(ctx, 'OIL', textX, ry, 'hud', size, 'hudGold');
+    ry += pitch;
+
+    drawArt(ctx, ARROWS[YOU_OCTANT], x, ry, iconScale, ARROW_PALETTE);
+    drawAt(ctx, YOU_LABEL, textX, ry, 'hud', size, 'hudBright');
     ry += pitch;
 
     drawPortalIcon(ctx, x, ry, iconScale);

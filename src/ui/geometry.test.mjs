@@ -193,7 +193,7 @@ test('HUD: on a portrait phone the top panels end above the world band', () => {
   }
 });
 
-test('HUD: the score drops to single height once it would take a quarter of the screen', () => {
+test('HUD: the score is one size whatever its value — it never jumps mid-run', () => {
   const vp = VIEWPORTS[0];
   const sizeOfScore = (/** @type {number} */ score) => {
     const hud = hudAt(vp, 'off');
@@ -210,10 +210,9 @@ test('HUD: the score drops to single height once it would take a quarter of the 
     assert.ok(box !== undefined, `score ${score} drawn`);
     return { unit: box.unit, u: hud.surface.metrics.u };
   };
-  const small = sizeOfScore(4820);
-  assert.equal(small.unit, 2 * small.u, 'a four-figure score is double height');
-  const big = sizeOfScore(193740);
-  assert.equal(big.unit, big.u, 'a six-figure score is not the loudest thing on screen');
+  // It used to drop from 2u to u as it crossed ~100,000 at 1280×720: a size change mid-run.
+  const sizes = [4820, 99990, 100100, 193740, 1234567].map(sizeOfScore);
+  for (const s of sizes) assert.equal(s.unit, s.u + 1, `the score is drawn at u + 1 (×${s.unit})`);
 });
 
 // ─── Menus ───────────────────────────────────────────────────────────────────────────────────
@@ -280,7 +279,9 @@ test('level complete: the tally is never the smallest text on the screen', () =>
     const total = texts.find((b) => b.label === 'TOTAL');
     const heading = texts.find((b) => b.label.startsWith('Depth'));
     assert.ok(row !== undefined && total !== undefined && heading !== undefined);
-    assert.ok(heading.unit >= total.unit, `${vp.name}: heading ×${heading.unit} ≥ total ×${total.unit}`);
+    // Compared by drawn height, not by scale: the heading is set in the 12-row display face and the
+    // total in the 8-row HUD face, so a ×2 heading stands as tall as a ×3 TOTAL.
+    assert.ok(heading.h >= total.h, `${vp.name}: heading ${heading.h} px (×${heading.unit}) ≥ total ${total.h} px (×${total.unit})`);
     assert.ok(total.unit >= row.unit, `${vp.name}: total ×${total.unit} ≥ rows ×${row.unit}`);
     if (!m.narrow) assert.equal(row.unit, m.u, `${vp.name}: on a desktop the rows keep their full size`);
     const smallest = Math.min(...texts.filter((b) => b.kind === 'text').map((b) => b.h));
@@ -292,6 +293,53 @@ test('level complete: the tally is never the smallest text on the screen', () =>
           statLabel !== undefined && b.unit <= statLabel.unit && /^[A-Z\d×,%m]+$/.test(b.label),
           `${vp.name}: only the expedition strip is smaller than the tally rows, not "${b.label}" (${b.h} < ${row.h}, smallest ${smallest})`,
         );
+      }
+    }
+  }
+});
+
+test('end screens at 1280×720 and itch\'s 960×540: the expedition strip survives a boon offer', () => {
+  // The critic's find: with the "Choose a Boon" row the level-complete panel dropped the strip
+  // entirely at both sizes, and without it shrank the strip to ×1 while the heading kept its ×3.
+  const vps = [
+    { w: 1280, h: 720, dpr: 1, name: '1280x720' },
+    { w: 960, h: 540, dpr: 1, name: '960x540' },
+    { w: 1920, h: 1080, dpr: 1, name: '1920x1080' },
+  ];
+  for (const vp of vps) {
+    for (const boon of [false, true]) {
+      for (const screen of ['complete', 'gameover']) {
+        if (screen === 'gameover' && boon) continue;
+        const menus = menusAt(vp);
+        const state = playingState(screen === 'complete' ? 'levelComplete' : 'gameOver');
+        if (boon) state.offer = { open: true, level: 15, ids: ['whisper', 'appraiser', 'ember'] };
+        menus.render(state);
+        settle(menus, state, 0.5);
+        if (screen === 'complete') press(menus, state, 'confirm'); // skip the tally
+        settle(menus, state, 0.5);
+        const boxes = collectLayout(() => {
+          state.time += 1 / 60;
+          menus.render(state);
+        });
+        const what = `${vp.name} ${screen}${boon ? ' with a boon' : ''}`;
+        assert.equal(menus.screen(), screen, `${what}: still on the screen`);
+        assert.deepEqual(auditLayout(boxes, menus.surface.metrics), [], what);
+        const texts = boxes.filter((b) => b.kind === 'text');
+        if (boon) assert.ok(texts.some((b) => b.label === 'Choose a Boon'), `${what}: the boon row is laid out`);
+        const row = texts.find((b) => b.label === (screen === 'complete' ? 'DEPTH BONUS' : 'DEPTH REACHED'));
+        assert.ok(row !== undefined, `${what}: the rows are drawn`);
+        for (const label of ['LABYRINTH', 'EXPLORED', 'REFUELS', 'WALKED']) {
+          const stat = texts.find((b) => b.label === label);
+          assert.ok(stat !== undefined, `${what}: ${label} is shown`);
+          assert.ok(stat.unit >= row.unit - 1, `${what}: ${label} ×${stat.unit} is at most one step under the rows' ×${row.unit}`);
+        }
+        // A wide panel lays the four stats out as one row of columns.
+        const ys = new Set(texts.filter((b) => ['LABYRINTH', 'EXPLORED', 'REFUELS', 'WALKED'].includes(b.label)).map((b) => b.y));
+        assert.equal(ys.size, 1, `${what}: the strip is one row`);
+        const heading = texts.find((b) => b.h === 12 * b.unit && /^(Depth|Your torch)/.test(b.label));
+        const loudest = texts.find((b) => b.label === (screen === 'complete' ? 'TOTAL' : 'SCORE'));
+        assert.ok(heading !== undefined && loudest !== undefined, `${what}: heading and headline row`);
+        assert.ok(heading.h >= loudest.h, `${what}: heading ${heading.h} px ≥ ${loudest.label} ${loudest.h} px`);
       }
     }
   }
@@ -376,8 +424,13 @@ test('end screens: each stat value sits closer to its own label than to the next
       const next = find('REFUELS');
       assert.ok(label !== undefined && value !== undefined && next !== undefined, `${vp.name} ${screen}: strip drawn`);
       const own = value.y - (label.y + label.h);
-      const toNext = next.y - (value.y + value.h);
-      assert.ok(own < toNext, `${vp.name} ${screen}: label→value ${own} px must be < value→next label ${toNext} px`);
+      // One row of columns on a wide panel (the next label stands beside this one), a two-column
+      // grid on a phone (it sits under this pair): either way the gap to the next pair must be wider
+      // than the gap between a label and its own value.
+      const sameLine = next.y === label.y;
+      const toNext = sameLine ? next.x - Math.max(label.x + label.w, value.x + value.w) : next.y - (value.y + value.h);
+      assert.ok(own < toNext, `${vp.name} ${screen}: label→value ${own} px must be < value→next pair ${toNext} px`);
+      assert.ok(value.x === label.x, `${vp.name} ${screen}: the value stands under its own label`);
     }
   }
 });

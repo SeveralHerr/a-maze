@@ -685,16 +685,29 @@ test('the fuel readout is labelled OIL, never TANK, and never crowds the clock',
      */
     const shoot = () => {
       state.time += 1 / 60;
-      const boxes = collectLayout(() => hud.render(state, null, 0)).filter((b) => b.kind === 'text');
+      const all = collectLayout(() => hud.render(state, null, 0));
+      const boxes = all.filter((b) => b.kind === 'text');
       const clock = boxes.find((b) => /^\d+:\d\d$/.test(b.label));
       const label = boxes.find((b) => allowed.includes(b.label));
-      return { label, clock, all: boxes.map((b) => b.label) };
+      // The oil flask (7×9 art pixels) drawn on the clock's line, left of it: the stand-in for the word.
+      const flask =
+        clock === undefined
+          ? undefined
+          : all.find((b) => b.kind === 'art' && b.label === 'oil-flask' && b.y < clock.y + clock.h && b.y + b.h > clock.y);
+      return { label, clock, flask, all: boxes.map((b) => b.label) };
     };
     /** @param {ReturnType<typeof shoot>} f @param {string} what */
     const check = (f, what) => {
       assert.ok(!f.all.some((t) => /TANK/.test(t)), `${w}x${h} ${what}: no TANK anywhere (${f.all.join(' | ')})`);
       assert.ok(f.clock, `${w}x${h} ${what}: the clock is drawn (${f.all.join(" | ")})`);
-      if (f.label === undefined) return; // a bar with no room for any word drops it
+      if (f.label === undefined) {
+        // A bar with no room for any word shows the flask instead — never a bare bar and a clock
+        // (the critic's 390×844 phone at dpr 3 lost its only label).
+        assert.ok(f.flask !== undefined, `${w}x${h} ${what}: no OIL word, so the flask icon labels the gauge`);
+        const m = hud.surface.metrics;
+        assert.ok(f.clock.x - (f.flask.x + f.flask.w) >= Math.max(2, m.u - 1), `${w}x${h} ${what}: the flask clears the clock`);
+        return;
+      }
       const m = hud.surface.metrics;
       const glyph = f.label.w / f.label.label.length;
       assert.ok(f.clock.x - (f.label.x + f.label.w) >= Math.min(2 * glyph, 3 * m.u) - 1, `${w}x${h} ${what}: "${f.label.label}" crowds the clock`);

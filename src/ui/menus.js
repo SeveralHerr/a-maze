@@ -56,6 +56,7 @@ import {
   drawFlame,
   drawGemIcon,
   drawPanel,
+  drawTorchIcon,
   drawUnlockIcon,
   drawWell,
   fitScaleAt,
@@ -557,19 +558,25 @@ const MAX_CONTROL_ROWS = 12;
  * @type {ReadonlyArray<ControlHint>}
  */
 const DEFAULT_CONTROL_HINTS = Object.freeze([
-  Object.freeze({ label: 'Move', keys: 'W S  ·  UP DOWN', pad: 'Left stick' }),
+  // Spelled exactly as `describeControls` spells the default layout once its arrows are translated
+  // (title case, `/` between alternatives), so the fallback and the real table read the same.
+  Object.freeze({ label: 'Move', keys: 'W S / Up Down', pad: 'Left stick / D-pad' }),
   Object.freeze({ label: 'Strafe', keys: 'A D', pad: 'Left stick' }),
-  Object.freeze({ label: 'Turn', keys: 'Q E  ·  LEFT RIGHT', pad: 'Right stick' }),
-  Object.freeze({ label: 'Look', keys: 'MOUSE', pad: 'Right stick' }),
+  Object.freeze({ label: 'Turn', keys: 'Q E / Left Right', pad: 'Right stick' }),
+  Object.freeze({ label: 'Look', keys: 'Mouse', pad: 'Right stick' }),
   Object.freeze({ label: 'Chalk', keys: 'C', pad: 'X' }),
-  Object.freeze({ label: 'Map', keys: 'M  ·  TAB', pad: 'View' }),
-  Object.freeze({ label: 'Pause', keys: 'ESC  ·  P', pad: 'Menu' }),
-  Object.freeze({ label: 'Mute', keys: 'N', pad: '—' }),
-  Object.freeze({ label: 'Confirm', keys: 'ENTER  ·  SPACE', pad: 'A' }),
-  Object.freeze({ label: 'Back', keys: 'ESC  ·  BACKSPACE', pad: 'B' }),
+  Object.freeze({ label: 'Map', keys: 'M / Tab', pad: 'View' }),
+  Object.freeze({ label: 'Pause', keys: 'Esc / P', pad: 'Menu' }),
+  Object.freeze({ label: 'Mute', keys: 'N', pad: 'Y' }),
+  Object.freeze({ label: 'Confirm', keys: 'Enter / Space', pad: 'A' }),
+  Object.freeze({ label: 'Back', keys: 'Esc / Backspace', pad: 'B' }),
 ]);
 
-/** The line under the keyboard table, for a player who will pick the game up on a phone later. */
+/**
+ * The line under the keyboard table on a device that has a touchscreen but no fine primary pointer,
+ * so could be played either way. A mouse-and-keyboard desktop — touchscreen laptops included — has
+ * no use for it and does not get it (see `touchWithoutFinePointer` in `createMenus`).
+ */
 const TOUCH_HINT = 'Touch: stick moves, drag looks';
 
 /**
@@ -582,23 +589,27 @@ const TOUCH_HINT = 'Touch: stick moves, drag looks';
  * @type {ReadonlyArray<ControlHint>}
  */
 const TOUCH_CONTROL_HINTS = Object.freeze([
-  Object.freeze({ label: 'Move', keys: 'LEFT STICK' }),
-  Object.freeze({ label: 'Chalk', keys: 'CHALK BUTTON' }),
-  Object.freeze({ label: 'Look', keys: 'DRAG RIGHT SIDE' }),
-  Object.freeze({ label: 'Map', keys: 'MAP BUTTON' }),
-  Object.freeze({ label: 'Pause', keys: 'PAUSE BUTTON' }),
-  Object.freeze({ label: 'Choose', keys: 'TAP' }),
+  Object.freeze({ label: 'Move', keys: 'Left Stick' }),
+  Object.freeze({ label: 'Chalk', keys: 'Chalk Button' }),
+  Object.freeze({ label: 'Look', keys: 'Drag Right Side' }),
+  Object.freeze({ label: 'Map', keys: 'Map Button' }),
+  Object.freeze({ label: 'Pause', keys: 'Pause Button' }),
+  Object.freeze({ label: 'Choose', keys: 'Tap' }),
 ]);
 
 /** The footer under the touch table. */
 const KEYBOARD_HINT = 'Keyboard and pad work too';
 
-/** Characters the bitmap faces cannot draw, and what to say instead. */
+/**
+ * Characters the bitmap faces cannot draw, and what to say instead. Title case, like every other
+ * key name the bindings produce ('Esc', 'Enter', 'Tab'): upper-case arrows made the keys column read
+ * `W S / UP DOWN` next to `Enter / Space`.
+ */
 const GLYPH_FALLBACK = Object.freeze({
-  '↑': 'UP',
-  '↓': 'DOWN',
-  '←': 'LEFT',
-  '→': 'RIGHT',
+  '↑': 'Up',
+  '↓': 'Down',
+  '←': 'Left',
+  '→': 'Right',
   '—': '-',
   '–': '-',
 });
@@ -1592,7 +1603,11 @@ export function createMenus(overlayCanvas, callbacks) {
         index = row;
         pressedRow = row;
         followShrine(screen, true);
-        if (screen.items[row].kind === 'slider') {
+        // A slider is dragged by its **track** only. The rest of the row — the label, the value
+        // word — selects the row and nothing more. Arming the drag anywhere on the row mapped a press
+        // on the word "Sound" (left of the track) onto the track's minimum and saved it: picking the
+        // row muted the game, and picking "Look Speed" dropped mouse look to 0.2×.
+        if (screen.items[row].kind === 'slider' && onTrack(row, ptr[0], ptr[1])) {
           dragRow = row;
           applySliderDrag(screen, row, state);
         }
@@ -1622,6 +1637,13 @@ export function createMenus(overlayCanvas, callbacks) {
           sound('uiMove');
           return true;
         }
+        // A click on a slider row that never touched its track is a selection, not a nudge:
+        // `activate` would step the value up (the keyboard's confirm), which is not what a press on
+        // a label means.
+        if (item !== undefined && item.kind === 'slider') {
+          if (!pressedWasSelected) sound('uiMove');
+          return true;
+        }
         if (item !== undefined && item.kind === 'choice') {
           const word = choiceHit(row, ptr[0], ptr[1]);
           const values = item.values;
@@ -1636,6 +1658,27 @@ export function createMenus(overlayCanvas, callbacks) {
       default:
         return false;
     }
+  }
+
+  /**
+   * Is a point on a slider row's draggable track? The recorded track rectangle (already padded
+   * vertically for a thumb) is widened by a knob's half-width either side, so a press on the knob
+   * pinned at either end still grabs it.
+   * @param {number} row
+   * @param {number} x UI pixels
+   * @param {number} y UI pixels
+   * @returns {boolean}
+   */
+  function onTrack(row, x, y) {
+    if (row < 0 || row >= MAX_ROWS || !Number.isFinite(x) || !Number.isFinite(y)) return false;
+    const o = row * 4;
+    const w = trackRects[o + 2];
+    const h = trackRects[o + 3];
+    if (!(w > 0) || !(h > 0)) return false;
+    const pad = 2 * Math.max(1, surface.metrics.u);
+    const tx = trackRects[o] - pad;
+    const ty = trackRects[o + 1];
+    return x >= tx && x < tx + w + 2 * pad && y >= ty && y < ty + h;
   }
 
   /**
@@ -1730,6 +1773,7 @@ export function createMenus(overlayCanvas, callbacks) {
       // Ask the device question again on every screen: a hybrid tablet that has just gained a
       // mouse should stop being told to tap. One media query per screen entry, never per frame.
       coarsePointer = -1;
+      touchscreen = -1;
       if (screen.id === 'controls') padSeenAt = -1;
       if (screen.id === 'shrine') shrineTop = 0;
       screenSerial++;
@@ -2141,8 +2185,8 @@ export function createMenus(overlayCanvas, callbacks) {
    * attract-mode dungeon, as in `docs/art-reference.png`. On a **portrait phone** the world is a 4:3
    * band across the middle of the screen (§4.7 "Layout"), and fractions of the full height put the
    * logo in the black deck above it and cut a menu row in half across its bottom edge — so the
-   * title is laid out by bands instead: wordmark and subtitle centred in the upper deck, the rule on
-   * the band's top edge, the attract camera unobstructed in the band, and the menu, best score and
+   * title is laid out by bands instead: wordmark, subtitle and the rule under them centred together
+   * in the upper deck, the attract camera unobstructed in the band, and the menu, best score and
    * footer in the lower deck.
    * @param {CanvasRenderingContext2D} ctx
    * @param {SurfaceMetrics} m
@@ -2206,8 +2250,12 @@ export function createMenus(overlayCanvas, callbacks) {
     let ruleY = 0;
     let listTop = 0;
     if (band) {
-      logoY = Math.max(2 * u, Math.round((m.viewY - 4 * u - groupH) / 2)) - slide;
-      ruleY = m.viewY - 2 * u;
+      // Wordmark, subtitle and their rule are one group, centred in the upper deck. The rule used to
+      // be pinned to the band's top edge, ~50 CSS px under the subtitle on a 390×844 phone, where it
+      // belonged to neither the lettering nor the world.
+      const deckGroupH = groupH + 4 * u + 2 * u;
+      logoY = Math.max(2 * u, Math.round((m.viewY - deckGroupH) / 2)) - slide;
+      ruleY = logoY + groupH + 4 * u;
       listTop = viewBottom + 4 * u;
     } else {
       logoY = Math.round(m.h * 0.1) - slide;
@@ -2761,7 +2809,10 @@ export function createMenus(overlayCanvas, callbacks) {
     }
     const hints = touch ? TOUCH_CONTROL_HINTS : controlHints;
     const withPad = !touch && padShown && hintsHavePad(hints);
-    const footer = touch ? KEYBOARD_HINT : TOUCH_HINT;
+    // The other kind of device, named only where it could be used: a touch player learns a keyboard
+    // works; a keyboard player is told how touch plays only where touch is not a fine-pointer
+    // machine's afterthought.
+    const footer = touch ? KEYBOARD_HINT : touchWithoutFinePointer() ? TOUCH_HINT : '';
     const panelW = Math.round(Math.min(m.w - 4 * u, Math.max(110 * u, m.w * 0.74)));
     const colW = panelW - 14 * u;
     const headScale = fitScaleAt('Controls', panelW * 0.6, 'display', Math.max(2, u + 1), 1);
@@ -2783,7 +2834,7 @@ export function createMenus(overlayCanvas, callbacks) {
       // The footer is drawn at the table's size, or one step down — never smaller, because a line at
       // half the size of everything else on the panel reads as a mistake — and dropped when neither
       // fits.
-      footSize = measureAt(footer, 'hud', size) <= colW ? size : size > 1 && measureAt(footer, 'hud', size - 1) <= colW ? size - 1 : 0;
+      footSize = footer === '' ? 0 : measureAt(footer, 'hud', size) <= colW ? size : size > 1 && measureAt(footer, 'hud', size - 1) <= colW ? size - 1 : 0;
       footH = footSize > 0 ? heightAt('hud', footSize) + 3 * u : u;
       panelH = headH + 12 * u + (hints.length + (withPad ? 1 : 0)) * lineH + footH + rowH + 7 * u;
       if (panelH <= m.h - 4 * u || size <= 1) break;
@@ -2892,6 +2943,34 @@ export function createMenus(overlayCanvas, callbacks) {
   }
 
   /**
+   * Is touch a way this player could actually be playing, although it is not the primary pointer?
+   * True only for a device with a touchscreen (`navigator.maxTouchPoints > 0`) whose primary pointer
+   * is **not** a fine one — a touchscreen laptop driven by its trackpad has a fine primary pointer
+   * and is told nothing about sticks. (Where touch *is* the primary pointer the whole panel is the
+   * touch table instead; see {@link primaryPointerIsCoarse}.) Asked once per screen visit.
+   * @returns {boolean}
+   */
+  function touchWithoutFinePointer() {
+    if (touchscreen === -1) {
+      let yes = false;
+      try {
+        const g = /** @type {any} */ (globalThis);
+        const nav = g.navigator;
+        const touch = nav !== undefined && nav !== null && typeof nav.maxTouchPoints === 'number' && nav.maxTouchPoints > 0;
+        const fine = typeof g.matchMedia === 'function' && g.matchMedia.call(g, '(pointer: fine)').matches === true;
+        yes = touch && !fine;
+      } catch (err) {
+        yes = false;
+      }
+      touchscreen = yes ? 1 : 0;
+    }
+    return touchscreen === 1;
+  }
+
+  /** Cached answer of {@link touchWithoutFinePointer}: −1 not asked on this screen yet, 0 no, 1 yes. */
+  let touchscreen = -1;
+
+  /**
    * Is a gamepad connected right now? `false` wherever the Gamepad API is missing or throws.
    * @returns {boolean}
    */
@@ -2933,24 +3012,27 @@ export function createMenus(overlayCanvas, callbacks) {
     // texels wide and the loading art reads as a different game's. Never more than two steps above
     // the heading either — a phone fits the line only at ×1, and ×4 art over it outshouted the words.
     const artScale = Math.max(2, Math.min(u + 1, headScale + 2));
-    const artH = (ICON_SIZE.flameH + 2) * artScale;
+    const artH = ICON_SIZE.torchH * artScale;
 
-    // Composition: a lit torch with a chisel swinging at it, the line of text, then the dots.
-    // Everything is measured from the group's top so it stays centred at any size.
+    // Composition: a lit torch — flame and handle, the same torch the HUD's gauge carries — with a
+    // chisel swinging at the wall beside it, the line of text, then the dots. A flame drawn alone read
+    // as a fireball floating next to a stick. Everything is measured from the group's top so it stays
+    // centred at any size.
     const groupH = artH + headH + 16 * u;
     let y = Math.round(cy - groupH / 2);
 
     const swing = reduced ? 0 : Math.round(Math.sin(anim.clock * 5.5) * 1.5 * u);
-    // Centre the *pair*, not the torch: the chisel hangs off its left, so centring the flame alone
+    // Centre the *pair*, not the torch: the chisel hangs off its left, so centring the torch alone
     // would leave the whole group sitting left of the heading.
     const pickW = PICK_ART.w * artScale + 2 * u;
     const torchX = cx - Math.round((ICON_SIZE.flameW * artScale) / 2) + Math.round(pickW / 2);
-    drawFlame(ctx, torchX, y, artScale, reduced ? 0 : ((anim.clock * 12) | 0) % 3);
+    drawTorchIcon(ctx, torchX, y, artScale, reduced ? 0 : ((anim.clock * 12) | 0) % 3, 1);
+    // The chisel's head strikes at the torch's shoulder, where the flame meets the handle.
     drawArt(
       ctx,
       PICK_ART,
-      torchX - PICK_ART.w * artScale - 2 * u + swing,
-      y + 2 * u - swing,
+      torchX - PICK_ART.w * artScale - u + swing,
+      y + (ICON_SIZE.flameH - 3) * artScale - swing,
       artScale,
       PICK_PALETTE,
     );
@@ -3049,8 +3131,11 @@ export function createMenus(overlayCanvas, callbacks) {
   }
 
   /**
-   * Draw the stat rows as a two-column strip: label above value, so four numbers fit on one line
-   * of a phone and two lines of a desktop panel without a table.
+   * Draw the stat rows. Two arrangements, chosen by {@link stripOneRow} at the scale being drawn:
+   * - **one row** of label-over-value columns, each as wide as its own longer string and spread with
+   *   even gutters across the panel — what a wide panel gets, at half the height of the grid;
+   * - a **two-column grid** (label above value, two pairs a line) — what a phone gets, because four
+   *   columns do not fit its panel at any readable size.
    * @param {CanvasRenderingContext2D} ctx
    * @param {number} left
    * @param {number} right
@@ -3064,6 +3149,20 @@ export function createMenus(overlayCanvas, callbacks) {
     if (statCount === 0) return 0;
     const lineH = heightAt('hud', size);
     const pitch = statRowPitch(u, size);
+    if (stripOneRow(left, right, u, size)) {
+      // Columns take their own width; the slack is shared out as equal gutters, so the first column
+      // starts on the panel's left text edge and the last one ends on its right.
+      let used = 0;
+      for (let i = 0; i < statCount; i++) used += statColumnWidth(i) * size;
+      const gutter = statCount > 1 ? Math.floor((right - left - used) / (statCount - 1)) : 0;
+      let x = left;
+      for (let i = 0; i < statCount; i++) {
+        drawAt(ctx, statLabels[i], x, y, 'hud', size, 'hudDim', 'left', 'top', alpha);
+        drawAt(ctx, statValues[i], x, y + lineH + 2 * u, 'hud', size, 'hudBright', 'left', 'top', alpha);
+        x += statColumnWidth(i) * size + gutter;
+      }
+      return pitch;
+    }
     const perRow = statCount >= 3 ? 2 : statCount;
     const colW = Math.floor((right - left) / perRow);
     const rows = Math.ceil(statCount / perRow);
@@ -3081,8 +3180,52 @@ export function createMenus(overlayCanvas, callbacks) {
   }
 
   /**
-   * The largest scale, up to `maxScale`, at which every stat label and value fits **its own
-   * column** of the strip with a 3u gutter.
+   * Width of one stat column at scale 1: the longer of its label and its value.
+   * @param {number} i
+   * @returns {number}
+   */
+  function statColumnWidth(i) {
+    const a = measureAt(statLabels[i], 'hud', 1);
+    const b = measureAt(statValues[i], 'hud', 1);
+    return a > b ? a : b;
+  }
+
+  /**
+   * Does the strip fit as a single row of columns at this scale? Needs three or more stats (two
+   * already share one line in the grid) and a gutter of at least 4u between columns — twice the 2u
+   * between a label and its value, so a value still reads as belonging to the label above it rather
+   * than to the column beside it.
+   * @param {number} left
+   * @param {number} right
+   * @param {number} u
+   * @param {number} size
+   * @returns {boolean}
+   */
+  function stripOneRow(left, right, u, size) {
+    if (statCount < 3) return false;
+    let used = 0;
+    for (let i = 0; i < statCount; i++) used += statColumnWidth(i);
+    return used * size + (statCount - 1) * 4 * u <= right - left;
+  }
+
+  /**
+   * Lines of text pairs the strip takes at a scale (0 when there is nothing to show).
+   * @param {number} left
+   * @param {number} right
+   * @param {number} u
+   * @param {number} size
+   * @returns {number}
+   */
+  function stripLines(left, right, u, size) {
+    if (statCount === 0) return 0;
+    if (stripOneRow(left, right, u, size)) return 1;
+    return statCount >= 3 ? 2 : 1;
+  }
+
+  /**
+   * The largest scale, up to `maxScale`, at which the strip fits the panel — as one row of columns
+   * or, failing that, with every stat label and value inside **its own column** of the grid with a
+   * 3u gutter.
    *
    * WHY the strip has its own scale: it used to be drawn at the tally's row scale, which is fitted
    * to label/value pairs across the whole panel — never to half of it. On a phone every game over
@@ -3099,11 +3242,16 @@ export function createMenus(overlayCanvas, callbacks) {
     const perRow = statCount >= 3 ? 2 : statCount;
     const colW = Math.floor((right - left) / perRow);
     let unit = 0;
+    let used = 0;
     for (let i = 0; i < statCount; i++) {
-      unit = Math.max(unit, measureAt(statLabels[i], 'hud', 1), measureAt(statValues[i], 'hud', 1));
+      const cw = statColumnWidth(i);
+      unit = Math.max(unit, cw);
+      used += cw;
     }
     if (unit <= 0) return Math.max(1, maxScale);
-    return clamp(Math.floor((colW - 3 * u) / unit), 1, Math.max(1, maxScale));
+    const grid = Math.floor((colW - 3 * u) / unit);
+    const oneRow = statCount >= 3 ? Math.floor((right - left - (statCount - 1) * 4 * u) / used) : 0;
+    return clamp(Math.max(grid, oneRow), 1, Math.max(1, maxScale));
   }
 
   /**
@@ -3122,16 +3270,15 @@ export function createMenus(overlayCanvas, callbacks) {
   }
 
   /**
-   * Height the expedition strip will occupy, including the rule above it.
-   * @param {number} rows how many stat rows were filled
+   * Height the expedition strip will occupy.
+   * @param {number} lines from {@link stripLines}
    * @param {number} u
    * @param {number} size text scale
    * @returns {number}
    */
-  function statStripHeight(rows, u, size) {
-    if (rows === 0) return 0;
-    // 2u lead above the first label, and 6u under the last value (its pitch already holds 5u).
-    return (rows >= 3 ? 2 : 1) * statRowPitch(u, size) + u;
+  function statStripHeight(lines, u, size) {
+    if (lines === 0) return 0;
+    return lines * statRowPitch(u, size) + u;
   }
 
   // ── Level complete ──
@@ -3162,6 +3309,31 @@ export function createMenus(overlayCanvas, callbacks) {
   function fitOneRowScale(label, value, width, maxScale) {
     const unit = measureAt(label, 'hud', 1) + measureAt(value, 'hud', 1) + 6;
     return Math.max(1, Math.min(maxScale, Math.floor(width / unit)));
+  }
+
+  /**
+   * The largest display scale, up to `cap`, at which **every** row of a screen fits `maxW` with the
+   * selection's flames either side of it — measured on the screen's own labels, so "Choose a Boon"
+   * (the longest end-screen row, present only while a boon waits) can never run off a phone's panel
+   * the way a fit on "Quit to Title" alone let it.
+   * @param {Screen} screen
+   * @param {number} maxW UI pixels
+   * @param {number} u
+   * @param {number} cap
+   * @returns {number}
+   */
+  function fitItemScale(screen, maxW, u, cap) {
+    let scale = Math.max(1, cap);
+    const items = screen.items;
+    for (; scale > 1; scale--) {
+      const flames = 2 * (ICON_SIZE.flameW * Math.max(1, Math.round(scale * 0.8)) + 2 * u);
+      let fits = true;
+      for (let i = 0; i < items.length && fits; i++) {
+        if (measureAt(items[i].label, 'display', scale) + flames > maxW) fits = false;
+      }
+      if (fits) break;
+    }
+    return scale;
   }
 
   /**
@@ -3282,17 +3454,27 @@ export function createMenus(overlayCanvas, callbacks) {
     const statRows = buildRunStats(state);
 
     // The panel is *fitted*: a height computed once and centred runs off a short surface. What
-    // gives way, in order, is what the screen is least about — the heading's size, then the
-    // buttons', then the expedition strip — and only then the tally, which is the content. The first
-    // version shrank the tally first, so at 1280×720 the rows came out the smallest text on the
-    // screen, below the heading, the buttons and even the prompt that skips them.
+    // gives way, in order, is what the screen is least about — decoration before content:
+    //   1. the heading, down to the rows' own size (never under ×2: the display face at ×2 is as
+    //      tall as a ×3 TOTAL);
+    //   2. the buttons, down to the rows' size;
+    //   3. the expedition strip, down to one step under the rows;
+    //   4. the TOTAL row's extra step;
+    //   5. the strip, further, and then entirely;
+    //   6. and only then the tally rows themselves.
+    // The first version shrank the tally first (the rows came out the smallest text on the screen);
+    // the second stopped the heading at the TOTAL's size, so at 1280×720 a boon offer dropped the
+    // whole expedition strip while "Depth 3 Cleared" kept its ×3.
     let rowScale = fitRowScale(labels, finals, colW, u);
-    let totalScale = Math.min(rowScale + 1, fitOneRowScale(labels[3], finals[3], colW, u + 1));
+    const totalFit = fitOneRowScale(labels[3], finals[3], colW, u + 1);
+    let totalBoost = 1;
+    let totalScale = Math.min(rowScale + totalBoost, totalFit);
     const headTop = clearedTopMemo(level);
     const headW = panelW - 12 * u;
     let headScale = fitHeading(headText, headTop, HEADING_CLEARED, headW, Math.max(2, u + 1), m.narrow);
     let headSplit = false;
-    let itemScale = fitScaleAt('Quit to Title', panelW * 0.7, 'display', Math.min(scaleCap(m, 150), totalScale + 1), 1);
+    // The buttons are never louder than the heading they sit under.
+    let itemScale = fitItemScale(screen, panelW - 8 * u, u, Math.min(scaleCap(m, 150), totalScale + 1, headScale));
     let stripScale = stripScaleFor(left, right, u, rowScale);
     let statsShown = statRows > 0;
     let rowLineH = 0;
@@ -3302,18 +3484,22 @@ export function createMenus(overlayCanvas, callbacks) {
     let statH = 0;
     let panelH = 0;
     for (;;) {
-      totalScale = Math.min(rowScale + 1, fitOneRowScale(labels[3], finals[3], colW, u + 1));
+      totalScale = Math.max(rowScale, Math.min(rowScale + totalBoost, totalFit));
       rowLineH = heightAt('hud', rowScale) + 4 * u;
       totalLineH = heightAt('hud', totalScale) + 4 * u;
       headSplit = headingSplits(headText, headW, headScale);
       headH = headingHeight(headScale, headSplit, u);
       rowH = heightAt('display', itemScale) + 4 * u;
-      statH = statsShown ? statStripHeight(statRows, u, stripScale) : 0;
+      statH = statsShown ? statStripHeight(stripLines(left, right, u, stripScale), u, stripScale) : 0;
       panelH =
         headH + 14 * u + rowLineH * (TALLY_ROWS - 1) + totalLineH + 4 * u + statH + rowH * screen.items.length + 6 * u;
       if (panelH <= m.h - 4 * u) break;
-      if (headScale > Math.max(2, totalScale)) headScale--;
+      // Heading and buttons come down together, the louder first, so the buttons never outrank it.
+      if (itemScale > Math.max(1, rowScale) && itemScale >= headScale) itemScale--;
+      else if (headScale > Math.max(2, rowScale)) headScale--;
       else if (itemScale > Math.max(1, rowScale)) itemScale--;
+      else if (statsShown && stripScale > Math.max(1, rowScale - 1)) stripScale--;
+      else if (totalBoost > 0 && totalScale > rowScale) totalBoost = 0;
       else if (statsShown && stripScale > 1) stripScale--;
       else if (statsShown) statsShown = false;
       else if (rowScale > 1) {
@@ -3474,13 +3660,17 @@ export function createMenus(overlayCanvas, callbacks) {
     const right = px + panelW - 7 * u;
     const colW = right - left;
     const statRows = buildRunStats(state);
-    // Fitted, in the order spelled out in `drawComplete`: heading, buttons, strip, then the rows.
+    // Fitted, in the order spelled out in `drawComplete`: heading, buttons, strip, the score's extra
+    // step, then the rows.
     let rowScale = fitRowScale(labels, values, colW, u);
-    let scoreScale = Math.min(rowScale + 1, fitOneRowScale(labels[0], values[0], colW, u + 1));
+    const scoreFit = fitOneRowScale(labels[0], values[0], colW, u + 1);
+    let scoreBoost = 1;
+    let scoreScale = Math.min(rowScale + scoreBoost, scoreFit);
     const headW = panelW - 12 * u;
     let headScale = fitHeading(headText, HEADING_OUT_TOP, HEADING_OUT_BOTTOM, headW, Math.max(2, u + 1), m.narrow);
     let headSplit = false;
-    let itemScale = fitScaleAt('Try Again', panelW * 0.6, 'display', Math.min(scaleCap(m, 150), scoreScale + 1), 1);
+    // The buttons are never louder than the heading they sit under.
+    let itemScale = fitItemScale(screen, panelW - 8 * u, u, Math.min(scaleCap(m, 150), scoreScale + 1, headScale));
     let stripScale = stripScaleFor(left, right, u, rowScale);
     let statsShown = statRows > 0;
     let bestScale = 0;
@@ -3492,7 +3682,7 @@ export function createMenus(overlayCanvas, callbacks) {
     let statH = 0;
     let panelH = 0;
     for (;;) {
-      scoreScale = Math.min(rowScale + 1, fitOneRowScale(labels[0], values[0], colW, u + 1));
+      scoreScale = Math.max(rowScale, Math.min(rowScale + scoreBoost, scoreFit));
       // The record line is drawn at the score's size whenever it fits the column there — on a
       // phone as well, now that it no longer has to share the line with a number.
       bestScale = newBest ? fitScaleAt(NEW_BEST_TEXT, colW, 'hud', scoreScale, 1) : rowScale;
@@ -3504,11 +3694,15 @@ export function createMenus(overlayCanvas, callbacks) {
       depthH = heightAt('hud', rowScale) + 4 * u;
       bestH = heightAt('hud', bestScale) + 4 * u;
       rowH = heightAt('display', itemScale) + 4 * u;
-      statH = statsShown ? statStripHeight(statRows, u, stripScale) : 0;
+      statH = statsShown ? statStripHeight(stripLines(left, right, u, stripScale), u, stripScale) : 0;
       panelH = headH + 15 * u + scoreH + depthH + bestH + 2 * u + statH + rowH * screen.items.length + 6 * u;
       if (panelH <= m.h - 4 * u) break;
-      if (headScale > Math.max(2, scoreScale)) headScale--;
+      // Heading and buttons come down together, the louder first, so the buttons never outrank it.
+      if (itemScale > Math.max(1, rowScale) && itemScale >= headScale) itemScale--;
+      else if (headScale > Math.max(2, rowScale)) headScale--;
       else if (itemScale > Math.max(1, rowScale)) itemScale--;
+      else if (statsShown && stripScale > Math.max(1, rowScale - 1)) stripScale--;
+      else if (scoreBoost > 0 && scoreScale > rowScale) scoreBoost = 0;
       else if (statsShown && stripScale > 1) stripScale--;
       else if (statsShown) statsShown = false;
       else if (rowScale > 1) {
@@ -3602,17 +3796,19 @@ export function createMenus(overlayCanvas, callbacks) {
   /**
    * A catalogue string wrapped to a width, cached: wrapping allocates, so it is done once per
    * (entry, text, width, scale) rather than per frame.
-   * @param {number} key small integer naming the entry and which of its texts
+   * @param {number} key small integer naming the entry and which of its texts (each text, and each
+   *   face a text is wrapped in, needs its own key)
    * @param {string} text
    * @param {number} width UI px
    * @param {number} scale
+   * @param {'hud'|'display'} [font] defaults to the HUD face
    * @returns {string[]}
    */
-  function wrapped(key, text, width, scale) {
+  function wrapped(key, text, width, scale, font) {
     const k = ((key * 4096 + Math.max(0, Math.min(4095, Math.round(width)))) * 16 + scale) | 0;
     let lines = wrapCache.get(k);
     if (lines === undefined) {
-      lines = text === '' ? [] : wrapText(text, width, { font: 'hud', size: scale });
+      lines = text === '' ? [] : wrapText(text, width, { font: font === undefined ? 'hud' : font, size: scale });
       if (wrapCache.size > 512) wrapCache.clear();
       wrapCache.set(k, lines);
     }
@@ -3660,16 +3856,20 @@ export function createMenus(overlayCanvas, callbacks) {
     const ruleY = py + 4 * u + headH + 2 * u;
     drawRule(ctx, cx, ruleY, Math.round(panelW * 0.28), u);
     const textSize = narrow ? Math.max(1, u - 1) : u;
+    // The purse is the number every purchase on this screen is measured against, so it stands a step
+    // above the list — it used to be the smallest number on the panel.
+    const purseSize = textSize + 1;
     const purseText = purseMemo(purse);
-    const gemS = Math.max(1, textSize);
-    const purseW = ICON_SIZE.gem * gemS + 2 * u + measureAt(purseText, 'hud', textSize);
+    const gemS = purseSize;
+    const purseW = ICON_SIZE.gem * gemS + 2 * u + measureAt(purseText, 'hud', purseSize);
     const purseY = ruleY + 4 * u;
-    drawGemIcon(ctx, cx - (purseW >> 1), purseY, gemS);
-    drawAt(ctx, purseText, cx - (purseW >> 1) + ICON_SIZE.gem * gemS + 2 * u, purseY, 'hud', textSize, 'hudGem');
+    const purseH = Math.max(heightAt('hud', purseSize), ICON_SIZE.gem * gemS);
+    drawGemIcon(ctx, cx - (purseW >> 1), purseY + ((heightAt('hud', purseSize) - ICON_SIZE.gem * gemS) >> 1), gemS);
+    drawAt(ctx, purseText, cx - (purseW >> 1) + ICON_SIZE.gem * gemS + 2 * u, purseY, 'hud', purseSize, 'hudGem');
 
     const left = px + 6 * u;
     const right = px + panelW - 6 * u;
-    const bodyTop = purseY + heightAt('hud', textSize) + 5 * u;
+    const bodyTop = purseY + purseH + 5 * u;
     // 56 % on a wide panel: at 52 % "Dead-End Whisper" left no room for the pip column on any row.
     const listW = narrow ? right - left : Math.round((right - left) * 0.56);
     fitShrineRows(listW, textSize, u);
@@ -3783,47 +3983,87 @@ export function createMenus(overlayCanvas, callbacks) {
         const inL = dx + 5 * u;
         const inW = dw - 10 * u;
         let y = dy + 5 * u;
-        // One scale for every name, chosen by the longest, so the plaque does not change size as the
-        // cursor walks the list.
-        const nameScale = fitScaleAt(shrineFit.longest, inW, 'display', Math.max(1, u), 1);
-        // The price line sits on the well's floor, where the eye lands last; NOW and NEXT stand on it,
-        // each taking a second line when its value is too long to sit beside the label.
+        // The price line sits on the well's floor, where the eye lands last; NOW and NEXT stand on it.
+        // They share one form, chosen by the longer of the two: both beside their labels, or both on
+        // the line under them — one inline and one wrapped read as two different kinds of row.
         const priceY = dy + dh - 4 * u - heightAt('hud', textSize);
         const nowText = rank > 0 ? info.ranks[rank - 1] : SHRINE_NOT_OWNED;
         const nextText = maxed ? SHRINE_MASTERED : info.ranks[rank];
         const nowKey = 20000 + (sel * 8 + rank) * 2;
-        const nowLines = labelledLines(nowText, inW, textSize, u, nowKey);
-        const effectLines = nowLines + labelledLines(nextText, inW, textSize, u, nowKey + 1);
-        let effectsY = priceY - 3 * u - effectLines * lineH;
-        // The blurb is shown whole: the icon gives up size first (down to 2u) to make room for it.
+        const below =
+          labelledLines(nowText, inW, textSize, u, nowKey) > 1 || labelledLines(nextText, inW, textSize, u, nowKey + 1) > 1;
+        const nowLines = labelledLines(nowText, inW, textSize, u, nowKey, below);
+        const effectLines = nowLines + labelledLines(nextText, inW, textSize, u, nowKey + 1, below);
+        /** The lowest the effects may start: their lines and a 3u gap above the price — or, for a
+         * mastered unlock, which has no price line, on the well's floor. */
+        const effectsFloor = (maxed ? dy + dh - 4 * u : priceY - 3 * u) - effectLines * lineH;
+
+        // The header is the unlock's icon with its name beside it. One scale for every name, chosen by
+        // the longest **word** in the catalogue, so the name is never smaller than the list beside the
+        // plaque: fitted to the longest whole name ("Dead-End Whisper") it came out at ×1 in the display
+        // face, under the ×2 group line and the NOW/NEXT rows. A name too long for its line at that
+        // scale takes two. The icon stands beside the name, sized to its line, rather than above it.
+        let bigS = Math.max(2, Math.round((heightAt('display', Math.max(1, u)) + 3 * u) / UNLOCK_ICON));
+        const nameW = inW - UNLOCK_ICON * bigS - 3 * u;
+        let nameScale = fitScaleAt(shrineFit.longestWord, nameW, 'display', Math.max(1, u), 1);
+        let nameLines = wrapped(sel * 64 + 5, info.name, nameW, nameScale, 'display');
         const blurb = wrapped(sel * 64, info.blurb, inW, textSize);
-        const textBlock = heightAt('display', nameScale) + 2 * u + lineH + 2 * u + blurb.length * lineH;
-        let bigS = Math.max(2, 3 * u);
-        while (bigS > Math.max(2, 2 * u) && y + UNLOCK_ICON * bigS + 3 * u + textBlock > effectsY - 2 * u) bigS--;
+        const groupH = lineH + 2 * u;
+        const blurbH = blurb.length * lineH;
+        const room = effectsFloor - 2 * u - y;
+        // What gives way when the well is short, in order: the blurb (whole or not at all — a sentence
+        // cut off mid-way reads broken), the icon's size, a two-line name (set on one line a size
+        // down), and last the group line. The effects and the price are what the plaque is for.
+        let showBlurb = plaqueHeaderH(bigS, nameLines.length, nameScale, u) + groupH + blurbH <= room;
+        if (!showBlurb) {
+          while (bigS > 2 && plaqueHeaderH(bigS, nameLines.length, nameScale, u) + groupH > room) bigS--;
+          if (nameLines.length > 1 && plaqueHeaderH(bigS, nameLines.length, nameScale, u) + groupH > room) {
+            // Measured against the room beside the icon as it now is (it may just have shrunk).
+            nameScale = fitScaleAt(info.name, inW - UNLOCK_ICON * bigS - 3 * u, 'display', nameScale, 1);
+            nameLines = wrapped(sel * 64 + 9, info.name, 4095, nameScale, 'display');
+          }
+          // With the header smaller the blurb may fit after all.
+          showBlurb = plaqueHeaderH(bigS, nameLines.length, nameScale, u) + groupH + blurbH <= room;
+        }
+        const showGroup = showBlurb || plaqueHeaderH(bigS, nameLines.length, nameScale, u) + groupH <= room;
+
+        const nameLineH = heightAt('display', nameScale);
+        const nameH = nameLines.length * nameLineH + (nameLines.length - 1) * u;
         const bigW = UNLOCK_ICON * bigS;
-        drawUnlockIcon(ctx, info.id, dx + ((dw - bigW) >> 1), y, bigS);
-        y += bigW + 3 * u;
-        drawAt(ctx, info.name, dx + (dw >> 1), y, 'display', nameScale, 'gothic', 'center');
-        y += heightAt('display', nameScale) + 2 * u;
-        const group = /** @type {any} */ (SHRINE_GROUP_LABEL)[info.group] || '';
-        const pw = pipsWidth(info.max, pip);
-        const groupW = group === '' ? 0 : measureAt(group, 'hud', textSize) + 4 * u;
-        const lineX = dx + ((dw - groupW - pw) >> 1);
-        if (group !== '') drawAt(ctx, group, lineX, y, 'hud', textSize, 'hudDim');
-        drawPips(ctx, lineX + groupW, y + ((heightAt('hud', textSize) - pip) >> 1), rank, info.max, pip, affordable);
-        y += lineH + 2 * u;
-        // Whole or not at all: a sentence cut off mid-way reads broken. Without it, NOW and NEXT move
-        // up under the heading instead of leaving a hole in the middle of the plaque.
-        if (y + blurb.length * lineH <= effectsY - 2 * u) {
+        const headerH = Math.max(bigW, nameH);
+        // Centred as a group: icon, a 3u gap, and the widest line of the name.
+        let widest = 0;
+        for (let k = 0; k < nameLines.length; k++) widest = Math.max(widest, measureAt(nameLines[k], 'display', nameScale));
+        const headerX = dx + ((dw - bigW - 3 * u - widest) >> 1);
+        drawUnlockIcon(ctx, info.id, headerX, y + ((headerH - bigW) >> 1), bigS);
+        let ny = y + ((headerH - nameH) >> 1);
+        for (let k = 0; k < nameLines.length; k++) {
+          drawAt(ctx, nameLines[k], headerX + bigW + 3 * u, ny, 'display', nameScale, 'gothic');
+          ny += nameLineH + u;
+        }
+        y += headerH + 3 * u;
+        if (showGroup) {
+          const group = /** @type {any} */ (SHRINE_GROUP_LABEL)[info.group] || '';
+          const pw = pipsWidth(info.max, pip);
+          const groupW = group === '' ? 0 : measureAt(group, 'hud', textSize) + 4 * u;
+          const lineX = dx + ((dw - groupW - pw) >> 1);
+          if (group !== '') drawAt(ctx, group, lineX, y, 'hud', textSize, 'hudDim');
+          drawPips(ctx, lineX + groupW, y + ((heightAt('hud', textSize) - pip) >> 1), rank, info.max, pip, affordable);
+          y += groupH;
+        }
+        let effectsY = effectsFloor;
+        if (showBlurb) {
           for (let k = 0; k < blurb.length; k++) {
             drawAt(ctx, blurb[k], dx + (dw >> 1), y, 'hud', textSize, 'hud', 'center');
             y += lineH;
           }
         } else {
-          effectsY = Math.min(effectsY, y + 2 * u);
+          // Without the blurb NOW and NEXT move up under the header instead of leaving a hole in the
+          // middle of the plaque — never above where the header ended.
+          effectsY = y + 2 * u;
         }
-        drawLabelled(ctx, 'NOW', nowText, inL, inL + inW, effectsY, textSize, u, rank > 0 ? 'hudGold' : 'hudDim', lineH, nowKey);
-        drawLabelled(ctx, 'NEXT', nextText, inL, inL + inW, effectsY + nowLines * lineH, textSize, u, maxed ? 'hudGold' : 'hudBright', lineH, nowKey + 1);
+        drawLabelled(ctx, 'NOW', nowText, inL, inL + inW, effectsY, textSize, u, rank > 0 ? 'hudGold' : 'hudDim', lineH, nowKey, below);
+        drawLabelled(ctx, 'NEXT', nextText, inL, inL + inW, effectsY + nowLines * lineH, textSize, u, maxed ? 'hudGold' : 'hudBright', lineH, nowKey + 1, below);
         if (!maxed) drawPriceLine(ctx, inL, inL + inW, priceY, textSize, u, cost, affordable, purse, reduced);
       }
     }
@@ -3848,10 +4088,22 @@ export function createMenus(overlayCanvas, callbacks) {
   }
 
   /**
+   * Height of the Shrine plaque's header — icon beside a name of `lines` lines — plus its 3u gap.
+   * @param {number} iconScale
+   * @param {number} lines
+   * @param {number} nameScale
+   * @param {number} u
+   * @returns {number}
+   */
+  function plaqueHeaderH(iconScale, lines, nameScale, u) {
+    return Math.max(UNLOCK_ICON * iconScale, lines * heightAt('display', nameScale) + (lines - 1) * u) + 3 * u;
+  }
+
+  /**
    * The Shrine list's fitted numbers, recomputed only when the width or the text size changes (the
    * fit measures every name, which is catalogue-sized work that has no business running per frame).
    */
-  const shrineFit = { key: -1, text: 1, pip: 3, pips: true, longest: '' };
+  const shrineFit = { key: -1, text: 1, pip: 3, pips: true, longest: '', longestWord: '' };
 
   /**
    * Fit the Shrine's rows: one text size for every row (the largest at which the longest name and a
@@ -3873,6 +4125,16 @@ export function createMenus(overlayCanvas, callbacks) {
       if (unlocks[i].max > maxRanks) maxRanks = unlocks[i].max;
     }
     shrineFit.longest = longest;
+    // The longest single word of any name, in the display face: what the plaque's name has to fit
+    // on one line at the scale it is set in (see `drawShrine`).
+    let longestWord = '';
+    for (let i = 0; i < unlocks.length; i++) {
+      const words = unlocks[i].name.split(' ');
+      for (let k = 0; k < words.length; k++) {
+        if (measureAt(words[k], 'display', 1) > measureAt(longestWord, 'display', 1)) longestWord = words[k];
+      }
+    }
+    shrineFit.longestWord = longestWord;
     let text = textSize;
     for (;;) {
       const need = UNLOCK_ICON * text + 3 * u + measureAt(longest, 'hud', text) + 3 * u + measureAt('000', 'hud', text);
@@ -3894,10 +4156,11 @@ export function createMenus(overlayCanvas, callbacks) {
    * @param {number} size
    * @param {number} u
    * @param {number} key wrap-cache key for this value
+   * @param {boolean} [below] force the value onto the line(s) under its label
    * @returns {number}
    */
-  function labelledLines(value, width, size, u, key) {
-    if (measureAt(value, 'hud', size) <= width - measureAt('NEXT', 'hud', size) - 3 * u) return 1;
+  function labelledLines(value, width, size, u, key, below) {
+    if (below !== true && measureAt(value, 'hud', size) <= width - measureAt('NEXT', 'hud', size) - 3 * u) return 1;
     return 1 + wrapped(key, value, width, size).length;
   }
 
@@ -3917,12 +4180,14 @@ export function createMenus(overlayCanvas, callbacks) {
    * @param {string} valueStyle
    * @param {number} [lineH] pitch of the lines below; enables the wrapped form
    * @param {number} [key] wrap-cache key (required with `lineH`)
+   * @param {boolean} [below] with `lineH`: put the value under the label even when it would fit
+   *   beside it, so two rows drawn together can share one form
    * @returns {void}
    */
-  function drawLabelled(ctx, label, value, left, right, y, size, u, valueStyle, lineH, key) {
+  function drawLabelled(ctx, label, value, left, right, y, size, u, valueStyle, lineH, key, below) {
     const labelW = measureAt('NEXT', 'hud', size) + 3 * u;
     drawAt(ctx, label, left, y, 'hud', size, 'hudDim');
-    if (lineH !== undefined && key !== undefined && labelledLines(value, right - left, size, u, key) > 1) {
+    if (lineH !== undefined && key !== undefined && labelledLines(value, right - left, size, u, key, below) > 1) {
       const lines = wrapped(key, value, right - left, size);
       for (let k = 0; k < lines.length; k++) drawAt(ctx, lines[k], right, y + (k + 1) * lineH, 'hud', size, valueStyle, 'right');
       return;
@@ -4006,13 +4271,17 @@ export function createMenus(overlayCanvas, callbacks) {
     const textSize = narrow ? Math.max(1, u - 1) : u;
     const offer = /** @type {any} */ (state).offer;
     const note = offer && typeof offer.level === 'number' ? boonNoteMemo(offer.level) : '';
-    const noteLine = measureAt(BOON_NOTE, 'hud', textSize) <= m.w - 8 * u ? BOON_NOTE : BOON_NOTE_SHORT;
+    // On a phone the two note lines are a caption, not a headline: at the cards' text size they ran
+    // the full width in the HUD face and outshouted the gothic card names under them ("Appraiser" at
+    // ×1). Two steps under the unit keeps them at or below every card name.
+    const noteSize = narrow ? Math.max(1, u - 2) : textSize;
+    const noteLine = measureAt(BOON_NOTE, 'hud', noteSize) <= m.w - 8 * u ? BOON_NOTE : BOON_NOTE_SHORT;
     if (note !== '') {
-      drawAt(ctx, note, cx, y, 'hud', textSize, 'hudGold', 'center');
-      y += heightAt('hud', textSize) + 2 * u;
+      drawAt(ctx, note, cx, y, 'hud', noteSize, 'hudGold', 'center');
+      y += heightAt('hud', noteSize) + 2 * u;
     }
-    drawAt(ctx, noteLine, cx, y, 'hud', textSize, 'hudDim', 'center');
-    y += heightAt('hud', textSize) + 6 * u;
+    drawAt(ctx, noteLine, cx, y, 'hud', noteSize, 'hudDim', 'center');
+    y += heightAt('hud', noteSize) + 6 * u;
 
     const laterScale = Math.max(1, Math.min(u, headScale - 1));
     const laterH = heightAt('display', laterScale) + 4 * u;
@@ -4065,6 +4334,9 @@ export function createMenus(overlayCanvas, callbacks) {
       while (bigS > 1 && 8 * u + UNLOCK_ICON * bigS + 4 * u + longestW > cardW - 4 * u) bigS--;
       const tw = cardW - 12 * u - UNLOCK_ICON * bigS;
       nameScale = fitScaleAt(longestName, tw, 'display', Math.max(1, u), 1);
+      // The effect is never set taller than the card's name: in the HUD face a size up it wrapped to
+      // three chunky lines and outweighed the gothic name above it.
+      eSize = Math.min(eSize, Math.max(1, Math.floor(heightAt('display', nameScale) / heightAt('hud', 1))));
       const room = cardH - 7 * u - heightAt('display', nameScale) - 2 * u - pip - 3 * u;
       for (let k = 0; k < BOON_CARDS; k++) {
         const other = rowEnabled[k] ? unlockInfo(boonIdAt(state, k)) : null;
@@ -4073,6 +4345,18 @@ export function createMenus(overlayCanvas, callbacks) {
         const r = rankOf(state, other.id);
         const text = other.ranks[Math.min(r, other.max - 1)];
         while (eSize > 1 && wrapped((ui * 16 + r) * 4 + 3, text, tw, eSize).length * (heightAt('hud', eSize) + u) > room) eSize--;
+      }
+      // The blurb under the effect, on every card or on none, when every card has the room for it
+      // whole — a tall phone card otherwise stood half empty under one short line.
+      const pitchE = heightAt('hud', eSize) + u;
+      for (let k = 0; k < BOON_CARDS; k++) {
+        const other = rowEnabled[k] ? unlockInfo(boonIdAt(state, k)) : null;
+        if (other === null) continue;
+        const ui = unlocks.indexOf(other);
+        const r = rankOf(state, other.id);
+        const e = wrapped((ui * 16 + r) * 4 + 3, other.ranks[Math.min(r, other.max - 1)], tw, eSize).length;
+        const b = wrapped(ui * 64 + 1, other.blurb, tw, eSize).length;
+        if ((e + b) * pitchE + 2 * u > room) showBlurbs = false;
       }
     }
 
@@ -4170,6 +4454,14 @@ export function createMenus(overlayCanvas, callbacks) {
         for (let k = 0; k < lines.length && ty + heightAt('hud', eSize) <= drawY + h - 2 * u; k++) {
           drawAt(ctx, lines[k], tx, ty, 'hud', eSize, 'hudBright');
           ty += heightAt('hud', eSize) + u;
+        }
+        if (showBlurbs) {
+          const blurb = wrapped(unlocks.indexOf(info) * 64 + 1, info.blurb, tw, eSize);
+          ty += 2 * u;
+          for (let k = 0; k < blurb.length && ty + heightAt('hud', eSize) <= drawY + h - 2 * u; k++) {
+            drawAt(ctx, blurb[k], tx, ty, 'hud', eSize, 'hudDim');
+            ty += heightAt('hud', eSize) + u;
+          }
         }
       }
       ctx.globalAlpha = before;

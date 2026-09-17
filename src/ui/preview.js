@@ -53,6 +53,11 @@ const bandParam = params.get('band') === '1';
 const mapLockParam = params.get('maplock');
 /** Seconds into the preview at which `?maplock=found` picks the scroll up. */
 const MAP_FOUND_AT = 0.5;
+/**
+ * `?boon=1`: a boon is waiting (ARCHITECTURE.md §4.9), so `?screen=complete` shows its "Choose a
+ * Boon" row — the tallest level-complete panel there is. `?screen=boon` implies it.
+ */
+const boonParam = params.get('boon') === '1';
 /** `?pad=1`: pretend a gamepad is connected, so the Controls panel shows its PAD column. */
 if (params.get('pad') === '1') {
   try {
@@ -263,6 +268,31 @@ const state = {
   derived: { exitDist: 14, nearExit: 0.2, lowFuel: lowFuel },
   events: [],
 };
+// The unlocks wave's fields (§4.9): a purse part-spent, a few ranks owned, and — with `?boon=1` or
+// `?screen=boon` — a boon waiting on the level-complete screen.
+/** @type {any} */ (state).progress = { purse: 140, ranks: { reservoir: 2, richOil: 1, chalk: 3, whisper: 1 }, boonLevel: 0 };
+/** @type {any} */ (state).offer =
+  boonParam || screenParam === 'boon'
+    ? { open: true, level: state.level, ids: ['whisper', 'appraiser', 'ember'] }
+    : { open: false, level: 0, ids: [] };
+
+// ─── Unlocks (§4.9) ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * A stand-in for `UNLOCKS` in `src/state/balance.js`, which `src/ui` may not import (§2) — the same
+ * shape main.js hands to `createMenus`, with the longest shipped names and effects, so the Shrine and
+ * the Boon are judged against the strings that actually have to fit.
+ */
+const UNLOCK_STUB = Object.freeze([
+  { id: 'reservoir', name: 'Reservoir', group: 'torch', costs: [15, 30, 55, 90, 140], blurb: 'A deeper oil tank for your torch.', ranks: ['Tank +10%', 'Tank +20%', 'Tank +30%', 'Tank +40%', 'Tank +50%'] },
+  { id: 'richOil', name: 'Rich Oil', group: 'torch', costs: [15, 35, 65, 110], blurb: 'Every flask burns longer.', ranks: ['Flasks +12%', 'Flasks +24%', 'Flasks +36%', 'Flasks +48%'] },
+  { id: 'ember', name: 'Ember Reserve', group: 'torch', costs: [25, 60, 120], blurb: 'Once per floor, a dead torch rekindles.', ranks: ['Rekindle for 10s', 'Rekindle for 18s', 'Rekindle for 28s'] },
+  { id: 'siphon', name: 'Siphon', group: 'torch', costs: [20, 50, 100], blurb: 'Spilled oil is saved and poured back in.', ranks: ['Store 15s of overflow', 'Store 30s of overflow', 'Store 50s of overflow'] },
+  { id: 'wideFlame', name: 'Wide Flame', group: 'sight', costs: [15, 35, 70], blurb: 'Your torch throws its light further.', ranks: ['Light +15%', 'Light +30%', 'Light +45%'] },
+  { id: 'whisper', name: 'Dead-End Whisper', group: 'sight', costs: [40, 100, 180], blurb: 'Passages that lead nowhere grow dark.', ranks: ['Last 4 tiles darken', 'Last 10 tiles darken', 'Whole dead ends darken'] },
+  { id: 'chalk', name: 'Chalk', group: 'fortune', costs: [10, 30, 70], blurb: 'Scrawl A-MAZE on a wall to mark your way.', ranks: ['4 marks per floor', '8 marks per floor', '16 marks per floor'] },
+  { id: 'appraiser', name: 'Appraiser', group: 'fortune', costs: [45, 120, 240], blurb: 'Each gem is worth more at the Shrine.', ranks: ['2 shrine gems per gem', '3 shrine gems per gem', '4 shrine gems per gem'] },
+]);
 
 // ─── Wiring ──────────────────────────────────────────────────────────────────────────────────
 
@@ -317,6 +347,20 @@ const menus = createMenus(overlay, {
     uiSoundCount++;
     if (uiSounds.length > 8) uiSounds.shift();
   },
+  unlocks: UNLOCK_STUB,
+  onBuy: (id) => {
+    const progress = /** @type {any} */ (state).progress;
+    const info = UNLOCK_STUB.find((u) => u.id === id);
+    const rank = progress.ranks[id] || 0;
+    if (info === undefined || rank >= info.costs.length || progress.purse < info.costs[rank]) return;
+    progress.purse -= info.costs[rank];
+    progress.ranks[id] = rank + 1;
+  },
+  onClaimBoon: (id) => {
+    const progress = /** @type {any} */ (state).progress;
+    progress.ranks[id] = (progress.ranks[id] || 0) + 1;
+    /** @type {any} */ (state).offer.open = false;
+  },
 });
 
 /** Ring of the last few UI sound requests, shown by `?hint=1` (stands in for `audio.js`). */
@@ -362,15 +406,35 @@ function setScreen(name) {
       break;
     case 'options':
     case 'controls':
-    case 'credits': {
-      // The sub-screens are internal to `menus`; reach them the way a player does — by pressing
-      // Down to the row and confirming. Title rows: Descend, Options, Controls, Credits.
+    case 'credits':
+    case 'shrine': {
+      // The sub-screens are internal to `menus`; reach them the way a player does — Down to a row and
+      // confirm — and find the row by what it opens rather than by a remembered position: the step
+      // counts this used to hard-code went stale when the Shrine joined the title list, and every
+      // sub-screen deep link then showed its neighbour. Row 0 (Descend) would start a run: skipped.
       state.phase = 'title';
-      const steps = name === 'options' ? 1 : name === 'controls' ? 2 : 3;
-      for (let i = 0; i < steps; i++) menus.handleInput(frameWith('down'), state);
-      menus.handleInput(frameWith('confirm'), state);
+      menus.render(state);
+      for (let row = 1; row < 8; row++) {
+        for (let i = 0; i < row; i++) menus.handleInput(frameWith('down'), state);
+        menus.handleInput(frameWith('confirm'), state);
+        menus.render(state);
+        if (menus.screen() === name) break;
+        // Wrong row: back out to the title (which remembers the row) and walk back up to Descend.
+        if (menus.screen() !== 'title') menus.handleInput(frameWith('back'), state);
+        for (let i = 0; i < row; i++) menus.handleInput(frameWith('up'), state);
+        menus.render(state);
+      }
       break;
     }
+    case 'boon':
+      // Level complete with a boon waiting: skip the tally, then take the "Choose a Boon" row.
+      state.phase = 'levelComplete';
+      state.run.levelScore = 500 * state.level + Math.floor(state.run.fuel) * 10 * state.level;
+      menus.render(state);
+      menus.handleInput(frameWith('confirm'), state);
+      menus.render(state);
+      menus.handleInput(frameWith('confirm'), state);
+      break;
     case 'font':
       break;
     default:
