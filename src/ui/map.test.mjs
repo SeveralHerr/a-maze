@@ -227,7 +227,7 @@ test('paintTiles paints only newly explored tiles and reports the dirty rect', (
 
   explored[1 * w + 1] = 1;
   explored[1 * w + 2] = 1;
-  const first = paintTiles(out, w, h, 0, 0, w - 1, h - 1, maze.tiles, explored, null, -1, -1, bounds);
+  const first = paintTiles(out, w, h, 0, 0, w - 1, h - 1, maze.tiles, explored, null, -1, bounds);
   assert.equal(first, 2);
   assert.deepEqual(Array.from(bounds), [1, 1, 2, 1]);
   assert.notEqual(out[1 * w + 1], 0);
@@ -235,14 +235,14 @@ test('paintTiles paints only newly explored tiles and reports the dirty rect', (
   // Idempotent: a second pass over the same region paints nothing and leaves the rect alone.
   bounds.set([w, h, -1, -1]);
   assert.equal(
-    paintTiles(out, w, h, 0, 0, w - 1, h - 1, maze.tiles, explored, null, -1, -1, bounds),
+    paintTiles(out, w, h, 0, 0, w - 1, h - 1, maze.tiles, explored, null, -1, bounds),
     0,
   );
   assert.deepEqual(Array.from(bounds), [w, h, -1, -1]);
 
   // Floors and walls are different colours — that is the whole point of the map.
   explored[0] = 1;
-  paintTiles(out, w, h, 0, 0, w - 1, h - 1, maze.tiles, explored, null, -1, -1, bounds);
+  paintTiles(out, w, h, 0, 0, w - 1, h - 1, maze.tiles, explored, null, -1, bounds);
   assert.notEqual(out[0], out[1 * w + 1], 'wall and floor must not be the same pixel');
 });
 
@@ -253,11 +253,11 @@ test('paintTiles clamps a box that runs off the raster', () => {
   const explored = new Uint8Array(w * h).fill(1);
   const out = new Uint32Array(w * h);
   const bounds = new Int32Array([w, h, -1, -1]);
-  const n = paintTiles(out, w, h, -50, -50, 500, 500, maze.tiles, explored, null, -1, -1, bounds);
+  const n = paintTiles(out, w, h, -50, -50, 500, 500, maze.tiles, explored, null, -1, bounds);
   assert.equal(n, w * h, 'every tile, none out of bounds');
   assert.deepEqual(Array.from(bounds), [0, 0, w - 1, h - 1]);
   // A box entirely off the raster is a no-op, not a throw.
-  assert.equal(paintTiles(out, w, h, 100, 100, 200, 200, maze.tiles, explored, null, -1, -1, bounds), 0);
+  assert.equal(paintTiles(out, w, h, 100, 100, 200, 200, maze.tiles, explored, null, -1, bounds), 0);
 });
 
 test('items and the exit get their own colours in the raster', () => {
@@ -270,7 +270,7 @@ test('items and the exit get their own colours in the raster', () => {
   itemLayer[1 * w + 3] = 2; // oil
   const exitIdx = 5 * w + 5;
   const bounds = new Int32Array([w, maze.height, -1, -1]);
-  paintTiles(out, w, maze.height, 0, 0, w - 1, maze.height - 1, maze.tiles, explored, itemLayer, exitIdx, -1, bounds);
+  paintTiles(out, w, maze.height, 0, 0, w - 1, maze.height - 1, maze.tiles, explored, itemLayer, exitIdx, bounds);
   const gem = out[1 * w + 1];
   const oil = out[1 * w + 3];
   const exit = out[exitIdx];
@@ -603,4 +603,95 @@ test('the wide full map moves its text into side rails and gets the whole height
   const pixel = { w: 216, h: 480, px: 5, u: 2, narrow: true, originX: 1, originY: 1 };
   const [, , qw] = blitAt(pixel, 110, 50);
   assert.equal(qw, 1028, `257 tiles × 4 device px on a 1 082-px-wide phone (got ${qw})`);
+});
+
+test('at the 128×128 cap the player and exit markers are whole, device-sized and inside the frame', () => {
+  // The critic's find: the start is tile (1, 1) and the exit the far corner, and the clip was the
+  // raster's own edge — so on a 1280×720 screen the arrow was an 8-pixel sliver cut to a quarter and
+  // the exit a 4-pixel dot with two of its four arms. Now the raster is inset by the markers' reach
+  // and the markers have a device-pixel floor.
+  const state = makeState(128, 128);
+  const { width, height } = state.levelData.maze;
+  reveal(state, 1, 1, 3);
+  reveal(state, width - 2, height - 2, 3);
+  state.level = 15;
+  for (const [name, m, gR, gB] of /** @type {const} */ ([
+    ['1280x720', { w: 640, h: 360, px: 2, u: 2, narrow: false, originX: 0, originY: 0 }, 158, 42],
+    ['1920x1080', { w: 960, h: 540, px: 2, u: 3, narrow: false, originX: 0, originY: 0 }, 237, 54],
+    ['390x844@3', { w: 234, h: 506, px: 5, u: 3, narrow: true, originX: 0, originY: 0 }, 120, 60],
+  ])) {
+    const { view } = makeView();
+    view.update(state, 0);
+    /** @type {number[]} */
+    let clipRect = [];
+    /** @type {number[]|null} */
+    let blit = null;
+    /** @type {number[][]} */
+    const fills = [];
+    const ctx = {
+      globalAlpha: 1,
+      fillStyle: '#000',
+      fillRect(/** @type {number[]} */ ...r) {
+        // Only what is drawn in raster space, after the map itself: the markers.
+        if (blit !== null && clipRect.length > 0) fills.push(r);
+      },
+      save() {},
+      restore() {
+        clipRect = [];
+      },
+      setTransform() {},
+      beginPath() {},
+      rect(/** @type {number[]} */ ...r) {
+        clipRect = r;
+      },
+      clip() {},
+      drawImage(/** @type {any[]} */ ...args) {
+        if (args.length === 9) blit = args.slice(5);
+      },
+    };
+    let savedClip = /** @type {number[]} */ ([]);
+    const rect = ctx.rect;
+    ctx.rect = (...r) => {
+      rect(...r);
+      savedClip = r;
+    };
+    view.drawFull(ctx, m, state, 0, true, gR, gB);
+    assert.ok(blit !== null && savedClip.length === 4, `${name}: the map was drawn under a clip`);
+    const [bx, by, bw, bh] = /** @type {number[]} */ (blit);
+    const [cx, cy, cw, ch] = savedClip;
+    const dev = m.px;
+    const perTile = bw / width;
+    const at = (/** @type {number} */ t) => t * perTile;
+    /** Fills whose centre is within `r` device px of a point. */
+    const near = (/** @type {number} */ px, /** @type {number} */ py, /** @type {number} */ r) =>
+      fills.filter(([x, y, w, h]) => Math.abs(x + w / 2 - px) <= r && Math.abs(y + h / 2 - py) <= r);
+    const bbox = (/** @type {number[][]} */ list) => [
+      Math.min(...list.map((f) => f[0])),
+      Math.min(...list.map((f) => f[1])),
+      Math.max(...list.map((f) => f[0] + f[2])),
+      Math.max(...list.map((f) => f[1] + f[3])),
+    ];
+    const player = near(bx + at(1.5), by + at(1.5), 40 * dev);
+    const exit = near(bx + at(width - 1.5), by + at(height - 1.5), 40 * dev);
+    assert.ok(player.length > 0 && exit.length > 0, `${name}: both markers drew`);
+    // The player marker — halo, ring and arrow — and the exit's glyph are whole. (The glyph is the
+    // exit's small fills; its crosshair arms are the long ones.)
+    const glyph = exit.filter(([, , w, h]) => Math.max(w, h) < 16 * dev);
+    for (const [what, list] of /** @type {const} */ ([['player', player], ['exit glyph', glyph]])) {
+      assert.ok(list.length > 0, `${name}: the ${what} drew`);
+      const [x0, y0, x1, y1] = bbox(list);
+      assert.ok(
+        x0 >= cx && y0 >= cy && x1 <= cx + cw && y1 <= cy + ch,
+        `${name}: the ${what} [${x0},${y0}–${x1},${y1}] is whole inside the clip [${cx},${cy} ${cw}×${ch}]`,
+      );
+      assert.ok(x1 - x0 >= 7 * dev && y1 - y0 >= 7 * dev, `${name}: the ${what} is at least 7 UI px across (${x1 - x0}×${y1 - y0})`);
+    }
+    // The crosshair keeps at least three quarters of its reach on both axes. Where the integer fit
+    // leaves no room at all (1920×1080 uses 1 028 of 1 032 device rows) one arm may run under the
+    // frame; before the inset two whole arms and three quarters of the glyph were cut.
+    const [ex0, ey0, ex1, ey1] = bbox(exit);
+    const visW = Math.min(ex1, cx + cw) - Math.max(ex0, cx);
+    const visH = Math.min(ey1, cy + ch) - Math.max(ey0, cy);
+    assert.ok(visW >= 0.75 * (ex1 - ex0) && visH >= 0.75 * (ey1 - ey0), `${name}: the crosshair shows ${visW}×${visH} of ${ex1 - ex0}×${ey1 - ey0}`);
+  }
 });

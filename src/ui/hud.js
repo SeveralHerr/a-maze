@@ -45,7 +45,7 @@
 
 import { clamp, clamp01 } from '../core/math.js';
 import { createLogger, isDebug } from '../core/log.js';
-import { COLOR, drawAt, heightAt, measureAt } from './font.js';
+import { COLOR, drawAt, heightAt, measureAt, probeLayout } from './font.js';
 import {
   createCounter,
   createTextMemo,
@@ -590,6 +590,9 @@ const HUD_GLYPH_W = measureAt('0', 'hud', 1);
 
 /** Pen advance of the monospace HUD face at scale 1 (glyph plus its spacing column). */
 const HUD_ADVANCE = measureAt('00', 'hud', 1) - HUD_GLYPH_W;
+
+/** Cap height of the HUD face in font rows (its 8-row cell less the descender row). */
+const HUD_CAP_ROWS = 7;
 
 /**
  * Width of an integer as `formatInt` prints it (`1,234,567`), without formatting it: the HUD face
@@ -1232,12 +1235,13 @@ export function createHud(overlayCanvas, options) {
           else break;
         }
       } else {
-        // Double height only while the number is a modest share of the screen. A six-figure score
-        // at 2u was the loudest thing on the screen at the size cap, louder than the tank the
-        // player is actually managing. Decided on the *target* score, so the size never flips in
-        // the middle of a roll.
+        // One step above the gem line, whatever the score. It used to be 2u until the number took a
+        // quarter of the screen and u from then on, so at 1280×720 the readout halved in size in the
+        // middle of a run as it crossed ~100,000 — which looked like a glitch. At u + 1 a seven-figure
+        // score still takes about a quarter of the width, and the tank the player is actually
+        // managing stays the heavier panel.
         gemSize = u;
-        scoreSize = intWidth(run.score, 2 * u) <= m.w * 0.25 ? 2 * u : u;
+        scoreSize = u + 1;
       }
       scoreContentH = heightAt('hud', scoreSize) + u + heightAt('hud', gemSize);
       scorePanelW =
@@ -1419,6 +1423,20 @@ export function createHud(overlayCanvas, options) {
     }
     if (labelW + timeW <= barW) {
       drawAt(ctx, tankLabel, barX, textY, 'hud', size, low ? 'hudAlarm' : 'hudDim');
+      return;
+    }
+    // No room for the word (a phone at dpr 3 — the most common phone there is): the flask icon says
+    // the same thing in a third of the width, so the gauge is never an unlabelled bar and a clock.
+    // The largest whole scale whose flask clears the clock (by a unit less one: the phone that needs
+    // this has exactly that to spare), centred on the digits' cap.
+    const clockW = measureAt(timeText, 'hud', size);
+    for (let s = size; s >= 1; s--) {
+      if (ICON_SIZE.oilW * s + Math.max(2, u - 1) + clockW > barW) continue;
+      const flaskY = textY + ((HUD_CAP_ROWS * size - ICON_SIZE.oilH * s) >> 1);
+      // Reported to the layout audits like a line of text: it stands in for one.
+      probeLayout('art', barX, flaskY, ICON_SIZE.oilW * s, ICON_SIZE.oilH * s, s, 'oil-flask');
+      drawOilIcon(ctx, barX, flaskY, s);
+      break;
     }
   }
 

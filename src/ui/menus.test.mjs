@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 
 import { cellsForLevel, createMenus, hitTest, menuStep, sliderValueAt } from './menus.js';
 import { resetMapMode, setMapMode } from './map.js';
+import { setLayoutProbe } from './font.js';
 
 // ─── Pure helpers ────────────────────────────────────────────────────────────────────────────
 
@@ -763,6 +764,56 @@ test('options: dragging a slider track quantises and clamps', () => {
   h.settings.length = 0;
   h.menus.handlePointer({ type: 'pointermove', clientX: 40, clientY: rowY });
   assert.equal(h.settings.length, 0, 'the pointer no longer owns the slider after release');
+  resetMapMode();
+});
+
+test('options: pressing a slider row off its track selects it and changes nothing; the track still drags', () => {
+  // The critic's high-severity find: a click or tap on the word "Sound" armed the drag, mapped the
+  // pointer (left of the track) onto the minimum and saved it — selecting the row muted the game.
+  for (const [w, hgt, dpr] of [[1280, 720, 1], [960, 540, 1], [390, 844, 3]]) {
+    resetMapMode();
+    const h = optionsHarness(w, hgt, dpr);
+    const m = h.surface.metrics;
+    const toClientX = (/** @type {number} */ uiX) => ((uiX + 0.5) * m.px * m.cssW) / m.devW;
+    const toClientY = (/** @type {number} */ uiY) => ((uiY + 0.5) * m.px * m.cssH) / m.devH;
+    /** @type {Array<{label:string, x:number, y:number, w:number, h:number}>} */
+    const texts = [];
+    setLayoutProbe((kind, x, y, bw, bh, unit, label) => {
+      if (kind === 'text') texts.push({ label, x, y, w: bw, h: bh });
+    });
+    try {
+      h.menus.render(h.state);
+    } finally {
+      setLayoutProbe(null);
+    }
+    for (const [label, key, start] of [['Sound', 'volume', 0.8], ['Music', 'music', 0.55], ['Look Speed', 'sensitivity', 1]]) {
+      const box = texts.find((t) => t.label === label);
+      assert.ok(box !== undefined, `${w}x${hgt}: the ${label} label is laid out`);
+      h.state.settings[key] = start;
+      h.settings.length = 0;
+      // The middle of the word, then its first letter: both are "the row", neither is the track.
+      for (const uiX of [box.x + (box.w >> 1), box.x + 1]) {
+        h.click(toClientX(uiX), toClientY(box.y + (box.h >> 1)));
+        assert.deepEqual(h.settings, [], `${w}x${hgt}: pressing "${label}" at x=${uiX} wrote nothing`);
+        assert.equal(h.state.settings[key], start, `${w}x${hgt}: ${key} is still ${start}`);
+      }
+      // …and the value word at the right edge of the row is not a target either.
+      const value = texts.find((t) => t.y + t.h > box.y && /^(\d+%|\d+\.\d×)$/.test(t.label) && t.x > box.x + box.w && (dpr < 2 ? Math.abs(t.y - box.y) < box.h : true));
+      if (value !== undefined && dpr < 2) {
+        h.click(toClientX(value.x + (value.w >> 1)), toClientY(value.y + (value.h >> 1)));
+        assert.deepEqual(h.settings, [], `${w}x${hgt}: pressing the ${label} value word wrote nothing`);
+      }
+    }
+    // The track itself still drags: press where the finder clicks (right of the label) and move.
+    const rowY = findRowY(h, 'volume');
+    assert.ok(rowY > 0, `${w}x${hgt}: the Sound track is reachable by pointer`);
+    h.settings.length = 0;
+    h.state.settings.volume = 0.5;
+    h.menus.handlePointer({ type: 'pointerdown', clientX: toClientX(Math.round(m.w * 0.62)), clientY: rowY });
+    h.menus.handlePointer({ type: 'pointermove', clientX: w - 1, clientY: rowY });
+    h.menus.handlePointer({ type: 'pointerup', clientX: w - 1, clientY: rowY });
+    assert.equal(h.settings.filter(([k]) => k === 'volume').pop()?.[1], 1, `${w}x${hgt}: a drag off the right pins to 100%`);
+  }
   resetMapMode();
 });
 
