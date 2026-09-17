@@ -1,6 +1,6 @@
 {
- "updated": "2026-09-17T15:11:58.955Z",
- "iteration": 21,
+ "updated": "2026-09-17T16:45:24.561Z",
+ "iteration": 22,
  "passThreshold": 8.5,
  "wave": "modelled-sprites",
  "waves": {
@@ -538,11 +538,11 @@
   },
   "gauntlet": {
    "status": "failing",
-   "rounds": 2
+   "rounds": 1
   },
   "stress": {
    "status": "done",
-   "summary": "Final stress gate PASS on every criterion: 4096x4096 gen ok, out-of-range throws RangeError, 128x128 soak 120 fps p99 9.4 ms, heap +0.22 MB, listeners stable, 0 console errors, worker builds never block frames."
+   "summary": "Final stress gate PASS on eeb25f5: 4096x4096 gen+validate ok, out-of-range throws RangeError, 128x128 soak 120 fps p99 11 ms, heap +0.23 MB, listeners 54->54, 0 console errors, worker builds non-blocking. Throttled 4x ~35.5 fps reported only (machine-dependent)."
   },
   "5-massive-mazes": {
    "status": "done",
@@ -659,49 +659,53 @@
  },
  "modules": {
   "maze": {
+   "score": 8.2,
+   "pass": false,
+   "lastScoredRound": 1,
+   "errors": 0,
+   "note": "1 high issue(s)"
+  },
+  "core": {
    "score": 8.7,
    "pass": true,
    "lastScoredRound": 1,
-   "note": ""
-  },
-  "core": {
-   "score": 8.5,
-   "pass": true,
-   "lastScoredRound": 2,
-   "note": ""
+   "errors": 0,
+   "note": "Gauntlet pass; no blocker/high issues."
   },
   "audio": {
-   "score": 8.1,
-   "pass": false,
-   "lastScoredRound": 2,
-   "note": "Round 2 revision committed in 2e9f56e after this score; not re-scored."
+   "score": 8.6,
+   "pass": true,
+   "lastScoredRound": 1,
+   "errors": 0,
+   "note": "Gauntlet pass; no blocker/high issues."
   },
   "input": {
-   "score": 8.7,
+   "score": 8.6,
    "pass": true,
    "lastScoredRound": 1,
    "errors": 0,
    "note": "Gauntlet pass; no blocker/high issues."
   },
   "state": {
-   "score": 8.7,
-   "pass": true,
+   "score": 7.6,
+   "pass": false,
    "lastScoredRound": 1,
-   "errors": 0,
-   "note": "Gauntlet pass; no blocker/high issues."
+   "errors": 1,
+   "note": "2 high issue(s)"
   },
   "renderer": {
-   "score": 7.5,
+   "score": 7.4,
    "pass": false,
-   "lastScoredRound": 2,
-   "note": "Round 2 revision committed in 2e9f56e after this score; not re-scored."
+   "lastScoredRound": 1,
+   "errors": 2,
+   "note": "2 high issue(s)"
   },
   "ui": {
-   "score": 8.2,
+   "score": 8,
    "pass": false,
-   "lastScoredRound": 2,
+   "lastScoredRound": 1,
    "errors": 0,
-   "note": "8.2 < 8.5; 0 blocker/high, 4 medium: menus.js row hit boxes sit below labels; advance() overwrites menu index after openSub/closeSub; preview ?screen=options/credits broken; Depth N Cleared heading top-heavy on phones; Decide Later boon loop"
+   "note": "below 8.5; mediums open (menu index stale, preview deep-link, phone headings/Shrine, Decide Later loop, AUTO button under pointer lock)"
   }
  },
  "metrics": {
@@ -715,10 +719,10 @@
   },
   "fpsUnlimited": 611.1,
   "renderMsAvgFull": 1.239,
-  "renderMsAvgWorld": 0.986,
+  "renderMsAvgWorld": 2.972,
   "renderMsP99World": 1.7,
   "stepMsAvg": 0.075,
-  "heapGrowthMB20s": 0.03,
+  "heapGrowthMB20s": 0.05,
   "capLevel": {
    "level": 15,
    "cells": "128x128",
@@ -769,23 +773,64 @@
   },
   "pageErrors": 0,
   "gameErrors": 0,
-  "verifyPass": true,
+  "verifyPass": false,
   "stateTests": 110,
-  "verifyTag": "final",
-  "checkedAt": "2026-09-17T04:44:40.852Z",
+  "verifyTag": "gauntlet",
+  "checkedAt": "2026-09-17T16:45:24.561Z",
   "validate": "784 mazes, 0 failures (--quick)",
   "stress": "pass (final gate)",
-  "fpsUncapped": 582.9,
-  "frameMsP99": 9.4,
-  "renderMsAvg": 1.763,
+  "fpsUncapped": 259.6,
+  "frameMsP99": 11,
+  "renderMsAvg": 3.302,
   "renderMsAvgUncapped": 1.357,
-  "heapGrowthMB": 0.22,
-  "largestGrid": "4096x4096 cells (Node gen+validate 2.1 s + 2.8 s, 511 MB RSS); gameplay cap 128x128 cells / 257x257 tiles"
+  "heapGrowthMB": 0.23,
+  "largestGrid": "4096x4096 cells (Node gen+validate 2.1 s + 4.2 s, 511 MB RSS); gameplay cap 128x128 cells / 257x257 tiles",
+  "throttled": {
+   "rate": 4,
+   "fps": 39.8,
+   "renderMsAvg": 19.554,
+   "worldMsAvg": 16.992
+  }
  },
  "blocking": [
   {
    "area": "gauntlet",
-   "issue": "ui 8.2 < 8.5 (no high/blocker issues; medium: menus.js row hit boxes sit below labels; advance() overwrites menu index after openSub/closeSub; preview ?screen=options/credits broken; Depth N Cleared heading top-heavy on phones; Decide Later boon loop)"
+   "module": "renderer",
+   "severity": "high",
+   "issue": "src/renderer/raycaster.js: throttled 4x verify gate fails (fps 39.8<50, render 19.55ms>12ms); world pass 17 ms — skip floor/ceiling segments hidden behind walls in renderFlats"
+  },
+  {
+   "area": "gauntlet",
+   "module": "renderer",
+   "severity": "high",
+   "issue": "src/renderer/raycaster.js: near-field torch tint (PLAYER_WARM=1) turns walls/floor tan; r-b +36/+63 vs reference -21/-28"
+  },
+  {
+   "area": "gauntlet",
+   "module": "ui",
+   "issue": "ui 8 < 8.5 (no high/blocker issues)"
+  },
+  {
+   "area": "gauntlet",
+   "module": "state",
+   "severity": "high",
+   "issue": "src/state/perf.test.mjs + sim.js stepPlayingBody: transient-garbage gate is JIT-dependent and flaky (6.64 B/tick), blocks CI deploys at random"
+  },
+  {
+   "area": "gauntlet",
+   "module": "state",
+   "severity": "high",
+   "issue": "src/state/autopilot.js: Auto Explore runs out of fuel in 6/32 runs (L4-L10), ending the persistent run"
+  },
+  {
+   "area": "gauntlet",
+   "module": "maze",
+   "severity": "high",
+   "issue": "src/maze/generator.js: connectSections/relaxDistances not O(n); 2000x2000 with campaign shortcuts takes 91 s; stress.mjs never exercises shortcuts"
+  },
+  {
+   "area": "verify",
+   "issue": "throttled (4×) fps 39.8 < 50 (unthrottled control: render 4.435ms, 193.9fps, gap max 10ms); throttled (4×) render avg 19.554ms > 12ms (unthrottled control: render 4.435ms, 193.9fps, gap max 10ms)"
   }
  ],
  "history": [
@@ -1001,6 +1046,21 @@
    "updated": "2026-09-17T15:11:58.955Z",
    "wave": "modelled-sprites",
    "summary": "3D-modelled wall sconce (7 view angles across its wall) and a still, shadowed 3D oil flask, rendered into palette sprites at load by the new models.js rasteriser; zero per-frame cost beyond one atan2 per visible torch."
+  },
+  {
+   "iteration": 22,
+   "updated": "2026-09-17T16:45:24.561Z",
+   "wave": "gauntlet",
+   "scores": {
+    "renderer": 7.4,
+    "ui": 8,
+    "state": 7.6,
+    "maze": 8.2,
+    "input": 8.6,
+    "audio": 8.6,
+    "core": 8.7
+   },
+   "stressPass": true
   }
  ],
  "openIssues": [
