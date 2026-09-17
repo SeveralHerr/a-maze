@@ -374,6 +374,16 @@ export const AUTO = Object.freeze({
   FRONTIER_CHOICES: 6,
   /** Path tiles within the nearest frontier's distance that count as a tie, chosen between at random. */
   FRONTIER_TIE: 2,
+  /**
+   * Extra path tiles charged to a frontier whose route starts behind the player (its first step is
+   * against the facing). Without it, a frontier uncovered a tile early made the replan pick a branch
+   * just passed about as often as the corridor ahead: ~4.5 mid-corridor U-turns a minute.
+   */
+  BACKTRACK_COST: 8,
+  /** Facing·first-step below which a route counts as starting behind the player (−0.5 ≈ beyond 120°). */
+  BACKTRACK_DOT: -0.5,
+  /** Frontier candidates a plan may hold while it keeps looking for one that is not behind. */
+  FRONTIER_CAP: 24,
   /** Frontier tiles collected once the pilot is searching toward the unseen exit. */
   SEEK_CHOICES: 48,
   /** Weight of the straight-line tiles still to the exit when searching toward it. */

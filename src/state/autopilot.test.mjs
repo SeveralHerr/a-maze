@@ -73,16 +73,23 @@ function drive(s, ap, maxSeconds, each) {
 }
 
 test('clears the first floor on its own, for several seeds', () => {
+  // Gems it walked near = gems on tiles it revealed. A seed can find the exit before revealing any
+  // (seed 3 does), so the pickup share is judged over all four floors, not per floor.
+  let gems = 0;
+  let revealed = 0;
   for (const seed of [1, 2, 3, 4]) {
     const s = playing(1, seed);
     const ap = createAutopilot();
-    let gems = 0;
     drive(s, ap, 600, (st) => {
       for (const e of st.events) if (e.type === 'pickup' && e.kind === 'gem') gems++;
     });
     assert.equal(s.phase, 'levelComplete', `seed ${seed}: the autopilot should clear level 1 (${JSON.stringify(ap.info())})`);
-    assert.ok(gems > 0, `seed ${seed}: it should pick up at least one gem it walked near`);
+    const w = s.levelData.maze.width;
+    for (const it of s.levelData.items) {
+      if (it.kind === 'gem' && s.explored[Math.floor(it.y) * w + Math.floor(it.x)] !== 0) revealed++;
+    }
   }
+  assert.ok(gems > 0 && gems >= revealed * 0.8, `picked up ${gems} of the ${revealed} gems it revealed`);
 });
 
 test('explores rather than dithering: a deep floor keeps uncovering new ground', () => {
@@ -246,6 +253,43 @@ test('turns before a corner rather than walking at the wall beyond it', () => {
   const p90 = past[Math.floor(past.length * 0.9)];
   assert.ok(median < 0, `median ${median.toFixed(3)} tiles past the corner centre`);
   assert.ok(p90 < 0.05, `p90 ${p90.toFixed(3)} tiles past the corner centre`);
+});
+
+test('does not turn round on a corridor that still leads on (backtrack cost)', () => {
+  // A U-turn: leaving a tile back onto the one it came from after turning more than ~130°, where the
+  // tile turned on is not a dead end. Measured before `AUTO.BACKTRACK_COST`: ~4.5 a minute, nearly
+  // all a replan picking a frontier behind when the one ahead was uncovered early. With it: ~0.7,
+  // most of those a detour back to a gem or flask just spotted.
+  let uturns = 0;
+  let seconds = 0;
+  for (const [level, seed] of [[3, 2], [5, 3], [12, 9], [15, 7], [25, 10], [30, 8]]) {
+    const s = playing(level, seed);
+    const ap = createAutopilot();
+    const { tiles, width: w } = s.levelData.maze;
+    const hist = [];
+    const turnedAt = [];
+    let cur = -1;
+    let turned = 0;
+    let lastAngle = s.player.angle;
+    const steps = drive(s, ap, 90, (st) => {
+      const da = st.player.angle - lastAngle;
+      turned += Math.atan2(Math.sin(da), Math.cos(da));
+      lastAngle = st.player.angle;
+      const tile = Math.floor(st.player.y) * w + Math.floor(st.player.x);
+      if (tile === cur) return;
+      cur = tile;
+      hist.push(tile);
+      turnedAt.push(turned);
+      const n = hist.length;
+      if (n < 3 || hist[n - 1] !== hist[n - 3] || Math.abs(turned - turnedAt[n - 3]) < 2.3) return;
+      const b = hist[n - 2];
+      const exits = [b + 1, b - 1, b + w, b - w].filter((k) => tiles[k] === tiles[b]).length;
+      if (exits >= 2) uturns++;
+    });
+    seconds += steps / 60;
+  }
+  const perMinute = (uturns / seconds) * 60;
+  assert.ok(perMinute < 1.5, `${perMinute.toFixed(2)} mid-corridor U-turns a minute`);
 });
 
 test('the torch burns at the pilot’s pace only on steps the pilot drove', () => {

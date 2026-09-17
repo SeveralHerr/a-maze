@@ -1,8 +1,8 @@
 {
- "updated": "2026-09-17T12:43:29.840Z",
- "iteration": 19,
+ "updated": "2026-09-17T13:09:43.654Z",
+ "iteration": 20,
  "passThreshold": 8.5,
- "wave": "auto-corners",
+ "wave": "auto-no-uturns",
  "waves": {
   "0-scaffold": {
    "status": "done",
@@ -985,6 +985,12 @@
    "updated": "2026-09-17T12:43:29.840Z",
    "wave": "auto-corners",
    "summary": "Auto Explore aims by pure pursuit (AUTO.PURSUIT 1.1 tiles along the route): it turns before a corner instead of walking at the far wall and pivoting. Corner overshoot past centre median +0.15 -> -0.07 tiles; wall-contact steps 0.27% -> 0.10%; gated in autopilot.test.mjs."
+  },
+  {
+   "iteration": 20,
+   "updated": "2026-09-17T13:09:43.654Z",
+   "wave": "auto-no-uturns",
+   "summary": "Auto Explore no longer turns round mid-corridor: a frontier whose route starts behind the player costs AUTO.BACKTRACK_COST (8) extra path tiles. Before, a frontier uncovered a tile early made the replan pick a branch just passed at random (FRONTIER_TIE): 4.5 mid-corridor U-turns/min over 10 levels, 87/90 onto open ground -> 0.7/min, most of those detours back to a gem or flask just seen. Gated in autopilot.test.mjs; the level-1 gem check now judges gems picked vs gems revealed."
   }
  ],
  "openIssues": [

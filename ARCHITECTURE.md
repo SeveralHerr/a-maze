@@ -1069,9 +1069,11 @@ below `AUTO.REFUEL_AT` (and any seen flask within `ITEM_DETOUR` below `TOPUP_AT`
 scroll within `AUTO.ITEM_DETOUR`, and frontier tiles (explored floor with an unexplored floor
 neighbour). Goal order: oil (when wanted) → exit (once seen and the level has been wandered for a
 rolled `EXPLORE_PAR_MIN…MAX` × par, or the tank is below `DESPERATE_AT`) → nearby item → nearest
-frontier, ties within `FRONTIER_TIE` tiles broken by `createRng(seed ^ level·φ).fork('auto')`. Past the
+frontier, ties within `FRONTIER_TIE` tiles broken by `createRng(seed ^ level·φ).fork('auto')`. A frontier
+whose route starts **behind** the player (first step against its facing) costs `BACKTRACK_COST` extra
+path tiles, so a goal uncovered early does not turn it round on a corridor that still leads on. Past the
 wander budget with the exit still unseen (or low on oil with none in sight) the frontier choice turns
-greedy toward the exit's position over `SEEK_CHOICES` candidates.
+greedy toward the exit's position over `SEEK_CHOICES` candidates (with the same backtrack cost).
 - **It moves like the title camera** (`step(state, out, dt)`), for watching rather than racing, and
   reads the `ATTRACT` table directly so the two cannot drift: cruise `ATTRACT.SPEED` (1.7 tiles/s, about
   half walking pace) scaled by `cos(err)^SPEED_FALLOFF` and eased at `SPEED_EASE_RATE`; a commanded

@@ -11,7 +11,9 @@
  * - the nearest **seen** oil flask, when the tank is below `AUTO.REFUEL_AT`;
  * - the nearest **seen** gem or map scroll within `AUTO.ITEM_DETOUR` path tiles;
  * - the nearest **frontier** tile (explored floor with an unexplored floor neighbour), a tie between
- *   frontiers within `AUTO.FRONTIER_TIE` path tiles — a junction's branches — broken at random;
+ *   frontiers within `AUTO.FRONTIER_TIE` path tiles — a junction's branches — broken at random. A
+ *   frontier reached by first stepping *behind* the player costs `AUTO.BACKTRACK_COST` extra tiles,
+ *   so uncovering a goal early does not turn it round on a corridor that still leads on;
  * - the exit, once it has been seen and the level has been wandered for a rolled share of its par
  *   time (or nothing is left to explore, or the torch is nearly out). Past that share with the exit
  *   still unseen, the frontier choice turns greedy toward the exit's position instead of random.
@@ -73,6 +75,38 @@ const TAU = Math.PI * 2;
 const DEFAULT_DT = 1 / 60;
 
 /**
+ * Does a route whose first step is onto tile `step` (−1: the route starts where it is) leave from
+ * `start` against the facing `(faceX, faceY)`?
+ * @param {number} step
+ * @param {number} start
+ * @param {number} w
+ * @param {number} faceX
+ * @param {number} faceY
+ * @returns {boolean}
+ */
+function behind(step, start, w, faceX, faceY) {
+  if (step < 0) return false;
+  const dx = (step % w) - (start % w);
+  const dy = ((step / w) | 0) - ((start / w) | 0);
+  return dx * faceX + dy * faceY < AUTO.BACKTRACK_DOT;
+}
+
+/**
+ * A frontier's path distance, plus `AUTO.BACKTRACK_COST` when its route starts behind the player.
+ * @param {number} f
+ * @param {number} start
+ * @param {number} w
+ * @param {Int32Array} dst
+ * @param {Int32Array} fst
+ * @param {number} faceX
+ * @param {number} faceY
+ * @returns {number}
+ */
+function frontierCost(f, start, w, dst, fst, faceX, faceY) {
+  return dst[f] + (behind(fst[f], start, w, faceX, faceY) ? AUTO.BACKTRACK_COST : 0);
+}
+
+/**
  * Grow-only `Int32Array`.
  * @param {Int32Array|null} a
  * @param {number} n
@@ -99,10 +133,12 @@ export function createAutopilot() {
   let dist = null;
   /** BFS queue. @type {Int32Array|null} */
   let queue = null;
+  /** BFS first step out of the start tile on the path to each tile, valid where `seen[i] === gen`. @type {Int32Array|null} */
+  let first = null;
   /** The route, as tile indices from the first step to the goal. @type {Int32Array|null} */
   let route = null;
   /** Frontier candidates collected by the last search. */
-  const frontier = new Int32Array(Math.max(AUTO.FRONTIER_CHOICES, AUTO.SEEK_CHOICES));
+  const frontier = new Int32Array(Math.max(AUTO.FRONTIER_CAP, AUTO.SEEK_CHOICES));
   let gen = 0;
   /** @type {Rng|null} */
   let rng = null;
@@ -258,6 +294,7 @@ export function createAutopilot() {
     prev = ensure(prev, n);
     dist = ensure(dist, n);
     queue = ensure(queue, n);
+    first = ensure(first, n);
     route = ensure(route, n);
     const items = level.items;
     for (let i = 0; i < items.length; i++) {
@@ -316,6 +353,7 @@ export function createAutopilot() {
     const dst = /** @type {Int32Array} */ (dist);
     const q = /** @type {Int32Array} */ (queue);
     const at = /** @type {Int32Array} */ (itemAt);
+    const fst = /** @type {Int32Array} */ (first);
 
     const px = Math.floor(state.player.x);
     const py = Math.floor(state.player.y);
@@ -334,6 +372,10 @@ export function createAutopilot() {
     // Wandered long enough but the exit is still in the fog: search toward it instead of at random.
     const seek = wandered && !exitSeen;
     const choices = seek || wantFuel ? AUTO.SEEK_CHOICES : AUTO.FRONTIER_CHOICES;
+    // Past `choices`, keep collecting (up to the buffer) until one frontier is not behind the player.
+    const cap = seek || wantFuel ? AUTO.SEEK_CHOICES : AUTO.FRONTIER_CAP;
+    const faceX = Math.cos(state.player.angle);
+    const faceY = Math.sin(state.player.angle);
 
     if (++gen === 0x7fffffff) {
       vis.fill(0);
@@ -345,10 +387,12 @@ export function createAutopilot() {
     vis[start] = gen;
     par[start] = start;
     dst[start] = 0;
+    fst[start] = -1;
 
     let oil = -1;
     let item = -1;
     let frontiers = 0;
+    let ahead = false;
     let exitReached = false;
     while (head < tail) {
       const i = q[head++];
@@ -367,13 +411,25 @@ export function createAutopilot() {
             item = i;
           }
         }
-        if (frontiers < choices && isFrontier(tiles, explored, w, h, i)) frontier[frontiers++] = i;
+        if (frontiers < cap && (frontiers < choices || !ahead) && isFrontier(tiles, explored, w, h, i)) {
+          frontier[frontiers++] = i;
+          if (!behind(fst[i], start, w, faceX, faceY)) ahead = true;
+        }
       }
       // Stop as soon as the goal this plan will pick is decided. Distances are non-decreasing in a
       // BFS, so nothing found later could beat what is already in hand.
       if (wantFuel && oil >= 0) break;
       if (wantExit && exitReached) break;
-      if (!wantFuel && !wantExit && frontiers >= choices && d > AUTO.ITEM_DETOUR) break;
+      // A frontier further than the nearest one plus the backtrack cost could not win either.
+      if (
+        !wantFuel &&
+        !wantExit &&
+        frontiers >= choices &&
+        d > AUTO.ITEM_DETOUR &&
+        (ahead || frontiers >= cap || d > dst[frontier[0]] + AUTO.BACKTRACK_COST + AUTO.FRONTIER_TIE)
+      ) {
+        break;
+      }
 
       const x = i % w;
       const y = (i / w) | 0;
@@ -387,6 +443,7 @@ export function createAutopilot() {
         vis[ni] = gen;
         par[ni] = i;
         dst[ni] = d + 1;
+        fst[ni] = i === start ? ni : fst[i];
         q[tail++] = ni;
       }
     }
@@ -412,7 +469,9 @@ export function createAutopilot() {
       const ey = maze.exit.y;
       for (let r = 0; r < frontiers; r++) {
         const f = frontier[r];
-        const score = dst[f] + AUTO.SEEK_WEIGHT * (Math.abs((f % w) - ex) + Math.abs(((f / w) | 0) - ey));
+        const score =
+          frontierCost(f, start, w, dst, fst, faceX, faceY) +
+          AUTO.SEEK_WEIGHT * (Math.abs((f % w) - ex) + Math.abs(((f / w) | 0) - ey));
         if (score < bestScore) {
           bestScore = score;
           best = r;
@@ -423,12 +482,22 @@ export function createAutopilot() {
     } else if (frontiers > 0) {
       // Nearest first, which walks a corridor to its end rather than thrashing between far-apart
       // frontiers; ties (a junction's branches, within FRONTIER_TIE tiles) are broken at random.
-      const limit = dst[frontier[0]] + AUTO.FRONTIER_TIE;
-      let ties = 1;
-      while (ties < frontiers && dst[frontier[ties]] <= limit) ties++;
-      const pick = ties > 1 ? /** @type {Rng} */ (rng).int(ties) : 0;
+      // Distances carry the backtrack cost, so the corridor ahead beats a branch just passed.
+      let lowest = Infinity;
+      for (let r = 0; r < frontiers; r++) lowest = Math.min(lowest, frontierCost(frontier[r], start, w, dst, fst, faceX, faceY));
+      const limit = lowest + AUTO.FRONTIER_TIE;
+      let ties = 0;
+      for (let r = 0; r < frontiers; r++) if (frontierCost(frontier[r], start, w, dst, fst, faceX, faceY) <= limit) ties++;
+      let pick = ties > 1 ? /** @type {Rng} */ (rng).int(ties) : 0;
+      tile = frontier[0];
+      for (let r = 0; r < frontiers; r++) {
+        if (frontierCost(frontier[r], start, w, dst, fst, faceX, faceY) > limit) continue;
+        if (pick-- === 0) {
+          tile = frontier[r];
+          break;
+        }
+      }
       goal = GOAL_FRONTIER;
-      tile = frontier[pick];
     } else if (exitReached) {
       // Nothing left to explore that can be reached: leave.
       goal = GOAL_EXIT;
