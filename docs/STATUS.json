@@ -1,6 +1,6 @@
 {
- "updated": "2026-09-17T03:13:28.482Z",
- "iteration": 15,
+ "updated": "2026-09-17T04:45:29.242Z",
+ "iteration": 16,
  "passThreshold": 8.5,
  "wave": "tilesets",
  "waves": {
@@ -537,12 +537,12 @@
    }
   },
   "gauntlet": {
-   "status": "stopped after round 2 (usage budget)",
-   "rounds": 2,
-   "note": "Stopped by project lead to conserve usage. Round 3+ would anchor critics to prior findings (see .claude/workflows/gauntlet.js)."
+   "status": "failing",
+   "rounds": 2
   },
   "stress": {
-   "status": "pending"
+   "status": "done",
+   "summary": "Final stress gate PASS on every criterion: 4096x4096 gen ok, out-of-range throws RangeError, 128x128 soak 120 fps p99 9.4 ms, heap +0.22 MB, listeners stable, 0 console errors, worker builds never block frames."
   },
   "5-massive-mazes": {
    "status": "done",
@@ -665,16 +665,18 @@
    "note": "Round 2 revision committed in 2e9f56e after this score; not re-scored."
   },
   "input": {
-   "score": 8,
-   "pass": false,
-   "lastScoredRound": 2,
-   "note": "Round 2 revision committed in 2e9f56e after this score; not re-scored."
+   "score": 8.7,
+   "pass": true,
+   "lastScoredRound": 1,
+   "errors": 0,
+   "note": "Gauntlet pass; no blocker/high issues."
   },
   "state": {
-   "score": 7.6,
-   "pass": false,
-   "lastScoredRound": 2,
-   "note": "Round 2 revision committed in 2e9f56e after this score; not re-scored."
+   "score": 8.7,
+   "pass": true,
+   "lastScoredRound": 1,
+   "errors": 0,
+   "note": "Gauntlet pass; no blocker/high issues."
   },
   "renderer": {
    "score": 7.5,
@@ -683,14 +685,15 @@
    "note": "Round 2 revision committed in 2e9f56e after this score; not re-scored."
   },
   "ui": {
-   "score": 7.2,
+   "score": 8.2,
    "pass": false,
    "lastScoredRound": 2,
-   "note": "Round 2 revision committed in 2e9f56e after this score; not re-scored."
+   "errors": 0,
+   "note": "8.2 < 8.5; 0 blocker/high, 4 medium: menus.js row hit boxes sit below labels; advance() overwrites menu index after openSub/closeSub; preview ?screen=options/credits broken; Depth N Cleared heading top-heavy on phones; Decide Later boon loop"
   }
  },
  "metrics": {
-  "source": "logs/massive.json (tools/verify.mjs --tag massive, 1280x720 headless Chrome) + npm test + validate-mazes + stress",
+  "source": "logs/gauntlet.json (verify) + logs/stress-gate.json",
   "sizeCurve": "L1 16x16 cells / 33x33 tiles; +8 cells/side/level; cap 128x128 cells / 257x257 tiles / 16,384 cells at L15 (CAP_LEVEL derived from BASE_CELLS 16, GROWTH 8, MAX_CELLS 128). Braid 0 -> 0.6 over 17 levels, square-root shaped (0.54 at L15, 0.6 from L18); past the cap drain +2%/level to 1.35x and oil density thins 1/20 -> 1/30 cells.",
   "tankSeconds": "L1 110 s -> cap 150 s, independent of maze area",
   "fpsVsyncLimited": {
@@ -729,7 +732,7 @@
   "mazesValidated": 117306,
   "campaignLevelsValidated": 750,
   "mazeFailures": 0,
-  "fps": 596,
+  "fps": 120,
   "loadMs": 562,
   "renderMsMaxWorld": 4.3,
   "droppedFrames": 0,
@@ -757,14 +760,20 @@
   "verifyPass": true,
   "stateTests": 110,
   "verifyTag": "final",
-  "checkedAt": "2026-09-16T18:11:00.646Z",
+  "checkedAt": "2026-09-17T04:44:40.852Z",
   "validate": "784 mazes, 0 failures (--quick)",
-  "stress": "pass (--quick)"
+  "stress": "pass (final gate)",
+  "fpsUncapped": 582.9,
+  "frameMsP99": 9.4,
+  "renderMsAvg": 1.763,
+  "renderMsAvgUncapped": 1.357,
+  "heapGrowthMB": 0.22,
+  "largestGrid": "4096x4096 cells (Node gen+validate 2.1 s + 2.8 s, 511 MB RSS); gameplay cap 128x128 cells / 257x257 tiles"
  },
  "blocking": [
   {
    "area": "gauntlet",
-   "issue": "renderer/ui/state/input/audio below 8.5 at last scoring (round 2, pre-revision). Re-run: Workflow .claude/workflows/gauntlet.js with args {only:[...]}"
+   "issue": "ui 8.2 < 8.5 (no high/blocker issues; medium: menus.js row hit boxes sit below labels; advance() overwrites menu index after openSub/closeSub; preview ?screen=options/credits broken; Depth N Cleared heading top-heavy on phones; Decide Later boon loop)"
   }
  ],
  "history": [
@@ -939,6 +948,17 @@
    "updated": "2026-09-17T03:13:28.482Z",
    "wave": "more-shortcuts",
    "summary": "Playtest asked for more shortcuts three times, the last \"especially as they get higher\". Shortcut knobs now ramp over the size curve (level 1 -> CAP_LEVEL): cells per shortcut 8 -> 4, detour 6 -> 4 cells, route keep 0.85 -> 0.70 (shipped before this wave: 24 / 12 / 0.85, flat). At 8/6/0.85 the route guard was binding on every floor from 3 up. Placed at seed 1337 went 3->6 on floor 1 and 683->1935 at the cap at 8/6; the ramp measures 1991->3555 at 128x128 (2 seeds, before braid). Gate fix in feasibility.test: reducerWalk walkers never entered the <=3-tile side pocket the refuel chain places flasks in, so they only won while flasks landed on the path; denser loops broke that (level 11: path-only seed 529782, then the 2x wanderer seed 110866) although walkRefuelChain reported ok. Walkers now fetch a pocket flask when the tank is below POCKET_GRAB_FRACTION 0.35 (a player who notices the torch getting low). Both every-walk-wins and no-early-alarm assertions stay intact. Lowest tank 2x: 0.599 -> 0.483; path only 0.615 -> 0.445. npm test 40/40; validate-mazes (full) 117306 mazes OK, worst reserve 62.8%; stress (full) OK. Also: sconce plate decal removed (textures back to b96f506). Open: map scroll detour outside [4, gap/4] on levels 1,19,21,24,26,28,29 (informational, not a gate)."
+  },
+  {
+   "iteration": 16,
+   "updated": "2026-09-17T04:45:29.242Z",
+   "wave": "gauntlet",
+   "scores": {
+    "ui": 8.2,
+    "state": 8.7,
+    "input": 8.7
+   },
+   "stressPass": true
   }
  ],
  "openIssues": [
