@@ -1,8 +1,8 @@
 {
- "updated": "2026-09-17T16:45:24.561Z",
- "iteration": 22,
+ "updated": "2026-09-17T20:59:50.170Z",
+ "iteration": 24,
  "passThreshold": 8.5,
- "wave": "modelled-sprites",
+ "wave": "gauntlet",
  "waves": {
   "0-scaffold": {
    "status": "done",
@@ -538,11 +538,11 @@
   },
   "gauntlet": {
    "status": "failing",
-   "rounds": 1
+   "rounds": 2
   },
   "stress": {
    "status": "done",
-   "summary": "Final stress gate PASS on eeb25f5: 4096x4096 gen+validate ok, out-of-range throws RangeError, 128x128 soak 120 fps p99 11 ms, heap +0.23 MB, listeners 54->54, 0 console errors, worker builds non-blocking. Throttled 4x ~35.5 fps reported only (machine-dependent)."
+   "summary": "FINAL STRESS GATE PASS — 18/18 checks (logs/stress-gate.json). tools/stress.mjs 6 extreme cases 0 failures, peak RSS 68.8 MB; 2000x2000 with campaign shortcut density 7.05 us/cell (the 91 s / no-shortcut-coverage blocker is stale). 45-case extreme sweep incl. buildLevel 4096x4096 (22.2 s, 1069 MB, clean) and clean RangeError on every over-limit input; no recursion in src/maze|core|state. Two headless-Chrome runs: 60 s cap-level soak 295.3/306.1 fps, frame p99 5.5/5.9 ms, 0 frames over 33.4 ms, heap +0.25/+0.21 MB after forced GC, listeners 24->24 and 13->13 over 5 full run cycles, worker builds max rAF gap 3.1/3.7 ms against a 172 ms synchronous control, 0 console/page/request/in-game errors, npm test 44/44. Throttled 4x re-measured on an idle run: median 48.2 fps, render avg 12.8-16.7 ms — still under verify.mjs's 50 fps / 12 ms gate, reported as an open renderer finding, not a stress failure."
   },
   "5-massive-mazes": {
    "status": "done",
@@ -661,9 +661,9 @@
   "maze": {
    "score": 8.2,
    "pass": false,
-   "lastScoredRound": 1,
+   "lastScoredRound": 2,
    "errors": 0,
-   "note": "1 high issue(s)"
+   "note": "1 high issue(s); 8.2 < 8.5"
   },
   "core": {
    "score": 8.7,
@@ -687,29 +687,29 @@
    "note": "Gauntlet pass; no blocker/high issues."
   },
   "state": {
-   "score": 7.6,
+   "score": 8.4,
    "pass": false,
-   "lastScoredRound": 1,
-   "errors": 1,
-   "note": "2 high issue(s)"
+   "lastScoredRound": 2,
+   "errors": 0,
+   "note": "1 high issue(s); 8.4 < 8.5"
   },
   "renderer": {
-   "score": 7.4,
+   "score": 7.8,
    "pass": false,
-   "lastScoredRound": 1,
-   "errors": 2,
-   "note": "2 high issue(s)"
+   "lastScoredRound": 2,
+   "errors": 0,
+   "note": "1 high issue(s); 7.8 < 8.5"
   },
   "ui": {
-   "score": 8,
+   "score": 8.2,
    "pass": false,
-   "lastScoredRound": 1,
+   "lastScoredRound": 2,
    "errors": 0,
-   "note": "below 8.5; mediums open (menu index stale, preview deep-link, phone headings/Shrine, Decide Later loop, AUTO button under pointer lock)"
+   "note": "1 high issue(s); 8.2 < 8.5"
   }
  },
  "metrics": {
-  "source": "logs/gauntlet.json (verify) + logs/stress-gate.json",
+  "source": "logs/gauntlet.json (verify) + logs/fix-*.json + logs/stress-gate.json",
   "sizeCurve": "L1 16x16 cells / 33x33 tiles; +8 cells/side/level; cap 128x128 cells / 257x257 tiles / 16,384 cells at L15 (CAP_LEVEL derived from BASE_CELLS 16, GROWTH 8, MAX_CELLS 128). Braid 0 -> 0.6 over 17 levels, square-root shaped (0.54 at L15, 0.6 from L18); past the cap drain +2%/level to 1.35x and oil density thins 1/20 -> 1/30 cells.",
   "tankSeconds": "L1 110 s -> cap 150 s, independent of maze area",
   "fpsVsyncLimited": {
@@ -744,11 +744,11 @@
   "fuelSecondsRecovered": 348.19,
   "consoleErrors": 0,
   "consoleWarnings": 0,
-  "tests": "37/37 files",
+  "tests": "44/44 files",
   "mazesValidated": 117306,
   "campaignLevelsValidated": 750,
   "mazeFailures": 0,
-  "fps": 120,
+  "fps": 295.3,
   "loadMs": 562,
   "renderMsMaxWorld": 4.3,
   "droppedFrames": 0,
@@ -776,61 +776,62 @@
   "verifyPass": false,
   "stateTests": 110,
   "verifyTag": "gauntlet",
-  "checkedAt": "2026-09-17T16:45:24.561Z",
+  "checkedAt": "2026-09-17T20:59:50.170Z",
   "validate": "784 mazes, 0 failures (--quick)",
-  "stress": "pass (final gate)",
-  "fpsUncapped": 259.6,
-  "frameMsP99": 11,
-  "renderMsAvg": 3.302,
+  "stress": "pass (final gate, 18/18)",
+  "fpsUncapped": 306.1,
+  "frameMsP99": 5.5,
+  "renderMsAvg": 2.4,
   "renderMsAvgUncapped": 1.357,
-  "heapGrowthMB": 0.23,
-  "largestGrid": "4096x4096 cells (Node gen+validate 2.1 s + 4.2 s, 511 MB RSS); gameplay cap 128x128 cells / 257x257 tiles",
+  "heapGrowthMB": 0.25,
+  "largestGrid": "4096x4096 cells (buildLevel 22.2 s, 1069 MB peak RSS, clean completion); gameplay cap 128x128 cells / 257x257 tiles",
   "throttled": {
    "rate": 4,
-   "fps": 39.8,
-   "renderMsAvg": 19.554,
-   "worldMsAvg": 16.992
-  }
+   "fps": 48.2,
+   "fpsSamples": [
+    39.9,
+    51.3,
+    48.2
+   ],
+   "renderMsAvg": "12.8-16.7",
+   "note": "median of 3x10 s on the cap level, dedicated idle run; verify gate is 50 fps / 12 ms"
+  },
+  "errors": 0
  },
  "blocking": [
   {
    "area": "gauntlet",
    "module": "renderer",
    "severity": "high",
-   "issue": "src/renderer/raycaster.js: throttled 4x verify gate fails (fps 39.8<50, render 19.55ms>12ms); world pass 17 ms — skip floor/ceiling segments hidden behind walls in renderFlats"
-  },
-  {
-   "area": "gauntlet",
-   "module": "renderer",
-   "severity": "high",
-   "issue": "src/renderer/raycaster.js: near-field torch tint (PLAYER_WARM=1) turns walls/floor tan; r-b +36/+63 vs reference -21/-28"
+   "issue": "src/renderer/textures.js: walls read as a grid of dark framed panels, not masonry — paintBlock bevels row 0 and column 0 at +0.28*bevel (40-76% brighter than the face) then shadows two rows/cols on top of MORTAR 3, so only ~37% of a block cell is the block; COURSES(4) x BLOCK_W_MIN 20 puts 12 blocks on a 1x1 face against the reference's ~4-6. Fix: drop the column bevel, MORTAR 3->2, COURSES to 3 (0,21,43,64), BLOCK_W_MIN 20->28 / SPREAD 5->9."
   },
   {
    "area": "gauntlet",
    "module": "ui",
-   "issue": "ui 8 < 8.5 (no high/blocker issues)"
+   "severity": "high",
+   "issue": "src/ui/menus.js:3714,3732,3820-3822: level-complete TOTAL is not the sum of the rows above it from depth 2 on — targets[3] = run.score under a summation rule (Depth 2 shows 0 + 2,260 + 1,000 = 4,710). Either relabel to RUN TOTAL and drop the rule, or sum the three rows and add a separate RUN line; gate it in menus.test.mjs."
   },
   {
    "area": "gauntlet",
    "module": "state",
    "severity": "high",
-   "issue": "src/state/perf.test.mjs + sim.js stepPlayingBody: transient-garbage gate is JIT-dependent and flaky (6.64 B/tick), blocks CI deploys at random"
-  },
-  {
-   "area": "gauntlet",
-   "module": "state",
-   "severity": "high",
-   "issue": "src/state/autopilot.js: Auto Explore runs out of fuel in 6/32 runs (L4-L10), ending the persistent run"
+   "issue": "ARCHITECTURE.md S1:76-77 and S4.2:384 state FUEL.GAP_SAFETY 0.7 -> GAP_SAFETY_END 0.8 (30%->20% headroom) while balance.js:347/355 has 0.62/0.62, making gapSafety() a lerp between identical numbers. Binding-contract drift: reconcile doc and code in one commit and assert the endpoints in balance.test.mjs."
   },
   {
    "area": "gauntlet",
    "module": "maze",
    "severity": "high",
-   "issue": "src/maze/generator.js: connectSections/relaxDistances not O(n); 2000x2000 with campaign shortcuts takes 91 s; stress.mjs never exercises shortcuts"
+   "issue": "src/maze/populate.js:333-342: resolveGap floors the refuel gap at 1 but placeRefuelChain cannot resolve below 4 (nearestPathFrom snaps within OIL_BRANCH_RADIUS 3), so a state-side retune ships a level whose refuel guarantee is silently broken ({fuelSeconds:150,drain:10} -> walkRefuelChain ok:false; {oilRefuelSeconds:0.5} -> minFuel -7505 s). Floor the gap at 2*OIL_BRANCH_RADIUS-2 and surface chainOk so buildLevel refuses the level."
+  },
+  {
+   "area": "gauntlet",
+   "module": "renderer",
+   "severity": "medium",
+   "issue": "Throttled 4x still misses tools/verify.mjs (median 48.2 fps vs 50, render avg 12.8-16.7 ms vs 12). Improved from 39.8 fps / 19.55 ms but open; renderer has one quality knob (INTERNAL_H 240, a module constant) so there is no resolution fallback — needs an ARCHITECTURE.md S4.5 change to parameterise internalH."
   },
   {
    "area": "verify",
-   "issue": "throttled (4×) fps 39.8 < 50 (unthrottled control: render 4.435ms, 193.9fps, gap max 10ms); throttled (4×) render avg 19.554ms > 12ms (unthrottled control: render 4.435ms, 193.9fps, gap max 10ms)"
+   "issue": "tools/verify.mjs throttled (4x) gate still fails: fps 48.2 < 50, render avg 12.8-16.7 ms > 12 ms. Unthrottled control 273-329 fps. Not a stress-gate failure (stress gate PASSES 18/18)."
   }
  ],
  "history": [
@@ -1061,6 +1062,28 @@
     "core": 8.7
    },
    "stressPass": true
+  },
+  {
+   "iteration": 23,
+   "updated": "2026-09-17T20:57:17.324Z",
+   "wave": "final-stress-gate",
+   "stressPass": true,
+   "note": "18/18 gate checks; no src/ defect found, no src/ changes made"
+  },
+  {
+   "iteration": 24,
+   "updated": "2026-09-17T20:59:50.170Z",
+   "wave": "gauntlet",
+   "scores": {
+    "renderer": 7.8,
+    "ui": 8.2,
+    "state": 8.4,
+    "maze": 8.2,
+    "input": 8.6,
+    "audio": 8.6,
+    "core": 8.7
+   },
+   "stressPass": true
   }
  ],
  "openIssues": [
@@ -1083,5 +1106,51 @@
   "Auto Explore is a fog-bound random explorer walking at the title camera pace: in Node (3 seeds each) it cleared depth 10 3/3 and depth 5 2/3 but depth 3 0/3. It slows into corners below the 1.7 tiles/s cruise the burn is scaled to (~1.2 average), so each tile still costs ~1.4x the oil; scaling by measured pace, or remembering passed flasks, would carry it further.",
   "perf.test.mjs \"transient garbage\" is flaky on main too: turning in place measures 6.64 B/tick in ~2 of 8 runs (threshold 2). Pre-existing, not caused by the auto/saves change.",
   "A save is tied to the generator: after a deploy that changes maze generation, a mid-level save starts its level fresh (totals kept). A checkpoint save is unaffected."
- ]
+ ],
+ "stressGate": {
+  "at": "2026-09-17T20:56:51.432Z",
+  "pass": true,
+  "source": "logs/stress-gate.json",
+  "checks": "18/18 passed",
+  "node": {
+   "stressMjs": "ok, peak RSS 68.8 MB; 2000x2000 with campaign shortcuts 28.2 s = 7.05 us/cell (O(n) holds)",
+   "extremeLimits": "45 cases: 4096x1, 1x4096, 2x4096, 2048x2048, 3000x3000, braid 1.0 at 1000x1000, buildLevel 4096x4096 (22.2 s, 1069 MB RSS). Every over-limit/NaN/Infinity/null input threw a clean RangeError; validateMaze never throws on malformed input.",
+   "recursion": "257 function bodies scanned in src/maze, src/core, src/state - zero self-calls (rng fromSeedWords is a fork factory, allowlisted with reason)"
+  },
+  "browser": {
+   "workerNeverBlocksFrames": "forced 40x40 / 128x128 / 200x200 builds through createMazeClient(mode:always): max rAF gap 3.1-3.7 ms; cap-level install 10.2-35.3 ms (gate 50). Synchronous 200x200 control stalled 163-172 ms, so the sampler is proven able to see blocking.",
+   "soak60s": "fps 295.3/306.1, frame p99 5.5/5.9 ms, 0 frames over 33.4 ms, 0 steps discarded",
+   "heapGrowthMB": [
+    0.29,
+    0.21
+   ],
+   "listeners": "window 24->24, document 13->13 across 5 newGame->gameOver->toTitle cycles (CDP DOMDebugger.getEventListeners)",
+   "consoleErrors": 0
+  },
+  "throttled4x": {
+   "fpsMin": 39.9,
+   "fpsMedian": 48.2,
+   "fpsMax": 51.3,
+   "renderMsAvg": [
+    13.438,
+    12.828,
+    16.691
+   ],
+   "note": "Reported, not gated - the PASS criteria gate fps unthrottled. Still under verify.mjs THROTTLED_MIN_FPS 50 / THROTTLED_MAX_RENDER_MS_AVG 12, so the renderer throttled item stays open (was 39.8 fps / 19.55 ms, now 40-51 fps / 12.8-16.7 ms)."
+  },
+  "openFindings": [
+   {
+    "severity": "medium",
+    "module": "renderer",
+    "finding": "With CPU throttled 4x on the 128x128 cap level the loop holds 40-51 fps (median 48) at 12.8-16.7 ms render avg — under tools/verify.mjs THROTTLED_MIN_FPS 50 and THROTTLED_MAX_RENDER_MS_AVG 12. Improved from the recorded 39.8 fps / 19.55 ms but still short. Not a stress-gate failure (the PASS criteria gate fps unthrottled), and no defect: the frame budget degrades linearly, 0 sim steps are discarded and nothing errors.",
+    "evidence": "logs/_gate-throttle.json"
+   },
+   {
+    "severity": "low",
+    "module": "maze",
+    "finding": "src/maze/constants.js MAX_CELLS_PER_SIDE docstring states ~12 s generate, ~12 s validate and ~490 MiB RSS for a 4096x4096 maze. Measured here: buildLevel(4096x4096) 22.2 s and 1069 MB peak RSS. The cap still holds (clean completion, no OOM, no stack overflow) but the quoted memory figure is ~2x optimistic.",
+    "evidence": "logs/_gate-extreme-heavy.log"
+   }
+  ]
+ }
 }
