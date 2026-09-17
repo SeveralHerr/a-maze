@@ -598,9 +598,19 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
 - `textures.js` — `createTextures(seed) → TextureSet` procedurally paints 64×64 pixel-art
   textures (indices + packed pixels + a stipple mask): `wall[4]` (plain, cracked, mossy, vined),
   `floor[3]` (two cobbles + iron grate), `ceiling[2]` (planks, planks + beam), `portal[8]`,
-  `torch[4]`, `gem[8]`, `oil[4]`, `map[1]` (the scroll; `MAP_FLOOR_ROW` export rests it on the floor), `sparkle[4]`. **Every field is an array** — consumers index them,
+  `torch[TORCH_VIEWS × TORCH_FRAMES]` (7 views × 4 flame frames; `torch[view * TORCH_FRAMES + frame]`,
+  views fanned over ±`TORCH_YAW_MAX` across the wall), `gem[8]`, `oil[1]` (the modelled flask as one
+  still 3/4 view at `OIL_YAW`, with its floor shadow; it neither spins nor bobs), `map[1]` (the scroll; `MAP_FLOOR_ROW` export rests it on the floor), `sparkle[4]`. **Every field is an array** — consumers index them,
   and the raycaster picks a per-tile variant by hash. Deterministic and Node-safe (no DOM) so it
-  can be unit tested; ~20 ms for a full set.
+  can be unit tested; ~35 ms for a full set.
+- `models.js` — load-time low-poly mesh rasteriser: `createMesh()`, `lathe`, `box`, `tube`,
+  `renderMesh(mesh, materials, {yaw, pitch, originRow, light, outline?, shadows?, ground?}, pick, out)` and
+  `projectPoint`. Orthographic, z-buffered, Lambert + Blinn + glass transmission, quantised through
+  palette ramps by the caller's `pick`. `shadows` adds a self-shadow map; `ground: {index, contact,
+  stipple}` paints a cast + contact shadow on y = 0 into empty texels, solid at the core with a
+  stippled edge (the flask's `oil` frame therefore carries a stipple mask; Oil Sense's ghost skips
+  stippled texels). `textures.js` uses it to render the oil flask and the wall
+  sconce into ordinary sprite frames; nothing here runs per frame. Imports nothing.
 - `sprite-index.js` — `createSpriteIndex(cell = INDEX_CELL) → SpriteIndex` with
   `build(count, readX, readY, tilesW, tilesH)` and the public typed arrays `cellStart` / `entries` /
   `px` / `py` plus `cell` / `cols` / `rows` / `count`. A uniform-grid (counting-sort) bucketing of a

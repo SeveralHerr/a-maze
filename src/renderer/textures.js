@@ -4,7 +4,7 @@
  *
  * Every surface and sprite in the game is painted here from `palette.js` indices — there are no
  * image assets, so the download is a few kilobytes of code and the art is reproducible from a
- * seed. Painting the whole set costs roughly 10–20 ms once at load.
+ * seed. Painting the whole set costs roughly 30–40 ms once at load (the modelled sprites are ~15 ms).
  *
  * ART DIRECTION (docs/art-reference.png):
  * - **Walls** — big landscape blue-grey stone blocks (~2:1) in a running bond, each face a few flat
@@ -16,8 +16,9 @@
  *   gaps, moss tufts in the gaps, plus an occasional iron grate tile.
  * - **Ceiling** — dark brown planks with grain, nails and knots, and a heavier cross beam every
  *   few tiles.
- * - **Sprites** — iron sconce with a 4-frame flame, a swirling violet/cyan portal, a faceted
- *   spinning gem, an amber oil flask, a sparkle, and a rolled parchment map scroll tied with a red
+ * - **Sprites** — a modelled iron sconce (`models.js`, one view per angle across its wall) with a
+ *   4-frame flame, a swirling violet/cyan portal, a faceted spinning gem, a modelled amber oil flask
+ *   (one still view), a sparkle, and a rolled parchment map scroll tied with a red
  *   ribbon (deliberately dim — it is hidden, not a beacon).
  *
  * INVARIANTS (the raycaster depends on all of these):
@@ -39,6 +40,7 @@
 
 import { createRng, hash2 } from '../core/rng.js';
 import { C, PALETTE, RAMPS } from './palette.js';
+import { box, createMesh, lathe, projectPoint, renderMesh, tube } from './models.js';
 
 /** Texture edge length in texels. 64 matches the reference's chunk size at 240p internal res. */
 export const SIZE = 64;
@@ -82,10 +84,11 @@ export const BAYER = Float32Array.from(
  * @property {Texture[]} wall       4 variants: plain, cracked, mossy, vined
  * @property {Texture[]} floor      3 variants: cobbles A, cobbles B, iron grate
  * @property {Texture[]} ceiling    2 variants: planks, planks + cross beam
- * @property {Texture[]} torch      4 flame frames (sconce baked in), emissive
+ * @property {Texture[]} torch      `TORCH_VIEWS × TORCH_FRAMES`: the modelled sconce per view across its
+ *   wall, 4 flame frames each (`torch[view * TORCH_FRAMES + frame]`), emissive
  * @property {Texture[]} portal     8 swirl frames, emissive
  * @property {Texture[]} gem        8 spin frames
- * @property {Texture[]} oil        4 bob frames
+ * @property {Texture[]} oil        1 frame: the modelled flask, a still 3/4 view (`OIL_YAW`) with its shadow
  * @property {Texture[]} sparkle    4 frames, emissive
  * @property {Texture[]} map        1 frame: the hidden map scroll (§4.8), solid, not emissive
  * @property {Texture[]} chalk      {@link CHALK_VARIANTS} wall decals: the word A-MAZE scrawled big and
@@ -844,58 +847,82 @@ function paintCeiling(seed, beam, plankSeed) {
 
 // ─── Sprites ───────────────────────────────────────────────────────────────────────────────────
 
+/** Views of the wall sconce, fanned across its wall from `-TORCH_YAW_MAX` to `+TORCH_YAW_MAX`. */
+export const TORCH_VIEWS = 7;
+
+/** Yaw of the outermost sconce view, radians. Beyond it the raycaster keeps the last view. */
+export const TORCH_YAW_MAX = 1.25;
+
+/** Flame frames per sconce view: `torch[view * TORCH_FRAMES + frame]`. */
+export const TORCH_FRAMES = 4;
+
+/** Texel row of the sconce's model-space origin (y = 0). */
+const TORCH_ORIGIN_ROW = 32;
+
 /**
- * Paint an iron wall sconce with a burning flame. The sconce is identical in every frame; only
- * the flame animates, so the four frames cycle without the bracket appearing to twitch.
+ * Where the wall plane sits in the sconce's model space, in texels: the billboard hangs 0.02 tiles
+ * in front of the wall at 128 texels per tile (`TORCH_OFFSET`, `TORCH_SPRITE_SCALE` in the raycaster).
+ */
+const TORCH_WALL_Z = -2.5;
+
+/** Model-space centre of the cup's mouth, where the flame is rooted. */
+const TORCH_CUP = /** @type {const} */ ([0, 6, 12]);
+
+/** @type {import('./models.js').Material[]} */
+const TORCH_MATS = [
+  { ramp: RAMPS.iron, albedo: 0.78, spec: 0.55, shine: 14, ambient: 0.28 }, // 0 forged iron
+  { ramp: RAMPS.iron, albedo: 0.95, spec: 0.8, shine: 22, ambient: 0.4 }, // 1 rolled rim, rivets
+  { ramp: RAMPS.fire, albedo: 0.42, ambient: 0.8 }, // 2 coals
+];
+
+/** @type {import('./models.js').Mesh|null} */
+let torchMesh = null;
+
+/**
+ * The sconce: a riveted wall plate, an arm that runs out of the wall and bends up into a flared
+ * cup, a brace under it, and a rolled rim. Built once and shared by every view.
+ * @returns {import('./models.js').Mesh}
+ */
+function sconceMesh() {
+  if (torchMesh) return torchMesh;
+  const m = createMesh();
+  const wz = TORCH_WALL_Z;
+  box(m, -6, -22, wz, 6, -8, wz + 2, 0);
+  for (const [rx, ry] of [[-4, -10], [4, -10], [-4, -20], [4, -20]]) box(m, rx - 1, ry - 1, wz + 2, rx + 1, ry + 1, wz + 3, 1);
+  tube(m, [[0, -13, wz + 1], [0, -13, 4], [0, -11.5, 8.5], [0, -7.5, 11.4], [0, -2, 12]], 1.7, 0, 8);
+  tube(m, [[0, -20, wz + 1], [0, -17, 3], [0, -12, 8]], 1.1, 0, 6);
+  const [cx, cy, cz] = TORCH_CUP;
+  lathe(m, [[2.5, cy - 8], [4, cy - 6], [6, cy - 3], [7.6, cy]], 0, { cx, cz, segs: 16, capBottom: true });
+  /** @type {[number, number, number][]} */
+  const rim = [];
+  for (let k = 0; k <= 16; k++) {
+    const a = (Math.PI * 2 * k) / 16;
+    rim.push([cx + 7.8 * Math.sin(a), cy, cz + 7.8 * Math.cos(a)]);
+  }
+  tube(m, rim, 0.9, 1, 6);
+  lathe(m, [[7, cy - 1.2], [0, cy - 0.6]], 2, { cx, cz, segs: 16 });
+  torchMesh = m;
+  return m;
+}
+
+/**
+ * Paint one frame of the flame and its stippled halo, rooted at `(cx, base)`. The flame stays 2D
+ * art over the modelled cup: fire has no surface to model, and a billboard flame is what the
+ * reference shows.
+ * @param {Uint8Array} buf
+ * @param {Uint8Array} stipple
  * @param {number} seed
  * @param {number} frame 0..3
- * @param {Uint8Array} stipple out-param: halo texels are marked 1
- * @returns {Uint8Array}
+ * @param {number} cx texel column of the flame's axis
+ * @param {number} base texel row of the flame's root
+ * @returns {void}
  */
-function paintTorch(seed, frame, stipple) {
-  const buf = new Uint8Array(AREA);
-  const cx = 32;
-
-  // ── Iron sconce ──
-  // Wall plate with rivets.
-  for (let y = 40; y < 54; y++) {
-    for (let x = 26; x < 38; x++) {
-      const t = x < 28 ? 0.72 : x > 35 ? 0.16 : y < 42 ? 0.6 : 0.42;
-      putClip(buf, x, y, rampPickChunky(RAMPS.iron, t, x, y));
-    }
-  }
-  putClip(buf, 28, 43, C.ironHilite);
-  putClip(buf, 35, 43, C.ironShadow);
-  putClip(buf, 28, 51, C.ironHilite);
-  putClip(buf, 35, 51, C.ironShadow);
-  // Shaft rising from the plate to the cup.
-  for (let y = 30; y < 44; y++) {
-    putClip(buf, cx - 2, y, C.ironLight);
-    putClip(buf, cx - 1, y, C.ironBase);
-    putClip(buf, cx, y, C.ironBase);
-    putClip(buf, cx + 1, y, C.ironDark);
-  }
-  // Cup: a flared bowl holding the pitch.
-  for (let y = 25; y < 32; y++) {
-    const halfW = 8 - (y - 25);
-    for (let x = cx - halfW; x <= cx + halfW; x++) {
-      const t = x < cx - halfW + 2 ? 0.8 : x > cx + halfW - 2 ? 0.1 : 0.45;
-      putClip(buf, x, y, rampPickChunky(RAMPS.iron, t, x, y));
-    }
-  }
-  // Glowing coals inside the cup.
-  for (let x = cx - 5; x <= cx + 5; x++) {
-    putClip(buf, x, 25, ((x + frame) & 3) === 0 ? C.fireHot : C.fireEmber);
-    putClip(buf, x, 26, ((x + frame) & 1) === 0 ? C.fireEmber : C.fireDeep);
-  }
-
-  // ── Flame ──
+function paintFlame(buf, stipple, seed, frame, cx, base) {
   // A teardrop that narrows to a tip, wobbling per frame. `t` runs 0 at the tip → 1 at the base.
-  const tip = 3 + (frame & 1);
-  const base = 26;
+  const tip = base - 23 + (frame & 1);
   for (let y = tip; y <= base; y++) {
     const t = (y - tip) / (base - tip);
-    const wob = (h01(y, frame * 7 + 1, seed) - 0.5) * 2;
+    const wob = (h01(y - base + 26, frame * 7 + 1, seed) - 0.5) * 2;
     const flameX = cx + wob * 2.6 * (1 - t) * (1 - t);
     // Widest around 70 % of the way down, then tucks back into the cup.
     const halfW = Math.sin(Math.pow(t, 0.72) * Math.PI * 0.86) * 8.4 + 0.6 + wob * 0.5;
@@ -910,12 +937,14 @@ function paintTorch(seed, frame, stipple) {
   }
 
   // ── Halo ── stippled warm glow so the light source reads even at distance.
-  for (let y = 0; y < 40; y++) {
-    for (let x = 12; x < 52; x++) {
+  const hy = base - 10;
+  const hx = Math.round(cx);
+  for (let y = Math.max(0, hy - 17); y < Math.min(SIZE, hy + 17); y++) {
+    for (let x = Math.max(0, hx - 15); x < Math.min(SIZE, hx + 16); x++) {
       const i = (y << 6) | x;
       if (buf[i] !== 0) continue;
       const dx = (x - cx) / 15;
-      const dy = (y - 16) / 17;
+      const dy = (y - hy) / 17;
       const d = dx * dx + dy * dy;
       if (d > 1) continue;
       const n = h01(x >> 1, (y >> 1) + frame * 13, seed ^ 0xf1a3);
@@ -924,7 +953,24 @@ function paintTorch(seed, frame, stipple) {
       stipple[i] = 1;
     }
   }
+}
 
+/**
+ * Paint the modelled iron sconce seen from one view across its wall, with a burning flame.
+ * @param {number} seed
+ * @param {number} frame 0..TORCH_FRAMES-1 flame frame
+ * @param {number} view 0..TORCH_VIEWS-1 across the wall
+ * @param {Uint8Array} stipple out-param: halo texels are marked 1
+ * @returns {Uint8Array}
+ */
+function paintTorch(seed, frame, view, stipple) {
+  const buf = new Uint8Array(AREA);
+  const yaw = TORCH_VIEWS > 1 ? -TORCH_YAW_MAX + (2 * TORCH_YAW_MAX * view) / (TORCH_VIEWS - 1) : 0;
+  const pitch = -0.14; // the sconce hangs above eye level: a glimpse of the cup's underside
+  renderMesh(sconceMesh(), TORCH_MATS, { yaw, pitch, originRow: TORCH_ORIGIN_ROW, light: [0, 0.9, 0.45] }, rampPickChunky, buf);
+  const [cx, cy, cz] = TORCH_CUP;
+  const at = projectPoint(cx, cy, cz, yaw, pitch, TORCH_ORIGIN_ROW);
+  paintFlame(buf, stipple, seed, frame, at.sx - 0.5, Math.round(at.sy));
   return buf;
 }
 
@@ -1038,66 +1084,84 @@ function paintGem(seed, frame) {
 }
 
 /**
- * Paint one frame of the amber oil flask. Frames differ only in the bubble position and the
- * highlight, which makes the bottle look alive without any motion of the silhouette.
- * @param {number} seed
- * @param {number} frame 0..3
+ * Yaw of the flask's single still view, radians: a 3/4 turn that shows the handle looping out on
+ * the right and the sealed label on the front-left. A still image rather than a turntable — the
+ * flask stands on the floor with its shadow baked in, so it must not spin or bob off it.
+ */
+export const OIL_YAW = Math.PI / 6;
+
+/** Texel row of the flask's model-space origin (its base, y = 0). */
+const OIL_ORIGIN_ROW = 49;
+
+/** @type {import('./models.js').Material[]} */
+const OIL_MATS = [
+  { ramp: RAMPS.oil, albedo: 0.66, spec: 0.7, shine: 26, trans: 0.3, ambient: 0.34 }, // 0 glass full of oil
+  { ramp: RAMPS.oil, albedo: 0.38, spec: 0.75, shine: 30, trans: 0.12, ambient: 0.3 }, // 1 glass above the oil
+  { ramp: RAMPS.wood, albedo: 0.95, spec: 0.1, ambient: 0.35 }, // 2 cork
+  { ramp: RAMPS.wood, albedo: 0.7, spec: 0.15, ambient: 0.3 }, // 3 twine and handle
+  { ramp: RAMPS.map, albedo: 0.9, ambient: 0.35 }, // 4 parchment label
+  { ramp: RAMPS.seal, albedo: 0.95, spec: 0.3, ambient: 0.35 }, // 5 wax seal
+];
+
+/** @type {import('./models.js').Mesh|null} */
+let oilMesh = null;
+
+/**
+ * The flask: a round-shouldered amber bottle filled to the shoulder, a corked neck bound with
+ * twine, a looped handle on one side and a sealed parchment label on another. The asymmetric
+ * parts are what make the still view read as a solid object rather than a flat bottle shape.
+ * @returns {import('./models.js').Mesh}
+ */
+function flaskMesh() {
+  if (oilMesh) return oilMesh;
+  const m = createMesh();
+  const FILL = 15;
+  lathe(m, [[0, 0], [8, 0], [10.5, 1.2], [12.2, 3.6], [13, 7.5], [12.7, 11.5], [11.8, FILL]], 0, { segs: 22 });
+  lathe(m, [[11.8, FILL], [10, 17.8], [7, 20.6], [4.6, 22.6], [4, 25], [4, 30], [5.2, 31], [5.2, 32.4], [3.6, 33.2]], 1, { segs: 22 });
+  lathe(m, [[3.3, 30], [3.5, 34], [3.1, 38.5]], 2, { segs: 12, capTop: true });
+  /** @type {[number, number, number][]} */
+  const ring = [];
+  for (let k = 0; k <= 14; k++) {
+    const a = (Math.PI * 2 * k) / 14;
+    ring.push([4.5 * Math.sin(a), 27, 4.5 * Math.cos(a)]);
+  }
+  tube(m, ring, 1, 3, 6);
+  tube(m, [[4.2, 28, 0], [9, 28.6, 0], [13, 26, 0], [14.6, 21, 0], [13.4, 15.5, 0], [12, 13, 0]], 1.4, 3, 6);
+  lathe(m, [[13.35, 4], [13.4, 7.5], [13.1, 11.2]], 4, { segs: 6, a0: -0.62 - Math.PI / 2, a1: 0.62 - Math.PI / 2 });
+  box(m, -14.4, 6, -1.6, -13.2, 9, 1.6, 5);
+  oilMesh = m;
+  return m;
+}
+
+/** Radius, texels, of the flask's solid contact shadow: the widest part of the body (13) plus a skirt. */
+const OIL_CONTACT = 14.5;
+
+/**
+ * Paint the modelled oil flask, shadowed: the handle, twine and cork shade the bottle, and the
+ * flask casts a shadow on the floor with a darker contact ring under its base.
+ * @param {Uint8Array} stipple out-param: half-shade shadow texels are marked 1
  * @returns {Uint8Array}
  */
-function paintOil(seed, frame) {
+function paintOil(stipple) {
   const buf = new Uint8Array(AREA);
-  const cx = 32;
-
-  // Body: a rounded flask, wider at the bottom.
-  for (let y = 26; y <= 50; y++) {
-    const t = (y - 26) / 24;
-    const w = Math.round(5 + Math.sin(t * Math.PI * 0.85) * 5 + t * 3);
-    for (let x = cx - w; x <= cx + w; x++) {
-      const r = (x - cx) / w;
-      // Glass: dark rim, bright body, a vertical specular band on the left.
-      let tone = 0.55 - Math.abs(r) * 0.42 + (0.5 - t) * 0.1;
-      if (r < -0.62) tone += 0.18;
-      if (r > 0.55) tone -= 0.14;
-      putClip(buf, x, y, rampPickChunky(RAMPS.oil, tone, x, y));
-    }
-    putClip(buf, cx - w - 1, y, C.oilDeep);
-    putClip(buf, cx + w + 1, y, C.oilDeep);
-  }
-  // Fill line: oil does not reach the shoulder.
-  for (let x = cx - 7; x <= cx + 7; x++) putClip(buf, x, 31, C.oilLight);
-
-  // Neck: a tall narrow throat so the silhouette reads as a bottle, not a pot.
-  for (let y = 15; y < 27; y++) {
-    const w = y > 24 ? 5 : y > 22 ? 4 : 3;
-    for (let x = cx - w; x <= cx + w; x++) {
-      const tone = x < cx - w + 2 ? 0.66 : x > cx + w - 2 ? 0.16 : 0.4;
-      putClip(buf, x, y, rampPickChunky(RAMPS.oil, tone, x, y));
-    }
-    putClip(buf, cx - w - 1, y, C.oilDeep);
-    putClip(buf, cx + w + 1, y, C.oilDeep);
-  }
-  // A collar ring where the neck meets the shoulder.
-  for (let x = cx - 5; x <= cx + 5; x++) putClip(buf, x, 16, C.oilLight);
-  // Cork: proud of the neck, lighter than the glass so it separates.
-  for (let y = 9; y < 16; y++) {
-    for (let x = cx - 4; x <= cx + 4; x++) {
-      const tone = x < cx - 2 ? 0.72 : x > cx + 2 ? 0.24 : 0.5;
-      putClip(buf, x, y, rampPickChunky(RAMPS.wood, tone, x, y));
-    }
-    putClip(buf, cx - 5, y, C.woodShadow);
-    putClip(buf, cx + 5, y, C.woodShadow);
-  }
-  for (let x = cx - 4; x <= cx + 4; x++) putClip(buf, x, 9, C.woodHilite);
-
-  // Rising bubble + moving specular.
-  const by = 46 - frame * 3;
-  putClip(buf, cx + 2, by, C.oilPale);
-  putClip(buf, cx + 3, by, C.oilLight);
-  putClip(buf, cx + 2, by + 1, C.oilLight);
-  for (let y = 34 + (frame & 1); y < 44; y += 2) {
-    putClip(buf, cx - 5, y, C.oilPale);
-    putClip(buf, cx - 4, y, C.oilLight);
-  }
+  const yaw = OIL_YAW;
+  // Seen from a little above: the player's eye is half a tile up and the flask stands on the floor.
+  // Lit from high up and to the left, so the cast shadow falls short and to the right and stays
+  // inside the 64-texel card.
+  renderMesh(
+    flaskMesh(),
+    OIL_MATS,
+    {
+      yaw,
+      pitch: 0.28,
+      originRow: OIL_ORIGIN_ROW,
+      light: [-0.5, 1, 0.45],
+      shadows: true,
+      ground: { index: C.void, contact: OIL_CONTACT, stipple },
+    },
+    rampPickChunky,
+    buf,
+  );
   return buf;
 }
 
@@ -1467,8 +1531,8 @@ export function createTextures(seed = 0xa11a2e) {
   const torchSeed = s('torch');
   /** @type {Texture[]} */
   const torch = [];
-  for (let f = 0; f < 4; f++) {
-    torch.push(finishStippled((st) => paintTorch(torchSeed, f, st), true));
+  for (let v = 0; v < TORCH_VIEWS; v++) {
+    for (let f = 0; f < TORCH_FRAMES; f++) torch.push(finishStippled((st) => paintTorch(torchSeed, f, v, st), true));
   }
 
   const portalSeed = s('portal');
@@ -1483,10 +1547,9 @@ export function createTextures(seed = 0xa11a2e) {
   const gem = [];
   for (let f = 0; f < 8; f++) gem.push(finish(paintGem(gemSeed, f), null, false));
 
-  const oilSeed = s('oil');
+  // One still frame (`OIL_YAW`), an array like every other field.
   /** @type {Texture[]} */
-  const oil = [];
-  for (let f = 0; f < 4; f++) oil.push(finish(paintOil(oilSeed, f), null, false));
+  const oil = [finishStippled(paintOil, false)];
 
   /** @type {Texture[]} */
   const sparkle = [];

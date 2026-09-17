@@ -53,7 +53,14 @@
 import { hash2, createRng } from '../core/rng.js';
 import { DIR_DX, DIR_DY, TILE } from '../maze/constants.js';
 import { C, LITTLE_ENDIAN, PALETTE_GLOW, PALETTE_RGB, PALETTE_SIZE, pack } from './palette.js';
-import { CHALK_VARIANTS, createTextures, MAP_FLOOR_ROW, SIZE as TEX } from './textures.js';
+import {
+  CHALK_VARIANTS,
+  createTextures,
+  MAP_FLOOR_ROW,
+  SIZE as TEX,
+  TORCH_FRAMES,
+  TORCH_YAW_MAX,
+} from './textures.js';
 import { createParticles, PARTICLE, PARTICLE_COLORS } from './particles.js';
 import { createSpriteIndex } from './sprite-index.js';
 
@@ -2212,6 +2219,22 @@ export function createRaycaster(canvas, options) {
           if (d2 > flameFar2 || !inFrustum(dx, dy)) continue;
           const phase = (t.x * 3 + t.y * 5) & 7;
           const frame = ((time * 11 + phase) | 0) & 3;
+          // The sconce is modelled (`models.js`): pick the view whose yaw matches where the eye
+          // stands across the wall — the signed angle from the wall normal to the ray back to the
+          // camera. A positive model yaw carries the cup (model +z, out of the wall) to screen-right,
+          // which is where it belongs when the wall is on the left of the view; the sign is pinned
+          // by the "turns to match the eye" test. A set with only one view (tests' blank art)
+          // keeps view 0.
+          const torchFrames = textures.torch;
+          const views = (torchFrames.length / TORCH_FRAMES) | 0;
+          let view = 0;
+          if (views > 1) {
+            const yaw = Math.atan2(ny * dx - nx * dy, -(nx * dx + ny * dy));
+            let u = ((yaw / TORCH_YAW_MAX + 1) * 0.5 * (views - 1) + 0.5) | 0;
+            if (u < 0) u = 0;
+            else if (u > views - 1) u = views - 1;
+            view = u;
+          }
           // Emissive: the flame is a light source, so only distance dims it — through a thinner fog
           // than surfaces see (`FLAME_FOG_SCALE`), so a sconce down a dark corridor stays a beacon.
           const flick = 0.88 + 0.12 * tnoise(time * 9 + phase, 0x2c1a);
@@ -2235,7 +2258,7 @@ export function createRaycaster(canvas, options) {
           addSprite(
             x,
             y,
-            textures.torch[frame],
+            torchFrames[view * TORCH_FRAMES + frame],
             TORCH_SPRITE_SCALE,
             -0.17,
             levelFx(flick * vis, 0, 1), // distance 0: `vis` already carries the flame's own fog
@@ -2320,9 +2343,11 @@ export function createRaycaster(canvas, options) {
           }
           const frames = isGem ? textures.gem : textures.oil;
           const phase = (it.id | 0) * 0.7;
-          // Gentle bob and a slow spin — enough life that a pickup catches the eye down a corridor.
-          const spin = ((time * (isGem ? 6 : 3) + phase) | 0) % frames.length;
-          const bobZ = Math.sin(time * 2.2 + phase) * 0.045;
+          // Gems bob and spin — enough life that a pickup catches the eye down a corridor. The
+          // flask is a still image standing on the floor with its shadow painted in (`OIL_YAW`), so
+          // it does neither: a bob would lift the shadow off the cobbles with it.
+          const spin = isGem ? ((time * 6 + phase) | 0) % frames.length : 0;
+          const bobZ = isGem ? Math.sin(time * 2.2 + phase) * 0.045 : 0;
           let lvl = levelFx(illumFlat(it.x, it.y, allLights, lightN) * (isGem ? 1.25 : 1.1), d, 1);
           // Oil Sense (§4.9): a flask in range is drawn through walls, and never darker than its ghost.
           const sensed = !isGem && d2 <= oilSense2;
@@ -2491,8 +2516,10 @@ export function createRaycaster(canvas, options) {
             const ty = gp >> 16;
             gp += stepFx;
             if (ty >= 0 && ty < TEX && ((x + y) & 1) === 0) {
-              const gi = ind[(ty << 6) | tx];
-              if (gi !== 0) buf[gpi] = colormap[(OIL_GHOST_LEVEL << 8) | gi];
+              const gti = (ty << 6) | tx;
+              const gi = ind[gti];
+              // A stippled texel (the flask's floor shadow) is not part of the ghost.
+              if (gi !== 0 && (stip === null || stip[gti] === 0)) buf[gpi] = colormap[(OIL_GHOST_LEVEL << 8) | gi];
             }
             gpi += w;
           }

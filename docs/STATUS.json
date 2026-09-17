@@ -1,8 +1,8 @@
 {
- "updated": "2026-09-17T13:09:43.654Z",
- "iteration": 20,
+ "updated": "2026-09-17T15:11:58.955Z",
+ "iteration": 21,
  "passThreshold": 8.5,
- "wave": "auto-no-uturns",
+ "wave": "modelled-sprites",
  "waves": {
   "0-scaffold": {
    "status": "done",
@@ -651,6 +651,10 @@
   "calm-auto": {
    "status": "done",
    "notes": "Playtest: auto mode read as frantic, and the toggle was buried in Options. Autopilot now steers with the title camera's ATTRACT numbers read directly (1.7 tiles/s cruise with cos-falloff and speed easing, eased capped turn rate, LOOKAHEAD aim, ARRIVE-early waypoints, sway); eased motion survives replans. Level 3 measured: turn reversals ~65 -> ~11/min, peak angular acceleration 124 -> <=12 rad/s^2, average speed 2.6 -> 1.2 tiles/s. Torch burn while the pilot drives scales by AUTO_DRAIN_SCALE = ATTRACT.SPEED / PLAYER.WALK_SPEED (tick action auto:true, set by main.js only on steps autoFrame drove); chosen by the user over keeping the normal burn (which died by depth 2-3). AUTO button: HUD bottom centre for a mouse (hud.hitAuto / setAutoButton, window capture listeners so the press never becomes pointer lock), touch-bar AUTO button (leftmost, outline when lit), pause-menu Auto Explore / Stop Auto Explore row (toggle + resume) for a captured mouse. shouldLockPointer is false while Auto Explore drives, so the cursor stays free and mouse drift does not steer. Gates: npm test 42/42 files (772 tests), autopilot.test.mjs gates the calm motion and the burn scale; headless Chrome: real click toggles on/off with no lock, drift keeps walking, world click does not lock, locked player -> pause -> Auto Explore -> playing unlocked and walking."
+  },
+  "modelled-sprites": {
+   "status": "done",
+   "notes": "Oil flask and wall sconce are low-poly 3D models rasterised into palette sprites at load (new src/renderer/models.js: lathe/box/tube meshes, orthographic z-buffer, Lambert+Blinn+glass transmission, 1-texel outline, self-shadow map, stippled-edge ground shadow). Sconce: TORCH_VIEWS 7 views x 4 flame frames fanned over +-TORCH_YAW_MAX 1.25 rad; the raycaster picks the view from the signed angle between the wall normal and the ray to the eye (one atan2 per visible torch), so the plate stays on the wall and the cup stands out over the corridor (sign pinned by the both-sides orientation test after a mirrored first version). Flask: per user, one still 3/4 view (OIL_YAW pi/6) with a solid-core, stipple-edged floor shadow; no spin, no bob (a bob would lift it off the painted shadow); Oil Sense ghost skips stippled shadow texels. Texture paint ~36 ms warm (was ~21). Gates: npm test 43/43 files (782 tests), validate-mazes --quick and full stress OK; orientation and stillness tests mutation-checked. Reviewed via before/after + fly-by video artifacts."
   }
  },
  "modules": {
@@ -991,6 +995,12 @@
    "updated": "2026-09-17T13:09:43.654Z",
    "wave": "auto-no-uturns",
    "summary": "Auto Explore no longer turns round mid-corridor: a frontier whose route starts behind the player costs AUTO.BACKTRACK_COST (8) extra path tiles. Before, a frontier uncovered a tile early made the replan pick a branch just passed at random (FRONTIER_TIE): 4.5 mid-corridor U-turns/min over 10 levels, 87/90 onto open ground -> 0.7/min, most of those detours back to a gem or flask just seen. Gated in autopilot.test.mjs; the level-1 gem check now judges gems picked vs gems revealed."
+  },
+  {
+   "iteration": 21,
+   "updated": "2026-09-17T15:11:58.955Z",
+   "wave": "modelled-sprites",
+   "summary": "3D-modelled wall sconce (7 view angles across its wall) and a still, shadowed 3D oil flask, rendered into palette sprites at load by the new models.js rasteriser; zero per-frame cost beyond one atan2 per visible torch."
   }
  ],
  "openIssues": [

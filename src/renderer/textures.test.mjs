@@ -18,7 +18,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { C, PALETTE, PALETTE_RGB, PALETTE_SIZE, RAMPS, isPaletteColor } from './palette.js';
-import { MAP_FLOOR_ROW, SIZE, createTextures } from './textures.js';
+import { MAP_FLOOR_ROW, SIZE, TORCH_FRAMES, TORCH_VIEWS, createTextures } from './textures.js';
 
 const AREA = SIZE * SIZE;
 
@@ -116,7 +116,8 @@ test('every texture has the documented shape', () => {
     }
   }
   assert.ok(set.wall.length >= 3, 'ARCHITECTURE §4.5 requires at least 3 wall variants');
-  assert.equal(set.torch.length, 4, 'four flame frames');
+  assert.equal(set.torch.length, TORCH_VIEWS * TORCH_FRAMES, 'four flame frames per modelled sconce view');
+  assert.equal(set.oil.length, 1, 'the flask is one still frame');
   assert.ok(set.portal.length >= 4, 'portal must be animated');
   assert.equal(set.size, SIZE);
   assert.equal(set.seed, 1234);
@@ -468,4 +469,37 @@ test('walls use the whole stone ramp (blocks, mortar and bevels are all present)
   }
   assert.ok(dark > AREA * 0.05, 'no mortar grooves');
   assert.ok(light > AREA * 0.05, 'no lit block faces');
+});
+
+test('the modelled sconce changes silhouette across its views, and its flame follows the cup', () => {
+  // Frame 0 of each view: the iron (non-fire) texels must differ view to view, or the "3D" fan
+  // would be one billboard repeated.
+  const fire = new Set(RAMPS.fire);
+  /** @param {number} v */
+  const iron = (v) => set.torch[v * TORCH_FRAMES].indices.map((c) => (c !== 0 && !fire.has(c) ? c : 0));
+  for (let v = 1; v < TORCH_VIEWS; v++) assert.notDeepEqual(iron(v), iron(v - 1), `sconce views ${v - 1} and ${v} match`);
+  // The outermost views are mirror images in silhouette: the cup sits to opposite sides of centre.
+  /** @param {number} v */
+  const fireCentre = (v) => {
+    const ix = set.torch[v * TORCH_FRAMES].indices;
+    let sx = 0;
+    let n = 0;
+    for (let p = 0; p < AREA; p++) if (fire.has(ix[p])) (sx += p & 63), n++;
+    return sx / n;
+  };
+  assert.ok(fireCentre(0) < 30 && fireCentre(TORCH_VIEWS - 1) > 34, `flame centres ${fireCentre(0)} / ${fireCentre(TORCH_VIEWS - 1)}`);
+});
+
+test('the flask casts a floor shadow: void texels, dithered only at the edge', () => {
+  for (const [f, t] of set.oil.entries()) {
+    let solid = 0;
+    let edge = 0;
+    for (let p = 0; p < AREA; p++) {
+      if (t.stipple !== null && t.stipple[p] === 1) {
+        assert.equal(t.indices[p], C.void, `oil[${f}] stipples a non-shadow texel at ${p}`);
+        edge++;
+      } else if (t.indices[p] === C.void) solid++;
+    }
+    assert.ok(solid > 20 && edge > 10, `oil[${f}] shadow: ${solid} solid, ${edge} dithered texels`);
+  }
 });

@@ -1460,3 +1460,97 @@ test('the sprite draw radius is where fog has already swallowed a billboard', ()
   visible.rc.render(makeView(maze, { ...base, items: ringItems(400, 80.5, 80.5, 18) }));
   assert.notDeepEqual(visible.read(), empty, 'items at 18 tiles must still be drawn');
 });
+
+// ── Modelled sconce orientation ─────────────────────────────────────────────────────────────────
+// The sconce is a fan of pre-rendered views (`models.js`). The view must match where the eye stands:
+// the cup sits out from the wall, so on screen it is always on the corridor side of the wall plate.
+// Measured by splitting the art into its fire (flame + halo) and its iron, and comparing where on
+// screen each part landed.
+
+/**
+ * Mean screen column the torch art painted, with only the texels `keep` accepts.
+ * @param {import('../core/types.js').Maze} maze
+ * @param {import('../core/types.js').Torch[]} torches
+ * @param {{x:number, y:number, angle:number}} player
+ * @param {(index:number) => boolean} keep
+ * @returns {number}
+ */
+function torchPartColumn(maze, torches, player, keep) {
+  const art = {
+    ...textures,
+    torch: textures.torch.map((t) => ({ ...t, indices: t.indices.map((c) => (keep(c) ? c : 0)) })),
+  };
+  const view = () => makeView(maze, { torches, player, exit: { x: 1, y: 1 }, time: 2, light: 0.9 });
+  const withArt = fakeCanvas();
+  const rc = createRaycaster(withArt.canvas, { textures: art });
+  rc.resize(960, 540, 1);
+  rc.render(view());
+  const bare = fakeCanvas();
+  const rcBare = createRaycaster(bare.canvas, { textures: noTorchArt });
+  rcBare.resize(960, 540, 1);
+  rcBare.render(view());
+  const a = withArt.read();
+  const b = bare.read();
+  const w = rc.internalSize.w;
+  const h = rc.internalSize.h;
+  let sum = 0;
+  let n = 0;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (a[y * w + x] !== b[y * w + x]) {
+        sum += x;
+        n++;
+      }
+    }
+  }
+  assert.ok(n > 30, `torch part should be on screen at ${JSON.stringify(player)} (${n} px)`);
+  return sum / n;
+}
+
+test('the modelled sconce turns to match the eye: its cup stands out from the wall on screen', () => {
+  const FIRE = new Set([C.fireDeep, C.fireEmber, C.fireMid, C.fireHot, C.fireCore]);
+  const torches = [{ x: 7, y: 2, face: /** @type {1} */ (1) }];
+  // From the west the wall (row 2, smaller y) is on screen-left, so the cup is right of the plate;
+  // from the east the wall is on screen-right and the cup is left of it.
+  const cases = [
+    { player: { x: 5.6, y: 3.6, angle: -0.3 }, cupRight: true },
+    { player: { x: 8.4, y: 3.6, angle: Math.PI + 0.3 }, cupRight: false },
+  ];
+  for (const { player, cupRight } of cases) {
+    const fire = torchPartColumn(strip(true), torches, player, (c) => FIRE.has(c));
+    const iron = torchPartColumn(strip(true), torches, player, (c) => c !== 0 && !FIRE.has(c));
+    assert.ok(
+      cupRight ? fire > iron + 2 : fire < iron - 2,
+      `from ${JSON.stringify(player)} the flame (col ${fire.toFixed(1)}) should be ${cupRight ? 'right' : 'left'} of the plate (col ${iron.toFixed(1)})`,
+    );
+  }
+});
+
+test('the oil flask is a still image: it neither spins nor bobs off its shadow', () => {
+  const maze = strip(false);
+  const items = [{ id: 3, kind: /** @type {const} */ ('oil'), x: 7.5, y: 3.5, taken: false }];
+  /** @param {number} time */
+  const frame = (time) => {
+    const view = makeView(maze, { items, player: { x: 7.5, y: 5.2, angle: -Math.PI / 2 }, time, light: 1 });
+    const noOil = { ...textures, oil: textures.oil.map((t) => ({ ...t, indices: new Uint8Array(t.indices.length) })) };
+    const shown = fakeCanvas();
+    const rc = createRaycaster(shown.canvas, { textures });
+    rc.resize(960, 540, 1);
+    rc.render(view);
+    const bare = fakeCanvas();
+    const rcBare = createRaycaster(bare.canvas, { textures: noOil });
+    rcBare.resize(960, 540, 1);
+    rcBare.render(view);
+    const a = shown.read();
+    const b = bare.read();
+    /** @type {number[]} */
+    const painted = [];
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) painted.push(i);
+    return painted;
+  };
+  const first = frame(0.2);
+  assert.ok(first.length > 400, 'the flask is on screen');
+  // Across a spin period and a bob phase the flask covers exactly the same pixels (their colours
+  // may breathe with the player's torch flicker).
+  for (const t of [0.9, 1.7, 3.1]) assert.deepEqual(frame(t), first, `the flask moved at t=${t}`);
+});
