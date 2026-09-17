@@ -593,7 +593,9 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
 - `textures.js` — `createTextures(seed) → TextureSet` procedurally paints 64×64 pixel-art
   textures (indices + packed pixels + a stipple mask): `wall[4]` (plain, cracked, mossy, vined),
   `floor[3]` (two cobbles + iron grate), `ceiling[2]` (planks, planks + beam), `portal[8]`,
-  `torch[4]`, `gem[8]`, `oil[4]`, `map[1]` (the scroll; `MAP_FLOOR_ROW` export rests it on the floor), `sparkle[4]`. **Every field is an array** — consumers index them,
+  `torch[4]` (cup, rod and flame — rotationally symmetric, so they may billboard), `sconce[1]` (the
+  iron wall plate as a wall-resolution decal, 0 = clear: the wall pass draws it on every torch's
+  mounting face so it foreshortens with the stone instead of turning with the camera), `gem[8]`, `oil[4]`, `map[1]` (the scroll; `MAP_FLOOR_ROW` export rests it on the floor), `sparkle[4]`. **Every field is an array** — consumers index them,
   and the raycaster picks a per-tile variant by hash. Deterministic and Node-safe (no DOM) so it
   can be unit tested; ~20 ms for a full set.
 - `sprite-index.js` — `createSpriteIndex(cell = INDEX_CELL) → SpriteIndex` with
@@ -605,7 +607,9 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   imports nothing.
 - `raycaster.js` — `createRaycaster(canvas, {textures?, seed?}) → { resize(cssW, cssH, dpr), render(view:RenderView), stats():RenderStats, internalSize:{w,h}, particles, textures, setTextures(set), depth(), lights(), dispose() }`.
   Canvas 2D `ImageData` + `Uint32Array` framebuffer at **low internal resolution** (height 240,
-  width from aspect, clamped 320…560 and made even), upscaled with CSS `image-rendering: pixelated`.
+  width from aspect, clamped 320…560 and made even; narrower than 4:3 the width holds at 320 and
+  the height grows to at most 400 rows, projection scale still 240, so the horizontal FOV never
+  shrinks), upscaled with CSS `image-rendering: pixelated`.
   DDA wall casting with textured walls, one perspective row-walk serving floor **and** ceiling,
   per-column z-buffer, sorted billboard sprites (items, portal, torch flames) with z-test,
   **dynamic lighting**: player torch radius = `lerp(2.5, 7, view.light)` with two octaves of
@@ -904,7 +908,7 @@ opens over ~0.4 s when a level starts — the §1 iris wipe.
 the post effects frame the **world** and never darken the HUD or the menus. `#view` and `#post` are
 sized in JS to the largest box that preserves the framebuffer's aspect, snapped to a whole pixel
 multiple when that costs < 3 % (exact 3× at 720p), and centred — at 42 % of the height on a
-portrait phone, where the 4:3 framebuffer must letterbox and the deeper deck below the world holds
+portrait phone (viewport taller than 1.25× its width), where the 4:3 framebuffer letterboxes and the deeper deck below the world holds
 the minimap and the thumb on the virtual stick. `#overlay` and `#touch` are inset by
 the safe-area insets instead, so a notch never sits on the fuel gauge. After sizing, `layout()` hands the band to the shared overlay surface with
 `hud.surface.setViewRect(...)` (overlay-relative CSS px) before `hud.resize`/`menus.resize`, so the UI
@@ -1137,9 +1141,10 @@ the scroll-sense pulse and the lodestone needle; main.js raises notices for `emb
   spatial index (§4.5), and the map maintains an incremental raster (§4.6). This is the single
   invariant the massive-maze change rests on; a new feature that scans a level array per frame
   regresses it invisibly on level 1 and visibly at the cap.
-- **The world letterboxes rather than stretching.** The framebuffer is 240 rows with the width
-  clamped to 320…560 (§4.5), so it can be anywhere from 4:3 to 21:9 but never taller than 4:3. A
-  portrait phone therefore shows a 4:3 band with a control deck below it, and a 21:9 monitor shows
+- **The world letterboxes rather than stretching.** The framebuffer is 240 rows at 4:3 and wider, the width
+  clamped to 320…560 and the height to 240…400 (§4.5), so it can be anywhere from 4:5 to 21:9: a
+  foldable's near-square inner screen fills edge to edge. A portrait phone (taller than 5:4 in CSS
+  px) is deliberately handed a 4:3 buffer and shows a 4:3 band with a control deck below it, and a 21:9 monitor shows
   the world with hairline bars. Cropping to fill instead would cut the horizontal FOV to a slit.
 - **The loading screen has a floor, not a spinner** (`MIN_LOAD_S`, §4.7). Generation got *faster*
   relative to the level's size, not slower: a 128×128 build lands in ~25–60 ms, which is three

@@ -59,12 +59,23 @@ import { createSpriteIndex } from './sprite-index.js';
 
 // ─── Tunables ──────────────────────────────────────────────────────────────────────────────────
 
-/** Internal framebuffer height in pixels. Fixed: it *is* the art's pixel size. */
+/**
+ * Projection scale in rows per world unit at distance 1, and the framebuffer height at 4:3 or
+ * wider. Fixed: it *is* the art's pixel size.
+ */
 const INTERNAL_H = 240;
 
 /** Internal width bounds. Narrower than 320 crops the view; wider than 560 costs fill rate. */
 const MIN_W = 320;
 const MAX_W = 560;
+
+/**
+ * Tallest framebuffer, for a view narrower than 4:3 (a foldable's inner screen, a square window).
+ * There the width holds at `MIN_W` and the buffer grows *rows* instead: the projection scale stays
+ * `INTERNAL_H`, so the horizontal FOV and the pixel size are unchanged and the extra rows just show
+ * more floor and ceiling. 320×400 (4:5) is still fewer pixels than the 560×240 maximum.
+ */
+const MAX_H = 400;
 
 /** Shade levels in the colormap. 64 + ordered dither is indistinguishable from continuous. */
 const LEVELS = 64;
@@ -967,6 +978,7 @@ export function createRaycaster(canvas, options) {
     planeY: 1,
     invDet: 1,
     horizon: 0,
+    proj: INTERNAL_H,
     colormap,
     fogLut,
     fogScale: FOG_SCALE,
@@ -1000,6 +1012,12 @@ export function createRaycaster(canvas, options) {
   let chalkApplied = 0;
   /** Seed per chalked face, so the lettering variant is the mark's own (index = tile·4 + face). */
   let chalkSeed = new Int32Array(0);
+  /**
+   * Faces per tile that carry a wall torch: bit `1 << face`, as `chalkMask`. The wall pass draws the
+   * sconce's iron plate (`textures.sconce`) on them, so the plate foreshortens with the wall rather
+   * than turning with the billboard. Rebuilt with the spatial indexes, once per level.
+   */
+  let sconceMask = new Uint8Array(0);
   /** 1 = floor tile inside a dead-end branch within the whisper depth. */
   let whisperMask = new Uint8Array(0);
   /** @type {object|null} */
@@ -1057,11 +1075,16 @@ export function createRaycaster(canvas, options) {
     if (w < MIN_W) w = MIN_W;
     else if (w > MAX_W) w = MAX_W;
     w &= ~1; // even width keeps the centre of the screen at cameraX === 0 exactly
+    // Narrower than 4:3: keep the width and add rows (see `MAX_H`). Even, so the horizon stays centred.
+    let h = w === MIN_W ? Math.round(MIN_W / aspect) : INTERNAL_H;
+    if (h < INTERNAL_H) h = INTERNAL_H;
+    else if (h > MAX_H) h = MAX_H;
+    h &= ~1;
     statsObj.dpr = dpr;
-    if (w === width && INTERNAL_H === height && image) return;
+    if (w === width && h === height && image) return;
 
     width = w;
-    height = INTERNAL_H;
+    height = h;
     internalSize.w = width;
     internalSize.h = height;
     statsObj.w = width;
@@ -1110,6 +1133,16 @@ export function createRaycaster(canvas, options) {
     idxTorchCount = torches.length;
     itemIndex.build(items.length, readItemX, readItemY, maze.width, maze.height);
     torchIndex.build(torches.length, readTorchX, readTorchY, maze.width, maze.height);
+    const tileCount = maze.width * maze.height;
+    if (sconceMask.length < tileCount) sconceMask = new Uint8Array(tileCount);
+    else sconceMask.fill(0, 0, tileCount);
+    for (let i = 0; i < torches.length; i++) {
+      const t = torches[i];
+      const tx = t.x | 0;
+      const ty = t.y | 0;
+      if (tx < 0 || ty < 0 || tx >= maze.width || ty >= maze.height) continue;
+      sconceMask[ty * maze.width + tx] |= 1 << ((t.face | 0) & 3);
+    }
     // Visibility windows belong to a level: forget every bake, and grow the store only past its
     // high-water mark (a level-change cost, like the index build above).
     if (torchVisReady.length < torches.length) {
@@ -1764,19 +1797,26 @@ export function createRaycaster(canvas, options) {
       wallX -= Math.floor(wallX);
       // Chalk (§4.9): which face was hit, and where along it in the viewer's own left-to-right —
       // taken before the per-tile mirroring below, so the word never reads backwards.
+      // A torch's face gets its iron plate the same way, lit and tinted like the stone under it.
       let decal = null;
+      let plate = null;
       let decalX = 0;
       const tileAt = mapY * mw + mapX;
       const chalkBits = chalkMaze === maze ? chalkMask[tileAt] : 0;
-      if (chalkBits !== 0) {
+      const sconceBits = idxMaze === maze ? sconceMask[tileAt] : 0;
+      if ((chalkBits | sconceBits) !== 0) {
         const faceHit = side === 0 ? (stepX > 0 ? 2 : 0) : stepY > 0 ? 3 : 1;
+        const alongRight = side === 0 ? stepX > 0 : stepY < 0;
+        decalX = (((alongRight ? wallX : 1 - wallX) * TEX) | 0) & (TEX - 1);
         if ((chalkBits & (1 << faceHit)) !== 0) {
           const set = textures.chalk;
           if (set && set.length > 0) {
-            const alongRight = side === 0 ? stepX > 0 : stepY < 0;
-            decalX = (((alongRight ? wallX : 1 - wallX) * TEX) | 0) & (TEX - 1);
             decal = set[((chalkSeed[tileAt * 4 + faceHit] >>> 0) % CHALK_VARIANTS) % set.length].indices;
           }
+        }
+        if ((sconceBits & (1 << faceHit)) !== 0) {
+          const set = textures.sconce;
+          if (set && set.length > 0) plate = set[0].indices;
         }
       }
       let texX = (wallX * TEX) | 0;
@@ -1822,7 +1862,7 @@ export function createRaycaster(canvas, options) {
       // run unbroken along a wall — and round its corners — the way the reference's masonry does;
       // the rails are broken up by per-block bevel strength and tone in the painting instead.
 
-      const lineH = h / dist;
+      const lineH = INTERNAL_H / dist;
       const topF = horizon - lineH * 0.5;
       let y0 = topF < 0 ? 0 : topF | 0;
       let y1 = (horizon + lineH * 0.5) | 0;
@@ -1853,24 +1893,30 @@ export function createRaycaster(canvas, options) {
         let cur = lvl - (run === 0 ? horizon - from : from - horizon) * rampStep;
         const curStep = run === 0 ? rampStep : -rampStep;
         let pi = from * w + x;
-        if (decal !== null) {
-          // A chalked face: the wall texel, or the chalk over it lifted a few levels. Rare (a
-          // handful of columns on the frames a mark is in view), so it gets its own loop and the two
-          // loops below stay exactly as fast as before.
+        if (decal !== null || plate !== null) {
+          // A chalked or sconce-bearing face: the wall texel, the plate over it, or the chalk over
+          // both lifted a few levels. Rare (a handful of columns on the frames one is in view), so it
+          // gets its own loop and the two loops below stay exactly as fast as before.
           for (let y = from; y < to; y++) {
             const ty = (texPos >> 16) & (TEX - 1);
             texPos += stepFx;
             const bk = ((y & 3) << 2) | bayerCol;
-            const chalkIdx = decal[(ty << 6) | decalX];
+            const di = (ty << 6) | decalX;
+            const chalkIdx = decal !== null ? decal[di] : 0;
             let level = (cur + (chalkIdx !== 0 ? CHALK_LIFT_FX : 0) + BAYER16[bk]) >> 16;
             if (level < 0) level = 0;
             else if (level > LEVEL_MAX) level = LEVEL_MAX;
+            const plateIdx = plate !== null ? plate[di] : 0;
             // Chalk takes no firelight tint: under the torch's warm core a tinted white read as
             // orange flame, and the mark has to read as chalk at a glance.
             buf[pi] =
               chalkIdx !== 0
                 ? colormap[(level << 8) | chalkIdx]
-                : colormap[(((warmFx + BAYER_W[bk]) >> 16) << WARM_SHIFT) | (level << 8) | tIdx[(ty << 6) | texX]];
+                : colormap[
+                    (((warmFx + BAYER_W[bk]) >> 16) << WARM_SHIFT) |
+                      (level << 8) |
+                      (plateIdx !== 0 ? plateIdx : tIdx[(ty << 6) | texX])
+                  ];
             cur += curStep;
             pi += w;
           }
@@ -1920,7 +1966,7 @@ export function createRaycaster(canvas, options) {
   function renderFlats(maze) {
     const w = width;
     const h = height;
-    const posZ = 0.5 * h;
+    const posZ = 0.5 * INTERNAL_H;
     const ray0X = dirX - planeX;
     const ray0Y = dirY - planeY;
     const ray1X = dirX + planeX;
@@ -1934,7 +1980,7 @@ export function createRaycaster(canvas, options) {
     const mh = maze.height;
     const maxD = (horizon > h - horizon ? horizon : h - horizon) | 0;
     // Rows this far from the horizon are within ~1.5 tiles of the eye (see `BAYER_NEAR`).
-    const nearD = (maxD * 0.7) | 0;
+    const nearD = ((maxD * 0.7 * INTERNAL_H) / h) | 0;
 
     for (let d = 0; d < maxD; d++) {
       const yF = horizon + d;
@@ -2412,10 +2458,10 @@ export function createRaycaster(canvas, options) {
       const tX = invDet * (dirY * rx - dirX * ry);
 
       const scale = sprScale[i];
-      const size = Math.abs((h / tY) * scale);
+      const size = Math.abs((INTERNAL_H / tY) * scale);
       if (size < 1) continue;
       const screenX = halfW * (1 + tX / tY);
-      const vMove = (sprVOff[i] / tY) * h;
+      const vMove = (sprVOff[i] / tY) * INTERNAL_H;
       const topF = horizon - size * 0.5 + vMove;
       const leftF = screenX - size * 0.5;
 
@@ -2626,8 +2672,9 @@ export function createRaycaster(canvas, options) {
     dirX = Math.cos(angle);
     dirY = Math.sin(angle);
     // Plane length = half the view width at unit distance. Tying it to the aspect ratio keeps
-    // pixels square at every window shape (vertical FOV is fixed at 2·atan(0.5) ≈ 53°).
-    planeLen = (0.5 * width) / height;
+    // pixels square at every window shape (vertical FOV is 2·atan(0.5) ≈ 53° at 4:3 and wider; a
+    // taller buffer widens it instead of narrowing the horizontal FOV — see `MAX_H`).
+    planeLen = (0.5 * width) / INTERNAL_H;
     planeX = -dirY * planeLen;
     planeY = dirX * planeLen;
 

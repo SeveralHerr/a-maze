@@ -277,7 +277,7 @@ function previewScene(pose) {
   };
 }
 
-test('internal resolution is 240 rows, even, and clamped to 320…560 columns', () => {
+test('internal resolution is 240 rows (up to 400 below 4:3), even, and clamped to 320…560 columns', () => {
   const { rc } = makeRenderer();
   assert.equal(rc.internalSize.h, 240);
   assert.equal(rc.internalSize.w, 426, '16:9 → 240 × 16/9 = 426.67, rounded down to an even 426');
@@ -286,6 +286,12 @@ test('internal resolution is 240 rows, even, and clamped to 320…560 columns', 
   assert.equal(rc.internalSize.w, 560, 'clamped to MAX_W');
   rc.resize(100, 1000, 1); // taller than wide
   assert.equal(rc.internalSize.w, 320, 'clamped to MIN_W');
+  assert.equal(rc.internalSize.h, 400, 'grows rows up to MAX_H instead of narrowing further');
+  rc.resize(1000, 1000, 1); // square, like a foldable's inner screen
+  assert.equal(rc.internalSize.w, 320);
+  assert.equal(rc.internalSize.h, 320, 'a square view fills with a square buffer');
+  rc.resize(1600, 900, 1);
+  assert.equal(rc.internalSize.h, 240, '4:3 and wider keep exactly 240 rows');
   rc.resize(0, 0, 1); // degenerate: fall back to 16:9 rather than divide by zero
   assert.ok(rc.internalSize.w >= 320 && rc.internalSize.w <= 560);
   assert.equal(rc.internalSize.w % 2, 0, 'width stays even so the centre column is cameraX = 0');

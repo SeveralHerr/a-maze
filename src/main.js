@@ -866,7 +866,12 @@ function boot() {
     const cssH = Math.max(1, globalThis.innerHeight || doc.documentElement.clientHeight || 540);
     const dpr = clamp(globalThis.devicePixelRatio || 1, 0.5, 4);
 
-    raycaster.resize(cssW, cssH, dpr);
+    // The framebuffer can grow taller than 4:3 (§4.5: 320 columns, up to 400 rows), which fills a
+    // foldable's near-square inner screen. A phone in portrait is far past that, so it keeps the 4:3
+    // band on purpose: the strip above it takes the HUD's top row, and the deeper deck below takes
+    // the minimap and the thumb that drives the virtual stick — a handheld cabinet, not a broken video.
+    const portrait = cssH > cssW * 1.25;
+    raycaster.resize(cssW, portrait ? cssW * 0.75 : cssH, dpr);
     const iw = raycaster.internalSize.w || 426;
     const ih = raycaster.internalSize.h || 240;
 
@@ -876,12 +881,7 @@ function boot() {
     const boxW = Math.round((iw * scale) / dpr);
     const boxH = Math.round((ih * scale) / dpr);
 
-    // The framebuffer can never be taller than 4:3 (§4.5 pins 240 rows and clamps the width to
-    // 320…560), so a phone in portrait always letterboxes. Rather than centring the band and
-    // leaving two dead bars, it is pushed up to 42 % of the height: the strip above it takes the
-    // HUD's top row, and the deeper deck below takes the minimap and the thumb that
-    // drives the virtual stick. The result reads as a handheld cabinet instead of a broken video.
-    const portrait = cssH > cssW * 1.15;
+    // Rather than centring the portrait band and leaving two dead bars, it is pushed up to 42 %.
     for (const el of /** @type {HTMLElement[]} */ ([view, postRoot])) {
       if (!el) continue;
       el.style.width = `${boxW}px`;

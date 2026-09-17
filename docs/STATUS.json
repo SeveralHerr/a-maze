@@ -1,6 +1,6 @@
 {
- "updated": "2026-09-17T01:36:08.524Z",
- "iteration": 13,
+ "updated": "2026-09-17T02:22:46.168Z",
+ "iteration": 14,
  "passThreshold": 8.5,
  "wave": "tilesets",
  "waves": {
@@ -909,12 +909,24 @@
     "state": 8
    },
    "stressPass": true
-   },
-   {
+  },
+  {
    "iteration": 12,
    "updated": "2026-09-16T23:14:53.339Z",
    "wave": "maze-shortcuts-denser",
    "summary": "Playtest asked for a bunch more shortcuts (screenshot of a 32x32 level with ~20 extra spots marked). The old tuning requested 21 on 32x32 but only ~13 landed: the 0.9 route guard rejected the rest, and at detour 24/16 candidates ran out. Retuned LEVEL.SHORTCUT_CELLS 48->24, SHORTCUT_DETOUR 24->12, SHORTCUT_ROUTE_KEEP 0.9->0.85 (generator defaults match). Placed per level (10 seeds): 16x16 2->7, 24x24 8->20, 32x32 13->33, 64x64 66->164, 128x128 325->683. feasibility.test.mjs: 250/250 runs won, lowest tank L1/2 0.697 vs L10-12 0.534 (was 0.70 vs 0.57), so the tension curve holds."
+  },
+  {
+   "iteration": 13,
+   "updated": "2026-09-17T02:22:06.554Z",
+   "wave": "sconce-plate-decal",
+   "summary": "Playtest (phone screenshot): the torch base looked odd because it turned with the camera. The iron wall plate was painted into the torch billboard. Split it: textures.torch keeps only cup, rod and flame (rotationally symmetric, so billboarding is fine); new textures.sconce[1] is the plate at wall texel density, drawn by the wall pass on every torch mounting face via a per-tile face mask built with the spatial indexes (once per level, no per-frame scan), lit and tinted like the stone. ARCHITECTURE.md textures.js line updated. textures.test.mjs gains a regression test (no iron outside the rod below the halo; plate meets the rod foot). Verified in preview.html: grazing view the plate foreshortens with the wall, head-on it sits centred under the rod. npm test 40/40."
+  },
+  {
+   "iteration": 14,
+   "updated": "2026-09-17T02:22:46.168Z",
+   "wave": "foldable-fill",
+   "summary": "Playtest (fold phone inner screen): the world letterboxed with black bars above and below because the framebuffer was capped at 4:3 (width clamped 320..560, 240 rows). Narrower than 4:3 the buffer now keeps 320 columns and grows rows up to MAX_H=400 (4:5); the projection scale stays INTERNAL_H=240 (walls, flats, sprites, particles via partCam.proj) so horizontal FOV and pixel size are unchanged and the extra rows show more floor/ceiling. main.js hands portrait phones (cssH > 1.25*cssW, was 1.15) a 4:3 aspect so the cabinet layout is untouched. ARCHITECTURE §4.5/§4.7/decisions updated; raycaster resize test extended. npm test 40/40; headless shots: 945x980 fills (320x332 buffer), 390x844 unchanged 4:3 band, 1280x720 unchanged 426x240."
   }
  ],
  "openIssues": [

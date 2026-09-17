@@ -58,6 +58,7 @@ const EMBER_LIFT = 0.55;
  * @property {number} planeY
  * @property {number} invDet        1 / (planeX*dirY - dirX*planeY), precomputed once per frame
  * @property {number} horizon       screen row of the eye level, in pixels
+ * @property {number} [proj]        rows per world unit at distance 1; the framebuffer height when omitted
  * @property {Uint32Array} colormap shade table, `(level << 8) | paletteIndex`
  * @property {Float32Array} fogLut  distance → 0..1 visibility
  * @property {number} fogScale      multiply a distance in tiles by this to index `fogLut`
@@ -244,6 +245,7 @@ export function createParticles(capacity = 384) {
   function draw(buf, w, h, zbuf, cam) {
     let drawn = 0;
     const halfW = w * 0.5;
+    const proj = cam.proj > 0 ? cam.proj : h;
     for (let i = 0; i < count; i++) {
       const sx = px[i] - cam.px;
       const sy = py[i] - cam.py;
@@ -254,7 +256,7 @@ export function createParticles(capacity = 384) {
       const scrX = (halfW * (1 + tX / tY)) | 0;
       if (scrX < 0 || scrX >= w) continue;
       if (tY >= zbuf[scrX]) continue; // occluded by a wall
-      const scrY = (cam.horizon + ((0.5 - pz[i]) / tY) * h) | 0;
+      const scrY = (cam.horizon + ((0.5 - pz[i]) / tY) * proj) | 0;
       if (scrY < 0 || scrY >= h) continue;
 
       const fade = life[i] / life0[i]; // 1 → 0 across the lifetime
