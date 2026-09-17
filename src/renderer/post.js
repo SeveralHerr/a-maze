@@ -160,13 +160,15 @@ export function createPost(rootEl) {
     }
     const whole = pitch === Math.round(pitch);
     const band = Math.round(pitch);
-    // One dark line per internal row: a single CSS pixel up to a 6 px pitch, two beyond.
-    const thick = band >= 6 ? 2 : 1;
-    // Strength scales with the pitch. At a wide pitch the dark line is one row in six and reads as
-    // CRT character; at the shipped 3 px pitch (1280×720 over a 240-row buffer) it is one row in
-    // THREE, and at 0.42 that cost ~14 % of the mean luminance plus hard banding straight across
-    // every wall face — measurably more wall detail than the effect was buying.
-    const lineDark = band >= 6 ? 0.42 : band >= 5 ? 0.34 : band >= 4 ? 0.28 : 0.22;
+    // One dark line per internal row: a single CSS pixel at a 3 px pitch (two would leave only a
+    // one-pixel gap), two from a 4 px pitch, three from 7 px.
+    const thick = band >= 7 ? 3 : band >= 4 ? 2 : 1;
+    // Strength scales with the pitch. At a wide pitch the dark line reads as CRT character; at the
+    // shipped 3 px pitch (1280×720 over a 240-row buffer) it is one row in THREE, and at 0.42 that
+    // cost ~14 % of the mean luminance plus hard banding straight across every wall face —
+    // measurably more wall detail than the effect was buying. The two-pixel lines at 4–5 px carry a
+    // lighter alpha so their mean darkening (~10 %) sits between the 3 px and 6 px pitches.
+    const lineDark = band >= 6 ? 0.42 : band >= 5 ? 0.26 : band >= 4 ? 0.2 : 0.22;
     // A fractional pitch keeps the mean darkening (`alpha × thick / pitch`) of its nearest whole
     // pitch, so 4.5 px rows read neither lighter nor darker than 4 or 5 px ones.
     const dark = whole ? lineDark : Math.round(((lineDark * pitch) / band) * 1000) / 1000;

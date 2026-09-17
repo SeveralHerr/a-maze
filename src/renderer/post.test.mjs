@@ -182,11 +182,11 @@ test('a fractional row pitch is drawn at its true period instead of beating agai
   const g = scan.style.backgroundImage;
   const stops = [...g.matchAll(/([\d.]+)px/g)].map((m) => Number(m[1]));
   assert.equal(stops[stops.length - 1], 4.5, `the period must be exactly one row (4.5px), got ${g}`);
-  assert.equal(stops[1], 1, 'one CSS pixel of line per row, as at a whole pitch');
+  assert.equal(stops[1], 2, 'two CSS pixels of line per row, as at the nearest whole pitch');
   // The mean darkening matches what the nearest whole pitch would have drawn, within a hair.
   const alpha = Number(/rgba\(0,0,0,([\d.]+)\)/.exec(g)?.[1]);
   const mean = (alpha * stops[1]) / 4.5;
-  assert.ok(Math.abs(mean - 0.34 / 5) < 0.004, `mean darkening ${mean.toFixed(4)} drifted from the 5 px pitch's`);
+  assert.ok(Math.abs(mean - (0.26 * 2) / 5) < 0.004, `mean darkening ${mean.toFixed(4)} drifted from the 5 px pitch's`);
 
   // 1280×720 is exactly 3 px per row: whole-pixel stops, as before.
   post.resize(1280, 720, 240);
@@ -210,27 +210,32 @@ test('the scanline gap is transparent — a white lift under multiply would do n
 
 test('a tight scanline pitch draws a gentler line than a wide one', () => {
   // At 3 CSS px per row one row in three is darkened; at the old fixed 0.42 that cost ~14 % of the
-  // mean luminance and banded every wall face. The line's strength must fall with the pitch.
+  // mean luminance and banded every wall face. The mean darkening must fall with the pitch.
   const { root } = makeDom();
   const post = createPost(root);
   const scan = root.children[0];
   post.set({ scanlines: true });
-  /** @returns {number} alpha of the dark scanline stop */
-  const darkAlpha = () => {
-    const m = /rgba\(0,0,0,([\d.]+)\)/.exec(scan.style.backgroundImage);
-    assert.ok(m, `no dark stop in ${scan.style.backgroundImage}`);
-    return Number(m[1]);
+  /** @returns {{alpha:number, mean:number}} dark stop alpha and alpha × thickness / pitch */
+  const dark = () => {
+    const g = scan.style.backgroundImage;
+    const m = /rgba\(0,0,0,([\d.]+)\) 0px, rgba\(0,0,0,[\d.]+\) (\d+)px.* ([\d.]+)px\)$/.exec(g);
+    assert.ok(m, `no dark stop in ${g}`);
+    const alpha = Number(m[1]);
+    return { alpha, mean: (alpha * Number(m[2])) / Number(m[3]) };
   };
   post.resize(1280, 720, 240); // pitch 3
-  const tight = darkAlpha();
+  const tight = dark();
   post.resize(1600, 960, 240); // pitch 4
-  const mid = darkAlpha();
+  const mid = dark();
   post.resize(1920, 1440, 240); // pitch 6
-  const wide = darkAlpha();
-  assert.ok(tight < mid && mid < wide, `line alpha must grow with pitch: ${tight}, ${mid}, ${wide}`);
-  assert.ok(tight <= 0.25, `the shipped 3 px pitch must stay gentle (got ${tight})`);
+  const wide = dark();
+  assert.ok(
+    tight.mean < mid.mean && mid.mean < wide.mean,
+    `mean darkening must grow with pitch: ${tight.mean}, ${mid.mean}, ${wide.mean}`,
+  );
+  assert.ok(tight.alpha <= 0.25, `the shipped 3 px pitch must stay gentle (got ${tight.alpha})`);
   // Mean darkening at pitch 3 (one dark row in three) stays under ~8 %.
-  assert.ok(tight / 3 < 0.08);
+  assert.ok(tight.mean < 0.08);
 });
 
 test('the iris closes to a hole and hides itself when fully open', () => {
