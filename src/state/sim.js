@@ -107,6 +107,8 @@ const BASE_PERKS = Object.freeze(computePerks(null));
  * @property {number} turn    keyboard/stick turn −1..1 (right +)
  * @property {number} lookDX  mouse/touch yaw delta in radians for this step
  * @property {boolean} [chalk] the `chalk` action was pressed this step (ARCHITECTURE.md §4.9)
+ * @property {boolean} [auto]  Auto Explore wrote this step's axes (§4.10): the torch burns at
+ *   `AUTO_DRAIN_SCALE` — its calm pace over the walking pace — so oil per tile matches normal play
  */
 
 /**
@@ -195,6 +197,13 @@ const _candW = new Int32Array(4);
  * the bucket box within 3×3 whatever `px/py` hold.
  */
 const MAX_SWEEP = 1.5;
+
+/**
+ * Torch burn multiplier while Auto Explore drives (§4.10): its cruise (the title camera's
+ * `ATTRACT.SPEED`) over the one walking speed, so a tile costs the same oil at either pace. Derived,
+ * not typed, so retuning either speed keeps the flask chain honest.
+ */
+export const AUTO_DRAIN_SCALE = ATTRACT.SPEED / PLAYER.WALK_SPEED;
 
 /** Bit returned by `moveCircle` when the x axis was blocked. */
 const BLOCKED_X = 1;
@@ -1328,7 +1337,9 @@ export function stepPlayingBody(state, input) {
   if (input.chalk === true) chalkWall(state);
 
   // ── Fuel ─────────────────────────────────────────────────────────────────────────────────
-  run.fuel -= dt * FUEL.DRAIN * sim.drain;
+  // Auto Explore walks at the title camera's pace, about half the walking speed; a torch burning at
+  // the full rate would make every tile cost twice the oil the level's flask chain is built for.
+  run.fuel -= dt * FUEL.DRAIN * sim.drain * (input.auto === true ? AUTO_DRAIN_SCALE : 1);
   if (run.fuel < 0) run.fuel = 0;
   // Siphon (§4.9): the stored overflow pours back in while the tank is below half.
   if (run.reserve > 0 && run.fuelMax > 0 && run.fuel < run.fuelMax * SIPHON.POUR_BELOW) {

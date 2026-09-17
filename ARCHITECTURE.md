@@ -398,7 +398,7 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   mismatch, oversized payload) degrades to factory defaults rather than throwing. All three take an
   optional trailing `storage` argument so tests can inject a fake. (DOM-optional: no-ops in Node.)
 - **Actions** (`Action` union):
-  `{type:'tick', dt, input:InputFrame}` · `{type:'newGame', seed}` · `{type:'levelReady', data:LevelData}` ·
+  `{type:'tick', dt, input:InputFrame, auto?:boolean}` (`auto`: Auto Explore drove this step — §4.10) · `{type:'newGame', seed}` · `{type:'levelReady', data:LevelData}` ·
   `{type:'pause'}` · `{type:'resume'}` · `{type:'nextLevel'}` · `{type:'toTitle'}` ·
   `{type:'setSetting', key, value}` · `{type:'debugWin'}` (headless tools only) ·
   `{type:'buyUnlock', id}` (title | levelComplete | gameOver; needs the purse and a rank to buy) ·
@@ -1071,20 +1071,54 @@ neighbour). Goal order: oil (when wanted) → exit (once seen and the level has 
 rolled `EXPLORE_PAR_MIN…MAX` × par, or the tank is below `DESPERATE_AT`) → nearby item → nearest
 frontier, ties within `FRONTIER_TIE` tiles broken by `createRng(seed ^ level·φ).fork('auto')`. Past the
 wander budget with the exit still unseen (or low on oil with none in sight) the frontier choice turns
-greedy toward the exit's position over `SEEK_CHOICES` candidates. Steering is proportional
-(`TURN_GAIN`, walk/creep by heading alignment), skipping waypoints within `WAYPOINT_R2`.
+greedy toward the exit's position over `SEEK_CHOICES` candidates.
+- **It moves like the title camera** (`step(state, out, dt)`), for watching rather than racing, and
+  reads the `ATTRACT` table directly so the two cannot drift: cruise `ATTRACT.SPEED` (1.7 tiles/s, about
+  half walking pace) scaled by `cos(err)^SPEED_FALLOFF` and eased at `SPEED_EASE_RATE`; a commanded
+  turn rate `err × TURN_GAIN` capped at `TURN_RATE` and eased at `TURN_EASE_RATE`; an aim point
+  `LOOKAHEAD` tiles past the waypoint along its leg plus the `SWAY` idle yaw; waypoints passed `ARRIVE`
+  early along the leg (the `attractArrived` rule). Written out as the player's axes
+  (`turn = rate / PLAYER.TURN_SPEED`, `moveY = speed / PLAYER.WALK_SPEED`). Eased speed and rate
+  survive a replan (a new goal bends the walk rather than stopping it); `interrupt()` resets them.
+  Measured on level 3: turn reversals ~65 → ~11 a minute, peak angular acceleration 124 → ≤ 12 rad/s²,
+  average speed 2.6 → 1.2 tiles/s; `autopilot.test.mjs` gates < 25 reversals/min and < 30 rad/s².
+- **The torch burns at its pace:** a tick carries `auto: true` when main.js's `autoFrame` drove that
+  step, and the sim multiplies the drain by `AUTO_DRAIN_SCALE = ATTRACT.SPEED / PLAYER.WALK_SPEED`
+  (exported from `sim.js`, derived so retuning either speed keeps it honest) — a tile costs the same oil
+  at either pace. A step where the player took over is an ordinary step at the full burn.
 - **Cost:** O(1) per step. The BFS is O(tiles) and runs only on a **replan** — route finished, goal
   item taken, frontier goal uncovered, the tank crossing `REFUEL_AT` (an edge, not a level), exit
   budget reached, or `STUCK_STEPS` without moving — and non-forced replans wait
   `REPLAN_COOLDOWN_STEPS`. Buffers are grow-only `Int32Array`s with a generation stamp (no clearing);
   `autopilot.test.mjs` asserts nothing survives a GC across 30 000 steps and hundreds of plans at the cap.
-- **Honest limit:** a fog-bound random explorer clears early floors reliably but, measured in Node,
-  usually runs out of oil somewhere past depth ~10: it wanders further than the 2.0× feasibility
-  model the flask chain is built for. It is a way to watch the game, not a solver.
+- **Honest limit:** a fog-bound random explorer clears early floors reliably but still runs dry on
+  some deeper ones (measured in Node, 3 seeds each: depth 10 cleared 3/3, depth 5 2/3, depth 3 0/3):
+  it wanders further than the 2.0× feasibility model the flask chain is built for, and it slows into
+  corners below the cruise the burn is scaled to. It is a way to watch the game, not a solver.
 - **Setting & controls:** `Settings.autoExplore` (boolean, default false, persisted) with an Options
-  row; the `auto` `InputAction` (bit 10) on **O** toggles it in play with a HUD notice. `hud.js` draws a
-  breathing **AUTO** plaque at the bottom centre of the world band while it drives.
-- **main.js:** `driveAuto(frame, state)` substitutes a reused `autoFrame` while `autoExplore` and
+  row; the `auto` `InputAction` (bit 10) on **O** toggles it in play with a HUD notice. On screen for the
+  whole of play:
+  - **HUD button** (mouse): `hud.js` draws an **AUTO** button at the bottom centre of the world band —
+    dim when off, gold, outlined and breathing when on — and records its rectangle;
+    `hud.hitAuto(clientX, clientY)` hit-tests the last frame's button, `hud.setAutoButton(on)` suppresses
+    it. It is not drawn while paused, in the full map, in a **narrow** layout (a phone's band is ~130 UI
+    px, where the bottom centre belongs to the unlock chips and score pops) or when suppressed.
+  - **Touch bar** (touch): `touch-overlay.js` has an **AUTO** button, leftmost (so it never moves MAP or
+    PAUSE), firing the `auto` action; dim (`0.7`) when off, full opacity with a gold `outline` and
+    `aria-pressed="true"` when on — `outline`, because the press/release styling never touches it.
+  - **Pause menu:** second row *Auto Explore* / *Stop Auto Explore* (`SCREENS.pauseAuto` while on),
+    which calls `onToggleAuto` and then `onResume`. A mouse player's pointer is normally locked, and a
+    locked cursor cannot aim at the HUD button, so Esc → *Auto Explore* is their way in; once it drives,
+    the cursor is free (below) and the HUD button turns it off.
+- **main.js:** calls `hud.setAutoButton(!input.isTouch)` each frame. The HUD button is taken by
+  **window capture** listeners: a primary `pointerdown` on `hud.hitAuto` toggles, and the rest of that
+  press (`mousedown`, `pointerup`, `mouseup`, `click`, `touchstart`, `touchend` within 600 ms) is stopped
+  before `input.js` can turn it into pointer lock or a look-drag. `shouldLockPointer()` is
+  `playing && !autoExplore`, which (every lock request and all unlocked mouse-look in `input.js` are
+  gated on it) keeps the cursor free and the camera still under a drifting mouse while the pilot
+  drives; switching Auto Explore on also releases a held lock. The O key, the touch bar and the HUD
+  button share `toggleAuto()`.
+- **main.js (driving):** `driveAuto(frame, state, dt)` substitutes a reused `autoFrame` while `autoExplore` and
   `playing`; any real move/turn/look input that step is used instead and calls `interrupt()` (the
   player can always take over); action presses pass through. `applySettings` calls `interrupt()`
   whenever `autoExplore` changes, however it was switched. On `levelComplete` it dispatches
@@ -1123,7 +1157,7 @@ level is not stored: `(params, seed)` rebuilds it (§4.4), so a save records onl
 - **Menus:** callbacks `onContinue`, `onSaveQuit`, `savedRun() → {level, score}|null`. With a save the
   title rows are *Continue · New Descent · Shrine · Options · Controls · Credits* (Continue selected),
   the record line reads `SAVED RUN · DEPTH n · score`, and New Descent opens the confirm dialog
-  (*Keep It* / *Start Over*, note `YOUR SAVED RUN ENDS HERE`). Pause is *Resume · Options · Controls ·
+  (*Keep It* / *Start Over*, note `YOUR SAVED RUN ENDS HERE`). Pause is *Resume · Auto Explore · Options · Controls ·
   Save & Quit · Abandon Run* (Abandon keeps the existing confirm). Level complete is *(Choose a Boon ·)
   Descend · Shrine · Save & Quit* — no abandon there, which also keeps the expedition strip on the panel
   at 1280×720; Escape on the tally moves the cursor to Save & Quit, and Save & Quit shows a waiting boon
@@ -1131,7 +1165,7 @@ level is not stored: `(params, seed)` rebuilds it (§4.4), so a save records onl
 - `window.__game` additionally exposes `autopilot()` (= `autopilot.info()`) and `savedRun()`.
 
 ## 5. Quality gates (automated)
-- `npm test` — every `src/*/*.test.mjs` (node:test) in its own process (**764 tests in 42 files**).
+- `npm test` — every `src/*/*.test.mjs` (node:test) in its own process (**772 tests in 42 files**).
   Two of those files, `src/state/perf.test.mjs` and `src/state/feasibility.test.mjs`, import
   `src/maze` as a **test-only** dependency: the §2 runtime rule is unchanged (`src/state` still
   imports only `src/maze/constants.js` at runtime), but a feasibility proof over fake mazes would

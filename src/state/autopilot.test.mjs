@@ -12,7 +12,8 @@ import v8 from 'node:v8';
 import vm from 'node:vm';
 
 import { buildLevel } from '../maze/level.js';
-import { AUTO, levelParams } from './balance.js';
+import { ATTRACT, AUTO, FUEL, PLAYER, levelParams } from './balance.js';
+import { AUTO_DRAIN_SCALE } from './sim.js';
 import { createInitialState, reducer } from './game.js';
 import { createAutopilot } from './autopilot.js';
 
@@ -59,7 +60,8 @@ function frame() {
  */
 function drive(s, ap, maxSeconds, each) {
   const f = frame();
-  const tick = { type: 'tick', dt: 1 / 60, input: f };
+  // `auto: true`, exactly as main.js marks a step the pilot drove (the torch burns at its pace).
+  const tick = { type: 'tick', dt: 1 / 60, input: f, auto: true };
   let steps = 0;
   while (s.phase === 'playing' && steps < maxSeconds * 60) {
     ap.step(s, f);
@@ -89,17 +91,18 @@ test('explores rather than dithering: a deep floor keeps uncovering new ground',
   drive(s, ap, 120);
   let seen = 0;
   for (let i = 0; i < s.explored.length; i++) seen += s.explored[i];
-  // Two minutes of walking at ~3 tiles/s reveals several hundred tiles; a pilot thrashing between two
-  // frontiers reveals a few dozen.
-  assert.ok(seen > 600, `explored only ${seen} tiles in two minutes`);
-  assert.ok(s.run.distance > 200, `walked only ${s.run.distance.toFixed(0)} tiles`);
+  // Two minutes at the calm ~1.2 tiles/s average (the title camera's pace, slowing into corners)
+  // reveals a few hundred tiles; a pilot thrashing between two frontiers reveals a few dozen.
+  assert.ok(seen > 250, `explored only ${seen} tiles in two minutes`);
+  assert.ok(s.run.distance > 100, `walked only ${s.run.distance.toFixed(0)} tiles`);
 });
 
 test('never heads for an item on a tile it has not revealed', () => {
   const s = playing(3, 9);
   const ap = createAutopilot();
   const f = frame();
-  const tick = { type: 'tick', dt: 1 / 60, input: f };
+  // `auto: true`, exactly as main.js marks a step the pilot drove (the torch burns at its pace).
+  const tick = { type: 'tick', dt: 1 / 60, input: f, auto: true };
   const w = s.levelData.maze.width;
   let targeted = 0;
   for (let i = 0; i < 60 * 90 && s.phase === 'playing'; i++) {
@@ -151,7 +154,8 @@ test('stepping the pilot on a max-size level leaves nothing behind (massive-maze
   const s = playing(15, 2);
   const ap = createAutopilot();
   const f = frame();
-  const tick = { type: 'tick', dt: 1 / 60, input: f };
+  // `auto: true`, exactly as main.js marks a step the pilot drove (the torch burns at its pace).
+  const tick = { type: 'tick', dt: 1 / 60, input: f, auto: true };
   // Warm up: adopt the level, plan many times, let the JIT settle.
   for (let i = 0; i < 6000 && s.phase === 'playing'; i++) {
     ap.step(s, f);
@@ -167,4 +171,56 @@ test('stepping the pilot on a max-size level leaves nothing behind (massive-maze
   const grown = process.memoryUsage().heapUsed - before;
   assert.ok(ap.info().plans - plans > 30000 / (AUTO.STUCK_STEPS + 2) / 2, 'the loop should have replanned repeatedly');
   assert.ok(grown < 256 * 1024, `autopilot steps grew the heap by ${(grown / 1024).toFixed(1)} KiB`);
+});
+
+test('it moves like the title camera: title-screen pace, no snapping turns, few reversals', () => {
+  const s = playing(3, 1);
+  const ap = createAutopilot();
+  const f = frame();
+  const tick = { type: 'tick', dt: 1 / 60, input: f, auto: true };
+  let lastAngle = s.player.angle;
+  let lastRate = 0;
+  let peakAcc = 0;
+  let flips = 0;
+  let lastSign = 0;
+  let speedSum = 0;
+  let peakSpeed = 0;
+  const steps = 60 * 90;
+  for (let i = 0; i < steps && s.phase === 'playing'; i++) {
+    ap.step(s, f, 1 / 60);
+    reducer(s, tick);
+    let da = s.player.angle - lastAngle;
+    da = (((da + Math.PI) % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+    lastAngle = s.player.angle;
+    const rate = da * 60;
+    if (i > 5) peakAcc = Math.max(peakAcc, Math.abs(rate - lastRate) * 60);
+    lastRate = rate;
+    const sign = Math.abs(rate) > 0.5 ? Math.sign(rate) : 0;
+    if (sign !== 0 && lastSign !== 0 && sign !== lastSign) flips++;
+    if (sign !== 0) lastSign = sign;
+    const speed = Math.hypot(s.player.vx, s.player.vy);
+    speedSum += speed;
+    peakSpeed = Math.max(peakSpeed, speed);
+  }
+  // Measured: the old player-speed pilot peaked at 124 rad/s² with ~65 turn reversals a minute; the
+  // title camera's own documented peak is ~11 rad/s².
+  assert.ok(peakAcc < 30, `peak angular acceleration ${peakAcc.toFixed(0)} rad/s²`);
+  assert.ok(flips / 1.5 < 25, `${(flips / 1.5).toFixed(0)} turn reversals a minute`);
+  assert.ok(peakSpeed <= ATTRACT.SPEED + 0.05, `peak speed ${peakSpeed.toFixed(2)} tiles/s`);
+  assert.ok(speedSum / steps > 0.6, 'but it does keep walking');
+});
+
+test('the torch burns at the pilot’s pace only on steps the pilot drove', () => {
+  assert.ok(Math.abs(AUTO_DRAIN_SCALE - ATTRACT.SPEED / PLAYER.WALK_SPEED) < 1e-12);
+  const burn = (/** @type {boolean} */ auto) => {
+    const s = playing(1, 3);
+    const before = s.run.fuel;
+    const tick = { type: 'tick', dt: 1 / 60, input: frame(), auto };
+    for (let i = 0; i < 60; i++) reducer(s, tick);
+    return before - s.run.fuel;
+  };
+  const normal = burn(false);
+  const auto = burn(true);
+  assert.ok(Math.abs(normal - FUEL.DRAIN) < 1e-6, `a second of play burns ${normal}`);
+  assert.ok(Math.abs(auto - normal * AUTO_DRAIN_SCALE) < 1e-6, `a second of Auto Explore burns ${auto}`);
 });

@@ -243,10 +243,10 @@
 
 /**
  * Store actions (ARCHITECTURE.md §4.2). `setSetting` is keyed by a `Settings` property name.
- * @typedef {{type:'tick', dt:number, input:InputFrame} | {type:'newGame', seed:number} | {type:'levelReady', data:LevelData}
+ * @typedef {{type:'tick', dt:number, input:InputFrame, auto?:boolean} | {type:'newGame', seed:number} | {type:'levelReady', data:LevelData}
  *   | {type:'pause'} | {type:'resume'} | {type:'nextLevel'} | {type:'toTitle'}
  *   | {type:'setSetting', key:keyof Settings, value:number|boolean|string} | {type:'debugWin'}
- *   | {type:'buyUnlock', id:string} | {type:'claimBoon', id:string}} Action
+ *   | {type:'buyUnlock', id:string} | {type:'claimBoon', id:string} | {type:'continueRun', save:unknown}} Action
  */
 
 /**

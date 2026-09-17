@@ -17,6 +17,16 @@
  *   still unseen, the frontier choice turns greedy toward the exit's position instead of random.
  * It only ever targets what the reveal has uncovered, so it plays the same fog the player does.
  *
+ * ## How it moves: like the title screen
+ * Auto Explore is for watching, so it walks with the title camera's calm rather than a player's
+ * urgency, and borrows its numbers from `ATTRACT` directly so the two cannot drift apart: cruise
+ * at `ATTRACT.SPEED` (about half the walking pace), a commanded turn rate capped at
+ * `ATTRACT.TURN_RATE` and eased at `TURN_EASE_RATE`, a speed that falls off with the heading error
+ * and eases at `SPEED_EASE_RATE`, an aim point `LOOKAHEAD` tiles along the leg, waypoints passed
+ * `ARRIVE` early, and the same slow sway. Speed and turn rate survive a replan, so a new goal bends
+ * the path instead of stopping the walk. The torch still drains in real time, so the slower pace
+ * costs oil per tile — a deliberate trade for a watching mode.
+ *
  * ## Cost (the massive-maze rule, §6)
  * Steering is O(1) per step. The search is O(tiles) and runs **only on a replan** — a route
  * finished, a goal vanished, the tank crossed a threshold, or the body got stuck — and never twice
@@ -25,9 +35,10 @@
  * allocates nothing.
  */
 
+import { angleDiff, clamp, damp } from '../core/math.js';
 import { createRng } from '../core/rng.js';
 import { TILE } from '../maze/constants.js';
-import { AUTO } from './balance.js';
+import { ATTRACT, AUTO, PLAYER } from './balance.js';
 
 /** @typedef {import('../core/types.js').GameState} GameState */
 /** @typedef {import('../core/types.js').LevelData} LevelData */
@@ -40,8 +51,9 @@ import { AUTO } from './balance.js';
 
 /**
  * @typedef {Object} Autopilot
- * @property {(state: Readonly<GameState>, out: AutoAxes) => boolean} step
- *   write this step's axes into `out`; false (and zeroed axes) when there is nothing to drive
+ * @property {(state: Readonly<GameState>, out: AutoAxes, dt?: number) => boolean} step
+ *   write this step's axes into `out` (`dt` defaults to the 1/60 s sim step); false when there is
+ *   nothing to drive and the pilot has coasted to a stop
  * @property {() => void} interrupt  drop the route (the player took the controls); the next step plans again
  * @property {() => void} reset      forget the level entirely
  * @property {() => {goal:string, tile:number, route:number, plans:number}} info  for tools and tests
@@ -56,6 +68,9 @@ const GOAL_EXIT = 4;
 const GOAL_NAMES = Object.freeze(['none', 'oil', 'item', 'frontier', 'exit']);
 
 const TAU = Math.PI * 2;
+
+/** The sim's fixed step (§4.1), used when a caller does not pass `dt`. */
+const DEFAULT_DT = 1 / 60;
 
 /**
  * Grow-only `Int32Array`.
@@ -111,7 +126,53 @@ export function createAutopilot() {
     exploreFor: 0,
     /** Whether the last plan was made wanting fuel. */
     plannedLow: false,
+    /** The tile the current route starts from (the leg into its first waypoint begins here). */
+    fromTile: -1,
+    /** Eased turn rate the pilot is commanding, rad/s. */
+    turnRate: 0,
+    /** Eased forward speed the pilot is commanding, tiles/s. */
+    speed: 0,
   };
+
+  /** Forget the eased motion, so the next drive starts gently from a standstill. @returns {void} */
+  function settle() {
+    s.turnRate = 0;
+    s.speed = 0;
+  }
+
+  /**
+   * The tile the leg into the current waypoint starts from.
+   * @param {Int32Array} r
+   * @returns {number}
+   */
+  function legFrom(r) {
+    return s.routeStep > 0 ? r[s.routeStep - 1] : s.fromTile;
+  }
+
+  /**
+   * Has the body reached waypoint `i`, walking in from tile `from`? On the waypoint's tile and at
+   * most `ATTRACT.ARRIVE` short of its centre along the leg (the title camera's rule); a zero leg
+   * (the route starts on the waypoint) needs the centre within that radius.
+   * @param {number} x
+   * @param {number} y
+   * @param {number} i
+   * @param {number} from
+   * @param {number} w
+   * @returns {boolean}
+   */
+  function arrived(x, y, i, from, w) {
+    const tx = i % w;
+    const ty = (i / w) | 0;
+    const cx = tx + 0.5;
+    const cy = ty + 0.5;
+    const legX = from < 0 ? 0 : tx - (from % w);
+    const legY = from < 0 ? 0 : ty - ((from / w) | 0);
+    if (legX === 0 && legY === 0) {
+      return (x - cx) * (x - cx) + (y - cy) * (y - cy) <= ATTRACT.ARRIVE * ATTRACT.ARRIVE;
+    }
+    if (Math.floor(x) !== tx || Math.floor(y) !== ty) return false;
+    return (x - cx) * legX + (y - cy) * legY >= -ATTRACT.ARRIVE;
+  }
 
   /** @returns {void} */
   function dropRoute() {
@@ -204,6 +265,7 @@ export function createAutopilot() {
     const py = Math.floor(state.player.y);
     if (px < 0 || py < 0 || px >= w || py >= h) return;
     const start = py * w + px;
+    s.fromTile = start;
     const exitIdx = maze.exit.y * w + maze.exit.x;
 
     const run = state.run;
@@ -376,8 +438,11 @@ export function createAutopilot() {
   }
 
   return {
-    step(state, out) {
-      if (state.phase !== 'playing' || state.levelData === null || state.explored === null) return idle(out);
+    step(state, out, dt = DEFAULT_DT) {
+      if (state.phase !== 'playing' || state.levelData === null || state.explored === null) {
+        settle();
+        return idle(out);
+      }
       if (state.levelData !== levelFor) adopt(state);
       s.sincePlan++;
 
@@ -388,37 +453,48 @@ export function createAutopilot() {
       s.lastY = p.y;
 
       if (wantsReplan(state) || s.stuck > AUTO.STUCK_STEPS) plan(state);
-      if (s.routeLen === 0) return idle(out);
 
       const maze = /** @type {LevelData} */ (state.levelData).maze;
       const w = maze.width;
       const r = /** @type {Int32Array} */ (route);
-      // Skip waypoints already reached; the last one is only passed by arriving on it.
-      while (s.routeStep < s.routeLen) {
-        const i = r[s.routeStep];
-        const dx = (i % w) + 0.5 - p.x;
-        const dy = ((i / w) | 0) + 0.5 - p.y;
-        if (dx * dx + dy * dy < AUTO.WAYPOINT_R2) s.routeStep++;
-        else break;
-      }
-      if (s.routeStep >= s.routeLen) return idle(out);
+      // Pass waypoints the way the title camera does (`attractArrived` in sim.js): a tile on a leg
+      // counts as reached a little *before* its centre, so the turn starts early and rounds the
+      // corner instead of overshooting toward the far wall.
+      while (s.routeStep < s.routeLen && arrived(p.x, p.y, r[s.routeStep], legFrom(r), w)) s.routeStep++;
 
-      const i = r[s.routeStep];
-      const tx = (i % w) + 0.5;
-      const ty = ((i / w) | 0) + 0.5;
-      let err = Math.atan2(ty - p.y, tx - p.x) - p.angle;
-      err = (((err + Math.PI) % TAU) + TAU) % TAU - Math.PI;
-      const aligned = Math.cos(err);
-      const turn = err * AUTO.TURN_GAIN;
-      out.turn = turn > 1 ? 1 : turn < -1 ? -1 : turn;
-      out.moveY = aligned > AUTO.WALK_ALIGN ? 1 : aligned > AUTO.CREEP_ALIGN ? AUTO.CREEP : 0;
+      // No route (nothing to do, or the goal was just reached): coast to a stop rather than halting.
+      let want = 0;
+      let command = 0;
+      if (s.routeStep < s.routeLen) {
+        const i = r[s.routeStep];
+        const from = legFrom(r);
+        const legX = (i % w) - (from % w);
+        const legY = ((i / w) | 0) - ((from / w) | 0);
+        // Aim a little past the waypoint along the leg, so a straight corridor does not re-aim at
+        // every tile — the title camera's LOOKAHEAD, and its slow idle sway.
+        const ax = (i % w) + 0.5 + legX * ATTRACT.LOOKAHEAD;
+        const ay = ((i / w) | 0) + 0.5 + legY * ATTRACT.LOOKAHEAD;
+        const sway = Math.sin(state.time * TAU * ATTRACT.SWAY_HZ) * ATTRACT.SWAY_AMP;
+        const err = angleDiff(p.angle, Math.atan2(ay - p.y, ax - p.x) + sway);
+        command = clamp(err * ATTRACT.TURN_GAIN, -ATTRACT.TURN_RATE, ATTRACT.TURN_RATE);
+        const align = Math.cos(err);
+        want = align > 0 ? ATTRACT.SPEED * Math.pow(align, ATTRACT.SPEED_FALLOFF) : 0;
+      }
+      // Both eased, never assigned: a corner or a replan changes the command, not the motion.
+      s.turnRate = damp(s.turnRate, command, ATTRACT.TURN_EASE_RATE, dt);
+      s.speed = damp(s.speed, want, ATTRACT.SPEED_EASE_RATE, dt);
+      // Written as the player's own axes: the sim turns at `turn × PLAYER.TURN_SPEED` and walks at
+      // `moveY × PLAYER.WALK_SPEED`, so every rule of play (collision, fuel, pickups) still applies.
+      out.turn = clamp(s.turnRate / PLAYER.TURN_SPEED, -1, 1);
+      out.moveY = clamp(s.speed / PLAYER.WALK_SPEED, 0, 1);
       out.moveX = 0;
-      return true;
+      return s.routeLen > 0 || s.speed > 0.01;
     },
 
     interrupt() {
       dropRoute();
       s.stuck = 0;
+      settle();
     },
 
     reset() {

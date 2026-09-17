@@ -101,7 +101,7 @@ chalk to mark the walls. The first time you clear a new depth, you also pick one
 | Mouse | Look (click the game to lock the mouse) |
 | `C` | Chalk the wall ahead (once unlocked) |
 | `M` | Map |
-| `O` | Auto Explore: the game walks the maze on its own (also in Options) |
+| `O` | Auto Explore: the game wanders the maze on its own, calmly (or click the AUTO button) |
 | `Esc` | Pause |
 
 Gamepad and touch controls work too.

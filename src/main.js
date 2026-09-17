@@ -398,6 +398,8 @@ function boot() {
       if (store.getState().phase !== 'title') dropRun();
       store.dispatch({ type: 'toTitle' });
     },
+    // Pause's Auto Explore row (the menus resume right after): the way in for a captured mouse.
+    onToggleAuto: () => toggleAuto(),
     onSaveQuit: () => {
       const st = store.getState();
       const saved =
@@ -440,7 +442,12 @@ function boot() {
     invertLook: appliedSettings.invertLook,
     // Pointer lock is only ever taken while the player is actually playing, so clicking a menu
     // never swallows the cursor.
-    shouldLockPointer: () => store.getState().phase === 'playing',
+    // Nor while Auto Explore drives (§4.10): the cursor stays free for the AUTO button, and a mouse
+    // drifting across the page is someone watching, not steering.
+    shouldLockPointer: () => {
+      const st = store.getState();
+      return st.phase === 'playing' && st.settings.autoExplore !== true;
+    },
     touchRoot: /** @type {HTMLElement|null} */ (touchRoot),
   });
 
@@ -832,7 +839,11 @@ function boot() {
     appliedSettings.reducedMotion = settings.reducedMotion;
     // However Auto Explore was switched (the O key or the Options row), a route planned before the
     // switch describes where the player *was*: drop it, so the pilot plans from where they are now.
-    if (settings.autoExplore !== appliedSettings.autoExplore) autopilot.interrupt();
+    if (settings.autoExplore !== appliedSettings.autoExplore) {
+      autopilot.interrupt();
+      // Switching it on hands the cursor back so the AUTO button can be clicked to switch it off.
+      if (settings.autoExplore) exitPointerLock();
+    }
     appliedSettings.autoExplore = settings.autoExplore;
     // Mark rather than write: `step()` flushes at most twice a second, which collapses a whole
     // slider drag — and the map hotkey's two dispatches (`mapMode` + the legacy `minimap` mirror)
@@ -893,15 +904,16 @@ function boot() {
    * afresh once the controls are let go. Action presses (pause, map, chalk…) always pass through.
    * @param {InputFrame} real the polled frame
    * @param {GameState} state
+   * @param {number} dt the step, seconds
    * @returns {InputFrame}
    */
-  function driveAuto(real, state) {
+  function driveAuto(real, state, dt) {
     if (state.settings.autoExplore !== true || state.phase !== 'playing') return real;
     if (real.moveX !== 0 || real.moveY !== 0 || real.turn !== 0 || real.lookDX !== 0) {
       autopilot.interrupt();
       return real;
     }
-    autopilot.step(state, autoFrame);
+    autopilot.step(state, autoFrame, dt);
     autoFrame.lookDX = 0;
     autoFrame.pressed = real.pressed;
     return autoFrame;
@@ -937,11 +949,46 @@ function boot() {
       if (on) mutedVolume = state.settings.volume;
       store.dispatch({ type: 'setSetting', key: 'volume', value: on ? 0 : mutedVolume });
     }
-    if (pressed.has('auto')) {
-      const next = state.settings.autoExplore !== true;
-      store.dispatch({ type: 'setSetting', key: 'autoExplore', value: next });
-      hud.notice(next ? NOTICE_AUTO_ON : NOTICE_AUTO_OFF);
+    // The O key, and the touch bar's AUTO button (which emits the same action).
+    if (pressed.has('auto')) toggleAuto();
+  }
+
+  /**
+   * Switch Auto Explore over and say so. Shared by the O key, the touch bar and the HUD button.
+   * @returns {void}
+   */
+  function toggleAuto() {
+    const next = store.getState().settings.autoExplore !== true;
+    store.dispatch({ type: 'setSetting', key: 'autoExplore', value: next });
+    hud.notice(next ? NOTICE_AUTO_ON : NOTICE_AUTO_OFF);
+  }
+
+  /** `performance.now()` until which the rest of a press that hit the HUD's AUTO button is swallowed. */
+  let autoPressUntil = -1;
+
+  /**
+   * The HUD's AUTO button (§4.10). Window capture listeners, so the press is taken before
+   * `input.js`'s canvas listeners can turn it into pointer lock or a look-drag, and before the
+   * menus see it. A press toggles on `pointerdown`; the `mousedown`/`pointerup`/`mouseup`/`click`
+   * (and touch events) belonging to the same press are swallowed for a short window.
+   * @param {any} ev
+   * @returns {void}
+   */
+  const onAutoButton = (ev) => {
+    if (!ev || store.getState().phase !== 'playing') return;
+    const t = performance.now();
+    if (ev.type === 'pointerdown') {
+      if (ev.button !== 0 || !hud.hitAuto(ev.clientX, ev.clientY)) return;
+      autoPressUntil = t + 600;
+      toggleAuto();
+    } else if (t > autoPressUntil) {
+      return;
     }
+    ev.stopPropagation();
+    if (ev.cancelable) ev.preventDefault();
+  };
+  for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'touchstart', 'touchend']) {
+    listen(globalThis, type, onAutoButton, { capture: true, passive: false });
   }
 
   // Pointer events reach the menus directly: they hit-test the layout recorded by the last render.
@@ -1111,7 +1158,7 @@ function boot() {
   };
 
   /** The tick action, reused: the reducer allocates nothing per step and neither should we. */
-  const tickAction = { type: 'tick', dt: 0, input: /** @type {InputFrame|null} */ (null) };
+  const tickAction = { type: 'tick', dt: 0, input: /** @type {InputFrame|null} */ (null), auto: false };
 
   /**
    * One simulation step. Input is polled exactly once per step, so no press can be seen twice.
@@ -1125,7 +1172,9 @@ function boot() {
     if (!menus.handleInput(polled, state)) handleHotkeys(polled, state);
 
     tickAction.dt = dt;
-    tickAction.input = driveAuto(polled, store.getState());
+    tickAction.input = driveAuto(polled, store.getState(), dt);
+    // The torch burns at the pilot's calm pace only on steps the pilot actually drove (§4.10).
+    tickAction.auto = tickAction.input === autoFrame;
     store.dispatch(tickAction);
 
     // Auto Explore carries on down: once the cleared depth's tally has had its moment, descend. From
@@ -1219,6 +1268,8 @@ function boot() {
     syncTileset(state.phase === 'title' ? 1 : state.level);
     raycaster.render(renderView);
 
+    // Touch devices get the AUTO button in the touch bar; the HUD's is for a mouse (§4.10).
+    hud.setAutoButton(!input.isTouch);
     hud.render(state, loop.stats(), alpha);
     menus.render(state);
 

@@ -211,7 +211,8 @@ test('pause: back resumes, and the rows do what they say', () => {
   assert.ok(log.includes('resume'));
 
   log.length = 0;
-  // Rows: Resume, Options, Controls, Save & Quit, Abandon Run.
+  // Rows: Resume, Auto Explore, Options, Controls, Save & Quit, Abandon Run.
+  menus.handleInput(press('down'), state);
   menus.handleInput(press('down'), state);
   menus.handleInput(press('down'), state);
   menus.handleInput(press('down'), state); // Save & Quit
@@ -244,7 +245,7 @@ test('the abandon dialog: back and the first row both keep the run', () => {
   const { menus, log } = harness();
   const state = makeState('paused');
   menus.render(state);
-  for (let i = 0; i < 4; i++) menus.handleInput(press('down'), state);
+  for (let i = 0; i < 5; i++) menus.handleInput(press('down'), state);
   menus.handleInput(press('confirm'), state);
   menus.render(state);
   assert.equal(menus.screen(), 'confirm');
@@ -928,6 +929,7 @@ test('the Controls panel is reachable from the title and from pause', () => {
   const paused = makeState('paused');
   paused.time = 1;
   menus.render(paused);
+  menus.handleInput(press('down'), paused); // Auto Explore
   menus.handleInput(press('down'), paused);
   menus.handleInput(press('down'), paused);
   log.length = 0;
@@ -1244,4 +1246,31 @@ test('Save & Quit on a cleared depth shows a waiting boon first, like Descend an
   menus.render(state);
   assert.equal(menus.screen(), 'boon');
   assert.equal(log.includes('saveQuit'), false);
+});
+
+test('pause: the Auto Explore row switches it over and resumes, whether it is on or off (§4.10)', () => {
+  /** @type {string[]} */
+  const log = [];
+  const menus = createMenus(null, {
+    onResume: () => log.push('resume'),
+    onToggleAuto: () => log.push('toggleAuto'),
+  });
+  const state = makeState('paused');
+  menus.render(state);
+  menus.handleInput(press('down'), state); // Auto Explore
+  menus.handleInput(press('confirm'), state);
+  assert.deepEqual(log, ['toggleAuto', 'resume'], 'one press: switch, then back to the maze');
+
+  // While it is on, the same row offers to stop it — and still resumes.
+  log.length = 0;
+  const on = makeState('paused');
+  on.settings.autoExplore = true;
+  const menus2 = createMenus(null, {
+    onResume: () => log.push('resume'),
+    onToggleAuto: () => log.push('toggleAuto'),
+  });
+  menus2.render(on);
+  menus2.handleInput(press('down'), on);
+  menus2.handleInput(press('confirm'), on);
+  assert.deepEqual(log, ['toggleAuto', 'resume']);
 });

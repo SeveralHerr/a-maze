@@ -77,6 +77,13 @@ const KNOB_IDLE_SHADOW = 'inset 0 0 0 2px rgba(0,0,0,0.5),0 0 10px rgba(217,164,
 const CHALK_EMPTY_OPACITY = '0.4';
 
 /**
+ * AUTO button opacity while Auto Explore is off. On, it is fully opaque and ringed with a gold
+ * outline — written as `outline`, which the press/release styling never touches, so a tap's
+ * visual inversion cannot wipe the lit state.
+ */
+const AUTO_OFF_OPACITY = '0.7';
+
+/**
  * Create the on-screen touch controls inside `root`.
  *
  * Fails soft: if `root` cannot host elements (no document, detached fake, exotic embedding) the
@@ -266,6 +273,10 @@ export function createTouchOverlay(root, opts) {
   // Before MAP, so adding it never moves the two buttons a thumb already knows (see BAR_DROP_PX).
   const chalkBtn = makeButton('CHALK', 'chalk');
   chalkBtn.style.display = 'none';
+  // Auto Explore (§4.10), leftmost for the same reason. Always shown in play; lit while it drives.
+  const autoBtn = makeButton('AUTO', 'auto');
+  autoBtn.style.opacity = AUTO_OFF_OPACITY;
+  bar.appendChild(autoBtn);
   bar.appendChild(chalkBtn);
   bar.appendChild(mapBtn);
   bar.appendChild(pauseBtn);
@@ -281,6 +292,7 @@ export function createTouchOverlay(root, opts) {
   let mapLocked = false; // last `data-map-locked` state written
   let chalkShown = false; // last CHALK visibility written
   let chalkEmpty = false; // last CHALK dimming written
+  let autoLit = false; // last AUTO lit state written
   let stickShown = false;
   let ringX = NaN;
   let ringY = NaN;
@@ -339,6 +351,16 @@ export function createTouchOverlay(root, opts) {
       if (empty !== chalkEmpty) {
         chalkEmpty = empty;
         chalkBtn.style.opacity = empty ? CHALK_EMPTY_OPACITY : '';
+      }
+
+      // Auto Explore (§4.10): lit while it drives. Opacity and outline only — never a position change.
+      const lit = !!settings && settings.autoExplore === true;
+      if (lit !== autoLit) {
+        autoLit = lit;
+        autoBtn.style.opacity = lit ? '' : AUTO_OFF_OPACITY;
+        autoBtn.style.outline = lit ? `2px solid ${GOLD}` : '';
+        autoBtn.style.outlineOffset = lit ? '2px' : '';
+        autoBtn.setAttribute('aria-pressed', lit ? 'true' : 'false');
       }
 
       // Anything that is not the playing phase is a menu, and menus own the screen: hiding the

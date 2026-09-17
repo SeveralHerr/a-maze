@@ -640,6 +640,11 @@ function intWidth(n, size) {
  * @property {(text:string) => void} notice  show a short centred one-line notice (~1.6 s) — e.g.
  *   `'NO MAP - FIND THE SCROLL'` when the map hotkey is pressed while locked. Replaces whatever
  *   banner is up. Store a constant string: the HUD keeps the reference, it does not copy it.
+ * @property {(clientX:number, clientY:number) => boolean} hitAuto  true when a pointer at these
+ *   client coordinates is over the AUTO button drawn in the last frame (§4.10); false whenever the
+ *   button is not on screen (paused, full map, narrow layout, disabled, any other phase)
+ * @property {(on:boolean) => void} setAutoButton  allow or suppress the HUD's AUTO button (default
+ *   allowed). main.js suppresses it on touch devices, which get the touch bar's AUTO button instead.
  * @property {() => void} dispose
  */
 
@@ -754,6 +759,12 @@ export function createHud(overlayCanvas, options) {
   /** Options handed to `drawPanel`, mutated per call instead of a literal per call per frame. */
   /** @type {{frame:'stone'|'wood'|'iron', border:number, rivets:boolean, texture:boolean, alpha:number}} */
   const panelOpts = { frame: 'stone', border: 1, rivets: true, texture: false, alpha: 0.72 };
+  /** The AUTO button's rectangle in UI px from the last frame, [x, y, w, h]; w 0 = not drawn. */
+  const autoRect = new Float64Array(4);
+  /** Pointer mapping scratch for `hitAuto`. */
+  const autoPtr = new Float64Array(2);
+  /** Whether the AUTO button may be drawn at all (`setAutoButton`; main.js turns it off on touch). */
+  let autoButtonEnabled = true;
 
   // ── Readout text, rebuilt only when the number behind it changes (see the file header) ──
   const fuelText = createTextMemo((sec) => formatTime(sec));
@@ -1032,6 +1043,8 @@ export function createHud(overlayCanvas, options) {
    * @returns {void}
    */
   function render(state, frameStats, alpha) {
+    // The Auto Explore button is only clickable in a frame that drew it (see `drawAutoButton`).
+    autoRect[2] = 0;
     const ctx = surface.beginFrame();
     if (ctx === null || state === null || typeof state !== 'object') return;
 
@@ -1090,7 +1103,7 @@ export function createHud(overlayCanvas, options) {
     drawScorePanel(ctx, state, m);
     drawDepthPanel(ctx, state, m);
     drawPerkChips(ctx, state, m, reduced);
-    drawAutoChip(ctx, state, m, reduced);
+    drawAutoButton(ctx, state, m, reduced);
     drawLodestone(ctx, state, m, reduced);
     if (mode === 'corner') mapView.drawCorner(ctx, m, state, anim.clock, reduced);
     drawPops(ctx, m, reduced);
@@ -1630,21 +1643,27 @@ export function createHud(overlayCanvas, options) {
   }
 
   /**
-   * Auto Explore (§4.10): while the autopilot has the level, a small AUTO plaque sits at the bottom
-   * centre of the world band, breathing slowly, so a player who walks back to the screen knows at a
-   * glance that nobody is at the keys.
+   * Auto Explore (§4.10): an AUTO button at the bottom centre of the world band, on screen for the
+   * whole of play so the mode is one click or tap away rather than in Options. Off, it is a quiet
+   * dim plaque; on, the lettering is gold and breathes slowly, so a player who walks back to the
+   * screen knows at a glance that nobody is at the keys. Its rectangle is recorded for `hitAuto`.
    * @param {CanvasRenderingContext2D} ctx
    * @param {GameState} state
    * @param {SurfaceMetrics} m
    * @param {boolean} reduced
    * @returns {void}
    */
-  function drawAutoChip(ctx, state, m, reduced) {
-    if (state.settings === undefined || state.settings.autoExplore !== true || state.phase !== 'playing') return;
+  function drawAutoButton(ctx, state, m, reduced) {
+    // Touch devices and narrow layouts use the AUTO button in the touch bar instead: a phone's world
+    // band is ~130 UI px wide, where the bottom centre belongs to the unlock chips and score pops.
+    if (!autoButtonEnabled || m.narrow || state.settings === undefined || state.phase !== 'playing') return;
+    const on = state.settings.autoExplore === true;
     const u = m.u;
     const size = m.narrow ? Math.max(1, u - 1) : u;
-    const chipH = 2 * insetY + heightAt('hud', size);
-    const w = 2 * insetX + measureAt(AUTO_TEXT, 'hud', size);
+    // Roomier than a readout chip: it is a target for a thumb as well as a cursor.
+    const padX = insetX + 2 * u;
+    const chipH = 2 * insetY + 2 * u + heightAt('hud', size);
+    const w = 2 * padX + measureAt(AUTO_TEXT, 'hud', size);
     const x = m.viewX + ((m.viewW - w) >> 1);
     const y = m.viewY + m.viewH - 3 * u - chipH;
     panelOpts.frame = 'stone';
@@ -1652,9 +1671,31 @@ export function createHud(overlayCanvas, options) {
     panelOpts.rivets = false;
     drawPanel(ctx, x, y, w, chipH, u, panelOpts);
     const before = ctx.globalAlpha;
-    if (!reduced) ctx.globalAlpha = before * (0.7 + 0.3 * Math.sin(anim.clock * 2.4));
-    drawAt(ctx, AUTO_TEXT, x + (w >> 1), y + (chipH >> 1), 'hud', size, 'hudGold', 'center', 'middle');
+    if (on) {
+      if (!reduced) ctx.globalAlpha = before * (0.7 + 0.3 * Math.sin(anim.clock * 2.4));
+      ctx.fillStyle = COLOR.goldLight;
+      strokeRect(ctx, x, y, w, chipH, Math.max(1, border >> 1));
+    }
+    drawAt(ctx, AUTO_TEXT, x + (w >> 1), y + (chipH >> 1), 'hud', size, on ? 'hudGold' : 'hudDim', 'center', 'middle');
     ctx.globalAlpha = before;
+    autoRect[0] = x;
+    autoRect[1] = y;
+    autoRect[2] = w;
+    autoRect[3] = chipH;
+  }
+
+  /**
+   * Is a pointer at these client coordinates over the Auto Explore button drawn last frame?
+   * @param {number} clientX
+   * @param {number} clientY
+   * @returns {boolean}
+   */
+  function hitAuto(clientX, clientY) {
+    if (!(autoRect[2] > 0) || !Number.isFinite(clientX) || !Number.isFinite(clientY)) return false;
+    if (!surface.fromClient(clientX, clientY, autoPtr)) return false;
+    const x = autoPtr[0];
+    const y = autoPtr[1];
+    return x >= autoRect[0] && x < autoRect[0] + autoRect[2] && y >= autoRect[1] && y < autoRect[1] + autoRect[3];
   }
 
   /**
@@ -1813,6 +1854,10 @@ export function createHud(overlayCanvas, options) {
     mapStats: () => mapView.stats(),
     mapLocked,
     notice,
+    hitAuto,
+    setAutoButton(on) {
+      autoButtonEnabled = on === true;
+    },
     dispose,
   };
 }

@@ -252,7 +252,7 @@ test('the bar rests below the full map header line in every mode', () => {
 test('the CHALK button appears only with the unlock, dims at zero charges, and never moves MAP', () => {
   const m = mount();
   const bar = m.layer.childNodes[2];
-  const chalk = bar.childNodes[0];
+  const chalk = bar.childNodes[1];
   assert.equal(chalk.textContent, 'CHALK');
   m.overlay.update({ phase: 'playing', run: { mapFound: true, chalk: 0 }, perks: { chalk: 0 } });
   assert.equal(chalk.style.display, 'none', 'hidden without the unlock');
@@ -298,4 +298,33 @@ test('works without an onAction callback', () => {
   layer.findByText('PAUSE').dispatchEvent({ type: 'touchstart', cancelable: true });
   overlay.destroy();
   assert.equal(env.totalListeners(), 0);
+});
+
+test('the AUTO button fires the auto action, is lit while Auto Explore is on, and never moves MAP (§4.10)', () => {
+  const m = mount();
+  const bar = m.layer.childNodes[2];
+  const auto = bar.childNodes[0];
+  assert.equal(auto.textContent, 'AUTO', 'leftmost, so it never shifts MAP or PAUSE');
+  const mapBtn = m.layer.findByText('MAP');
+  const mapCss = mapBtn.style.cssText;
+
+  auto.dispatchEvent({ type: 'touchstart', cancelable: true });
+  auto.dispatchEvent({ type: 'touchend' });
+  assert.deepEqual(m.fired, ['auto']);
+
+  m.overlay.update({ phase: 'playing', settings: { autoExplore: false } });
+  assert.equal(auto.style.opacity, '0.7', 'dim while off');
+  assert.ok(!auto.style.outline);
+  m.overlay.update({ phase: 'playing', settings: { autoExplore: true } });
+  assert.equal(auto.style.opacity, '', 'full while on');
+  assert.match(auto.style.outline, /2px solid/);
+  assert.equal(auto.attributes['aria-pressed'], 'true');
+  // A press while lit inverts and restores the button without wiping the lit outline.
+  auto.dispatchEvent({ type: 'touchstart', cancelable: true });
+  auto.dispatchEvent({ type: 'touchend' });
+  assert.match(auto.style.outline, /2px solid/);
+  m.overlay.update({ phase: 'playing', settings: { autoExplore: false } });
+  assert.ok(!auto.style.outline, 'unlit again when switched off');
+  assert.equal(mapBtn.style.cssText, mapCss, 'MAP untouched throughout');
+  m.overlay.destroy();
 });

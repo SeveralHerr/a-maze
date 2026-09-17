@@ -52,7 +52,8 @@ function playedAndPaused(level, seed, seconds) {
   reducer(s, { type: 'levelReady', data: buildLevel(levelParams(level), mazeSeedFor(seed, level)) });
   const ap = createAutopilot();
   const f = { moveX: 0, moveY: 0, turn: 0, lookDX: 0, pressed: new Set() };
-  const tick = { type: 'tick', dt: 1 / 60, input: f };
+  // `auto: true`, exactly as main.js marks a step the pilot drove (the torch burns at its pace).
+  const tick = { type: 'tick', dt: 1 / 60, input: f, auto: true };
   for (let i = 0; i < seconds * 60 && s.phase === 'playing'; i++) {
     ap.step(s, f);
     reducer(s, tick);

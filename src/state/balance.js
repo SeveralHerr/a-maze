@@ -384,19 +384,14 @@ export const AUTO = Object.freeze({
    */
   EXPLORE_PAR_MIN: 0.2,
   EXPLORE_PAR_MAX: 0.8,
-  /** Steps without movement before the route is thrown away and planned again. */
-  STUCK_STEPS: 45,
+  /**
+   * Steps without movement before the route is thrown away and planned again. Long, because the
+   * calm steering (it walks like the title camera — `ATTRACT`) turns round in place for well over a
+   * second at a dead end, and that is not being stuck.
+   */
+  STUCK_STEPS: 150,
   /** Minimum steps between two plans that were not forced by finishing a route (bounds the BFS). */
   REPLAN_COOLDOWN_STEPS: 12,
-  /** Squared distance (tiles²) at which a waypoint counts as passed. */
-  WAYPOINT_R2: 0.16,
-  /** Proportional turn gain on the heading error (the value is a turn axis in [-1, 1]). */
-  TURN_GAIN: 2.6,
-  /** cos(heading error) above which the pilot walks at full speed, and above which it creeps. */
-  WALK_ALIGN: 0.35,
-  CREEP_ALIGN: -0.2,
-  /** Forward axis while creeping round a sharp corner. */
-  CREEP: 0.45,
   /** Seconds the level-complete tally is shown before Auto Explore descends on its own. */
   NEXT_LEVEL_DELAY: 4,
   /** Seconds into the clear before Auto Explore descends past boon cards that opened themselves. */

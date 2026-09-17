@@ -91,7 +91,7 @@ const log = createLogger('state');
  * escapes the synchronous reducer call.
  * @type {SimInput}
  */
-const _input = { moveX: 0, moveY: 0, turn: 0, lookDX: 0, chalk: false };
+const _input = { moveX: 0, moveY: 0, turn: 0, lookDX: 0, chalk: false, auto: false };
 
 /**
  * Phases from which `newGame` is honoured. See the phase-machine note in the file header.
@@ -204,7 +204,7 @@ export function reducer(state, action) {
 
   switch (type) {
     case 'tick':
-      applyTick(state, /** @type {number} */ (a.dt), a.input);
+      applyTick(state, /** @type {number} */ (a.dt), a.input, a.auto === true);
       return;
     case 'newGame':
       applyNewGame(state, a.seed);
@@ -321,9 +321,10 @@ function axis(v) {
  * @param {State} state
  * @param {unknown} rawDt seconds
  * @param {unknown} rawInput
+ * @param {boolean} auto the frame was written by Auto Explore (§4.10): the torch burns at its pace
  * @returns {void}
  */
-function applyTick(state, rawDt, rawInput) {
+function applyTick(state, rawDt, rawInput, auto) {
   // A zero, negative or non-finite dt advances nothing — including the interpolation snapshot, so a
   // paused frame does not collapse the renderer's alpha blend.
   if (typeof rawDt !== 'number' || !(rawDt > 0) || rawDt === Infinity) return;
@@ -337,7 +338,9 @@ function applyTick(state, rawDt, rawInput) {
 
   const phase = state.phase;
   if (phase === 'playing') {
-    stepPlayingBody(state, readInput(rawInput));
+    const input = readInput(rawInput);
+    input.auto = auto;
+    stepPlayingBody(state, input);
     return;
   }
   if (phase === 'title') {

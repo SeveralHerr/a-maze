@@ -205,14 +205,24 @@ const TITLE_SAVED_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
   { id: 'credits', label: 'Credits', kind: 'action' },
 ]);
 
-/** Pause screen. Save & Quit is the way out that keeps the run (§4.10); Abandon asks first. */
+/**
+ * Pause screen. Save & Quit is the way out that keeps the run (§4.10); Abandon asks first. The
+ * second row switches Auto Explore and resumes in one press — it is how a player whose mouse is
+ * captured (so the HUD's AUTO button cannot be clicked) hands the walk over, one Esc away.
+ */
 const PAUSE_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
   { id: 'resume', label: 'Resume', kind: 'action' },
+  { id: 'auto', label: 'Auto Explore', kind: 'action' },
   { id: 'options', label: 'Options', kind: 'action' },
   { id: 'controls', label: 'Controls', kind: 'action' },
   { id: 'savequit', label: 'Save & Quit', kind: 'action' },
   { id: 'quit', label: 'Abandon Run', kind: 'action' },
 ]);
+
+/** Pause screen while Auto Explore is on: the same rows, the second one offering to stop it. */
+const PAUSE_AUTO_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ (
+  PAUSE_ITEMS.map((item) => (item.id === 'auto' ? { id: 'auto', label: 'Stop Auto Explore', kind: 'action' } : item))
+);
 
 /**
  * Options screen. The ranges mirror `SETTING_SPEC` in `src/state/balance.js` (see the file
@@ -421,6 +431,7 @@ const SCREENS = Object.freeze({
   titleSaved: Object.freeze({ id: 'title', items: TITLE_SAVED_ITEMS }),
   replace: Object.freeze({ id: 'confirm', items: REPLACE_ITEMS }),
   pause: Object.freeze({ id: 'pause', items: PAUSE_ITEMS }),
+  pauseAuto: Object.freeze({ id: 'pause', items: PAUSE_AUTO_ITEMS }),
   options: Object.freeze({ id: 'options', items: OPTION_ITEMS }),
   credits: Object.freeze({ id: 'credits', items: CREDITS_ITEMS }),
   controls: Object.freeze({ id: 'controls', items: CONTROLS_ITEMS }),
@@ -808,6 +819,7 @@ const PICK_PALETTE = Object.freeze([
  * @property {() => void} [onResume]     leave the pause screen
  * @property {() => void} [onQuit]       abandon the run and return to the title
  * @property {() => void} [onSaveQuit]   keep the run as a saved run and return to the title (§4.10)
+ * @property {() => void} [onToggleAuto] switch Auto Explore over (pause's second row, which then resumes)
  * @property {() => void} [onContinue]   pick the saved run back up (title "Continue")
  * @property {() => ({level:number, score:number}|null)} [savedRun] the saved run waiting on the
  *   title, or null. Asked each frame on the title, so it must be a cheap read of a cached value.
@@ -1038,7 +1050,8 @@ export function createMenus(overlayCanvas, callbacks) {
         if (subScreen() !== null) return /** @type {Screen} */ (subScreen());
         return savedSummary() === null ? SCREENS.title : SCREENS.titleSaved;
       case 'paused':
-        return subScreen() === null ? SCREENS.pause : /** @type {Screen} */ (subScreen());
+        if (subScreen() !== null) return /** @type {Screen} */ (subScreen());
+        return state.settings !== undefined && state.settings.autoExplore === true ? SCREENS.pauseAuto : SCREENS.pause;
       case 'loading':
         return SCREENS.loading;
       case 'levelComplete':
@@ -1246,6 +1259,12 @@ export function createMenus(overlayCanvas, callbacks) {
         return true;
       case 'resume':
         sound('uiConfirm');
+        invoke(cb.onResume, 'onResume');
+        return true;
+      case 'auto':
+        // Switch Auto Explore over and get straight back to the maze: turning it on is asking to watch.
+        sound('uiConfirm');
+        invoke(cb.onToggleAuto, 'onToggleAuto');
         invoke(cb.onResume, 'onResume');
         return true;
       case 'quit':

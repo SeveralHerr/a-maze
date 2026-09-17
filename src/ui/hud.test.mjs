@@ -419,6 +419,9 @@ test('there is no compass: nothing is drawn at the bottom centre, however many g
     const canvas = drawableCanvas(1280, 720);
     const hud = createHud(canvas, { map: 'off' });
     hud.resize(1280, 720, 1);
+    // The AUTO button lives at the bottom centre now (§4.10, tested below); this test is about the
+    // compass, so it measures the HUD without the button.
+    hud.setAutoButton(false);
     const state = playingState(run);
     state.level = 9;
     hud.render(state, null, 0);
@@ -806,4 +809,58 @@ test('running low on oil raises a notice once per level, on the crossing only', 
   let late = 0;
   for (let i = 0; i < 60 * 5; i++) late += count(step(hud, state)) > 0 ? 1 : 0;
   assert.ok(late > 0, 'a crossing under "Map Found" still warns after the banner clears');
+});
+
+test('the AUTO button: on screen in play, hit-testable, lit when on, and absent where it should be (§4.10)', () => {
+  const canvas = drawableCanvas(1280, 720);
+  const hud = createHud(canvas, { map: 'off' });
+  hud.resize(1280, 720, 1);
+  const state = playingState();
+  const m = hud.surface.metrics;
+
+  hud.render(state, null, 0);
+  // `hitAuto` takes client (CSS) coordinates; the fake canvas fills the page, so scan it for the button.
+  /** @param {any} h */
+  const hits = (h) => {
+    const pts = [];
+    for (let y = 0; y < 720; y += 2) for (let x = 0; x < 1280; x += 2) if (h.hitAuto(x, y)) pts.push([x, y]);
+    return pts;
+  };
+  const pts = hits(hud);
+  assert.ok(pts.length > 20, 'the button is on screen and hit-testable while off');
+  const midX = pts.reduce((s, q) => s + q[0], 0) / pts.length;
+  const midY = pts.reduce((s, q) => s + q[1], 0) / pts.length;
+  assert.ok(Math.abs(midX - 640) < 8, `centred horizontally (${midX})`);
+  assert.ok(midY > 720 * 0.8, `at the bottom of the view (${midY})`);
+  const [cx, nearBottom] = pts[pts.length >> 1];
+  assert.equal(hud.hitAuto(640, 300), false, 'the middle of the view is not the button');
+  assert.equal(hud.hitAuto(Number.NaN, 5), false);
+
+  // Lit when on: its gold outline is an extra filled edge over the off drawing.
+  const off = canvas.__ctx.calls.fills;
+  canvas.__ctx.calls.fills = 0;
+  state.settings.autoExplore = true;
+  hud.render(state, null, 0);
+  assert.ok(canvas.__ctx.calls.fills > off - 1, 'drawing it on does not skip the button');
+  assert.equal(hud.hitAuto(cx, nearBottom), true, 'still clickable while on, to switch it off');
+
+  // Not clickable where it is not drawn.
+  state.phase = 'paused';
+  hud.render(state, null, 0);
+  assert.equal(hud.hitAuto(cx, nearBottom), false, 'not while paused');
+  state.phase = 'playing';
+  hud.setAutoButton(false);
+  hud.render(state, null, 0);
+  assert.equal(hud.hitAuto(cx, nearBottom), false, 'not when suppressed (touch devices use the touch bar)');
+  hud.setAutoButton(true);
+
+  const phone = drawableCanvas(390, 844);
+  const narrowHud = createHud(phone, { map: 'off' });
+  narrowHud.resize(390, 844, 3);
+  narrowHud.render(playingState(), null, 0);
+  const pm = narrowHud.surface.metrics;
+  assert.equal(pm.narrow, true);
+  let hit = false;
+  for (let y = 0; y < 844; y += 4) for (let x = 0; x < 390; x += 4) hit = hit || narrowHud.hitAuto(x, y);
+  assert.equal(hit, false, 'a narrow layout has no HUD button anywhere');
 });
