@@ -49,7 +49,9 @@ tree is served locally (`npm run serve`) and uploaded to itch.io by CI.
   reached at level 15. `LEVEL.MAX_CELLS` in `balance.js` is the **single documented size knob** and
   the cap level is *derived* from it (`CAP_LEVEL`), never typed twice. Past the cap, levels get
   **harder, not bigger**: every level (level 1 included) also gets one cross-section **shortcut**
-  per `LEVEL.SHORTCUT_CELLS` (24) cells, so long cul-de-sacs sometimes have a back door;
+  per `LEVEL.SHORTCUT_CELLS_START` (8) cells on level 1 rising to one per `SHORTCUT_CELLS_END` (4) at
+  `CAP_LEVEL`, with the detour (6 → 4 cells) and route guard (0.85 → 0.70) relaxing along the same
+  ramp, so long cul-de-sacs usually have a back door and deeper floors loop more;
   braid keeps rising (0→0.6 over 17 levels, square-root shaped, 0.6 from
   level 18), the torch drains 3 % faster per level (`FUEL.DRAIN_PER_LEVEL`) from
   `LEVEL.DRAIN_RAMP_START` (level 5, so the ramp is felt inside the size curve) to a 1.35× ceiling
@@ -593,9 +595,7 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
 - `textures.js` — `createTextures(seed) → TextureSet` procedurally paints 64×64 pixel-art
   textures (indices + packed pixels + a stipple mask): `wall[4]` (plain, cracked, mossy, vined),
   `floor[3]` (two cobbles + iron grate), `ceiling[2]` (planks, planks + beam), `portal[8]`,
-  `torch[4]` (cup, rod and flame — rotationally symmetric, so they may billboard), `sconce[1]` (the
-  iron wall plate as a wall-resolution decal, 0 = clear: the wall pass draws it on every torch's
-  mounting face so it foreshortens with the stone instead of turning with the camera), `gem[8]`, `oil[4]`, `map[1]` (the scroll; `MAP_FLOOR_ROW` export rests it on the floor), `sparkle[4]`. **Every field is an array** — consumers index them,
+  `torch[4]`, `gem[8]`, `oil[4]`, `map[1]` (the scroll; `MAP_FLOOR_ROW` export rests it on the floor), `sparkle[4]`. **Every field is an array** — consumers index them,
   and the raycaster picks a per-tile variant by hash. Deterministic and Node-safe (no DOM) so it
   can be unit tested; ~20 ms for a full set.
 - `sprite-index.js` — `createSpriteIndex(cell = INDEX_CELL) → SpriteIndex` with

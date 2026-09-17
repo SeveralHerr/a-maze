@@ -455,24 +455,42 @@ export const LEVEL = Object.freeze({
    * sibling twig. Doubled from 48 in a playtest pass that asked for "a bunch" more: placed per
    * maze size (10 seeds) went 2 → 7 at 16×16, 8 → 20 at 24×24, 13 → 33 at 32×32,
    * 66 → 164 at 64×64 and 325 → 683 at the cap. Small grids accept fewer than requested (≈7 of 11
-   * on level 1): the detour and route rules run out of candidates.
+   * on level 1): the detour and route rules run out of candidates. Halved again to 12 (with
+   * `SHORTCUT_DETOUR` 12 → 8) when a later playtest asked for more still. Density alone moved
+   * nothing — at detour 12 the candidates were already spent — so the detour is the real lever:
+   * placed (6 seeds) went 2 → 4 at 10×10, 19 → 35 at 24×24, 34 → 60 at 32×32, 91 → 152 at 48×48.
+   * Then 12 → 8 (detour 8 → 6) for "more" once more: 4 → 6, 35 → 52, 60 → 89, 152 → 223. Detour 4
+   * would place ~60 % more again, but at 8 tiles it mostly joins sibling corridors.
+   *
+   * Since a playtest asked for more again, "especially as they get higher", all three shortcut knobs
+   * ramp over the size curve (level 1 → `CAP_LEVEL`): `_START` on level 1, `_END` at the cap. At 8/6
+   * the route guard was the binding rule on every floor from 3 up (the route sat at exactly 0.85),
+   * so density alone could not add more; the detour is the big lever on a large grid and the guard
+   * the second. Measured (2 seeds, before braid) at 8/6/0.85 → 4/4/0.70: 64×64 389 → 752,
+   * 96×96 973 → 1742, 128×128 1991 → 3555.
    */
-  SHORTCUT_CELLS: 24,
+  SHORTCUT_CELLS_START: 8,
+  SHORTCUT_CELLS_END: 4,
   /**
    * Minimum path distance, in cells, between the two cells a shortcut joins (so each one spares at
-   * least 24 tiles of backtracking). Lowered from 24 with the doubled density: at 24 or 16 the
+   * least 12 tiles of backtracking; 24 at the original 12). Lowered from 24 to 12 with the doubled density: at 24 or 16 the
    * candidates run out and half the requests go unplaced (32×32: 25 of 51 at 16). Re-measured in
    * `feasibility.test.mjs` (10 seeds per level) the lowest tank is still 0.70 on levels 1–2 against
    * 0.53 deep, so the "L1 generous, L10 tense" curve survives.
    */
-  SHORTCUT_DETOUR: 12,
+  SHORTCUT_DETOUR_START: 6,
+  /** Detour at the cap: 4 cells = 8 tiles. Rounded to whole cells along the ramp. */
+  SHORTCUT_DETOUR_END: 4,
   /**
    * Fraction of the carved start→exit route shortcuts must leave intact. They exist to spare
    * backtracking, not to hand out a faster exit: unguarded, four of them halve a 16×16 route.
    * At 0.85 the level-1 route drops at most 15 %; at 0.9 the guard alone rejected ~40 % of the
-   * requests on a 32×32 level.
+   * requests on a 32×32 level. Relaxed toward the cap (see `SHORTCUT_CELLS_START`): a 128×128
+   * route is ~700 tiles, so 70 % of it is still a long walk, and it is what lets the denser
+   * shortcuts deep in the curve actually land.
    */
-  SHORTCUT_ROUTE_KEEP: 0.85,
+  SHORTCUT_ROUTE_KEEP_START: 0.85,
+  SHORTCUT_ROUTE_KEEP_END: 0.7,
   /**
    * Levels over which braid ramps from 0 to `BRAID_MAX`. Longer than the size ramp on purpose, so
    * braid **keeps rising past the size cap** (0.49 at `CAP_LEVEL`, 0.6 from level 18).
@@ -684,7 +702,11 @@ export function levelParams(level) {
 
   const braid =
     Math.pow(clamp01((lv - 1) / LEVEL.BRAID_RAMP_LEVELS), LEVEL.BRAID_RAMP_SHAPE) * LEVEL.BRAID_MAX;
-  const shortcuts = Math.round(cells / LEVEL.SHORTCUT_CELLS);
+  // Shortcut ramp over the size curve: level 1 → the cap (see `LEVEL.SHORTCUT_CELLS_START`).
+  const ts = CAP_LEVEL > 1 ? clamp01((lv - 1) / (CAP_LEVEL - 1)) : 1;
+  const shortcuts = Math.round(cells / lerp(LEVEL.SHORTCUT_CELLS_START, LEVEL.SHORTCUT_CELLS_END, ts));
+  const shortcutDetour = Math.round(lerp(LEVEL.SHORTCUT_DETOUR_START, LEVEL.SHORTCUT_DETOUR_END, ts));
+  const shortcutRouteKeep = lerp(LEVEL.SHORTCUT_ROUTE_KEEP_START, LEVEL.SHORTCUT_ROUTE_KEEP_END, ts);
 
   // Density ramp: t = 0 on level 1, 1 once the maze has stopped growing.
   const t = clamp01((lv - 1) / LEVEL.DENSITY_RAMP_LEVELS);
@@ -712,8 +734,8 @@ export function levelParams(level) {
     rows: side,
     braid,
     shortcuts,
-    shortcutDetour: LEVEL.SHORTCUT_DETOUR,
-    shortcutRouteKeep: LEVEL.SHORTCUT_ROUTE_KEEP,
+    shortcutDetour,
+    shortcutRouteKeep,
     gems,
     oil,
     fuelSeconds,

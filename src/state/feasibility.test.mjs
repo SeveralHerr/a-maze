@@ -352,8 +352,9 @@ test('feasibility: a level with no flasks at all is correctly judged unwinnable'
 /**
  * A walking route over a built level, as tile indices: the solution path, plus — for a wanderer —
  * side excursions of up to 20 tiles (walked out and back) spread along it until the route is about
- * `wander` × the path. A path-only walker (`wander` 1) never steps off the path, so it ignores every
- * flask that is not on it; a wanderer passes whatever lies down the side passages it explores.
+ * `wander` × the path. A path-only walker (`wander` 1) never explores; a wanderer passes whatever
+ * lies down the side passages it explores. Both also fetch flask pockets once the tank runs low —
+ * that is decided while walking, in `reducerWalk` (see `POCKET_GRAB_FRACTION`), not here.
  * Deterministic for a given `seed`.
  * @param {import('../core/types.js').LevelData} data
  * @param {number} wander
@@ -410,6 +411,54 @@ function walkingRoute(data, wander, seed) {
 }
 
 /**
+ * Tank fraction below which a walker steps into a side pocket for a flask it can see from the route.
+ * A player with a full torch walks past oil; one down to about a third goes and gets it. Above
+ * `FUEL.LOW_FRACTION` so the pocket is taken before the alarm, and low enough that the walkers still
+ * run the tank down far enough for the depth trend to show.
+ */
+const POCKET_GRAB_FRACTION = 0.35;
+
+/**
+ * The out-and-back walk into a flask pocket off route tile `t`: breadth-first over off-path floor, at
+ * most 3 tiles deep (`OIL_BRANCH_RADIUS`, the pocket the refuel chain places a flask in), to the
+ * nearest flask in `oil`. The flask is removed from `oil` once chosen.
+ * @param {import('../core/types.js').Maze} maze
+ * @param {Set<number>} onPath
+ * @param {Set<number>} oil flask tiles not yet taken
+ * @param {number} t
+ * @returns {number[]|null} tiles out to the flask, back, and ending on `t`; null when none is in reach
+ */
+function pocketTrail(maze, onPath, oil, t) {
+  const w = maze.width;
+  const from = new Map([[t, -1]]);
+  let layer = [t];
+  for (let depth = 0; depth < 3 && layer.length > 0; depth++) {
+    /** @type {number[]} */
+    const next = [];
+    for (const c of layer) {
+      const cx = c % w;
+      const cy = (c - cx) / w;
+      for (let dir = 0; dir < DIR_COUNT; dir++) {
+        const m = (cy + DIR_DY[dir]) * w + cx + DIR_DX[dir];
+        if (maze.tiles[m] !== TILE.FLOOR || onPath.has(m) || from.has(m)) continue;
+        from.set(m, c);
+        next.push(m);
+        if (!oil.has(m)) continue;
+        oil.delete(m);
+        /** @type {number[]} */
+        const out = [];
+        for (let k = m; k !== t; k = /** @type {number} */ (from.get(k))) out.unshift(k);
+        for (let k = out.length - 2; k >= 0; k--) out.push(out[k]);
+        out.push(t);
+        return out;
+      }
+    }
+    layer = next;
+  }
+  return null;
+}
+
+/**
  * Walk a route through the **real reducer** at 60 Hz, steering like a mouse player (yaw flick
  * capped at 0.25 rad per step, forward held when roughly aligned), and report how low the tank got.
  * @param {number} level
@@ -421,6 +470,9 @@ function reducerWalk(level, seed, wander) {
   const data = buildLevel(levelParams(level), seed);
   const route = walkingRoute(data, wander, seed);
   const w = data.maze.width;
+  const onPath = new Set(data.validation.path);
+  const oil = new Set();
+  for (const it of data.items) if (it.kind === 'oil') oil.add((it.y - 0.5) * w + (it.x - 0.5));
   const s = createInitialState();
   reducer(s, { type: 'newGame', seed });
   s.level = level;
@@ -438,8 +490,14 @@ function reducerWalk(level, seed, wander) {
       const t = route[wp];
       const tx = (t % w) + 0.5;
       const ty = Math.floor(t / w) + 0.5;
-      if (wp < route.length - 1 && Math.hypot(s.player.x - tx, s.player.y - ty) < 0.3) wp++;
-      else break;
+      if (wp < route.length - 1 && Math.hypot(s.player.x - tx, s.player.y - ty) < 0.3) {
+        wp++;
+        // Arrived on a path tile with the torch half gone: fetch a flask from a pocket beside it.
+        if (onPath.has(t) && s.run.fuel < s.run.fuelMax * POCKET_GRAB_FRACTION) {
+          const trail = pocketTrail(data.maze, onPath, oil, t);
+          if (trail) route.splice(wp, 0, ...trail);
+        }
+      } else break;
     }
     if (wp !== last) {
       last = wp;

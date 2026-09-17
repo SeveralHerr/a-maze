@@ -1012,12 +1012,6 @@ export function createRaycaster(canvas, options) {
   let chalkApplied = 0;
   /** Seed per chalked face, so the lettering variant is the mark's own (index = tile·4 + face). */
   let chalkSeed = new Int32Array(0);
-  /**
-   * Faces per tile that carry a wall torch: bit `1 << face`, as `chalkMask`. The wall pass draws the
-   * sconce's iron plate (`textures.sconce`) on them, so the plate foreshortens with the wall rather
-   * than turning with the billboard. Rebuilt with the spatial indexes, once per level.
-   */
-  let sconceMask = new Uint8Array(0);
   /** 1 = floor tile inside a dead-end branch within the whisper depth. */
   let whisperMask = new Uint8Array(0);
   /** @type {object|null} */
@@ -1133,16 +1127,6 @@ export function createRaycaster(canvas, options) {
     idxTorchCount = torches.length;
     itemIndex.build(items.length, readItemX, readItemY, maze.width, maze.height);
     torchIndex.build(torches.length, readTorchX, readTorchY, maze.width, maze.height);
-    const tileCount = maze.width * maze.height;
-    if (sconceMask.length < tileCount) sconceMask = new Uint8Array(tileCount);
-    else sconceMask.fill(0, 0, tileCount);
-    for (let i = 0; i < torches.length; i++) {
-      const t = torches[i];
-      const tx = t.x | 0;
-      const ty = t.y | 0;
-      if (tx < 0 || ty < 0 || tx >= maze.width || ty >= maze.height) continue;
-      sconceMask[ty * maze.width + tx] |= 1 << ((t.face | 0) & 3);
-    }
     // Visibility windows belong to a level: forget every bake, and grow the store only past its
     // high-water mark (a level-change cost, like the index build above).
     if (torchVisReady.length < torches.length) {
@@ -1797,26 +1781,19 @@ export function createRaycaster(canvas, options) {
       wallX -= Math.floor(wallX);
       // Chalk (§4.9): which face was hit, and where along it in the viewer's own left-to-right —
       // taken before the per-tile mirroring below, so the word never reads backwards.
-      // A torch's face gets its iron plate the same way, lit and tinted like the stone under it.
       let decal = null;
-      let plate = null;
       let decalX = 0;
       const tileAt = mapY * mw + mapX;
       const chalkBits = chalkMaze === maze ? chalkMask[tileAt] : 0;
-      const sconceBits = idxMaze === maze ? sconceMask[tileAt] : 0;
-      if ((chalkBits | sconceBits) !== 0) {
+      if (chalkBits !== 0) {
         const faceHit = side === 0 ? (stepX > 0 ? 2 : 0) : stepY > 0 ? 3 : 1;
-        const alongRight = side === 0 ? stepX > 0 : stepY < 0;
-        decalX = (((alongRight ? wallX : 1 - wallX) * TEX) | 0) & (TEX - 1);
         if ((chalkBits & (1 << faceHit)) !== 0) {
           const set = textures.chalk;
           if (set && set.length > 0) {
+            const alongRight = side === 0 ? stepX > 0 : stepY < 0;
+            decalX = (((alongRight ? wallX : 1 - wallX) * TEX) | 0) & (TEX - 1);
             decal = set[((chalkSeed[tileAt * 4 + faceHit] >>> 0) % CHALK_VARIANTS) % set.length].indices;
           }
-        }
-        if ((sconceBits & (1 << faceHit)) !== 0) {
-          const set = textures.sconce;
-          if (set && set.length > 0) plate = set[0].indices;
         }
       }
       let texX = (wallX * TEX) | 0;
@@ -1893,30 +1870,24 @@ export function createRaycaster(canvas, options) {
         let cur = lvl - (run === 0 ? horizon - from : from - horizon) * rampStep;
         const curStep = run === 0 ? rampStep : -rampStep;
         let pi = from * w + x;
-        if (decal !== null || plate !== null) {
-          // A chalked or sconce-bearing face: the wall texel, the plate over it, or the chalk over
-          // both lifted a few levels. Rare (a handful of columns on the frames one is in view), so it
-          // gets its own loop and the two loops below stay exactly as fast as before.
+        if (decal !== null) {
+          // A chalked face: the wall texel, or the chalk over it lifted a few levels. Rare (a
+          // handful of columns on the frames a mark is in view), so it gets its own loop and the two
+          // loops below stay exactly as fast as before.
           for (let y = from; y < to; y++) {
             const ty = (texPos >> 16) & (TEX - 1);
             texPos += stepFx;
             const bk = ((y & 3) << 2) | bayerCol;
-            const di = (ty << 6) | decalX;
-            const chalkIdx = decal !== null ? decal[di] : 0;
+            const chalkIdx = decal[(ty << 6) | decalX];
             let level = (cur + (chalkIdx !== 0 ? CHALK_LIFT_FX : 0) + BAYER16[bk]) >> 16;
             if (level < 0) level = 0;
             else if (level > LEVEL_MAX) level = LEVEL_MAX;
-            const plateIdx = plate !== null ? plate[di] : 0;
             // Chalk takes no firelight tint: under the torch's warm core a tinted white read as
             // orange flame, and the mark has to read as chalk at a glance.
             buf[pi] =
               chalkIdx !== 0
                 ? colormap[(level << 8) | chalkIdx]
-                : colormap[
-                    (((warmFx + BAYER_W[bk]) >> 16) << WARM_SHIFT) |
-                      (level << 8) |
-                      (plateIdx !== 0 ? plateIdx : tIdx[(ty << 6) | texX])
-                  ];
+                : colormap[(((warmFx + BAYER_W[bk]) >> 16) << WARM_SHIFT) | (level << 8) | tIdx[(ty << 6) | texX]];
             cur += curStep;
             pi += w;
           }

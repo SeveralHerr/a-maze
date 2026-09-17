@@ -1,6 +1,6 @@
 {
- "updated": "2026-09-17T02:22:46.168Z",
- "iteration": 14,
+ "updated": "2026-09-17T03:13:28.482Z",
+ "iteration": 15,
  "passThreshold": 8.5,
  "wave": "tilesets",
  "waves": {
@@ -927,6 +927,18 @@
    "updated": "2026-09-17T02:22:46.168Z",
    "wave": "foldable-fill",
    "summary": "Playtest (fold phone inner screen): the world letterboxed with black bars above and below because the framebuffer was capped at 4:3 (width clamped 320..560, 240 rows). Narrower than 4:3 the buffer now keeps 320 columns and grows rows up to MAX_H=400 (4:5); the projection scale stays INTERNAL_H=240 (walls, flats, sprites, particles via partCam.proj) so horizontal FOV and pixel size are unchanged and the extra rows show more floor/ceiling. main.js hands portrait phones (cssH > 1.25*cssW, was 1.15) a 4:3 aspect so the cabinet layout is untouched. ARCHITECTURE §4.5/§4.7/decisions updated; raycaster resize test extended. npm test 40/40; headless shots: 945x980 fills (320x332 buffer), 390x844 unchanged 4:3 band, 1280x720 unchanged 426x240."
+  },
+  {
+   "iteration": 14,
+   "updated": "2026-09-17T02:39:39.520Z",
+   "wave": "sconce-revert",
+   "summary": "Playtest rejected both sconce reworks (plate as wall decal; then arm + soot + wall glow: \"terrible\"). Torch rendering reverted to b96f506: plate baked into the torch billboard, TORCH_OFFSET 0.02, no textures.sconce. textures.js/textures.test.mjs restored from b96f506; sconce hunks removed from raycaster.js and ARCHITECTURE.md; the foldable-screen framebuffer change from 12c0b98 is kept. Open: the plate still turns with the camera — any retry needs playtest sign-off on a mock-up first."
+  },
+  {
+   "iteration": 15,
+   "updated": "2026-09-17T03:13:28.482Z",
+   "wave": "more-shortcuts",
+   "summary": "Playtest asked for more shortcuts three times, the last \"especially as they get higher\". Shortcut knobs now ramp over the size curve (level 1 -> CAP_LEVEL): cells per shortcut 8 -> 4, detour 6 -> 4 cells, route keep 0.85 -> 0.70 (shipped before this wave: 24 / 12 / 0.85, flat). At 8/6/0.85 the route guard was binding on every floor from 3 up. Placed at seed 1337 went 3->6 on floor 1 and 683->1935 at the cap at 8/6; the ramp measures 1991->3555 at 128x128 (2 seeds, before braid). Gate fix in feasibility.test: reducerWalk walkers never entered the <=3-tile side pocket the refuel chain places flasks in, so they only won while flasks landed on the path; denser loops broke that (level 11: path-only seed 529782, then the 2x wanderer seed 110866) although walkRefuelChain reported ok. Walkers now fetch a pocket flask when the tank is below POCKET_GRAB_FRACTION 0.35 (a player who notices the torch getting low). Both every-walk-wins and no-early-alarm assertions stay intact. Lowest tank 2x: 0.599 -> 0.483; path only 0.615 -> 0.445. npm test 40/40; validate-mazes (full) 117306 mazes OK, worst reserve 62.8%; stress (full) OK. Also: sconce plate decal removed (textures back to b96f506). Open: map scroll detour outside [4, gap/4] on levels 1,19,21,24,26,28,29 (informational, not a gate)."
   }
  ],
  "openIssues": [

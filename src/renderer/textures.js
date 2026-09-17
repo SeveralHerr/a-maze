@@ -82,9 +82,7 @@ export const BAYER = Float32Array.from(
  * @property {Texture[]} wall       4 variants: plain, cracked, mossy, vined
  * @property {Texture[]} floor      3 variants: cobbles A, cobbles B, iron grate
  * @property {Texture[]} ceiling    2 variants: planks, planks + cross beam
- * @property {Texture[]} torch      4 flame frames (cup and rod baked in, no wall plate), emissive
- * @property {Texture[]} sconce     1 wall-plate decal, painted at wall texel density and drawn by the
- *   wall pass on a torch's mounting face (see `paintSconcePlate`)
+ * @property {Texture[]} torch      4 flame frames (sconce baked in), emissive
  * @property {Texture[]} portal     8 swirl frames, emissive
  * @property {Texture[]} gem        8 spin frames
  * @property {Texture[]} oil        4 bob frames
@@ -847,13 +845,8 @@ function paintCeiling(seed, beam, plankSeed) {
 // ─── Sprites ───────────────────────────────────────────────────────────────────────────────────
 
 /**
- * Paint an iron wall sconce's cup, rod and burning flame. The iron is identical in every frame;
- * only the flame animates, so the four frames cycle without the bracket appearing to twitch.
- *
- * WHY no wall plate: this texture is a billboard, so it turns to face the eye. A cup, a rod and a
- * flame look the same from every side, but a flat plate bolted to the wall does not — seen along a
- * corridor it stayed square-on while the stone around it foreshortened, and read as a card
- * swivelling with the camera. The plate is `paintSconcePlate`, drawn by the wall pass instead.
+ * Paint an iron wall sconce with a burning flame. The sconce is identical in every frame; only
+ * the flame animates, so the four frames cycle without the bracket appearing to twitch.
  * @param {number} seed
  * @param {number} frame 0..3
  * @param {Uint8Array} stipple out-param: halo texels are marked 1
@@ -864,8 +857,19 @@ function paintTorch(seed, frame, stipple) {
   const cx = 32;
 
   // ── Iron sconce ──
-  // Rod from the wall plate (a wall decal, meeting it at sprite rows 40–46) up to the cup.
-  for (let y = 30; y < 46; y++) {
+  // Wall plate with rivets.
+  for (let y = 40; y < 54; y++) {
+    for (let x = 26; x < 38; x++) {
+      const t = x < 28 ? 0.72 : x > 35 ? 0.16 : y < 42 ? 0.6 : 0.42;
+      putClip(buf, x, y, rampPickChunky(RAMPS.iron, t, x, y));
+    }
+  }
+  putClip(buf, 28, 43, C.ironHilite);
+  putClip(buf, 35, 43, C.ironShadow);
+  putClip(buf, 28, 51, C.ironHilite);
+  putClip(buf, 35, 51, C.ironShadow);
+  // Shaft rising from the plate to the cup.
+  for (let y = 30; y < 44; y++) {
     putClip(buf, cx - 2, y, C.ironLight);
     putClip(buf, cx - 1, y, C.ironBase);
     putClip(buf, cx, y, C.ironBase);
@@ -921,43 +925,6 @@ function paintTorch(seed, frame, stipple) {
     }
   }
 
-  return buf;
-}
-
-/**
- * Paint the iron plate a sconce is bolted to, as a wall decal (0 = the wall shows through).
- *
- * Texel rows here are wall rows: the wall pass maps row 0 to the top of the tile and row 32 to eye
- * height, the same mapping every wall painting uses. The torch billboard is `TORCH_SPRITE_SCALE`
- * (0.5) tall, lifted 0.17 (raycaster.js), so its sprite row `r` sits on wall row `5.12 + r / 2`:
- * the rod's foot (sprite row 46) lands on row 28, inside the top of this plate, and the plate
- * covers what the old baked-in one did (sprite rows 40–54, columns 26–38) at the wall's own
- * texel density, so it pixelates exactly like the stone around it.
- * @returns {Uint8Array}
- */
-function paintSconcePlate() {
-  const buf = new Uint8Array(AREA);
-  const x0 = 28;
-  const x1 = 35;
-  const y0 = 25;
-  const y1 = 33;
-  for (let y = y0; y <= y1; y++) {
-    for (let x = x0; x <= x1; x++) {
-      // Lit from above-left like the rest of the art: bright top and left edges, dark bottom/right.
-      const t = x === x0 ? 0.72 : x === x1 ? 0.16 : y === y0 ? 0.6 : y === y1 ? 0.2 : 0.42;
-      buf[(y << 6) | x] = rampPickChunky(RAMPS.iron, t, x, y);
-    }
-  }
-  // Four rivets, each a highlight over its own shadow.
-  for (const [rx, ry] of [
-    [x0 + 1, y0 + 1],
-    [x1 - 1, y0 + 1],
-    [x0 + 1, y1 - 1],
-    [x1 - 1, y1 - 1],
-  ]) {
-    buf[(ry << 6) | rx] = C.ironHilite;
-    buf[((ry + 1) << 6) | rx] = C.ironShadow;
-  }
   return buf;
 }
 
@@ -1503,8 +1470,6 @@ export function createTextures(seed = 0xa11a2e) {
   for (let f = 0; f < 4; f++) {
     torch.push(finishStippled((st) => paintTorch(torchSeed, f, st), true));
   }
-  /** @type {Texture[]} */
-  const sconce = [finish(paintSconcePlate(), null, false)];
 
   const portalSeed = s('portal');
   /** @type {Texture[]} */
@@ -1538,5 +1503,5 @@ export function createTextures(seed = 0xa11a2e) {
   const chalk = [];
   for (let v = 0; v < CHALK_VARIANTS; v++) chalk.push(finish(paintChalk((chalkSeed + v * 0x9e3779b9) >>> 0), null, false));
 
-  return { seed: usedSeed, size: SIZE, wall, floor, ceiling, torch, sconce, portal, gem, oil, sparkle, map, chalk };
+  return { seed: usedSeed, size: SIZE, wall, floor, ceiling, torch, portal, gem, oil, sparkle, map, chalk };
 }

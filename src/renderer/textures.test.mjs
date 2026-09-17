@@ -266,28 +266,6 @@ test('animation frames actually differ from each other', () => {
   }
 });
 
-test('the sconce plate is a wall decal, not part of the billboard that turns with the camera', () => {
-  // Only the rod may reach below the flame's halo: anything wider than it under row 40 is a plate
-  // painted into the billboard again, which swivels with the view instead of lying flat on the wall.
-  for (const t of set.torch) {
-    for (let y = 40; y < SIZE; y++) {
-      for (let x = 0; x < SIZE; x++) {
-        if (t.indices[(y << 6) | x] !== 0) {
-          assert.ok(x >= 30 && x <= 33, `torch frame has iron at (${x}, ${y}) outside the rod`);
-        }
-      }
-    }
-  }
-  assert.equal(set.sconce.length, 1);
-  assert.equal(set.sconce[0].emissive, false, 'the plate is lit like the wall it hangs on');
-  const plate = set.sconce[0].indices;
-  let drawn = 0;
-  for (let p = 0; p < AREA; p++) if (plate[p] !== 0) drawn++;
-  assert.ok(drawn > 40 && drawn < 200, `plate covers ${drawn} texels`);
-  // The rod's foot (sprite row 45 → wall row ≈27.6 at scale 0.5, lifted 0.17) lands on the plate.
-  assert.notEqual(plate[(28 << 6) | 32], 0, 'rod foot must meet the plate');
-});
-
 test('emissive art is flagged, and only glow art carries a stipple mask', () => {
   for (const t of set.torch) assert.equal(t.emissive, true);
   for (const t of set.portal) assert.equal(t.emissive, true);

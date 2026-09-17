@@ -59,9 +59,9 @@ test('levelParams: level 1 is the lean first floor — small, unbraided, a short
   assert.equal(p.cols, LEVEL.FIRST_CELLS, 'the first floor is 10×10 cells = 21×21 tiles');
   assert.equal(p.rows, LEVEL.FIRST_CELLS);
   assert.equal(p.braid, 0, 'level 1 is unbraided');
-  assert.equal(p.shortcuts, Math.round(p.cells / LEVEL.SHORTCUT_CELLS), 'shortcuts scale with area');
-  assert.equal(p.shortcutDetour, LEVEL.SHORTCUT_DETOUR);
-  assert.equal(p.shortcutRouteKeep, LEVEL.SHORTCUT_ROUTE_KEEP);
+  assert.equal(p.shortcuts, Math.round(p.cells / LEVEL.SHORTCUT_CELLS_START), 'shortcuts scale with area');
+  assert.equal(p.shortcutDetour, LEVEL.SHORTCUT_DETOUR_START);
+  assert.equal(p.shortcutRouteKeep, LEVEL.SHORTCUT_ROUTE_KEEP_START);
   assert.equal(p.fuelSeconds, LEVEL.FIRST_TANK, 'its own short tank');
   assert.ok(p.fuelSeconds < FUEL.TANK_START, 'shorter than level 2');
   assert.equal(p.drain, 1, 'no extra drain before the ramp');
