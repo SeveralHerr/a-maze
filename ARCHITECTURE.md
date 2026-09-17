@@ -574,10 +574,22 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   `ArrayBuffer`s on the books (48.9 MB → 0.0 MB, measured).
 
 ### 4.5 `src/renderer` (Wave 1 shell, Wave 3 polish)
-- `palette.js` — the master palette (**79 colours**, hard limit 256; `map` parchment + `seal` red ramps for the scroll, `chalk` for the wall lettering) sampled from the art
+- `palette.js` — the master palette (**79 shared colours** plus one block of ≤ `TILESET_PALETTE_MAX` (28) per deeper tileset, appended from `tilesets/<id>.palette.js`; hard limit 256; `map` parchment + `seal` red ramps for the scroll, `chalk` for the wall lettering) sampled from the art
   reference; every material needs a 5–9 step ramp for the ordered dither to avoid banding at 240p.
   All textures and UI colours come from here. Exports `PALETTE`, `PALETTE_RGB`, `C` (name → index),
-  `RAMPS`, `pack`, `hex`, `rgba`, `nearestIndex`.
+  `RAMPS`, `ramp`, `pack`, `hex`, `rgba`, `nearestIndex`, and `PALETTE_GLOW` (1 = a self-lit tileset
+  colour: the colormap never shades it below `GLOW_MIN_LIGHT`, so lava or fungus stays visible in the dark).
+- `tilesets/` _(tilesets wave)_ — **every floor wears a different tileset**: `index.js` exports
+  `TILESETS` (keep, cistern, ossuary, grotto, temple, glacier, forge — floor order),
+  `tilesetIndexForLevel(level, floorsPer = WORLD.FLOORS_PER_TILESET)` (cycles past the end),
+  `tilesetIndexById(id)` and `createTilesetTextures(index, seed?, base?) → TextureSet`. A tileset module
+  `<id>.js` exports `TILESET {id, name, fog, paint(seedOf) → {wall[4], floor[3], ceiling[2]}}` of raw
+  palette-index buffers with the Keep's variant semantics and texture invariants; sprites are shared
+  from the Keep set. `TextureSet` gains optional `tileset` (id), `fog` (palette index), `warmth` (0..1 torch tint strength). **Variants are seamless against each other:** texels are tied to world position (no per-tile offset, mirror or flip), so every wall variant meets every other horizontally, all three floors meet on both axes (the special tile is set *into* the common floor) and the two ceilings meet along y — variants share their structure along the tile edges and differ inside (`tilesets.test.mjs` measures the edge bands for every tileset, the Keep included);
+  `raycaster.setTextures(set)` rebuilds the colormap when the set's fog differs (once per floor).
+  `main.js` swaps sets when `state.level` changes (cached per tileset; the title wears floor 1), and
+  `?tileset=<id>` pins one for review. Each tileset's palette file is pure data (palette.js imports it).
+  `tilesets/sheet.html?tileset=<id>` and `node tools/shot-tileset.mjs --tileset <id> [--poses 0,…,6] [--views N --depth D]` are the art-review harnesses.
 - `textures.js` — `createTextures(seed) → TextureSet` procedurally paints 64×64 pixel-art
   textures (indices + packed pixels + a stipple mask): `wall[4]` (plain, cracked, mossy, vined),
   `floor[3]` (two cobbles + iron grate), `ceiling[2]` (planks, planks + beam), `portal[8]`,
@@ -631,12 +643,10 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
     from the focus, so once 8 lights are held and the 8th is nearer than that bound the search
     stops — 2–3 rings typically). Provably the same answer as the exhaustive scan, asserted against
     a brute-force sort over 600 torches.
-  - **Tile-keyed texture variety** for 257-tile corridors with no new textures: one extra bit of the
-    existing per-tile hash mirrors a wall's course horizontally (4 paintings × 64 offsets × 2 mirrors
-    = 512 looks, one comparison per column); because a floor texel index is `(v<<6)|u` with both
-    fields 6 bits, a per-tile XOR mask of `(63<<6)|63` gives all four dihedral flips for **one xor
-    per pixel** (2 cobble paintings → 8 looks). The ceiling is deliberately left unflipped so its
-    beams stay aligned.
+  - **Tile-keyed texture variety** comes from the variant hash alone. A per-tile wall u offset, a
+    wall mirror bit and per-tile floor flips used to multiply the looks, but each one cut a block or
+    a cobble in half at the tile seam; they are gone, and the paintings share their edges instead
+    (see `tilesets/`).
   - **The DDA is bounded by fog, not by maze size.** Measured over 480 columns × 8 headings × 40
     stations: ~1.0 steps/column and ~15 distinct `maze.tiles` reads per frame at 33², 129², 257²,
     1025² *and* 2001² tiles; the loop always exits on `dist > FAR`, never on `MAX_DDA_STEPS` (160).
@@ -993,8 +1003,8 @@ computed `state.perks` / `RenderView` fields and never the catalogue's numbers.
 |----|------------------------|
 | `reservoir` | tank +10 % (5) · `richOil` flask +12 % (4) · `slowWick` drain −6 % (4) |
 | `ember` | once per level, a dead torch rekindles for 10/18/28 s (3) · `siphon` flask overflow stored, 15/30/50 s, pours in below half a tank (3) |
-| `wideFlame` | torch light radius +15 % (3) · `cartographer` fog reveal radius 3→4→5 (2) · `oilSense` flasks within 5/8/12 tiles show through walls (3) |
-| `scrollSense` | HUD pulse within 14/28 tiles of the unfound scroll (2) · `whisper` walls of dead-end branches darken, 4/10/all tiles deep (3) · `lodestone` exit needle once the scroll is found (1) |
+| `wideFlame` | torch light radius +15 % (3) · `oilSense` flasks within 5/8/12 tiles show through walls (3) · `whisper` walls of dead-end branches darken, 4/10/all tiles deep (3) |
+| _retired_ | `cartographer` (fog reveal 3→4→5), `scrollSense` (HUD pulse near the unfound scroll), `lodestone` (exit needle once the scroll is found) — **removed from the catalogue for now**: buying a map upgrade before ever finding the map was awkward. `RETIRED_UNLOCK_COSTS` keeps their prices; `sanitizeProgress` refunds owned ranks to the purse and drops them. Their `UNLOCK_FX` tables, `Perks` fields and HUD drawing stay wired at rank 0. |
 | `chalk` | 4/8/16 chalk marks per level (3) · `magnet` gems within 1.2/1.6/2.0 tiles with line of sight are pulled in (3) · `appraiser` +1 purse gem per gem per rank (3) |
 
 **State.** `progress = {purse, ranks:{id→rank}, boonLevel}` is persisted by `save.js`. `perks` is
@@ -1029,7 +1039,8 @@ peels the start or exit) and dims wall faces bordering a marked floor tile. `vie
 within range through walls as a stippled ghost. `view.flame` scales the player torch radius.
 
 **UI.** `menus.js` gains two sub-screens: **`boon`** (three cards: icon, name, rank pips, the next rank's
-effect; opens itself once the level-complete tally is done while `offer.open`; *Descend* with an open
+effect; opens itself `BOON_HOLD_S` (3.5 s) after the level-complete tally is done while `offer.open`, so
+the floor's score can be read first — the *Choose a Boon* row opens it sooner; *Descend* with an open
 offer opens it instead of forfeiting) and **`shrine`** (reachable from title, level complete and game
 over: the purse, a scrolling list of every unlock with rank pips and cost, and a detail panel with the
 current → next effect; confirm buys). Callbacks `onBuy(id)` and `onClaimBoon(id)`. `screen()` may also

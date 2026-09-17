@@ -1,8 +1,8 @@
 {
- "updated": "2026-09-16T23:53:53.000Z",
- "iteration": 12,
+ "updated": "2026-09-17T01:36:08.524Z",
+ "iteration": 13,
  "passThreshold": 8.5,
- "wave": "unlocks",
+ "wave": "tilesets",
  "waves": {
   "0-scaffold": {
    "status": "done",
@@ -624,10 +624,25 @@
      "note": "quick 2-critic pass; all high/medium issues fixed afterwards (detail overprint, cut blurbs, inconsistent boon cards, glow strikethrough, pips, phone detail, chalk legibility) and re-shot; not re-scored"
     },
     "state": {
-     "score": 8.0,
+     "score": 8,
      "note": "0 regressions base vs maxed over 216 paired runs, 117k-action fuzz clean, chalk exact over 60k probes; fixed afterwards: Cartographer step cost 2.0x -> 1.06x (reveal sweeps now complete across steps, which also halved base step cost), savePersist keeps stored progress, persist on pause, siphon min room, quit guards an open boon, Appraiser repriced, stale comments; not re-scored"
     }
    }
+  },
+  "tilesets": {
+   "status": "done",
+   "notes": "Every floor wears a different tileset, cycling after 7: keep, cistern, ossuary, grotto, temple, glacier, forge (src/renderer/tilesets/, WORLD.FLOORS_PER_TILESET). Per-tileset palette blocks (<=28, palette now 233), fog colour and torch warmth rebuild the colormap once per floor; PALETTE_GLOW colours stay lit in the dark. Six painters fanned out, each shot v1, fixed 3 issues, re-shot. Also: boon opens 3.5 s after the tally (BOON_HOLD_S); map unlocks (cartographer, scrollSense, lodestone) retired from the catalogue with a purse refund, effects still wired at rank 0. tools/shot-tileset.mjs + tilesets/sheet.html for art review. Follow-up pass: grotto rock repainted as fused irregular masses; forge magma grate 17.8% -> ~6% glow with edge fade. shot-tileset.mjs gained --views N --depth D (in-game shots down the longest corridors). Seam pass: playtest showed brick/floor seams at tile edges. The raycaster no longer offsets, mirrors or flips tiles (wallPeriod/wallMirror and the floor XOR flip removed); instead every tileset (Keep included) paints its variants to share structure along the tile edges and differ inside, so any variant meets any other: walls horizontally, all 3 floors on both axes (specials inset into the common floor), ceilings along y. Gate: tilesets.test.mjs \"every variant meets every other seamlessly\" (2-texel edge bands within 6 luminance + own-wrap check) for all 7 tilesets; sheet.html gained mixed-variant rows. Cost: joint layouts repeat per tile; ice walls/pools, temple slab floor, forge pit and grotto ring are now insets.",
+   "gates": {
+    "npmTest": "740 tests pass",
+    "stress": "--quick OK",
+    "validateMazes": "not run (maze code untouched)",
+    "verify": "not run"
+   },
+   "openIssues": [
+    "Tileset warmth values tuned by eye on preview and floor 1/4 game shots only.",
+    "Grotto wall mass pattern is not vertically periodic, so the bottom row of masses can end in a short straight edge (walls do not need vertical tiling).",
+    "Ceiling seams remain where a north-south corridor tile meets a transposed east-west one (junctions); not covered by the seam gate."
+   ]
   }
  },
  "modules": {
@@ -891,7 +906,7 @@
    "wave": "unlocks",
    "scores": {
     "ui": 6.8,
-    "state": 8.0
+    "state": 8
    },
    "stressPass": true
    },

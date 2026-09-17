@@ -1092,7 +1092,17 @@ test('boon: opens itself after the tally, claims the chosen card, and Descend ne
   menus.render(state);
   menus.handleInput(press('confirm'), state); // skip the tally
   menus.render(state);
-  assert.equal(menus.screen(), 'boon', 'the boon opens itself');
+  assert.equal(menus.screen(), 'complete', 'the finished tally stays up long enough to read');
+  for (let i = 0; i < 60 * 3; i++) {
+    state.time += 1 / 60;
+    menus.render(state);
+  }
+  assert.equal(menus.screen(), 'complete', 'still reading after 3 s');
+  for (let i = 0; i < 60; i++) {
+    state.time += 1 / 60;
+    menus.render(state);
+  }
+  assert.equal(menus.screen(), 'boon', 'the boon opens itself after the hold');
   menus.handleInput(press('back'), state); // Decide Later
   menus.render(state);
   assert.equal(menus.screen(), 'complete');

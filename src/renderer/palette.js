@@ -51,13 +51,26 @@ export function pack(r, g, b, a = 255) {
     : ((rr << 24) | (gg << 16) | (bb << 8) | aa) >>> 0;
 }
 
+import CISTERN from './tilesets/cistern.palette.js';
+import OSSUARY from './tilesets/ossuary.palette.js';
+import GROTTO from './tilesets/grotto.palette.js';
+import TEMPLE from './tilesets/temple.palette.js';
+import GLACIER from './tilesets/glacier.palette.js';
+import FORGE from './tilesets/forge.palette.js';
+
+/**
+ * Most palette slots one tileset's block may take (`src/renderer/tilesets/*.palette.js`). Six blocks
+ * of 28 on top of the ~80 shared entries stays inside the 256 the colormap can index.
+ */
+export const TILESET_PALETTE_MAX = 28;
+
 /**
  * Authored palette: `[name, 0xRRGGBB]`, in ramp order. The array order *is* the index order, so
  * inserting a colour in the middle renumbers everything — append to a ramp's end instead, or
  * accept that saved screenshots change (nothing is persisted by index, so that is safe).
  * @type {ReadonlyArray<readonly [string, number]>}
  */
-const ENTRIES = /** @type {const} */ ([
+const SHARED_ENTRIES = /** @type {ReadonlyArray<readonly [string, number, boolean?]>} */ ([
   // 0 — transparency key. Its RGB is irrelevant (alpha 0) but kept as the fog colour so a
   // careless opaque blit of index 0 degrades to "distant darkness" rather than to a magenta hole.
   ['empty', 0x0a0e18],
@@ -175,6 +188,20 @@ const ENTRIES = /** @type {const} */ ([
   ['chalkPale', 0xf4f0e3], // where the chalk bit hardest
 ]);
 
+/**
+ * The deeper floors' tilesets (`src/renderer/tilesets/`), appended in floor order after the shared
+ * entries. Each block is `[name, 0xRRGGBB, glow?]`; `glow` marks a self-lit texel (lava, fungus,
+ * rune light) that the colormap keeps bright in the dark (see `PALETTE_GLOW`).
+ */
+const TILESET_BLOCKS = [CISTERN, OSSUARY, GROTTO, TEMPLE, GLACIER, FORGE];
+for (const block of TILESET_BLOCKS) {
+  if (block.length > TILESET_PALETTE_MAX) throw new Error(`palette: a tileset block has ${block.length} > ${TILESET_PALETTE_MAX} entries`);
+}
+
+/** Shared entries, then every tileset block. @type {ReadonlyArray<readonly [string, number, boolean?]>} */
+const ENTRIES = SHARED_ENTRIES.concat(...TILESET_BLOCKS);
+if (ENTRIES.length > 256) throw new Error(`palette: ${ENTRIES.length} entries exceed the 256 the colormap indexes`);
+
 /** Number of palette slots, including the transparency key at index 0. */
 export const PALETTE_SIZE = ENTRIES.length;
 
@@ -187,11 +214,19 @@ export const PALETTE_RGB = new Uint8Array(PALETTE_SIZE * 3);
 /** Palette names in index order (diagnostics, tests, the preview's swatch sheet). */
 export const PALETTE_NAMES = /** @type {ReadonlyArray<string>} */ (ENTRIES.map((e) => e[0]));
 
+/**
+ * 1 = a self-lit colour: the colormap never shades it below `GLOW_MIN_LIGHT` (raycaster.js), so a
+ * lava seam or a glowing fungus stays visible down a dark corridor. Only tileset blocks set it.
+ */
+export const PALETTE_GLOW = new Uint8Array(PALETTE_SIZE);
+
 /** @type {Record<string, number>} */
 const indexByName = Object.create(null);
 
 for (let i = 0; i < PALETTE_SIZE; i++) {
-  const [name, rgb] = ENTRIES[i];
+  const [name, rgb, glow] = ENTRIES[i];
+  if (indexByName[name] !== undefined) throw new Error(`palette: duplicate colour name "${name}"`);
+  PALETTE_GLOW[i] = glow === true ? 1 : 0;
   const r = (rgb >> 16) & 255;
   const g = (rgb >> 8) & 255;
   const b = rgb & 255;
@@ -218,7 +253,7 @@ export const TRANSPARENT = 0;
  * @param {...string} names
  * @returns {Uint8Array} palette indices
  */
-function ramp(...names) {
+export function ramp(...names) {
   const out = new Uint8Array(names.length);
   for (let i = 0; i < names.length; i++) {
     const idx = indexByName[names[i]];

@@ -52,7 +52,7 @@
 
 import { hash2, createRng } from '../core/rng.js';
 import { DIR_DX, DIR_DY, TILE } from '../maze/constants.js';
-import { C, LITTLE_ENDIAN, PALETTE_RGB, PALETTE_SIZE, pack } from './palette.js';
+import { C, LITTLE_ENDIAN, PALETTE_GLOW, PALETTE_RGB, PALETTE_SIZE, pack } from './palette.js';
 import { CHALK_VARIANTS, createTextures, MAP_FLOOR_ROW, SIZE as TEX } from './textures.js';
 import { createParticles, PARTICLE, PARTICLE_COLORS } from './particles.js';
 import { createSpriteIndex } from './sprite-index.js';
@@ -587,16 +587,24 @@ const EMPTY_TORCHES = /** @type {import('../core/types.js').Torch[]} */ ([]);
  * saturating it by 70 % of the ramp (the player's pool turned the cobbles tan and the stone neutral
  * grey; measured near-floor r−b +48…+83 against the reference's +9, near walls −5…+3 against
  * −20…−27). Measure the preview poses before retuning any of these numbers.
+ *
+ * `fogIndex` is the palette colour darkness fades into — each tileset brings its own (a green murk
+ * in the cistern, a red haze in the forge). Glow colours (`PALETTE_GLOW`) never drop below
+ * `GLOW_MIN_LIGHT`, so a lava seam or a patch of fungus stays lit in the dark at no per-pixel cost.
  * @param {Uint32Array} out length `WARM_STEPS * LEVELS * CM_STRIDE`
+ * @param {number} [fogIndex] palette index of the fog colour (default `C.fog`)
+ * @param {number} [warmth] 0..1 how strongly firelight tints the palette (the tileset's `warmth`):
+ *   1 is the Keep's amber; a cold tileset (ice, fungus) turns it down so its own hue survives the torch
  * @returns {void}
  */
-function buildColormap(out) {
-  const fogR = PALETTE_RGB[C.fog * 3];
-  const fogG = PALETTE_RGB[C.fog * 3 + 1];
-  const fogB = PALETTE_RGB[C.fog * 3 + 2];
+function buildColormap(out, fogIndex = C.fog, warmth = 1) {
+  const wm = warmth < 0 ? 0 : warmth > 1 ? 1 : warmth;
+  const fogR = PALETTE_RGB[fogIndex * 3];
+  const fogG = PALETTE_RGB[fogIndex * 3 + 1];
+  const fogB = PALETTE_RGB[fogIndex * 3 + 2];
   const fogPacked = pack(fogR, fogG, fogB, 255);
   for (let k = 0; k < WARM_STEPS; k++) {
-    const s = k / (WARM_STEPS - 1);
+    const s = (k / (WARM_STEPS - 1)) * wm;
     const expR = GAMMA_COOL_R + (GAMMA_FIRE_R - GAMMA_COOL_R) * s;
     const expG = GAMMA_COOL_G + (GAMMA_FIRE_G - GAMMA_COOL_G) * s;
     const expB = GAMMA_COOL_B + (GAMMA_FIRE_B - GAMMA_COOL_B) * s;
@@ -617,12 +625,22 @@ function buildColormap(out) {
       // The player tint eases in with a smoothstep up to `WARM_FULL`, so shadow keeps the palette's
       // own hue and only the lit end of the ramp picks up the torch's slight warmth.
       const wu = t >= WARM_FULL ? 1 : t / WARM_FULL;
-      const warm = wu * wu * (3 - 2 * wu);
+      const warm = wu * wu * (3 - 2 * wu) * wm;
       const tintR = (1 + (PLAYER_TINT_R - 1) * warm) * fireR;
       const tintG = (1 + (PLAYER_TINT_G - 1) * warm) * fireG;
       const tintB = (1 + (PLAYER_TINT_B - 1) * warm) * fireB;
       const base = (k << WARM_SHIFT) | (l << 8);
+      // A glow colour reads the table at `GLOW_MIN_LIGHT` at least, untinted by the sconce.
+      const tg = t > GLOW_MIN_LIGHT ? t : GLOW_MIN_LIGHT;
+      const glowL = tg < 1 ? tg : 1 + (tg - 1) * OVERBRIGHT_SLOPE;
       for (let i = 0; i < PALETTE_SIZE; i++) {
+        if (PALETTE_GLOW[i] === 1) {
+          const lr = t > GLOW_MIN_LIGHT ? gR * tintR : glowL;
+          const lg = t > GLOW_MIN_LIGHT ? gG * tintG : glowL;
+          const lb = t > GLOW_MIN_LIGHT ? gB * tintB : glowL;
+          out[base + i] = pack(PALETTE_RGB[i * 3] * lr, PALETTE_RGB[i * 3 + 1] * lg, PALETTE_RGB[i * 3 + 2] * lb, 255);
+          continue;
+        }
         // Past light 1 the fog term is gone entirely rather than subtracted.
         const r = PALETTE_RGB[i * 3] * tintR * gR + (gR < 1 ? fogR * (1 - gR) : 0);
         const g = PALETTE_RGB[i * 3 + 1] * tintG * gG + (gG < 1 ? fogG * (1 - gG) : 0);
@@ -635,6 +653,12 @@ function buildColormap(out) {
     }
   }
 }
+
+/**
+ * Least light a glow colour (`PALETTE_GLOW`) is ever shaded at: bright enough to read as self-lit
+ * down a dark corridor, dim enough that the player's torch still visibly brightens it up close.
+ */
+const GLOW_MIN_LIGHT = 0.8;
 
 /**
  * Distance → visibility. `exp(-(d/9)^1.9)`: barely any loss in the first couple of tiles, then a
@@ -798,7 +822,10 @@ export function createRaycaster(canvas, options) {
 
   // ── Shade tables (built once; independent of resolution) ──
   const colormap = new Uint32Array(WARM_STEPS * LEVELS * CM_STRIDE);
-  buildColormap(colormap);
+  /** Palette index the colormap currently fades into (the texture set's `fog`). */
+  let colormapFog = typeof textures.fog === 'number' ? textures.fog : C.fog;
+  let colormapWarmth = typeof textures.warmth === 'number' ? textures.warmth : 1;
+  buildColormap(colormap, colormapFog, colormapWarmth);
   const fogLut = new Float32Array(FOG_LUT_N);
   buildFogLut(fogLut);
   const attLut = new Float32Array(ATT_LUT_N + 1);
@@ -807,7 +834,7 @@ export function createRaycaster(canvas, options) {
   buildAttFlatLut(attLut, attFlatLut);
   const playerAttLut = new Float32Array(ATT_LUT_N + 1);
   buildPlayerAttLut(playerAttLut);
-  const fogPacked = colormap[C.fog]; // level 0 of any index is exactly the fog colour
+  let fogPacked = colormap[colormapFog]; // level 0 of any index is exactly the fog colour
 
   // ── Framebuffer state ──
   let width = 0;
@@ -1781,20 +1808,14 @@ export function createRaycaster(canvas, options) {
       const lvlEdge = levelFx(illum * edgeFactor, dist, shade);
       const drop = lvl - lvlEdge;
 
-      // One hash per column serves two purposes: which wall variant this tile wears, and a
-      // per-tile horizontal texture offset. The offset is what stops a corridor looking like the
-      // same photograph repeated — the block courses still line up, but the joints no longer do.
+      // The tile's hash picks which wall variant it wears — and nothing else. Every variant of a set
+      // is painted to meet every other at a tile seam (the brick joints, bedding and edge detail
+      // agree; tilesets.test.mjs measures it), so texel columns are tied to world position exactly
+      // as rows are tied to height. A per-tile u offset and a per-tile mirror used to add variety
+      // here, but each one cut a block in half at the seam and left a hard line down the wall.
       const hv = hash2(mapX, mapY, variantSeed);
-      const variant = WALL_VARIANT[hv & 15];
-      const tIdx = wallTex[variant].indices;
-      // A third use of the same hash: mirror the course horizontally on half the tiles. Four wall
-      // paintings across 64 offsets already gave plenty of variety in a 13-tile corridor; at 257
-      // tiles the eye starts to recognise individual blocks, and mirroring doubles the vocabulary
-      // for one comparison per column — far cheaper than painting more textures, and it cannot
-      // break the tiling, because the offset above has already displaced every joint anyway.
-      if (hv & 0x100000) texX = TEX - 1 - texX;
-      texX = (texX + ((hv >>> 8) & (TEX - 1))) & (TEX - 1);
-      // No per-tile VERTICAL offset, deliberately. One used to slide each tile by whole 8-texel
+      const tIdx = wallTex[WALL_VARIANT[hv & 15]].indices;
+      // No per-tile VERTICAL offset either. One used to slide each tile by whole 8-texel
       // steps to break up bright bevel "rails" along the course joints, but it made the joints jump
       // height at every tile seam, so each metre of wall read as a separate slab. Every variant now
       // shares one course table (`textures.js`) and texel rows are tied to world height, so courses
@@ -1955,14 +1976,6 @@ export function createRaycaster(canvas, options) {
       let fIdx = floorTex[0].indices;
       /** @type {Uint8Array} */
       let cIdx = ceilTex[0].indices;
-      /**
-       * Per-tile XOR applied to the floor's texel index. Because the index is `(v << 6) | u` with
-       * both fields 6 bits, XOR-ing with `(63 << 6)` flips v and `63` flips u — so one mask gives
-       * the four dihedral flips of a cobble tile for a single operation per pixel. Two cobble
-       * paintings became eight looks, which is what stops a 257-tile floor reading as wallpaper.
-       * The ceiling is deliberately left unflipped: its beams have to stay aligned across tiles.
-       */
-      let flatMask = 0;
 
       let segStart = 0;
       let illum = illumFlat(wx, wy, rowLights, rowN);
@@ -1999,9 +2012,10 @@ export function createRaycaster(canvas, options) {
               lastCX = cx;
               lastCY = cy;
               const hv = hash2(cx, cy, variantSeed);
-              // 1 tile in 16 is an iron grate, as in the reference's entrance hall.
+              // 1 tile in 16 is the set's special floor (the Keep's iron grate). Tiles are never
+              // flipped: a flipped tile no longer meets its neighbours, and the variants are painted
+              // to meet each other on all four edges.
               fIdx = floorTex[(hv & 15) === 5 ? 2 : (hv >>> 4) & 1].indices;
-              flatMask = ((hv >>> 20) & 1 ? 63 << 6 : 0) | ((hv >>> 21) & 1 ? 63 : 0);
               // Ceiling timber runs ACROSS the corridor, with a beam every third tile along it. The
               // painting runs its planks and beam along +x, which is across a north-south corridor;
               // an east-west one (solid to the north and south) takes the transposed copy and counts
@@ -2021,7 +2035,7 @@ export function createRaycaster(canvas, options) {
                 colormap[
                   (((warm + bayerW[bk]) >> 16) << WARM_SHIFT) |
                     (((levF + bayer[bk]) >> 16) << 8) |
-                    fIdx[ti ^ flatMask]
+                    fIdx[ti]
                 ];
             }
             if (drawC) {
@@ -2706,6 +2720,15 @@ export function createRaycaster(canvas, options) {
     textures = set;
     variantSeed = (set.seed | 0) ^ 0x5eed;
     transposeCeilings(set);
+    // A tileset with its own fog rebuilds the shade table (~a few ms, once per floor, never per frame).
+    const fog = typeof set.fog === 'number' ? set.fog : C.fog;
+    const warmth = typeof set.warmth === 'number' ? set.warmth : 1;
+    if (fog !== colormapFog || warmth !== colormapWarmth) {
+      colormapFog = fog;
+      colormapWarmth = warmth;
+      buildColormap(colormap, fog, warmth);
+      fogPacked = colormap[fog];
+    }
   }
 
   /**

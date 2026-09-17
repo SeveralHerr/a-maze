@@ -44,10 +44,10 @@ import { C, PALETTE, RAMPS } from './palette.js';
 export const SIZE = 64;
 
 /** `x & MASK` / `y & MASK` wraps a coordinate into the texture — the source of seamlessness. */
-const MASK = SIZE - 1;
+export const MASK = SIZE - 1;
 
 /** Texels per texture. */
-const AREA = SIZE * SIZE;
+export const AREA = SIZE * SIZE;
 
 /** 1 / 2^32 — turns a uint32 hash into a float in [0,1). */
 const INV_U32 = 2.3283064365386963e-10;
@@ -57,7 +57,7 @@ const INV_U32 = 2.3283064365386963e-10;
  * its bucket. `floor(value + threshold)` is then an unbiased quantisation: it is what lets an
  * 8-step ramp fake ~32 steps without the banding a hard `round()` would produce.
  */
-const BAYER = Float32Array.from(
+export const BAYER = Float32Array.from(
   [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5],
   (v) => (v + 0.5) / 16,
 );
@@ -90,6 +90,9 @@ const BAYER = Float32Array.from(
  * @property {Texture[]} map        1 frame: the hidden map scroll (§4.8), solid, not emissive
  * @property {Texture[]} chalk      {@link CHALK_VARIANTS} wall decals: the word A-MAZE scrawled big and
  *   diagonally in chalk (§4.9). Index 0 = bare wall; drawn over a wall face, never as a sprite
+ * @property {string} [tileset]     id of the tileset whose surfaces these are (`tilesets/index.js`)
+ * @property {number} [fog]         palette index distance fades into (default `C.fog`)
+ * @property {number} [warmth]      0..1 firelight tint strength (default 1, the Keep's amber)
  */
 
 /** Scratch mask reused by the wall painter (mortar map). Painting is single-threaded and
@@ -106,7 +109,7 @@ const scratchMask = new Uint8Array(AREA);
  * @param {number} c palette index
  * @returns {void}
  */
-function put(buf, x, y, c) {
+export function put(buf, x, y, c) {
   buf[((y & MASK) << 6) | (x & MASK)] = c;
 }
 
@@ -118,7 +121,7 @@ function put(buf, x, y, c) {
  * @param {number} c palette index
  * @returns {void}
  */
-function putClip(buf, x, y, c) {
+export function putClip(buf, x, y, c) {
   if (x < 0 || y < 0 || x >= SIZE || y >= SIZE) return;
   buf[(y << 6) | x] = c;
 }
@@ -131,7 +134,7 @@ function putClip(buf, x, y, c) {
  * @param {number} y texel y (dither phase)
  * @returns {number} palette index
  */
-function rampPick(ramp, t, x, y) {
+export function rampPick(ramp, t, x, y) {
   const last = ramp.length - 1;
   const f = (t <= 0 ? 0 : t >= 1 ? 1 : t) * last;
   let i = (f + BAYER[((y & 3) << 2) | (x & 3)]) | 0;
@@ -154,7 +157,7 @@ function rampPick(ramp, t, x, y) {
  * @param {number} y texel y
  * @returns {number} palette index
  */
-function rampPickChunky(ramp, t, x, y) {
+export function rampPickChunky(ramp, t, x, y) {
   const last = ramp.length - 1;
   const f = (t <= 0 ? 0 : t >= 1 ? 1 : t) * last;
   let i = (f + BAYER[(((y >> 1) & 3) << 2) | ((x >> 1) & 3)]) | 0;
@@ -176,7 +179,7 @@ function rampPickChunky(ramp, t, x, y) {
  * @param {number} t 0..1 position along the ramp (clamped)
  * @returns {number} palette index
  */
-function rampPickFlat(ramp, t) {
+export function rampPickFlat(ramp, t) {
   const last = ramp.length - 1;
   const f = (t <= 0 ? 0 : t >= 1 ? 1 : t) * last;
   let i = (f + 0.5) | 0;
@@ -191,7 +194,7 @@ function rampPickFlat(ramp, t) {
  * @param {number} seed
  * @returns {number}
  */
-function h01(x, y, seed) {
+export function h01(x, y, seed) {
   return hash2(x, y, seed) * INV_U32;
 }
 
@@ -204,7 +207,7 @@ function h01(x, y, seed) {
  * @param {number} seed
  * @returns {number} 0..1
  */
-function vnoise(x, y, cell, seed) {
+export function vnoise(x, y, cell, seed) {
   const n = SIZE / cell;
   const m = n - 1;
   const fx = x / cell;
@@ -237,7 +240,7 @@ function vnoise(x, y, cell, seed) {
  * @param {number} seed
  * @returns {number} 0..1
  */
-function fbmChunky(x, y, seed) {
+export function fbmChunky(x, y, seed) {
   const qx = x & ~1;
   const qy = y & ~1;
   return (
@@ -257,7 +260,7 @@ function fbmChunky(x, y, seed) {
  * @param {number} c
  * @returns {void}
  */
-function fillRect(buf, x0, y0, w, h, c) {
+export function fillRect(buf, x0, y0, w, h, c) {
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) put(buf, x0 + x, y0 + y, c);
 }
 
@@ -309,6 +312,30 @@ const BLOCK_W_MIN = 28;
 const BLOCK_W_SPREAD = 12;
 
 /**
+ * Texels from a tile edge inside which every variant of a surface paints the same thing.
+ *
+ * WHY: the raycaster ties texels to world position and picks a variant per tile, so any two
+ * variants end up side by side. Whatever touches a tile edge (the block that straddles it, the
+ * cobbles along it, the moss and wet sheen near it) is painted from the set's shared `edgeSeed`,
+ * and per-variant decoration fades out over this distance. Variants differ only inside.
+ */
+const EDGE_ZONE = 10;
+
+/**
+ * 0 at a tile edge, rising to 1 at `EDGE_ZONE` texels in: how much of a variant's own decoration
+ * survives at texel `x` (pass `y` too for a surface that meets its neighbours on both axes).
+ * @param {number} x
+ * @param {number} [y]
+ * @returns {number}
+ */
+function edgeFade(x, y) {
+  let d = Math.min(x, SIZE - 1 - x);
+  if (y !== undefined) d = Math.min(d, y, SIZE - 1 - y);
+  const t = d / EDGE_ZONE;
+  return t >= 1 ? 1 : t * t * (3 - 2 * t);
+}
+
+/**
  * Paint one stone block face, its bevel, cracks and speckle.
  * @param {Uint8Array} buf  index buffer
  * @param {Uint8Array} mask mortar mask (set to 0 on painted face texels)
@@ -346,6 +373,9 @@ function paintBlock(buf, mask, bx, by, bw, bh, seed, rng) {
       else if (y === 1 || x === 1) t += 0.13 * bevel;
       if (y >= fh - 2 || x >= fw - 2) t -= 0.19;
       if (y === fh - 1 || x === fw - 1) t -= 0.12;
+      // Never into the mortar tones (steps 0–1): on a dark block the shadowed bottom rows would
+      // otherwise merge with the joint below into one thick dark band.
+      if (t < 0.19) t = 0.19;
       put(buf, gx, gy, rampPickFlat(RAMPS.stone, t));
       mask[((gy & MASK) << 6) | (gx & MASK)] = 0;
     }
@@ -427,21 +457,28 @@ function paintCrack(buf, bx, by, fw, fh, rng) {
 
 /**
  * Paint a wall variant.
+ *
+ * Every variant lays the same bond (`edgeSeed` draws the block widths and each course's start) and
+ * paints the blocks at the tile edges identically, so any variant meets any other at a tile seam
+ * with the block running straight through. The variant's own `seed` paints the interior blocks'
+ * tone, weathering and cracks, and its moss and vines, which fade out toward the edges.
  * @param {number} seed
  * @param {{moss:number, vines:number, cracks:number}} opts
  *   `moss` 0..1 coverage, `vines` strand count, `cracks` 0..1 chance per block
+ * @param {number} edgeSeed shared by every wall variant of the set
  * @returns {Uint8Array} index buffer
  */
-function paintWall(seed, opts) {
+function paintWall(seed, opts, edgeSeed) {
   const courses = COURSES;
   const buf = new Uint8Array(AREA);
   const mask = scratchMask;
   const rng = createRng(seed);
+  const layout = createRng(edgeSeed);
 
   // 1. Mortar bed. Everything starts as a dark navy groove; blocks are laid on top.
   for (let y = 0; y < SIZE; y++) {
     for (let x = 0; x < SIZE; x++) {
-      const n = fbmChunky(x, y, seed ^ 0x51a7);
+      const n = fbmChunky(x, y, edgeSeed ^ 0x51a7);
       buf[(y << 6) | x] = rampPickChunky(RAMPS.stone, 0.015 + n * 0.14, x, y);
       mask[(y << 6) | x] = 1;
     }
@@ -451,22 +488,32 @@ function paintWall(seed, opts) {
   //    top to bottom). Widths are drawn to sum to exactly 64 so the row wraps seamlessly, and they
   //    are wide — two landscape blocks across a tile face, as the reference's masonry is — rather
   //    than three squares that foreshorten into portrait slivers on a grazing corridor wall.
+  //    The bond comes from `layout` (shared). A block reaching within `MORTAR` texels of a tile
+  //    edge is painted from a shared stream of its own, so it is the same stone in every variant.
   const rows = courses.length - 1;
   for (let r = 0; r < rows; r++) {
     const y0 = courses[r];
     const bh = courses[r + 1] - y0;
-    let x = rng.int(SIZE);
+    let x = layout.int(SIZE);
     let remaining = SIZE;
+    let b = 0;
     while (remaining > 0) {
-      let bw = remaining <= 50 ? remaining : BLOCK_W_MIN + rng.int(BLOCK_W_SPREAD);
+      let bw = remaining <= 50 ? remaining : BLOCK_W_MIN + layout.int(BLOCK_W_SPREAD);
       // Never leave a sliver: if the remainder would be unusably thin, take it now.
       if (remaining - bw > 0 && remaining - bw < BLOCK_W_MIN) bw = remaining - BLOCK_W_MIN;
-      paintBlock(buf, mask, x, y0, bw, bh, seed, rng);
-      if (opts.cracks > 0 && rng.chance(opts.cracks)) {
-        paintCrack(buf, x, y0, bw - MORTAR, bh - MORTAR, rng);
+      const x0 = x & MASK;
+      if (x0 <= MORTAR || x0 + bw >= SIZE - MORTAR) {
+        const shared = createRng((edgeSeed ^ Math.imul(r * 8 + b + 1, 0x9e3779b1)) >>> 0);
+        paintBlock(buf, mask, x, y0, bw, bh, edgeSeed, shared);
+      } else {
+        paintBlock(buf, mask, x, y0, bw, bh, seed, rng);
+        if (opts.cracks > 0 && rng.chance(opts.cracks)) {
+          paintCrack(buf, x, y0, bw - MORTAR, bh - MORTAR, rng);
+        }
       }
       x += bw;
       remaining -= bw;
+      b++;
     }
   }
 
@@ -486,18 +533,20 @@ function paintWall(seed, opts) {
               ? 1.08
               : 0.74;
         const n = fbmChunky(x + 37, y + 11, seed ^ 0x9e37) * groove * (0.55 + 0.75 * topBias);
-        if (n > 1 - opts.moss * 0.55) {
+        const moss = opts.moss * edgeFade(x); // the plain wall has none, so moss thins out at a seam
+        if (moss > 0 && n > 1 - moss * 0.55) {
           // Lighter tips where the noise is strongest: moss catches light on its outer growth.
-          const t = (n - (1 - opts.moss * 0.55)) * 3.4;
+          const t = (n - (1 - moss * 0.55)) * 3.4;
           buf[i] = rampPickChunky(RAMPS.moss, 0.15 + t, x, y);
         }
       }
     }
   }
 
-  // 4. Vines: strands hanging from the top edge, wobbling as they fall, with paired leaves.
+  // 4. Vines: strands hanging from the top edge, wobbling as they fall, with paired leaves. They
+  //    start far enough inside the tile that wobble and leaves never reach a neighbour's edge.
   for (let v = 0; v < opts.vines; v++) {
-    const startX = rng.int(SIZE);
+    const startX = EDGE_ZONE + 4 + rng.int(SIZE - 2 * (EDGE_ZONE + 4));
     const len = 26 + rng.int(34);
     let fx = startX;
     for (let y = 0; y < len; y++) {
@@ -531,13 +580,32 @@ const COB_CELLS = 4;
 const COB_SPAN = SIZE / COB_CELLS;
 
 /**
+ * Is feature cell (cx, cy) on the outer ring of the grid, i.e. a cobble along a tile edge?
+ * @param {number} cx
+ * @param {number} cy
+ * @returns {boolean}
+ */
+function isRingCell(cx, cy) {
+  return cx === 0 || cy === 0 || cx === COB_CELLS - 1 || cy === COB_CELLS - 1;
+}
+
+/** Moss and wet sheen every floor variant eases to at a tile edge (see `EDGE_ZONE`). */
+const FLOOR_EDGE = Object.freeze({ moss: 0.3, wet: 0.3 });
+
+/**
  * Paint a cobblestone floor: a toroidal jittered-Voronoi diagram where each region is one rounded
  * stone shaded from its centre outward, separated by near-black gaps with moss in them.
+ *
+ * The outer ring of feature cells, the texture noise and the moss noise come from `edgeSeed`, and
+ * moss and wetness ease to `FLOOR_EDGE` at the border, so every floor variant has the same cobbles
+ * along its four edges and meets any other without a break. Only the four inner stones and the
+ * variant's own moss and wetness differ.
  * @param {number} seed
  * @param {{moss:number, wet:number}} opts moss coverage 0..1, wet-stone highlight chance 0..1
+ * @param {number} edgeSeed shared by every floor variant of the set
  * @returns {Uint8Array}
  */
-function paintFloor(seed, opts) {
+function paintFloor(seed, opts, edgeSeed) {
   const buf = new Uint8Array(AREA);
 
   for (let y = 0; y < SIZE; y++) {
@@ -556,8 +624,9 @@ function paintFloor(seed, opts) {
           const wy = gy & (COB_CELLS - 1);
           // Jitter comes from the *wrapped* cell so opposite edges agree; the feature position
           // uses the unwrapped cell so distances stay continuous across the seam.
-          const jx = (gx + 0.18 + 0.64 * h01(wx, wy, seed)) * COB_SPAN;
-          const jy = (gy + 0.18 + 0.64 * h01(wx, wy, seed ^ 0x1234)) * COB_SPAN;
+          const js = isRingCell(wx, wy) ? edgeSeed : seed;
+          const jx = (gx + 0.18 + 0.64 * h01(wx, wy, js)) * COB_SPAN;
+          const jy = (gy + 0.18 + 0.64 * h01(wx, wy, js ^ 0x1234)) * COB_SPAN;
           const dx = x - jx;
           const dy = y - jy;
           const d = dx * dx + dy * dy;
@@ -574,14 +643,17 @@ function paintFloor(seed, opts) {
       }
 
       const edge = Math.sqrt(d2) - Math.sqrt(d1); // 0 on a cell border, grows inward
-      const noise = fbmChunky(x, y, seed ^ 0x77a1);
+      const noise = fbmChunky(x, y, edgeSeed ^ 0x77a1);
       const gapWidth = 2.1 + noise * 1.7; // irregular, so gaps are not machine-cut
+      const own = edgeFade(x, y);
+      const moss = FLOOR_EDGE.moss + (opts.moss - FLOOR_EDGE.moss) * own;
+      const wet = FLOOR_EDGE.wet + (opts.wet - FLOOR_EDGE.wet) * own;
 
       if (edge < gapWidth) {
         // Gap between stones: nearly black, with moss tufts sprouting in the wider parts.
         const deep = 1 - edge / gapWidth; // 1 at the very centre of the gap
-        const mossN = fbmChunky(x + 19, y + 5, seed ^ 0x2f5a);
-        if (mossN * (0.5 + deep) > 1 - opts.moss * 0.72) {
+        const mossN = fbmChunky(x + 19, y + 5, edgeSeed ^ 0x2f5a);
+        if (mossN * (0.5 + deep) > 1 - moss * 0.72) {
           buf[(y << 6) | x] = rampPickChunky(RAMPS.moss, 0.1 + (mossN - 0.5) * 1.6, x, y);
         } else {
           buf[(y << 6) | x] = rampPickChunky(RAMPS.cobble, 0.06 * (1 - deep) + noise * 0.09, x, y);
@@ -591,12 +663,13 @@ function paintFloor(seed, opts) {
 
       // Stone face: brighter toward the middle of the cobble (rounded), plus per-stone tone.
       const r = Math.sqrt(f1x * f1x + f1y * f1y) / (COB_SPAN * 0.78);
-      const stoneTone = 0.34 + h01(id1 & 3, id1 >> 2, seed ^ 0xabc) * 0.3;
+      const toneSeed = isRingCell(id1 & 3, id1 >> 2) ? edgeSeed : seed;
+      const stoneTone = 0.34 + h01(id1 & 3, id1 >> 2, toneSeed ^ 0xabc) * 0.3;
       let t = stoneTone + (1 - r * r) * 0.22 + (noise - 0.5) * 0.17;
       // Light comes from above-left in texture space, matching the wall bevel.
       t += (-f1x - f1y) * 0.012;
       if (edge < gapWidth + 1.6) t -= 0.14; // dark contact shadow at the stone's rim
-      if (opts.wet > 0 && noise > 1 - opts.wet * 0.18 && r < 0.55) t += 0.3; // wet sheen
+      if (wet > 0 && noise > 1 - wet * 0.18 && r < 0.55) t += 0.3; // wet sheen
       buf[(y << 6) | x] = rampPickChunky(RAMPS.cobble, t, x, y);
     }
   }
@@ -605,81 +678,109 @@ function paintFloor(seed, opts) {
 }
 
 /**
- * Paint an iron floor grate: a lattice of bars over a black void, rusted and mossy at the edges.
+ * Paint an iron floor grate set into the cobbles: the shared cobble border every floor variant has
+ * (so the grate tile meets its neighbours without a break), and in the middle a framed lattice of
+ * round bars over a black void, rusted and mossy at the joints.
  * Used on ~1 tile in 16 (see the raycaster's variant hash) exactly as in the reference art.
  * @param {number} seed
+ * @param {number} edgeSeed shared by every floor variant of the set
  * @returns {Uint8Array}
  */
-function paintGrate(seed) {
-  const buf = new Uint8Array(AREA);
+function paintGrate(seed, edgeSeed) {
+  const buf = paintFloor(edgeSeed ^ 0x6a7e, FLOOR_EDGE, edgeSeed);
   const rng = createRng(seed);
+  const lo = GRATE_LO;
+  const hi = GRATE_HI;
 
-  for (let y = 0; y < SIZE; y++) {
-    for (let x = 0; x < SIZE; x++) {
-      // Void below: almost black, with a faint cool glimmer so it is not a flat hole.
-      const n = fbmChunky(x, y, seed ^ 0x0d0d);
-      buf[(y << 6) | x] = n > 0.72 ? C.stoneShadow : C.void;
+  // A dark contact line where the cobbles were cut back for the frame.
+  for (let k = lo - 1; k <= hi; k++) {
+    put(buf, k, lo - 1, C.cobGap);
+    put(buf, k, hi, C.cobGap);
+    put(buf, lo - 1, k, C.cobGap);
+    put(buf, hi, k, C.cobGap);
+  }
+
+  for (let y = lo; y < hi; y++) {
+    for (let x = lo; x < hi; x++) {
+      const fx = Math.min(x - lo, hi - 1 - x);
+      const fy = Math.min(y - lo, hi - 1 - y);
+      let c;
+      if (fx < GRATE_FRAME || fy < GRATE_FRAME) {
+        // Frame: lit on its top and left outer edges, dark on the bottom and right.
+        const lit = (y - lo === 0 && x < hi - 1) || (x - lo === 0 && y < hi - 1);
+        const dark = y === hi - 1 || x === hi - 1;
+        c = lit ? C.ironLight : dark ? C.ironShadow : C.ironBase;
+      } else {
+        // Void below: almost black, with a faint cool glimmer so it is not a flat hole.
+        c = fbmChunky(x, y, seed ^ 0x0d0d) > 0.72 ? C.stoneShadow : C.void;
+      }
+      buf[(y << 6) | x] = c;
     }
   }
 
-  // Bars every 16 texels, 6 wide, with a lit top-left edge and a dark bottom-right edge so the
-  // lattice reads as round iron rather than as a flat grid.
-  const BAR = 6;
+  // Bars across the opening, horizontal ones laid over vertical ones, each shaded as a round bar.
+  const inner = lo + GRATE_FRAME;
+  const span = hi - GRATE_FRAME - inner;
+  const gap = (span - 2 * GRATE_BAR) / 3;
   /** @type {number[]} across-bar shading, light → dark (the bar's cylindrical roll-off) */
-  const barShade = [C.ironLight, C.ironHilite, C.ironBase, C.ironBase, C.ironDark, C.ironShadow];
-  for (let b = 0; b < SIZE; b += 16) {
-    for (let k = 0; k < SIZE; k++) {
-      for (let t = 0; t < BAR; t++) {
-        // Horizontal bars sit on top of vertical ones at the crossings (drawn second).
-        put(buf, b + t, k, barShade[t]);
-      }
+  const barShade = [C.ironHilite, C.ironLight, C.ironDark, C.ironShadow];
+  for (let n = 1; n <= 2; n++) {
+    const b = inner + Math.round(n * gap + (n - 1) * GRATE_BAR);
+    for (let k = inner; k < hi - GRATE_FRAME; k++) {
+      for (let t = 0; t < GRATE_BAR; t++) put(buf, b + t, k, barShade[t]);
     }
   }
-  for (let b = 0; b < SIZE; b += 16) {
-    for (let k = 0; k < SIZE; k++) {
-      for (let t = 0; t < BAR; t++) {
-        const cross = (k & 15) < BAR;
-        // At a crossing the horizontal bar is lifted one step so the joint is legible.
-        put(buf, k, b + t, cross && t > 0 && t < BAR - 1 ? C.ironLight : barShade[t]);
-      }
+  for (let n = 1; n <= 2; n++) {
+    const b = inner + Math.round(n * gap + (n - 1) * GRATE_BAR);
+    for (let k = inner; k < hi - GRATE_FRAME; k++) {
+      for (let t = 0; t < GRATE_BAR; t++) put(buf, k, b + t, barShade[t]);
     }
   }
 
-  // Rust, wear and moss at the joints — otherwise the lattice looks like a CAD drawing.
-  for (let i = 0; i < 90; i++) {
-    const x = rng.int(SIZE);
-    const y = rng.int(SIZE);
-    const onBar = (x & 15) < 4 || (y & 15) < 4;
-    if (!onBar) continue;
+  // Rust, wear and moss on the iron, otherwise the lattice looks like a CAD drawing.
+  const iron = new Set([C.ironShadow, C.ironDark, C.ironBase, C.ironLight, C.ironHilite]);
+  for (let i = 0; i < 40; i++) {
+    const x = lo + rng.int(hi - lo);
+    const y = lo + rng.int(hi - lo);
+    if (!iron.has(buf[(y << 6) | x])) continue;
     const roll = rng.next();
     put(buf, x, y, roll < 0.45 ? C.ironHilite : roll < 0.78 ? C.oilDark : C.mossDeep);
   }
   return buf;
 }
 
+/** The grate's iron frame spans texels `GRATE_LO … GRATE_HI - 1`: inside the shared cobble ring. */
+const GRATE_LO = 16;
+const GRATE_HI = 48;
+/** Frame and bar thickness in texels. */
+const GRATE_FRAME = 3;
+const GRATE_BAR = 4;
+
 // ─── Ceiling ───────────────────────────────────────────────────────────────────────────────────
 
 /**
  * Paint dark timber planks running along +x, with grain, nails and knots; optionally a heavier
- * cross beam. Seamless on both axes (4 planks of 16 texels).
+ * cross beam. Seamless on both axes (4 planks of 16 texels). The plank tones and grain come from
+ * `plankSeed`, shared by both ceilings, so a beamed tile and a plain one meet without a break.
  * @param {number} seed
  * @param {boolean} beam add a structural cross beam
+ * @param {number} plankSeed shared by both ceiling variants
  * @returns {Uint8Array}
  */
-function paintCeiling(seed, beam) {
+function paintCeiling(seed, beam, plankSeed) {
   const buf = new Uint8Array(AREA);
   const rng = createRng(seed);
 
   for (let p = 0; p < 4; p++) {
     const y0 = p * 16;
-    const plankTone = 0.34 + h01(p, 0, seed) * 0.26;
+    const plankTone = 0.34 + h01(p, 0, plankSeed) * 0.26;
     for (let y = y0; y < y0 + 16; y++) {
       const edge = y - y0;
       for (let x = 0; x < SIZE; x++) {
         // Grain: noise stretched 6× along the plank so it streaks lengthwise.
         const grain =
-          vnoise(x & ~1, (y & ~1) * 6, 16, seed ^ (p * 977)) * 0.62 +
-          vnoise(x & ~1, (y & ~1) * 6, 8, seed ^ 0x33) * 0.38;
+          vnoise(x & ~1, (y & ~1) * 6, 16, plankSeed ^ (p * 977)) * 0.62 +
+          vnoise(x & ~1, (y & ~1) * 6, 8, plankSeed ^ 0x33) * 0.38;
         let t = plankTone + (grain - 0.5) * 0.3;
         if (edge === 0) t -= 0.4; // shadowed joint between planks
         else if (edge === 1) t -= 0.16;
@@ -691,7 +792,7 @@ function paintCeiling(seed, beam) {
     const knots = rng.int(3);
     for (let k = 0; k < knots; k++) {
       const kx = rng.int(SIZE);
-      const ky = y0 + 5 + rng.int(7);
+      const ky = y0 + 5 + rng.int(p === 3 ? 5 : 7); // off the last plank's lower edge rows
       for (let dy = -3; dy <= 3; dy++) {
         for (let dx = -4; dx <= 4; dx++) {
           const d = (dx * dx) / 16 + (dy * dy) / 9;
@@ -1298,7 +1399,7 @@ function paintChalk(seed) {
  * @param {boolean} emissive
  * @returns {Texture}
  */
-function finish(indices, stipple, emissive) {
+export function finish(indices, stipple, emissive) {
   const pixels = new Uint32Array(AREA);
   for (let i = 0; i < AREA; i++) pixels[i] = PALETTE[indices[i]];
   return { w: SIZE, h: SIZE, indices, pixels, stipple, emissive };
@@ -1337,26 +1438,30 @@ export function createTextures(seed = 0xa11a2e) {
   const root = createRng(usedSeed);
   const s = (/** @type {string} */ name) => root.fork(name).u32();
 
-  // Every variant shares `COURSES`, so bed joints line up across tile seams whatever the mix.
+  // Variants of a surface share their edges (`COURSES`, the bond and the edge blocks; the cobble
+  // ring; the planks), so any variant meets any other at a tile seam whatever the mix.
+  const wallEdge = s('wallEdge');
   /** @type {Texture[]} */
   const wall = [
-    finish(paintWall(s('wall0'), { moss: 0, vines: 0, cracks: 0.22 }), null, false),
-    finish(paintWall(s('wall1'), { moss: 0.12, vines: 0, cracks: 0.7 }), null, false),
-    finish(paintWall(s('wall2'), { moss: 0.42, vines: 0, cracks: 0.35 }), null, false),
-    finish(paintWall(s('wall3'), { moss: 0.34, vines: 2, cracks: 0.3 }), null, false),
+    finish(paintWall(s('wall0'), { moss: 0, vines: 0, cracks: 0.22 }, wallEdge), null, false),
+    finish(paintWall(s('wall1'), { moss: 0.12, vines: 0, cracks: 0.7 }, wallEdge), null, false),
+    finish(paintWall(s('wall2'), { moss: 0.42, vines: 0, cracks: 0.35 }, wallEdge), null, false),
+    finish(paintWall(s('wall3'), { moss: 0.34, vines: 2, cracks: 0.3 }, wallEdge), null, false),
   ];
 
+  const floorEdge = s('floorEdge');
   /** @type {Texture[]} */
   const floor = [
-    finish(paintFloor(s('floor0'), { moss: 0.22, wet: 0.45 }), null, false),
-    finish(paintFloor(s('floor1'), { moss: 0.5, wet: 0.2 }), null, false),
-    finish(paintGrate(s('grate')), null, false),
+    finish(paintFloor(s('floor0'), { moss: 0.22, wet: 0.45 }, floorEdge), null, false),
+    finish(paintFloor(s('floor1'), { moss: 0.5, wet: 0.2 }, floorEdge), null, false),
+    finish(paintGrate(s('grate'), floorEdge), null, false),
   ];
 
+  const planks = s('planks');
   /** @type {Texture[]} */
   const ceiling = [
-    finish(paintCeiling(s('ceil0'), false), null, false),
-    finish(paintCeiling(s('ceil1'), true), null, false),
+    finish(paintCeiling(s('ceil0'), false, planks), null, false),
+    finish(paintCeiling(s('ceil1'), true, planks), null, false),
   ];
 
   const torchSeed = s('torch');

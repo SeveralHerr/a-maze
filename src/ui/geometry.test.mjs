@@ -444,7 +444,7 @@ test('controls: a connected gamepad adds a clean PAD column', () => {
  */
 function unlockState(phase) {
   const state = playingState(phase);
-  state.progress = { purse: 260, ranks: { reservoir: 2, richOil: 1, siphon: 2, oilSense: 3, whisper: 3, lodestone: 1, chalk: 3 }, boonLevel: 0 };
+  state.progress = { purse: 260, ranks: { reservoir: 2, richOil: 1, siphon: 2, oilSense: 3, whisper: 3, chalk: 3 }, boonLevel: 0 };
   state.offer = { open: true, level: 15, ids: ['whisper', 'appraiser', 'ember'] };
   return state;
 }
@@ -464,7 +464,8 @@ test('shrine and boon: clean at every viewport, scrolled or not, with the longes
       } else {
         press(menus, state, 'confirm'); // skip the tally; the boon opens itself
       }
-      settle(menus, state, 2);
+      // The boon holds 3.5 s after the tally before it opens itself.
+      settle(menus, state, screen === 'boon' ? 4.5 : 2);
       assert.equal(menus.screen(), screen, `${vp.name}: reached ${screen}`);
       const boxes = collectLayout(() => {
         state.time += 1 / 60;

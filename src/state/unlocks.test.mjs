@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 
 import { TILE } from '../maze/constants.js';
 import { createInitialState, reducer } from './game.js';
-import {
+import { RETIRED_UNLOCK_COSTS,
   BOON_CHOICES,
   SIPHON,
   UNLOCKS,
@@ -90,6 +90,23 @@ function started(data, ranks = {}, purse = 0) {
   return s;
 }
 
+/**
+ * Start a level with perk values set directly — for the retired map unlocks, whose effects stay
+ * wired but which no rank can reach any more (RETIRED_UNLOCK_COSTS).
+ * @param {any} data @param {Record<string, number>} perks @returns {any}
+ */
+function startedWithPerks(data, perks) {
+  const s = started(data);
+  Object.assign(s.perks, perks);
+  // `levelReady` already swept the reveal window at the base radius; forget it so the next step
+  // sweeps again with the perk in force.
+  s.sim.revealCursor = 0;
+  s.sim.revealSeen = 0;
+  s.sim.revealX = -1e9;
+  s.sim.revealY = -1e9;
+  return s;
+}
+
 /** @param {any} s @param {number} n @param {object} [inp] @returns {any[]} */
 function run(s, n, inp = {}) {
   const out = [];
@@ -103,7 +120,8 @@ function run(s, n, inp = {}) {
 // ─── Catalogue ───────────────────────────────────────────────────────────────────────────────
 
 test('catalogue: every unlock has a price and a description per rank, and an effect table to match', () => {
-  assert.equal(UNLOCKS.length, 14);
+  assert.equal(UNLOCKS.length, 11);
+  for (const id of Object.keys(RETIRED_UNLOCK_COSTS)) assert.equal(UNLOCK_IDS.includes(id), false, `${id} is retired`);
   const ids = new Set();
   for (const u of UNLOCKS) {
     assert.ok(!ids.has(u.id), `unique id ${u.id}`);
@@ -119,7 +137,8 @@ test('catalogue: every unlock has a price and a description per rank, and an eff
   assert.deepEqual([...UNLOCK_IDS], UNLOCKS.map((u) => u.id));
   assert.ok(UNLOCK_FX.magnet[UNLOCK_FX.magnet.length - 1] <= 2, 'the magnet stays inside the 3×3 bucket bound');
   assert.equal(unlockCost('reservoir', 0), 15);
-  assert.equal(unlockCost('lodestone', 1), Infinity, 'a maxed unlock has no next price');
+  assert.equal(unlockCost('wideFlame', 3), Infinity, 'a maxed unlock has no next price');
+  assert.equal(unlockCost('lodestone', 0), Infinity, 'a retired unlock cannot be bought');
   assert.equal(unlockCost('nope', 0), Infinity);
 });
 
@@ -140,11 +159,20 @@ test('perks: nothing owned is the base game; every rank only ever adds slack', (
   assert.equal(clamped.chalk, 0);
 });
 
+test('progress: ranks of a retired map unlock are refunded once and dropped', () => {
+  const p = sanitizeProgress({ purse: 7, ranks: { cartographer: 2, scrollSense: 1, lodestone: 5, chalk: 1 }, boonLevel: 0 });
+  assert.equal(p.purse, 7 + 30 + 80 + 15 + 150, 'every paid rank comes back, clamped to what existed');
+  assert.equal(/** @type {any} */ (p.ranks).cartographer, undefined);
+  assert.equal(/** @type {any} */ (p.ranks).lodestone, undefined);
+  assert.equal(p.ranks.chalk, 1);
+  assert.equal(sanitizeProgress(p).purse, p.purse, 'sanitising the result again refunds nothing');
+});
+
 test('progress: persisted progress is sanitised, never trusted', () => {
-  const p = sanitizeProgress({ purse: -5, ranks: { reservoir: 3.7, lodestone: 9, bogus: 4, chalk: 'x' }, boonLevel: 2.5 });
+  const p = sanitizeProgress({ purse: -5, ranks: { reservoir: 3.7, wideFlame: 9, bogus: 4, chalk: 'x' }, boonLevel: 2.5 });
   assert.equal(p.purse, 0);
   assert.equal(p.ranks.reservoir, 3);
-  assert.equal(p.ranks.lodestone, 1, 'clamped to the unlock max');
+  assert.equal(p.ranks.wideFlame, 3, 'clamped to the unlock max');
   assert.equal(/** @type {any} */ (p.ranks).bogus, undefined);
   assert.equal(p.ranks.chalk, 0);
   assert.equal(p.boonLevel, 2);
@@ -177,8 +205,8 @@ test('shrine: closed mid-level, and a maxed unlock cannot be bought again', () =
   reducer(s, { type: 'pause' });
   reducer(s, { type: 'buyUnlock', id: 'chalk' });
   assert.equal(s.progress.ranks.chalk, 0, 'nor while paused');
-  const t = createInitialState(undefined, undefined, { purse: 1000, ranks: { lodestone: 1 }, boonLevel: 0 });
-  reducer(t, { type: 'buyUnlock', id: 'lodestone' });
+  const t = createInitialState(undefined, undefined, { purse: 1000, ranks: { wideFlame: 3 }, boonLevel: 0 });
+  reducer(t, { type: 'buyUnlock', id: 'wideFlame' });
   assert.equal(t.progress.purse, 1000);
 });
 
@@ -315,17 +343,17 @@ test('perks: the Gem Magnet pulls a gem it can see, never one through a wall', (
   assert.equal(/** @type {any} */ (plain.levelData).items[0].taken, false, 'no magnet, no pull');
 });
 
-test('perks: Cartographer reveals further, Scroll Sense tracks the unfound scroll', () => {
+test('perks (retired, still wired): a wider reveal radius maps further, scroll sense tracks the unfound scroll', () => {
   const OPEN = ['###########', '#S........#', '#.........#', '#.........#', '#........E#', '###########'];
   const narrow = started(level([], OPEN));
-  const wide = started(level([], OPEN), { cartographer: 2 });
+  const wide = startedWithPerks(level([], OPEN), { reveal: UNLOCK_FX.cartographer[2] });
   run(narrow, 20);
   run(wide, 20);
   const seen = (/** @type {any} */ st) => st.explored.reduce((a, b) => a + b, 0);
   assert.ok(seen(wide) > seen(narrow), `${seen(wide)} tiles vs ${seen(narrow)}`);
 
   const scroll = item(9, 'map', 6.5, 1.5);
-  const s = started(level([scroll], OPEN), { scrollSense: 1 });
+  const s = startedWithPerks(level([scroll], OPEN), { scrollSense: UNLOCK_FX.scrollSense[1] });
   run(s, 1);
   assert.ok(s.derived.scrollSense > 0.5 && s.derived.scrollSense < 1, `sense ${s.derived.scrollSense}`);
   const blind = started(level([item(9, 'map', 6.5, 1.5)], OPEN));
@@ -384,7 +412,7 @@ test('reveal: a wide Cartographer window completes its sweep across steps, then 
   }
   rows[7] = rows[7].slice(0, 7) + 'S' + rows[7].slice(8);
   rows[13] = rows[13].slice(0, 13) + 'E' + rows[13].slice(14);
-  const s = started(level([], rows), { cartographer: 2 });
+  const s = startedWithPerks(level([], rows), { reveal: UNLOCK_FX.cartographer[2] });
   run(s, 60);
   assert.equal(s.sim.revealCursor, 0, 'the sweep finished');
   assert.equal(s.sim.revealSeen, 0);

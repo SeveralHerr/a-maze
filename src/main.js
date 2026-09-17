@@ -33,7 +33,7 @@ import { createRng, randomSeed } from './core/rng.js';
 
 import { createStore } from './state/store.js';
 import { createInitialState, reducer } from './state/game.js';
-import { UNLOCKS, levelParams } from './state/balance.js';
+import { UNLOCKS, WORLD, levelParams } from './state/balance.js';
 import { loadPersist, savePersist } from './state/save.js';
 
 import { createInput } from './input/input.js';
@@ -42,6 +42,8 @@ import { createFullscreen, shouldAutoFullscreen } from './input/fullscreen.js';
 import { createMazeClient } from './maze/client.js';
 
 import { createRaycaster } from './renderer/raycaster.js';
+import { createTextures } from './renderer/textures.js';
+import { createTilesetTextures, tilesetIndexById, tilesetIndexForLevel } from './renderer/tilesets/index.js';
 import { createPost } from './renderer/post.js';
 import { PARTICLE, PARTICLE_COLORS } from './renderer/particles.js';
 
@@ -165,6 +167,8 @@ const FULLSCREEN_PARAM = params.get('fullscreen');
 /** `?seed=N` pins the run seed so a headless run replays exactly. */
 const SEED_PARAM = Number(params.get('seed'));
 const FORCED_SEED = Number.isFinite(SEED_PARAM) && params.get('seed') !== null ? SEED_PARAM >>> 0 : null;
+/** `?tileset=<id>` pins every floor to one tileset (screenshots, art review); -1 = by depth. */
+const FORCED_TILESET = tilesetIndexById(params.get('tileset'));
 
 // ─── Fatal error panel ───────────────────────────────────────────────────────────────────────
 
@@ -286,7 +290,33 @@ function boot() {
   let mutedVolume = appliedSettings.volume > 0 ? appliedSettings.volume : 0.8;
 
   // ── Renderer, overlay, effects ──────────────────────────────────────────────────────────────
-  const raycaster = createRaycaster(view);
+  const keepTextures = createTextures();
+  const raycaster = createRaycaster(view, { textures: keepTextures });
+  /** Texture sets by tileset index, painted the first time a floor needs one (on the loading screen). */
+  /** @type {Array<import('./renderer/textures.js').TextureSet|undefined>} */
+  const tilesetCache = [keepTextures];
+  let tilesetShown = 0;
+  /**
+   * Put the floor's tileset on the raycaster when it changes. Called per frame but is one integer
+   * compare unless the floor changed; the title's attract camera wears the tileset of floor 1.
+   * @param {number} level
+   * @returns {void}
+   */
+  function syncTileset(level) {
+    const idx = FORCED_TILESET >= 0 ? FORCED_TILESET : tilesetIndexForLevel(level, WORLD.FLOORS_PER_TILESET);
+    if (idx === tilesetShown) return;
+    tilesetShown = idx;
+    let set = tilesetCache[idx];
+    if (set === undefined) {
+      set = createTilesetTextures(idx, keepTextures.seed, keepTextures);
+      tilesetCache[idx] = set;
+    }
+    raycaster.setTextures(set);
+  }
+  if (FORCED_TILESET >= 0) {
+    tilesetShown = -1;
+    syncTileset(1);
+  }
   const post = createPost(postRoot);
   const hud = createHud(overlay);
   const audio = createAudio({ volume: appliedSettings.volume, music: appliedSettings.music });
@@ -1043,6 +1073,7 @@ function boot() {
     const fuelFrac = run.fuelMax > 0 ? clamp01(run.fuel / run.fuelMax) : 1;
     renderView.light = state.phase === 'title' ? 0.85 : Math.pow(fuelFrac, 0.65);
 
+    syncTileset(state.phase === 'title' ? 1 : state.level);
     raycaster.render(renderView);
 
     hud.render(state, loop.stats(), alpha);

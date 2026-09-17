@@ -135,6 +135,13 @@ const ENTER_TIME = 0.26;
 const TALLY_STAGGER = 0.42;
 /** Seconds the tally waits before the first row appears. */
 const TALLY_DELAY = 0.5;
+
+/**
+ * Seconds the finished tally stays up before a waiting boon opens itself over it (§4.9). Opening it
+ * the instant the counters stopped gave no time to read the floor's score; the "Choose a Boon" row
+ * opens it sooner for anyone who wants it.
+ */
+const BOON_HOLD_S = 3.5;
 /** Largest clock delta integrated in one frame. */
 const MAX_FRAME_DT = 0.25;
 /** Rows the tally has. */
@@ -815,6 +822,8 @@ export function createMenus(overlayCanvas, callbacks) {
   let shrineTop = 0;
   /** Set once the boon has opened itself on this level-complete visit (§4.9). */
   let boonShown = false;
+  /** `anim.clock` when this visit's tally was first seen finished; -1 until then. */
+  let tallyDoneClock = -1;
 
   /** Sub-screen open over the title or pause screen, or null. @type {string|null} */
   let sub = null;
@@ -1775,6 +1784,7 @@ export function createMenus(overlayCanvas, callbacks) {
     }
     if (state.phase === 'levelComplete') {
       boonShown = false;
+      tallyDoneClock = -1;
       // The tally belongs to the phase, not to the screen: opening the abandon dialog over it and
       // cancelling must not roll it again.
       anim.tallyT = 0;
@@ -1796,9 +1806,17 @@ export function createMenus(overlayCanvas, callbacks) {
     if (state === null || typeof state !== 'object') return;
     lastState = state;
     syncPhase(state);
-    // A boon opens itself the moment the tally is done (§4.9) — once per visit, so "Decide Later"
-    // stays decided.
-    if (state.phase === 'levelComplete' && tallyDone && !boonShown && sub === null && boonIdAt(state, 0) !== '') {
+    // A boon opens itself `BOON_HOLD_S` after the tally is done (§4.9) — once per visit, so "Decide
+    // Later" stays decided.
+    if (state.phase === 'levelComplete' && tallyDone && tallyDoneClock < 0) tallyDoneClock = anim.clock;
+    if (
+      state.phase === 'levelComplete' &&
+      tallyDone &&
+      !boonShown &&
+      sub === null &&
+      anim.clock - tallyDoneClock >= BOON_HOLD_S &&
+      boonIdAt(state, 0) !== ''
+    ) {
       boonShown = true;
       openSub('boon');
     }

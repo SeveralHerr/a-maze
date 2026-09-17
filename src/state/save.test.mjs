@@ -215,13 +215,15 @@ test('node: an ambient storage is used when one exists', () => {
 
 test('progress: purse, ranks and boon level survive a round trip, sanitised both ways', () => {
   const store = fakeStorage();
-  const progress = { purse: 87, ranks: { reservoir: 2, chalk: 1, lodestone: 7 }, boonLevel: 3 };
+  const progress = { purse: 87, ranks: { reservoir: 2, chalk: 1, wideFlame: 7, lodestone: 1 }, boonLevel: 3 };
   assert.equal(savePersist({ best: { score: 1, level: 1 }, settings: defaultSettings(), progress }, store), true);
   const loaded = loadPersist(store);
-  assert.equal(loaded.progress.purse, 87);
+  assert.equal(loaded.progress.purse, 87 + 150, 'a retired unlock is refunded before it is written');
   assert.equal(loaded.progress.ranks.reservoir, 2);
   assert.equal(loaded.progress.ranks.chalk, 1);
-  assert.equal(loaded.progress.ranks.lodestone, 1, 'an impossible rank is clamped before it is written');
+  assert.equal(loaded.progress.ranks.wideFlame, 3, 'an impossible rank is clamped before it is written');
+  assert.equal(/** @type {any} */ (loaded.progress.ranks).lodestone, undefined);
+  assert.equal(loadPersist(store).progress.purse, 87 + 150, 'the refund is paid once');
   assert.equal(loaded.progress.boonLevel, 3);
 });
 

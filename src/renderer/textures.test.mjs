@@ -160,7 +160,7 @@ test('organic surfaces wrap smoothly', () => {
   for (const [i, tex] of set.wall.entries()) {
     assert.ok(seamRatio(tex.indices, 'x') < 2.5, `wall[${i}] has a visible vertical seam`);
   }
-  for (const i of [0, 1]) {
+  for (const i of [0, 1, 2]) {
     assert.ok(seamRatio(set.floor[i].indices, 'x') < 2.5, `floor[${i}] seam in x`);
     assert.ok(seamRatio(set.floor[i].indices, 'y') < 2.5, `floor[${i}] seam in y`);
   }
@@ -171,7 +171,7 @@ test('organic surfaces wrap smoothly', () => {
 });
 
 test('structured surfaces wrap on their period', () => {
-  // Planks are 16 rows tall and grate bars 16 columns apart; 16 divides 64, so the wrap lands on a
+  // Planks are 16 rows tall; 16 divides 64, so the wrap lands on a
   // joint exactly like the interior ones. The assertion is that the wrap *is* one of those joints:
   // comfortably above a mid-plank difference and no worse than the loudest interior joint. (Plank
   // tone is randomised per plank, so the joints legitimately differ in strength by up to ~2×.)
@@ -197,8 +197,6 @@ test('structured surfaces wrap on their period', () => {
   };
 
   for (const [i, tex] of set.ceiling.entries()) assertPeriodicWrap(`ceiling[${i}]`, tex.indices, 'y');
-  assertPeriodicWrap('grate x', set.floor[2].indices, 'x');
-  assertPeriodicWrap('grate y', set.floor[2].indices, 'y');
 
   // The detector has to have teeth: shifting a texture off its period must fail the same check.
   const rolled = new Uint8Array(AREA);
@@ -212,27 +210,28 @@ test('structured surfaces wrap on their period', () => {
   );
 });
 
-test('the grate lattice has a period that divides the texture, so it tiles exactly', () => {
+test('the grate is set into the cobbles: iron and void inside, the shared cobble ring outside', () => {
+  // Every floor variant meets every other at a tile seam (tilesets.test.mjs measures the edges), so
+  // the grate cannot run to the tile edge: it is a framed opening in the middle of the cobbles.
   const grate = set.floor[2].indices;
-  // A column is "on a bar" when most of it is dark iron rather than the void behind it.
-  /** @param {number} x @returns {boolean} */
-  const isBarColumn = (x) => {
-    let iron = 0;
-    for (let y = 0; y < SIZE; y++) {
-      const l = lum(grate, x, y);
-      if (l > 14) iron++; // the void is near-black; every iron shade is brighter
+  const iron = new Set([...RAMPS.iron, C.void, C.stoneShadow, C.oilDark, C.mossDeep]);
+  const cobble = new Set([...RAMPS.cobble, ...RAMPS.moss]);
+  let inside = 0;
+  let outside = 0;
+  for (let y = 0; y < SIZE; y++) {
+    for (let x = 0; x < SIZE; x++) {
+      const c = grate[(y << 6) | x];
+      if (x >= 20 && x < 44 && y >= 20 && y < 44) inside += iron.has(c) ? 1 : 0;
+      else if (x < 12 || x >= 52 || y < 12 || y >= 52) outside += cobble.has(c) ? 1 : 0;
     }
-    return iron > SIZE * 0.6;
-  };
-  for (let x = 0; x < SIZE; x++) {
-    assert.equal(
-      isBarColumn(x),
-      isBarColumn((x + 16) % SIZE),
-      `grate column ${x} does not repeat at period 16 — it would not tile`,
-    );
   }
-  assert.equal(isBarColumn(0), true, 'a bar should start at the texture origin');
-  assert.equal(isBarColumn(10), false, 'there should be a gap between bars');
+  assert.equal(inside, 24 * 24, 'the middle of the grate is all iron and void');
+  assert.equal(outside, SIZE * SIZE - 40 * 40, 'the border of the grate tile is all cobbles');
+  // Bars and gaps: a row through the opening alternates between them rather than being a lid.
+  const row = 32;
+  let voids = 0;
+  for (let x = 20; x < 44; x++) if (grate[(row << 6) | x] === C.void || grate[(row << 6) | x] === C.stoneShadow) voids++;
+  assert.ok(voids >= 8 && voids <= 20, `the opening shows ${voids}/24 void texels on row ${row}`);
 });
 
 test('painting is deterministic for a seed and different across seeds', () => {
@@ -358,9 +357,10 @@ test('every wall variant puts its bed joints on the same rows, so courses run un
   const joint = (/** @type {number} */ y) => phase(y) >= 13;
   for (const i of [0, 1, 2, 3]) {
     const rows = mortarRows(set.wall[i].indices);
-    // Every row that reads as a joint must be on (or, for the dark block-bottom shading, directly
-    // above) the shared bed — no variant may put a joint anywhere else.
-    for (const r of rows) assert.ok(phase(r) >= 12, `wall[${i}] has a joint on row ${r}, off the shared courses`);
+    // Every row that reads as a joint must be on (or, for the two dark block-bottom shading rows,
+    // directly above) the shared bed — no variant may put a joint anywhere else. On a course of
+    // dark-toned blocks both shading rows read as dark, hence phase 11.
+    for (const r of rows) assert.ok(phase(r) >= 11, `wall[${i}] has a joint on row ${r}, off the shared courses`);
     if (i < 2) {
       // Moss hides some mortar on the mossy and vined variants. The plain wall must show every joint
       // row; the cracked one carries a trace of moss (0.12) that may creep over part of one joint

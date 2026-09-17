@@ -121,6 +121,11 @@ export const BOB = Object.freeze({
  */
 export const WORLD = Object.freeze({
   /**
+   * Floors each tileset lasts before the dungeon changes its look (`src/renderer/tilesets/`). 1 =
+   * every floor wears a different tileset, cycling through the list past its end.
+   */
+  FLOORS_PER_TILESET: 1,
+  /**
    * Pickup radius in tiles (ARCHITECTURE.md §4.2, §4.8). It was 0.45, and the player could walk
    * straight past an item: cutting an L-turn keeps the body's centre `PLAYER.RADIUS` (0.22) from the
    * wall corner, which is √0.5 ≈ 0.707 from the corner tile's centre, so the closest approach was
@@ -998,16 +1003,10 @@ export const UNLOCKS = Object.freeze([
     'Store 15s of overflow', 'Store 30s of overflow', 'Store 50s of overflow']),
   unlock('wideFlame', 'Wide Flame', 'sight', [15, 35, 70], 'Your torch throws its light further.', [
     'Light +15%', 'Light +30%', 'Light +45%']),
-  unlock('cartographer', 'Cartographer', 'sight', [30, 80], 'Map what you see from further away.', [
-    'Reveal 4 tiles', 'Reveal 5 tiles']),
   unlock('oilSense', 'Oil Sense', 'sight', [20, 50, 100], 'Nearby flasks glow through the walls.', [
     'Sense within 5 tiles', 'Sense within 8 tiles', 'Sense within 12 tiles']),
-  unlock('scrollSense', 'Scroll Sense', 'sight', [15, 40], 'Feel the map scroll when it is near.', [
-    'Sense within 14 tiles', 'Sense within 28 tiles']),
   unlock('whisper', 'Dead-End Whisper', 'sight', [40, 100, 180], 'Passages that lead nowhere grow dark.', [
     'Last 4 tiles darken', 'Last 10 tiles darken', 'Whole dead ends darken']),
-  unlock('lodestone', 'Lodestone', 'sight', [150], 'Once the map is found, a needle finds the exit.', [
-    'Needle points to the exit']),
   unlock('chalk', 'Chalk', 'fortune', [10, 30, 70], 'Scrawl A-MAZE on a wall to mark your way.', [
     '4 marks per floor', '8 marks per floor', '16 marks per floor']),
   unlock('magnet', 'Gem Magnet', 'fortune', [15, 40, 80], 'Gems in sight leap into your hand.', [
@@ -1015,6 +1014,20 @@ export const UNLOCKS = Object.freeze([
   unlock('appraiser', 'Appraiser', 'fortune', [45, 120, 240], 'Each gem is worth more at the Shrine.', [
     '2 shrine gems per gem', '3 shrine gems per gem', '4 shrine gems per gem']),
 ]);
+
+/**
+ * Map unlocks retired from the catalogue for now: buying a map upgrade before the player has ever
+ * found the map scroll was awkward. Their effects (`UNLOCK_FX`, `computePerks`, the HUD's scroll
+ * sense and lodestone needle) stay wired but sit at rank 0. A save that owns ranks of one is
+ * refunded the gems it paid (`sanitizeProgress`), once, because the ranks are dropped on that load.
+ * Keyed by id; the value is the price list the catalogue charged.
+ * @type {Readonly<Record<string, ReadonlyArray<number>>>}
+ */
+export const RETIRED_UNLOCK_COSTS = Object.freeze({
+  cartographer: Object.freeze([30, 80]),
+  scrollSense: Object.freeze([15, 40]),
+  lodestone: Object.freeze([150]),
+});
 
 /**
  * Build one frozen catalogue entry.
@@ -1101,6 +1114,14 @@ export function sanitizeProgress(src) {
       const def = UNLOCKS[i];
       const v = Object.prototype.hasOwnProperty.call(r, def.id) ? r[def.id] : undefined;
       if (typeof v === 'number' && Number.isFinite(v)) out.ranks[def.id] = clamp(Math.floor(v), 0, def.max);
+    }
+    // Refund the ranks of retired unlocks: the gems go back in the purse and the ranks are dropped.
+    for (const id of Object.keys(RETIRED_UNLOCK_COSTS)) {
+      const v = Object.prototype.hasOwnProperty.call(r, id) ? r[id] : undefined;
+      if (typeof v !== 'number' || !Number.isFinite(v)) continue;
+      const costs = RETIRED_UNLOCK_COSTS[id];
+      const owned = clamp(Math.floor(v), 0, costs.length);
+      for (let k = 0; k < owned; k++) out.purse = Math.min(Number.MAX_SAFE_INTEGER, out.purse + costs[k]);
     }
   }
   return out;

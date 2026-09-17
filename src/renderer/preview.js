@@ -14,6 +14,7 @@ import { createLoop } from '../core/loop.js';
 import { createRng } from '../core/rng.js';
 import { lerpAngle, wrapAngle, clamp01 } from '../core/math.js';
 import { createRaycaster } from './raycaster.js';
+import { createTilesetTextures, tilesetIndexById } from './tilesets/index.js';
 import { createPost } from './post.js';
 import { PARTICLE, PARTICLE_COLORS } from './particles.js';
 import { POSES, PREVIEW_TORCHES, buildPreviewMaze, previewItems } from './preview-scene.js';
@@ -132,6 +133,9 @@ const raycaster = createRaycaster(canvas, {
   seed: seedParam !== null ? Number(seedParam) : undefined,
 });
 const post = createPost(postRoot);
+// `?tileset=<id>` dresses the scene in one of the deeper floors' tilesets.
+const tilesetIdx = tilesetIndexById(params.get('tileset'));
+if (tilesetIdx >= 0) raycaster.setTextures(createTilesetTextures(tilesetIdx, raycaster.textures.seed, raycaster.textures));
 
 if (poseParam !== null) {
   const pose = POSES[Math.max(0, Math.min(POSES.length - 1, Number(poseParam) | 0))];
