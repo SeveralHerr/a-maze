@@ -25,6 +25,8 @@
  * with the run's totals intact, rather than restoring bits onto the wrong maze.
  */
 
+import { TILE } from '../maze/constants.js';
+
 /** @typedef {import('../core/types.js').GameState} GameState */
 /** @typedef {import('../core/types.js').LevelData} LevelData */
 /** @typedef {import('../core/types.js').ChalkMark} ChalkMark */
@@ -411,7 +413,9 @@ export function applyMid(state, mid) {
   // The pose must be standing on floor, or the body would start inside a wall.
   const tx = Math.floor(mid.x);
   const ty = Math.floor(mid.y);
-  if (tx < 0 || ty < 0 || tx >= maze.width || ty >= maze.height || maze.tiles[ty * maze.width + tx] !== 0) return false;
+  if (tx < 0 || ty < 0 || tx >= maze.width || ty >= maze.height || maze.tiles[ty * maze.width + tx] !== TILE.FLOOR) {
+    return false;
+  }
 
   for (let i = 0; i < items.length; i++) items[i].taken = taken[i] === 1;
   explored.set(seen);
@@ -432,8 +436,13 @@ export function applyMid(state, mid) {
   run.gems = Math.min(mid.gems, run.gemsTotal);
   run.levelTime = mid.levelTime;
   run.refuels = mid.refuels;
-  run.chalk = mid.chalk;
-  run.reserve = mid.reserve;
+  // Clamped to what this run can actually hold, not merely to a sane-looking range: a save is a
+  // string in the player's own browser, so `chalk: 999999` must not restore as unlimited chalk, and
+  // a reserve past the Siphon's capacity must not restore as a second tank. `sanitizeMid` only
+  // rejects nonsense; the perks are what say how much is legitimate.
+  const perks = state.perks;
+  run.chalk = perks ? Math.min(mid.chalk, perks.chalk) : mid.chalk;
+  run.reserve = perks ? Math.min(mid.reserve, perks.siphonCap) : mid.reserve;
   run.emberUsed = mid.emberUsed;
   run.mapFound = mid.mapFound;
 

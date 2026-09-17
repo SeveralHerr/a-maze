@@ -11,8 +11,8 @@ tool dependency). `index.html` loads `src/main.js`. Deployed to itch.io
 ## Commands
 ```sh
 npm run serve                     # static dev server http://localhost:5173 — keep it running
-npm test                          # every src/*/*.test.mjs in its own Node process (772 tests)
-node tools/validate-mazes.mjs     # 117k mazes + the 750-level campaign incl. the refuel chain; --quick
+npm test                          # every src/*/*.test.mjs in its own Node process (808 tests in 44 files)
+node tools/validate-mazes.mjs     # 81k mazes + the 750-level campaign incl. the refuel chain; --quick
 node tools/stress.mjs             # extreme grid sizes + the gameplay maximum + leak loops; --quick
 node tools/verify.mjs --tag x     # headless Chrome autopilot run → logs/x.json + logs/shot-x-*.png
                                   #   descends to the size cap and drives it for 60s (~8 min total)
@@ -34,7 +34,7 @@ and `/src/ui/preview.html` (module harnesses).
   66 kB `explored` grid). **Nothing may be O(items) or O(tiles) per frame or per step** — pickups
   use a bucket grid, sprites and lights use a spatial index, the map keeps an incremental raster.
   A scan added here looks free on level 1 and costs the frame at the cap.
-- The torch is a **tank you refill** (110–150 s, independent of maze area), not a budget for the
+- The torch is a **tank you refill** (95–150 s, independent of maze area), not a budget for the
   level; oil flasks are the economy and their placement guarantee is a hard gate, not a balance note.
 - `tools/` and `src/state`'s `perf`/`feasibility` tests may import across module lines (they drive
   the real curve against real mazes on purpose); runtime modules may not.

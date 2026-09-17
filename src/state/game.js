@@ -35,7 +35,6 @@
  * reference to it.
  */
 
-import { clamp, damp } from '../core/math.js';
 import { createLogger } from '../core/log.js';
 import { applyMid, sanitizeRunSave } from './runsave.js';
 import {
@@ -203,9 +202,20 @@ export function reducer(state, action) {
   clearEvents(state.events);
 
   switch (type) {
-    case 'tick':
-      applyTick(state, /** @type {number} */ (a.dt), a.input, a.auto === true);
+    case 'tick': {
+      // A zero, negative or non-finite dt advances nothing — including the interpolation snapshot,
+      // so a paused frame does not collapse the renderer's alpha blend.
+      const rawDt = a.dt;
+      if (typeof rawDt !== 'number' || !(rawDt > 0) || rawDt === Infinity) return;
+      // `dt` reaches the step through a typed-array slot, never as a call argument: reading a double
+      // out of the action and passing it on boxes a fresh HeapNumber on every tick unless the
+      // compiler inlines the callee, and whether it does depends on what the session has run
+      // (measured: 8 B/tick from this one argument). Everything below it on the hot path is written
+      // the same way — see `stepPlayingBody`.
+      stepDt[0] = rawDt > SIM.MAX_DT ? SIM.MAX_DT : rawDt;
+      applyTick(state, a.input, a.auto === true);
       return;
+    }
     case 'newGame':
       applyNewGame(state, a.seed);
       return;
@@ -294,13 +304,25 @@ function readInput(src) {
     return _input;
   }
   const f = /** @type {Record<string, unknown>} */ (src);
-  _input.moveX = axis(f.moveX);
-  _input.moveY = axis(f.moveY);
-  _input.turn = axis(f.turn);
+  // Clamps written out rather than calling `clamp`: a helper that returns a double boxes it unless
+  // the compiler inlines the call, and that decision depends on the session (sim.js stepPlayingBody).
+  // The ternaries also leave an in-range value untouched, which is bit-identical to `clamp`, and
+  // `v - v === 0` is `Number.isFinite` for a number (false for NaN and ±Infinity) without calling a
+  // builtin — measured: the builtin call boxed each axis once the input frame's shape had varied.
+  const mx = f.moveX;
+  _input.moveX = typeof mx === 'number' && mx - mx === 0 ? (mx > 1 ? 1 : mx < -1 ? -1 : mx) : 0;
+  const my = f.moveY;
+  _input.moveY = typeof my === 'number' && my - my === 0 ? (my > 1 ? 1 : my < -1 ? -1 : my) : 0;
+  const tu = f.turn;
+  _input.turn = typeof tu === 'number' && tu - tu === 0 ? (tu > 1 ? 1 : tu < -1 ? -1 : tu) : 0;
   const look = f.lookDX;
   _input.lookDX =
-    typeof look === 'number' && Number.isFinite(look)
-      ? clamp(look, -SIM.MAX_LOOK_DX, SIM.MAX_LOOK_DX)
+    typeof look === 'number' && look - look === 0
+      ? look > SIM.MAX_LOOK_DX
+        ? SIM.MAX_LOOK_DX
+        : look < -SIM.MAX_LOOK_DX
+          ? -SIM.MAX_LOOK_DX
+          : look
       : 0;
   const pressed = /** @type {any} */ (f.pressed);
   _input.chalk = pressed !== null && typeof pressed === 'object' && typeof pressed.has === 'function' && pressed.has('chalk') === true;
@@ -308,30 +330,15 @@ function readInput(src) {
 }
 
 /**
- * Coerce one analogue axis to a finite value in [-1, 1].
- * @param {unknown} v
- * @returns {number}
- */
-function axis(v) {
-  return typeof v === 'number' && Number.isFinite(v) ? clamp(v, -1, 1) : 0;
-}
-
-/**
- * Advance the simulation by one fixed step.
+ * Advance the simulation by one fixed step. `dt` (already validated and clamped) arrives in
+ * `stepDt[0]`, not as an argument — see the `tick` case of the reducer.
  * @param {State} state
- * @param {unknown} rawDt seconds
  * @param {unknown} rawInput
  * @param {boolean} auto the frame was written by Auto Explore (§4.10): the torch burns at its pace
  * @returns {void}
  */
-function applyTick(state, rawDt, rawInput, auto) {
-  // A zero, negative or non-finite dt advances nothing — including the interpolation snapshot, so a
-  // paused frame does not collapse the renderer's alpha blend.
-  if (typeof rawDt !== 'number' || !(rawDt > 0) || rawDt === Infinity) return;
-  const dt = rawDt > SIM.MAX_DT ? SIM.MAX_DT : rawDt;
-  // `dt` reaches the step through a typed-array slot, not as an argument: a double passed to a call
-  // the compiler does not inline is boxed into a new HeapNumber every tick (sim.js `_move`).
-  stepDt[0] = dt;
+function applyTick(state, rawInput, auto) {
+  const dt = stepDt[0];
 
   state.time += dt;
   state.phaseTime += dt;
@@ -354,8 +361,9 @@ function applyTick(state, rawDt, rawInput, auto) {
   p.px = p.x;
   p.py = p.y;
   p.pangle = p.angle;
-  p.shake = damp(p.shake, 0, BOB.SHAKE_DECAY, dt);
-  p.bobAmp = damp(p.bobAmp, 0, BOB.AMP_RATE, dt);
+  // `damp(v, 0, rate, dt)` written out (see `readInput`).
+  if (p.shake !== 0) p.shake *= 1 - (1 - Math.exp(-BOB.SHAKE_DECAY * dt));
+  if (p.bobAmp !== 0) p.bobAmp *= 1 - (1 - Math.exp(-BOB.AMP_RATE * dt));
 }
 
 // ─── newGame ─────────────────────────────────────────────────────────────────────────────────

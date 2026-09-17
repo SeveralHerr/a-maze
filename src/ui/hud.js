@@ -582,6 +582,16 @@ const DEPTH_SEPARATOR = '·';
 /** The Auto Explore plaque's text (§4.10). */
 const AUTO_TEXT = 'AUTO';
 
+/**
+ * What the plaque becomes while the mouse is captured: the key that does the same thing. A locked
+ * cursor cannot be aimed at a button, so a drawn one is clutter that cannot be clicked.
+ */
+const AUTO_HINT_TEXT = 'O  AUTO';
+
+/** Seconds the key hint stays up, and the second over which it fades out. */
+const AUTO_HINT_HOLD = 4;
+const AUTO_HINT_FADE = 1;
+
 /** Font pixels either side of that separator — a glyph's worth, so "3 · 24×24" never reads "3·24". */
 const DEPTH_GAP = 4;
 
@@ -642,7 +652,8 @@ function intWidth(n, size) {
  *   banner is up. Store a constant string: the HUD keeps the reference, it does not copy it.
  * @property {(clientX:number, clientY:number) => boolean} hitAuto  true when a pointer at these
  *   client coordinates is over the AUTO button drawn in the last frame (§4.10); false whenever the
- *   button is not on screen (paused, full map, narrow layout, disabled, any other phase)
+ *   button is not on screen (paused, full map, narrow layout, disabled, any other phase, or the
+ *   pointer locked with Auto Explore off — see `drawAutoButton`)
  * @property {(on:boolean) => void} setAutoButton  allow or suppress the HUD's AUTO button (default
  *   allowed). main.js suppresses it on touch devices, which get the touch bar's AUTO button instead.
  * @property {() => void} dispose
@@ -765,6 +776,8 @@ export function createHud(overlayCanvas, options) {
   const autoPtr = new Float64Array(2);
   /** Whether the AUTO button may be drawn at all (`setAutoButton`; main.js turns it off on touch). */
   let autoButtonEnabled = true;
+  /** `anim.clock` when the Auto Explore key hint appeared; −1 while it is not showing. */
+  let autoHintAt = -1;
 
   // ── Readout text, rebuilt only when the number behind it changes (see the file header) ──
   const fuelText = createTextMemo((sec) => formatTime(sec));
@@ -1141,7 +1154,10 @@ export function createHud(overlayCanvas, options) {
     if (alpha64 <= 0) return;
 
     const gothic = banner.kind === BANNER_MAP_FOUND;
-    const font = gothic ? 'display' : 'hud';
+    // A notice is a sentence ("Your torch burns oil - grab flasks to refill"), so it is set in the
+    // proportional prose face rather than in the monospace readout face — the gauge's digits need
+    // fixed widths, a line of English does not (§4.6).
+    const font = gothic ? 'display' : 'text';
     const maxW = Math.max(16 * u, m.viewW - 12 * u);
     // Largest integer scale whose plaque fits the view: 2u for the headline on a desktop, a unit
     // for a notice; stepped down on a phone.
@@ -1656,10 +1672,43 @@ export function createHud(overlayCanvas, options) {
   function drawAutoButton(ctx, state, m, reduced) {
     // Touch devices and narrow layouts use the AUTO button in the touch bar instead: a phone's world
     // band is ~130 UI px wide, where the bottom centre belongs to the unlock chips and score pops.
-    if (!autoButtonEnabled || m.narrow || state.settings === undefined || state.phase !== 'playing') return;
+    if (!autoButtonEnabled || m.narrow || state.settings === undefined || state.phase !== 'playing') {
+      autoHintAt = -1;
+      return;
+    }
     const on = state.settings.autoExplore === true;
     const u = m.u;
     const size = m.narrow ? Math.max(1, u - 1) : u;
+    // While the pointer is locked the cursor is captured by the world and cannot reach the button —
+    // a real click on it toggles nothing. For most of a mouse player's session the plaque was
+    // therefore permanent clutter, so it gives way to a quiet key hint that fades after a few
+    // seconds. Switching Auto Explore *on* releases the lock (§4.10), so the full button — the one
+    // that turns it off — is on screen exactly when it can be clicked.
+    if (!on && pointerIsLocked()) {
+      if (autoHintAt < 0) autoHintAt = anim.clock;
+      const age = anim.clock - autoHintAt;
+      if (age >= AUTO_HINT_HOLD + AUTO_HINT_FADE) return;
+      // Reduced motion: it is there and then it is not, rather than dissolving.
+      const fade = reduced || age <= AUTO_HINT_HOLD ? 1 : 1 - (age - AUTO_HINT_HOLD) / AUTO_HINT_FADE;
+      const hintSize = Math.max(1, size - 1);
+      // The fade goes through the context, like every other animated alpha here (see `withAlphaStep`).
+      const before = ctx.globalAlpha;
+      ctx.globalAlpha = before * fade;
+      drawAt(
+        ctx,
+        AUTO_HINT_TEXT,
+        m.viewX + (m.viewW >> 1),
+        m.viewY + m.viewH - 3 * u - heightAt('hud', hintSize),
+        'hud',
+        hintSize,
+        'hudDim',
+        'center',
+        'top',
+      );
+      ctx.globalAlpha = before;
+      return;
+    }
+    autoHintAt = -1;
     // Roomier than a readout chip: it is a target for a thumb as well as a cursor.
     const padX = insetX + 2 * u;
     const chipH = 2 * insetY + 2 * u + heightAt('hud', size);
@@ -1682,6 +1731,26 @@ export function createHud(overlayCanvas, options) {
     autoRect[1] = y;
     autoRect[2] = w;
     autoRect[3] = chipH;
+  }
+
+  /**
+   * Is the mouse pointer captured by the page right now?
+   *
+   * Read straight off the document rather than passed in: the HUD needs it once a frame to decide
+   * whether its own button could be clicked, and `src/ui` registers no listeners (§4.6). Anything
+   * unavailable (Node, an old browser) reads as "not locked", which draws the button — the safe way
+   * round, since an unclickable button is the bug this answers.
+   * @returns {boolean}
+   */
+  function pointerIsLocked() {
+    try {
+      const doc = /** @type {any} */ (globalThis).document;
+      if (doc === undefined || doc === null) return false;
+      const el = doc.pointerLockElement;
+      return el !== undefined && el !== null;
+    } catch (err) {
+      return false;
+    }
   }
 
   /**

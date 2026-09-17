@@ -17,8 +17,9 @@
  *   `src/state/balance.js` owns the curve and passes it as `params.fuelSeconds`; this file only
  *   supplies a documented fallback for callers that do not (tests, tools, the title demo).
  * - **Oil flasks are the economy.** Their count scales with *area* so their density is roughly
- *   constant (~1 per 20 cells early, thinning to ~1 per 30 at the cap), and each restores ~35 % of
- *   the tank. The player therefore meets the "I need oil" moment every 60–90 s at every maze size.
+ *   constant (~1 per 20 cells early, thinning to ~1 per 30 at the cap), and each restores 35–44 % of
+ *   the tank (the share rises with depth; `FUEL.OIL_FRACTION`…`OIL_FRACTION_END` in balance.js own
+ *   it). The player therefore meets the "I need oil" moment every 60–90 s at every maze size.
  * - The **refuel chain** below is the guarantee that makes that fair.
  *
  * ## Placement rules (the "why"; the "what" is on each function)
@@ -40,7 +41,9 @@
  * ## THE REFUEL CHAIN GUARANTEE (proof)
  * Let
  *   - `T`  = tank size in seconds (`fuel`),
- *   - `R`  = seconds one flask restores (~0.35·T, clamped — mirrors `FUEL.OIL_*` in balance.js),
+ *   - `R`  = seconds one flask restores (`FUEL.OIL_FRACTION`…`OIL_FRACTION_END` of `T`, clamped to
+ *            `FUEL.OIL_MIN`…`OIL_MAX` — mirrors `FUEL.OIL_*` in balance.js; 39–66 s on the shipped
+ *            curve),
  *   - `spt` = fuel-seconds burned per tile actually walked = `c/v · drain`, where `v` =
  *            {@link WALK_SPEED}, `c` = {@link CORNER_FACTOR} (turn/accel overhead) and `drain` is
  *            the level's torch-drain multiplier (1 up to the size cap, `params.drain` past it),
@@ -57,13 +60,19 @@
  *
  * (`S` = {@link CHAIN_SAFETY}; `G` is `params.oilTargetGap` when the state module supplies a
  * *tighter* one — see {@link resolveGap}). By construction `t(G, k) ≤ R·S ≤ R` for every `k ≤ 3`.
+ * Note what the proof needs of `R`: only `t ≤ R·S ≤ R ≤ T`. The flask's *share* of the tank is a
+ * balance decision (`FUEL.OIL_FRACTION` 0.35 ramping to `FUEL.OIL_FRACTION_END` 0.44, clamped to
+ * `FUEL.OIL_MIN`…`FUEL.OIL_MAX`), and the argument holds for any of it — a flask that filled the
+ * whole tank would still chain.
  *
  * **Claim.** A player who walks the solution path with wander factor `w` and takes each chain flask
  * never runs dry.
  * **Proof.** Induction over the chain. Fuel at the start (q = 0) is `T`. If fuel on reaching flask
- * `i` is `T`, the walk to flask `i+1` costs `t(Δq, k) ≤ R ≤ 0.35·T < T`, so the player arrives with
- * `T − t ≥ T − R > 0` — never zero — and the flask restores `min(T, (T−t) + R) = T`, re-establishing
- * the hypothesis. The final segment costs `≤ R` as well, so the exit is reached with `≥ T − R > 0`. ∎
+ * `i` is `T`, the walk to flask `i+1` costs `t(Δq, k) ≤ R ≤ T`, so the player arrives with
+ * `T − t ≥ T − R ≥ 0` and, because `R < T` at every value the clamps allow (the biggest flask on
+ * the shipped curve is 66 s against a 150 s tank), strictly above zero — and the flask restores
+ * `min(T, (T−t) + R) = T`, re-establishing the hypothesis. The final segment costs `≤ R` as well,
+ * so the exit is reached with `≥ T − R > 0`. ∎
  *
  * Two notes on rigour. (1) The flask a player actually picks up first is the one reachable at the
  * *smallest* path index, which is exactly what {@link nearestPathFrom} measures, so placement and
@@ -174,8 +183,8 @@ const OIL_REFUEL_FRACTION = 0.35;
 /** Lower clamp on a flask's value, seconds. Mirrors `FUEL.OIL_MIN`. */
 const OIL_REFUEL_MIN = 25;
 
-/** Upper clamp on a flask's value, seconds. Mirrors `FUEL.OIL_MAX`. */
-const OIL_REFUEL_MAX = 60;
+/** Upper clamp on a flask's value, seconds. Mirrors `FUEL.OIL_MAX` (70). */
+const OIL_REFUEL_MAX = 70;
 
 /**
  * Measured ratio between a maze's optimal route and its side in cells (13 path tiles per cell of
@@ -205,9 +214,12 @@ const OIL_BRANCH_RADIUS = 3;
  * Exclusion radius around a flask (Chebyshev tiles): no flask is planted within this many tiles of
  * another, so flasks are ≥ 3 tiles apart.
  *
- * `src/state/sim.js` leaves a flask on the floor until the tank has room for half of it. Two flasks
- * on neighbouring tiles therefore play as "the second one cannot be picked up" (the first just filled
- * the tank), which players report as a bug — and the second is worth nothing to the route anyway.
+ * `src/state/sim.js` now tops the tank up whenever it has room for `FUEL.OIL_MIN_ROOM` (1 s), so a
+ * flask right next to another *is* picked up — and is worth almost nothing, because the one before
+ * it just filled the tank and the overflow is thrown away. Spacing them is therefore about the
+ * economy rather than about stuck pickups: two flasks on neighbouring tiles are one flask's worth
+ * of fuel taking up two of the level's budgeted flasks, and a stretch of route somewhere else pays
+ * for it.
  * It is a preference, never a hard constraint: the refuel chain (the hard guarantee) and the
  * last-resort mop-up in {@link fillByStride} fall back to a crowded tile when no spaced one exists,
  * which only happens on degenerate mazes (0 clustered pairs across levels 1–40 × 5 seeds).
@@ -607,6 +619,10 @@ export function walkRefuelChain(maze, validation, items, params) {
     height: maze.height,
     total,
     occupied: new Uint8Array(0),
+    // The verification twin only ever calls `nearestPathFrom`, which reads neither of these; they
+    // are present because `Ctx` declares them, and empty because allocating 66 kB to be ignored is
+    // the kind of thing that looks like a leak in a tool that runs 750 levels.
+    oilNear: new Uint8Array(0),
     pathDist: new Int32Array(total),
     pathIndexOf: new Int32Array(total),
     stamp: new Int32Array(total),

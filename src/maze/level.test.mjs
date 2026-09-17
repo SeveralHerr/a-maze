@@ -97,8 +97,8 @@ test('every size from 1×1 upward produces a playable level', () => {
 test('levelTransferList hands over the tile and path buffers exactly once', () => {
   const data = buildLevel(PARAMS, 3);
   const list = levelTransferList(data);
-  assert.ok(list.includes(data.maze.tiles.buffer));
-  assert.ok(list.includes(/** @type {Uint32Array} */ (data.validation.path).buffer));
+  assert.ok(list.includes(/** @type {ArrayBuffer} */ (data.maze.tiles.buffer)));
+  assert.ok(list.includes(/** @type {ArrayBuffer} */ (/** @type {Uint32Array} */ (data.validation.path).buffer)));
   assert.equal(new Set(list).size, list.length, 'a buffer may not appear twice');
   assert.deepEqual(levelTransferList(/** @type {never} */ ({})), []);
   assert.deepEqual(levelTransferList(/** @type {never} */ (null)), []);

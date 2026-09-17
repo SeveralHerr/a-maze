@@ -8,7 +8,10 @@
  * ## What it does
  * It explores the fog of war at random. A plan is one breadth-first search over floor tiles from
  * the player, which collects, nearest first:
- * - the nearest **seen** oil flask, when the tank is below `AUTO.REFUEL_AT`;
+ * - the nearest **seen** oil flask, when the tank is below `AUTO.REFUEL_AT` *or* too low for the
+ *   distance: a flask is only worth passing while the torch still covers `AUTO.REFUEL_MARGIN` times
+ *   the way there plus `REFUEL_RESERVE_TILES` of slack (half a tank is plenty three tiles from a
+ *   flask and nowhere near enough eighty tiles from one);
  * - the nearest **seen** gem or map scroll within `AUTO.ITEM_DETOUR` path tiles;
  * - the nearest **frontier** tile (explored floor with an unexplored floor neighbour), a tie between
  *   frontiers within `AUTO.FRONTIER_TIE` path tiles — a junction's branches — broken at random. A
@@ -17,7 +20,14 @@
  * - the exit, once it has been seen and the level has been wandered for a rolled share of its par
  *   time (or nothing is left to explore, or the torch is nearly out). Past that share with the exit
  *   still unseen, the frontier choice turns greedy toward the exit's position instead of random.
- * It only ever targets what the reveal has uncovered, so it plays the same fog the player does.
+ * It only ever targets what the reveal has uncovered, so it plays the same fog the player does —
+ * with one deliberate exception, the **survival valve**: below `AUTO.SMELL_AT` with no flask on any
+ * explored tile, it walks to the nearest flask on the level whether the fog has lifted off it or not.
+ * A watch mode that runs the torch dry costs the player their saved run (main.js clears it on
+ * `gameOver`), and a fog-bound explorer in a 128×128 labyrinth strands itself reliably: over levels
+ * 1–10 × 8 seeds it cleared 74 % of runs. With the valve, the distance rule above and a `TOPUP_AT`
+ * low enough that a detour for a flask is not spent filling a quarter of one, it clears 79 of those
+ * 80 runs (and 39 of 40 on the test's own seeds), which `autopilot.test.mjs` gates at 95 %.
  *
  * ## How it moves: like the title screen
  * Auto Explore is for watching, so it walks with the title camera's calm rather than a player's
@@ -40,7 +50,7 @@
 import { angleDiff, clamp, damp } from '../core/math.js';
 import { createRng } from '../core/rng.js';
 import { TILE } from '../maze/constants.js';
-import { ATTRACT, AUTO, PLAYER } from './balance.js';
+import { ATTRACT, AUTO, PLAYER, drainRate, swayAt, travelTiles } from './balance.js';
 
 /** @typedef {import('../core/types.js').GameState} GameState */
 /** @typedef {import('../core/types.js').LevelData} LevelData */
@@ -68,8 +78,6 @@ const GOAL_ITEM = 2;
 const GOAL_FRONTIER = 3;
 const GOAL_EXIT = 4;
 const GOAL_NAMES = Object.freeze(['none', 'oil', 'item', 'frontier', 'exit']);
-
-const TAU = Math.PI * 2;
 
 /** The sim's fixed step (§4.1), used when a caller does not pass `dt`. */
 const DEFAULT_DT = 1 / 60;
@@ -364,9 +372,18 @@ export function createAutopilot() {
 
     const run = state.run;
     const tank = run.fuelMax > 0 ? run.fuel / run.fuelMax : 1;
-    const wantFuel = tank < AUTO.REFUEL_AT;
+    // Tiles the torch still buys at this level's drain. Auto Explore walks at `ATTRACT.SPEED` and
+    // burns at `AUTO_DRAIN_SCALE` (= ATTRACT.SPEED / WALK_SPEED) times the rate, so a tile costs it
+    // exactly what it costs a walker: `travelTiles` is the right arithmetic for both.
+    // `drainRate` rather than the installed `sim.drain`, which is not part of the public state: the
+    // only difference is Slow Wick, which lowers the real drain, so the estimate is conservative.
+    const reach = travelTiles(run.fuel, drainRate(state.level));
+    // Fuel is wanted on a *distance*, not only on a fraction: half a tank is plenty three tiles from
+    // a flask and not nearly enough eighty tiles from one. The fraction stays as the floor (a flask
+    // passed at half a tank is still worth taking); the distance rule is what stops the pilot
+    // strolling past the last flask it can still reach. Set once the search finds the nearest flask.
+    let wantFuel = tank < AUTO.REFUEL_AT;
     const exitSeen = explored[exitIdx] !== 0;
-    s.plannedLow = wantFuel;
     const wandered = run.levelTime >= s.exploreFor;
     const wantExit = exitSeen && (wandered || tank < AUTO.DESPERATE_AT);
     // Wandered long enough but the exit is still in the fog: search toward it instead of at random.
@@ -390,20 +407,33 @@ export function createAutopilot() {
     fst[start] = -1;
 
     let oil = -1;
+    /** Nearest untaken flask whatever the fog says — the survival valve below. */
+    let smell = -1;
     let item = -1;
     let frontiers = 0;
     let ahead = false;
     let exitReached = false;
+    // Below this the pilot may walk to a flask it has not uncovered yet (see `AUTO.SMELL_AT`).
+    const desperate = tank < AUTO.SMELL_AT;
     while (head < tail) {
       const i = q[head++];
       const d = dst[i];
       if (i === exitIdx) exitReached = true;
+      if (desperate && smell < 0) {
+        const k = at[i] - 1;
+        if (k >= 0 && items[k].taken !== true && items[k].kind === 'oil') smell = i;
+      }
       if (explored[i] !== 0) {
         const k = at[i] - 1;
         if (k >= 0 && items[k].taken !== true) {
           const kind = items[k].kind;
           if (kind === 'oil') {
-            if (oil < 0) oil = i;
+            if (oil < 0) {
+              oil = i;
+              // The trip there and the slack to reach the one after it: a flask is only worth
+              // walking to while the tank still covers `REFUEL_MARGIN` times the way plus a margin.
+              if (reach < d * AUTO.REFUEL_MARGIN + AUTO.REFUEL_RESERVE_TILES) wantFuel = true;
+            }
             // A flask close by is worth topping up from before the tank is low: it may be far
             // behind by the time it is needed.
             if (item < 0 && tank < AUTO.TOPUP_AT && d <= AUTO.ITEM_DETOUR) item = i;
@@ -419,11 +449,15 @@ export function createAutopilot() {
       // Stop as soon as the goal this plan will pick is decided. Distances are non-decreasing in a
       // BFS, so nothing found later could beat what is already in hand.
       if (wantFuel && oil >= 0) break;
+      // Nothing uncovered to drink and a flask found in the fog: that is this plan's goal, and a
+      // BFS is nearest-first, so nothing further on could beat it.
+      if (desperate && smell >= 0 && oil < 0) break;
       if (wantExit && exitReached) break;
       // A frontier further than the nearest one plus the backtrack cost could not win either.
       if (
         !wantFuel &&
         !wantExit &&
+        !(desperate && smell < 0) &&
         frontiers >= choices &&
         d > AUTO.ITEM_DETOUR &&
         (ahead || frontiers >= cap || d > dst[frontier[0]] + AUTO.BACKTRACK_COST + AUTO.FRONTIER_TIE)
@@ -453,6 +487,14 @@ export function createAutopilot() {
     if (wantFuel && oil >= 0) {
       goal = GOAL_OIL;
       tile = oil;
+    } else if (desperate && smell >= 0) {
+      // The survival valve: on a nearly dead torch with nothing uncovered to refill it from, the
+      // pilot walks to the nearest flask on the level rather than exploring until it dies. This is
+      // the one place it looks past the fog, and it exists because Auto Explore is a *watch* mode
+      // whose death costs the player their saved run (main.js clears it on gameOver). Measured over
+      // levels 1–10 × 8 seeds it is most of the difference between clearing 74 % of runs and 99 %.
+      goal = GOAL_OIL;
+      tile = smell;
     } else if (wantExit && exitReached) {
       goal = GOAL_EXIT;
       tile = exitIdx;
@@ -504,6 +546,10 @@ export function createAutopilot() {
       tile = exitIdx;
     }
     if (goal === GOAL_NONE) return;
+    // "This plan is a refuel trip": the replan edges below are what stop a trip being re-planned
+    // every cooldown while the tank keeps falling, which used to flip the pilot between two flasks
+    // until the torch died with neither reached.
+    s.plannedLow = goal === GOAL_OIL;
 
     // Walk the parents back from the goal, then reverse in place.
     const r = /** @type {Int32Array} */ (route);
@@ -598,8 +644,10 @@ export function createAutopilot() {
       let command = 0;
       if (s.routeStep < s.routeLen) {
         aimAt(p.x, p.y, r, w);
-        const sway = Math.sin(state.time * TAU * ATTRACT.SWAY_HZ) * ATTRACT.SWAY_AMP;
-        const err = angleDiff(p.angle, Math.atan2(s.aimY - p.y, s.aimX - p.x) + sway);
+        const aimErr = angleDiff(p.angle, Math.atan2(s.aimY - p.y, s.aimX - p.x));
+        // The title camera's sway, from the title camera's own function: faded out while turning and
+        // in with the walking speed, so it never fights the pursuit aim (`balance.js` `swayAt`).
+        const err = aimErr + swayAt(state.time, aimErr, s.speed);
         command = clamp(err * ATTRACT.TURN_GAIN, -ATTRACT.TURN_RATE, ATTRACT.TURN_RATE);
         const align = Math.cos(err);
         want = align > 0 ? ATTRACT.SPEED * Math.pow(align, ATTRACT.SPEED_FALLOFF) : 0;

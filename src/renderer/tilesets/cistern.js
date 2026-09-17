@@ -298,24 +298,28 @@ function paintWall(edgeSeed, seed, o) {
     if (n > 0.45) put(buf, x, 22 + (n > 0.8 ? 1 : 0), C.cisLimeDark);
   }
 
-  // The tideline: a broken, uneven crust of limescale rather than a clean line — a continuous pale
-  // row lit by a warm torch read as a brass handrail running down every corridor. Crust comes in
-  // 2-texel clumps of varying thickness with gaps, mostly mid/dark lime, pale only in rare knots,
-  // with lime runs weeping below it.
+  // The tideline: an unbroken 1–2 texel crust of limescale that thickens and thins along the wall,
+  // mostly mid/dark lime with pale only in rare knots, weeping runs below it.
+  //
+  // WHY unbroken: a continuous *pale* row lit by a warm torch read as a brass handrail running down
+  // every corridor, so the crust was broken into clumps with gaps — and at one or two tiles those
+  // clumps plus the runs hanging under them read as a row of floating tan T-shapes rather than as a
+  // waterline. Keeping the row whole and letting only its thickness, tone and runs vary gives a line
+  // the eye follows without any piece of it reading as an object. The crust never grows *upward*
+  // for the same reason: a bar with a stem below it is a T, a waterline with drips under it is a
+  // waterline.
   for (let x = 0; x < SIZE; x++) {
     const wob = vnoise(x, 0, 16, edgeSeed ^ 0x7de) > 0.62 ? -1 : 0;
     const ty = TIDE + wob;
     const cov = vnoise(x & ~1, 0, 8, edgeSeed ^ 0x7c0);
     const n = h01(x >> 1, 3, edgeSeed ^ 0x71de);
-    if (cov < 0.34) {
-      // Gap in the crust: only a stain.
-      shiftBrick(buf, x, ty, -1);
-      continue;
-    }
-    const thick = cov > 0.62 ? 2 : 1;
-    if (thick === 2 && n > 0.5) put(buf, x, ty - 1, C.cisLimeDark);
-    put(buf, x, ty, n > 0.9 ? C.cisLimePale : n > 0.35 ? C.cisLimeMid : C.cisLimeDark);
+    // Mostly the dark tone, so the unbroken row still reads as a stain rather than as a bright rail
+    // along the corridor; the paler knots are what say "crust".
+    put(buf, x, ty, n > 0.94 ? C.cisLimePale : n > 0.62 ? C.cisLimeMid : C.cisLimeDark);
+    const thick = cov > 0.5 ? 2 : 1;
     if (thick === 2) put(buf, x, ty + 1, n > 0.6 ? C.cisLimeMid : C.cisLimeDark);
+    // Where the crust is thinnest the brick below it is merely stained.
+    else if (cov < 0.34) shiftBrick(buf, x, ty + 1, -1);
     if (h01(x, 9, edgeSeed ^ 0x71de) > 0.86) {
       const len = 2 + ((n * 5) | 0);
       for (let k = 0; k < len; k++) put(buf, x, ty + thick + k, k === len - 1 ? C.cisWaterGlint : C.cisLimeDark);
@@ -347,6 +351,13 @@ function paintWall(edgeSeed, seed, o) {
 
 /**
  * An iron mooring ring on a bolted plate, casting a shadow and bleeding rust to the floor.
+ *
+ * Read at one or two tiles, where the whole ring is 60–120 screen pixels: the band is three texels
+ * thick with a **one-texel dark outline** on both rims, a **lit arc** across its top-left quarter and
+ * a shadowed lower-right one, and it drops a cast shadow onto the brick below it. The first version
+ * painted a 1.7-texel band of mid-iron tones with no outline, which at that size fused into a tan
+ * blob with two dark holes in it — the "eyes" the gauntlet saw. What makes a ring read is the hole,
+ * so the hole gets an edge.
  * @param {Uint8Array} buf
  * @param {import('../../core/rng.js').Rng} rng
  * @param {number} seed
@@ -355,27 +366,31 @@ function paintRing(buf, rng, seed) {
   const cx = EDGE_ZONE + 8 + rng.int(SIZE - 2 * EDGE_ZONE - 18); // shadow and plate span cx-8..cx+9
   const py = 35;
   const rcy = py + 12;
-  const rx = 6.5;
-  const ry = 7.5;
+  const rx = 7;
+  const ry = 8;
   /** @param {number} dx @param {number} dy */
   const ringD = (dx, dy) => Math.sqrt((dx / rx) * (dx / rx) + (dy / ry) * (dy / ry));
-  // Shadow first, offset down-right.
+  // Shadow first, offset down-right — the ring stands off the wall, so it throws one.
   for (let dy = -9; dy <= 9; dy++) {
     for (let dx = -8; dx <= 8; dx++) {
       const d = ringD(dx, dy);
-      if (d > 0.72 && d < 1.24) {
+      if (d > 0.6 && d < 1.3) {
         shiftBrick(buf, cx + dx + 1, rcy + dy + 2, -3);
       }
     }
   }
   for (let y = py; y < py + 7; y++) for (let x = cx - 4; x <= cx + 5; x++) shiftBrick(buf, x, y + 1, -2);
-  // Ring.
+  // Ring: dark rims, a lit top-left arc, a dark lower-right one, rust at the bottom.
   for (let dy = -9; dy <= 9; dy++) {
     for (let dx = -8; dx <= 8; dx++) {
       const d = ringD(dx, dy);
-      if (d <= 0.72 || d >= 1.24) continue;
-      const lit = dx + dy < -2 ? (d < 0.95 ? 4 : 3) : dx + dy > 3 ? (d > 1.0 ? 0 : 1) : 2;
-      put(buf, cx + dx, rcy + dy, IRON[lit]);
+      if (d <= 0.6 || d >= 1.3) continue;
+      // Light from up and to the left: +1 on the top-left arc, −1 on the lower-right one.
+      const len = Math.sqrt(dx * dx + dy * dy) || 1;
+      const lit = (-dx * 0.45 - dy * 0.89) / len;
+      const rim = d < 0.78 || d > 1.14;
+      const step = rim ? 0 : lit > 0.45 ? 4 : lit > -0.1 ? 3 : lit > -0.6 ? 2 : 1;
+      put(buf, cx + dx, rcy + dy, IRON[step]);
     }
   }
   // Plate with a bolt, drawn over the top of the ring.
@@ -430,19 +445,24 @@ function paintDrain(buf, rng, seed) {
         if (dx + y - springY < -4 && o > 1.2) t += 0.12;
         put(buf, x, y, joint ? C.cisFlagShadow : rampPickFlat(FLAG, t));
       } else {
+        // Behind the bars is a void, not a dim recess: a black opening is what tells the eye the
+        // bars are bars. Only the first texel inside the frame keeps the stone's shadow tone.
         const depth = -o;
-        let c = depth < 1.2 ? C.cisFlagGap : C.void;
+        let c = depth < 1 ? C.cisFlagGap : C.void;
         if (y >= sill - 4) c = y === sill - 4 ? C.cisWaterMid : h01(dx, y, seed) > 0.8 ? C.cisWaterLight : C.cisWaterDeep;
         put(buf, x, y, c);
       }
     }
   }
-  // Iron bars.
-  for (const bxo of [-4, 0, 4]) {
+  // Iron bars: a lit left edge, a mid shaft and a dark right edge, so each one reads as a round bar
+  // against the void behind it rather than as a flat stripe. Three texels wide is the least that
+  // survives the 1–3 screen pixels a bar occupies at corridor distance.
+  for (const bxo of [-5, 0, 5]) {
     for (let y = top; y < sill; y++) {
       if (outside(bxo + 0.5, y + 0.5) > -0.2) continue;
-      put(buf, cx + bxo, y, C.ironLight);
-      put(buf, cx + bxo + 1, y, C.ironDark);
+      put(buf, cx + bxo - 1, y, C.ironHilite);
+      put(buf, cx + bxo, y, C.ironBase);
+      put(buf, cx + bxo + 1, y, C.ironShadow);
     }
   }
   for (let dx = -r + 1; dx < r; dx++) {

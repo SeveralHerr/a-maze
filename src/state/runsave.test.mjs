@@ -10,7 +10,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { buildLevel } from '../maze/level.js';
-import { levelParams } from './balance.js';
+import { levelParams, WORLD } from './balance.js';
 import { createInitialState, reducer } from './game.js';
 import { createAutopilot } from './autopilot.js';
 import { clearRun, loadRun, RUN_KEY, saveRun } from './save.js';
@@ -118,7 +118,16 @@ test('a mid-level save puts the run back exactly where it was paused', () => {
     a.levelData.items.map((/** @type {any} */ it) => it.taken),
   );
   assert.ok(a.levelData.items.some((/** @type {any} */ it) => it.taken), 'the fixture should have taken something');
-  assert.deepEqual(b.explored, a.explored);
+  // The fog comes back, but not always bit for bit: the reveal sweep is budgeted and spans steps
+  // (`sim.revealCursor`), so a pause can land mid-sweep with a tile in sight not yet marked, and the
+  // restored level's first reveal finishes that sweep. What is required is that nothing is *lost* —
+  // the restored grid covers everything the save recorded — and that it has not "revealed" a room.
+  let extra = 0;
+  for (let i = 0; i < a.explored.length; i++) {
+    if (a.explored[i] !== 0) assert.notEqual(b.explored[i], 0, `tile ${i} was explored and came back dark`);
+    else if (b.explored[i] !== 0) extra++;
+  }
+  assert.ok(extra <= WORLD.REVEAL_BUDGET, `the restore revealed ${extra} tiles the save did not have`);
   assert.deepEqual(b.marks, a.marks);
   assert.equal(b.sim.runBestScore, a.sim.runBestScore);
 });
@@ -228,4 +237,22 @@ test('a save at the size cap stays small, and the summary names depth and score'
   assert.equal(save.mid.hash, tileHash(a.levelData.maze.tiles));
   assert.deepEqual(summarizeRunSave(save), { level: 15, score: a.run.score, mid: true });
   assert.equal(summarizeRunSave(null), null);
+});
+
+test('a tampered save cannot restore more chalk or reserve than the run has earned', () => {
+  // A save is a string in the player's own browser. `sanitizeRunSave` only rejects nonsense — it has
+  // no idea what a legitimate value is — so the caps that matter are the perks: chalk charges are
+  // `perks.chalk` (0 with nothing unlocked) and the Siphon reserve is `perks.siphonCap`. Before this,
+  // `mid.chalk = 999999` restored as 999 999 charges of chalk.
+  const a = playedAndPaused(3, 21, 20);
+  const save = snapshotMidLevel(a);
+  assert.ok(save !== null);
+  const mid = /** @type {any} */ (save).mid;
+  mid.chalk = 999_999;
+  mid.reserve = 999_999;
+  const b = continued(JSON.parse(JSON.stringify(save)), /** @type {any} */ (save).mazeSeed ?? -1);
+  assert.equal(b.phase, 'playing');
+  assert.equal(b.run.chalk, b.perks.chalk, `chalk restored as ${b.run.chalk} against a cap of ${b.perks.chalk}`);
+  assert.equal(b.run.reserve, b.perks.siphonCap, `reserve restored as ${b.run.reserve}`);
+  assert.ok(b.run.fuel <= b.run.fuelMax, 'and fuel is still clamped to the tank');
 });

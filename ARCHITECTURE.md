@@ -43,7 +43,7 @@ tree is served locally (`npm run serve`) and uploaded to itch.io by CI.
   complete, game over) spends gems on ranks. Unlocks **carry across runs**. The oil placement
   guarantee is computed from **base stats only**, so every unlock is pure slack on top of it.
 - **Size curve _(massive mazes)_:** level 1 is a lean **10×10-cell** first floor (`LEVEL.FIRST_CELLS`,
-  an 80 s tank, thinner flasks and gems — `LEVEL.FIRST_*`); from level 2 the curve is the one below
+  a 95 s tank, thinner flasks and gems — `LEVEL.FIRST_*`); from level 2 the curve is the one below
   unchanged, as if level 1 were **16×16 cells = 33×33 tiles**, growing **+8 cells per
   side per level** to a cap of **128×128 cells = 257×257 tiles = 16 384 cells ≈ 33 000 floor tiles**,
   reached at level 15. `LEVEL.MAX_CELLS` in `balance.js` is the **single documented size knob** and
@@ -53,16 +53,17 @@ tree is served locally (`npm run serve`) and uploaded to itch.io by CI.
   `CAP_LEVEL`, with the detour (6 → 4 cells) and route guard (0.85 → 0.70) relaxing along the same
   ramp, so long cul-de-sacs usually have a back door and deeper floors loop more;
   braid keeps rising (0→0.6 over 17 levels, square-root shaped, 0.6 from
-  level 18), the torch drains 3 % faster per level (`FUEL.DRAIN_PER_LEVEL`) from
-  `LEVEL.DRAIN_RAMP_START` (level 5, so the ramp is felt inside the size curve) to a 1.35× ceiling
-  (`FUEL.DRAIN_MAX`, 1.30× at the cap, 1.35× from level 17), and oil thins from one flask per 20
-  cells to one per 34 (`LEVEL.OIL_CELLS_END`). Levels run ~3.5 minutes at level 1 to ~13 minutes at the deepest.
+  level 18), the torch drains 3.5 % faster per level (`FUEL.DRAIN_PER_LEVEL`) from
+  `LEVEL.DRAIN_RAMP_START` (level 3, so the ramp is felt inside the size curve) to a 1.45× ceiling
+  (`FUEL.DRAIN_MAX`, 1.42× at the cap, 1.45× from level 16), and oil thins from one flask per 20
+  cells to one per 34 (`LEVEL.OIL_CELLS_END`). Levels run ~1–1.5 minutes on the lean first floor,
+  ~4 minutes at level 2, to ~13 minutes at the deepest.
 - **Torch economy _(a tank you keep refilling, not a budget)_:** `fuelMax` is a **tank** of
-  110 s (level 1) → 150 s (the cap), **independent of maze area** — 64× the area buys 1.36× the
+  95 s (level 1), 113 s (level 2) → 150 s (the cap), **independent of maze area** — 64× the area buys 1.36× the
   tank. Oil flasks are the economy: their **count scales with area** so density is roughly constant
   (≈ one per 20 cells early, thinning to one per 34 past the cap), each restoring **35 % of the
   tank on level 1, climbing to 44 % on the cap's tank** (`FUEL.OIL_FRACTION` →
-  `FUEL.OIL_FRACTION_END`, clamped 25–70 s ⇒ 38–66 s in practice) — bigger, rarer refills deeper
+  `FUEL.OIL_FRACTION_END`, clamped 25–70 s ⇒ 33–66 s in practice) — bigger, rarer refills deeper
   down are the shape of the tension curve. A level takes **7–22 refuels** to cross and the
   player is never more than ~60–90 s from darkness, whatever the depth. Gems scale with area too
   (≈ one per 50–60 cells), still favouring dead ends, and remain the score currency.
@@ -368,7 +369,8 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   formulas, the settings spec, and
   `levelParams(level) → {cols, rows, braid, shortcuts, shortcutDetour, shortcutRouteKeep, gems, oil, fuelSeconds, par, fuelBase, fuelPerCell,
   fuelPerPathTile, cells, drain, oilTargetGap, oilDensity, gemDensity, oilRefuelSeconds, pathTiles}`.
-  - **`fuelSeconds` IS the tank** (110→150 s, independent of area), not `base + cells × perCell`.
+  - **`fuelSeconds` IS the tank** (95 s on level 1, 113→150 s from level 2, independent of area),
+    not `base + cells × perCell`.
   - **`par` is a FLOOR only** — `src/maze/populate.js` knows the real shortest path and derives the
     honest par from it, taking the larger.
   - `fuelBase` / `fuelPerCell` / `fuelPerPathTile` are retained for compatibility but are now
@@ -382,9 +384,19 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   `FUEL.GAP_SAFETY` 0.7 on level 1 → `FUEL.GAP_SAFETY_END` 0.8 at the cap, applied to
   `oilTargetGap`). `FUEL.LOW_FRACTION` (0.25) is the `lowFuel` threshold;
   `FUEL.OIL_MIN_ROOM` (1 s) is the tank room below which the sim leaves a flask on the floor
-  (`feasibility.test.mjs` also models a player who skips off-route flasks for a sip); `LEVEL.DRAIN_RAMP_START` (5) is the last level
-  that burns at 1× before `drainRate` climbs by `FUEL.DRAIN_PER_LEVEL`. Frozen tables `PLAYER / BUMP / BOB / WORLD / SIM / FUEL / SCORE /
-  ATTRACT / LEVEL`. Removed with the old economy (nothing referenced them): `FUEL.BASE_SECONDS`,
+  (`feasibility.test.mjs` also models a player who skips off-route flasks for a sip); `LEVEL.DRAIN_RAMP_START` (3) is the last level
+  that burns at 1× before `drainRate` climbs by `FUEL.DRAIN_PER_LEVEL` (3.5 %/level, ceiling
+  `FUEL.DRAIN_MAX` 1.45×). Also `swayAt(t, err, speed)` — the idle yaw sway, in radians, full at
+  cruise on a settled heading and nothing while turning into a corner or standing still. It lives
+  in `balance.js` with the numbers because **both** the title camera (`sim.js` `stepAttractBody`)
+  and Auto Explore (`autopilot.js`) sway, and §4.10 requires the pilot to move like the title
+  camera — which it cannot do if the two compute their sway differently. Frozen tables `PLAYER / BUMP / BOB / WORLD / SIM / FUEL / SCORE /
+  ATTRACT / LEVEL`. `PLAYER` gained **`TURN_RELEASE_RATE` (45/s)**, the smoothing rate used instead
+  of `TURN_EASE_RATE` (18/s) when the keyboard turn command drops or reverses: with one shared 18/s
+  ease a released turn key coasted the view on by `TURN_SPEED / 18` = 0.22 rad (10.9° measured off a
+  90° turn), and in a game made of 90° corners that is an overshoot to correct on every one, where
+  Wolfenstein and Doom stop dead. At 45/s the coast is ≈ 0.09 rad (≈ 5°) — rounded, not a snap —
+  and `sim.test.mjs` pins it under 6°. Removed with the old economy (nothing referenced them): `FUEL.BASE_SECONDS`,
   `PER_CELL_START/END`, `DECAY_LEVELS`, `PER_PATH_TILE_START/END`, `PAR_FRACTION`,
   `LEVEL.GEM_PER_DEAD_END`, `LEVEL.OIL_PER_DEAD_END`.
   **`SETTING_SPEC` gained a third kind, `'enum'`** (`{kind, def, values}`): `mapMode` is
@@ -489,16 +501,27 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
 ### 4.4 `src/maze` (Wave 2)
 - `constants.js` — `TILE = { FLOOR:0, WALL:1 }`, `DIRS`.
 - `generator.js` — `generateMaze({cols, rows, seed, braid=0, shortcuts=0, shortcutDetour=12,
-  shortcutRouteKeep=0.85}) → Maze`. **Iterative randomized
+  shortcutRouteKeep=0.85, braidRouteKeep=BRAID_ROUTE_KEEP}) → Maze`. **Iterative randomized
   recursive backtracker** with an explicit `Int32Array` stack (no recursion → no stack overflow at
   any size), followed by optional **shortcuts** (knock through up to `shortcuts` walls whose two
   cells are ≥ `shortcutDetour` cells apart by path — a bounded BFS on the live tiles — while keeping
   the start→exit route ≥ `shortcutRouteKeep` of the carved one; connects separate sections so a
   cul-de-sac can have a back door) and optional **braiding** (remove `braid` fraction of dead ends by knocking a
-  wall into a neighbouring corridor). Both only remove walls — keeps solvability, adds loops.
+  wall into a neighbouring corridor, under its own route guard `braidRouteKeep` — the fraction of
+  the *post-shortcut* route the braid pass must keep. It defaults to **0** (`BRAID_ROUTE_KEEP`, no
+  floor) and nothing in the shipped curve passes it, because braiding **is** the route brake rather
+  than a threat to it: `LEVEL.BRAID_MAX` exists precisely because a perfect 128×128 maze carries a
+  ~10 600-tile route. The knob is there so a curve that wants longer deep levels can ask for a floor
+  instead of the generator guessing — measured at the cap, the final route runs 715 tiles at 0,
+  1 016 at 0.12 and 1 956 at 0.25). Both only remove walls — keeps solvability, adds loops.
   Streams: `maze.carve`, `maze.connect`, `maze.braid`. Start = cell (0,0); exit =
   the cell **farthest from start** by BFS distance (guarantees a long route). Must handle
-  1×1 up to 2000×2000 cells in bounded memory/time (O(n)).
+  1×1 up to 2000×2000 cells in bounded memory/time (O(n)). **The route guard is exact up to a
+  per-cell repair budget** (`SHORTCUT_REPAIR_BUDGET`, cells lowered per maze cell) and falls back
+  past it to a repair-free 1-Lipschitz test that keeps the *identical* guarantee — no opened wall
+  can shorten the route below the keep fraction — while placing fewer shortcuts at stress sizes.
+  Repairing both distance fields after every opened wall is what would otherwise make this pass
+  superlinear; the budget is what keeps the whole generator O(cells).
 - `validator.js` — `validateMaze(maze) → Validation` via iterative BFS over tiles (typed-array
   queue). Checks solvable, fully connected, sealed border, tile values in range, start/exit on
   floor; computes shortest path, dead ends, loop count. Pure, Node-safe.
@@ -546,7 +569,7 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
     tank (tutorial, demo, fixture) but never raise it — a stale worker build or a future path-derived
     budget (~650 s on a 128×128 level) can never inflate the economy. Retune from `FUEL.*` and
     `LEVEL.*` in `balance.js`.
-- `level.js` — `buildLevel(params:{cols,rows,braid,shortcuts?,shortcutDetour?,shortcutRouteKeep?,gems,oil,fuelSeconds,par}, seed) → LevelData`
+- `level.js` — `buildLevel(params:{cols,rows,braid,shortcuts?,shortcutDetour?,shortcutRouteKeep?,braidRouteKeep?,gems,oil,fuelSeconds,par}, seed) → LevelData`
   (generate → validate → **throw if invalid** → populate). Deterministic for a given seed.
   Also `assertMazeValid(maze, validation, braid?)` (the guard, exported so its message is testable)
   and `levelTransferList(data) → ArrayBuffer[]` (the buffers to hand to `postMessage`).
@@ -628,8 +651,12 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   **dynamic lighting**: player torch radius = `lerp(2.5, 7, view.light)` with two octaves of
   flicker; its brightness and a warm firelight core around the player also fall with
   `view.light`, and below 0.4 it gutters (so the oil left reads in the world, not only on the
-  HUD) + the eight nearest wall torches as point lights (each occluded by the plane of the wall
-  it is bolted to) + distance fog to a cool blue-black. Head bob offsets the horizon, quantised to
+  HUD) + the eight nearest wall torches as point lights (each masked by a **baked per-torch
+  line-of-sight window** — `bakeTorchVisibility` fills a byte per tile in a `VIS_SPAN`² (11×11)
+  window around the flame, lazily and once per torch per level, and a lit surface outside that
+  window is skipped. This replaced a test against the plane of the wall the sconce is bolted to,
+  which passed for any tile on the flame's side of that plane and so leaked light through masonry
+  round a corner) + distance fog to a cool blue-black. Head bob offsets the horizon, quantised to
   whole pixels so the wall base and the floor rows cannot disagree by a pixel and shimmer.
   Shading is a Doom-style **colormap** (64 levels × 256 entries of pre-packed RGBA) plus a 4×4
   Bayer dither: one array lookup per pixel. Zero allocations per frame; `stats()` and
@@ -691,16 +718,22 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   (use it for level complete / game over). Using both doubles the brightness.
 
 ### 4.6 `src/ui` (Wave 3)
-- `font.js` — built-in **bitmap pixel font**: a gothic display face (12 rows, proportional, uniform
-  digit width) for titles and a clean 5×7 HUD face in an 8-row cell (one descender row) — both
-  covering 0x20…0x7E plus `© × … ·`. `drawText(ctx, text, x, y, {font, size, color, shadow, align,
+- `font.js` — built-in **bitmap pixel font**, **three faces** (`FontName` = `'hud' | 'display' |
+  'text'`): a gothic **display** face (12 rows, proportional, uniform digit width) for titles, a
+  clean 5×7 **hud** face in an 8-row cell (one descender row) for readouts, and a proportional
+  **text** face (the prose face — the hud cell with per-glyph advances, so a sentence sets tighter
+  and reads as prose rather than as a gauge) used by `menus.js` for credits and blurbs and by
+  `hud.js` for notice banners. All three cover 0x20…0x7E plus `© × … ·`; per-face details are
+  documented in-file. `drawText(ctx, text, x, y, {font, size, color, shadow, align,
   baseline, tracking, lineHeight, alpha})`, `drawTextBlock`, `measureLine`, `measureText`,
   `wrapText`, `fontMetrics`, `lineHeight`, `textHeight`, `catchesLight(glyph, x, y)` (the rim-light
   rule for the gothic face, exported for its test), plus `COLOR` and `FONT_STYLES`.
   **`size` is an integer pixel scale** (1 = one font pixel per surface pixel), not a point size;
   `measureText` returns `{width, height, lines}`. Glyphs are blitted from per-(face,style) atlases
-  built on first use. The overlay canvas is sized at the renderer's internal resolution ×2, so
-  lettering is pixel-crisp.
+  built on first use, capped at `MAX_ATLASES` = **24** (was 16, raised with the third face: three
+  faces × the styles in steady use is 13, and the cap must sit above what one frame draws or an
+  eviction becomes a rebuild inside that frame). The overlay canvas is sized at the renderer's
+  internal resolution ×2, so lettering is pixel-crisp.
   _Additive:_ a **scalar per-frame API** that takes no options object — `drawAt(ctx, text, x, y,
   font, size, color, align, baseline, alpha)`, `measureAt(text, font, size)`, `heightAt(font, size)`
   — so the HUD and menus allocate nothing per frame; `setLayoutProbe(fn)` / `probeLayout(kind, x, y,
@@ -721,9 +754,15 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
 - `map.js` — the **three-state map** (the massive-maze replacement for the minimap). Exports `MAP`,
   `MAP_MODES`, `MAP_MODE_LABEL`, `MapMode`, `normalizeMapMode`, `nextMapMode`, `mapModeFromSettings`,
   `readMapMode`, `setMapMode`, `cycleMapMode`, `resetMapMode`, `createMapView`, `paintTiles`,
-  `countExplored`, `chooseFullScale(cols, rows, boxW, boxH, out?)`, `fitBeats(a, b)`, `cornerWindow`.
+  `countExplored`, `chooseFullScale(cols, rows, boxW, boxH, out?)`, `fitBeats(a, b)`,
+  `cornerWindow(px, py, span, mw, mh, out, pad?)`.
   - **OFF → CORNER → FULL**, cycled by the existing `map` action. CORNER is a 25-tile (19 on a phone)
-    window centred on the player, zoomed 2–6×. FULL is a full-screen labyrinth map: header
+    window centred on the player, zoomed 2–6×. `cornerWindow`'s optional `pad` is an **overscan**:
+    how many tiles the window may slide past the maze edge, so a player pinned against a wall still
+    sits somewhere near the middle of the panel instead of being shoved to its rim. It defaults to
+    **0**, which is exactly the old behaviour, so the pinned tests are unchanged. The corner panel's
+    drawable box is inset by **two** panel borders (the frame is drawn, then the map is clipped
+    inside it — insetting by one let a tile bleed under the frame's inner edge). FULL is a full-screen labyrinth map: header
     (`DEPTH n · 128×128`, `MAPPED %`), the fitted map, and a legend (gems n/total, OIL, EXIT,
     distance to the exit once seen). The fuel gauge stays on screen in FULL, so the torch keeps
     burning while you read it. The view's internal `drawFull(ctx, m, state, clock, reduced,
@@ -739,6 +778,11 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
     silhouette into 1 028 device px — 88 % of the screen width — of real labyrinth. At the shipped
     128-cell cap neither target layout needs the cell fallback; it is kept, documented and
     unit-tested because it is what a smaller viewport or a raised `MAX_CELLS` would hit.
+    On a **narrow** screen the full map may draw **frameless** — the panel frame dropped for a
+    hairline margin (`BARE_MARGIN_DEV`, 2 device px, in place of `MAP.MARGIN_DEV`) — whenever
+    losing the frame buys a whole extra device pixel per tile. On a phone that is the difference
+    between a readable labyrinth and a smudge, so the trade is taken in the map's favour; the outer
+    wall is still stroked, or the labyrinth's edge would bleed into the page.
   - **One incremental offscreen raster, blitted with a single `drawImage`.** The old minimap scanned
     all 66 049 explored bytes *every frame* just to decide whether to rebuild. Now: the sim only
     reveals within radius 3, so each frame rescans a small box around the player grown by the
@@ -852,10 +896,19 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   (the tally is derived from `run.levelScore`, every other size reading uses the real
   `maze.cols`/`maze.rows`), so a drift shows up as a wrong split or a wrong loading banner, never as
   a wrong total — but they must be updated together with `balance.js`.
-  `FUEL.LOW_FRACTION` is **0.25**: on the tank that is a 27.5 s (level 1) to 37.5 s (cap) warning,
+  `FUEL.LOW_FRACTION` is **0.25**: on the tank that is a 23.8 s (level 1) to 37.5 s (cap) warning,
   comfortably more than one `oilTargetGap`, so the sim's `lowFuel` event, the red gauge and the
   heartbeat ramp all start at the same quarter-tank mark. Retuning it means changing `balance.js`,
   `hud.js` and `audio.js` **together**.
+- **Harness-only, never shipped:** `preview.js` + `preview.html` are the module harness
+  (`/src/ui/preview.html?screen=…`), and `preview-nav.js` holds the walk that reaches each
+  `?screen=` value. The sub-screens are internal to `menus.js` — there is no `openScreen(id)` in
+  this contract — so the harness reaches them the way a player does, by moving the selection and
+  confirming, which is fragile by nature: when that walk broke, `?screen=options` silently
+  screenshotted the loading screen instead. Extracting it gives `preview-nav.test.mjs` something it
+  can prove in Node against the real menus (`PREVIEW_SCREENS` maps every documented value to the id
+  `menus.screen()` must report). **`src/main.js` never imports either file**, so neither reaches the
+  shipped page.
 - `styles.css` lives at `/styles.css` (integrator) — layout, pixelated scaling, safe areas.
 
 ### 4.7 `src/main.js` (Integrator)
@@ -1059,7 +1112,12 @@ within range through walls as a stippled ghost. `view.flame` scales the player t
 **UI.** `menus.js` gains two sub-screens: **`boon`** (three cards: icon, name, rank pips, the next rank's
 effect; opens itself `BOON_HOLD_S` (3.5 s) after the level-complete tally is done while `offer.open`, so
 the floor's score can be read first — the *Choose a Boon* row opens it sooner; *Descend* with an open
-offer opens it instead of forfeiting) and **`shrine`** (reachable from title, level complete and game
+offer opens it instead of forfeiting, **on the first attempt only**: once the player has seen the
+cards and chosen *Decide Later* (or backed out), Descend and Save & Quit instead raise a confirm —
+heading *Forfeit the boon?*, note `THE GIFT IS LOST` — whose safe answer returns to the cards.
+Without that, *Decide Later* led nowhere, because both ways off the tally simply reopened the cards
+it had just dismissed. The dialog shares the confirm screen id, so `screen()` reports `'confirm'`
+for it) and **`shrine`** (reachable from title, level complete and game
 over: the purse, a scrolling list of every unlock with rank pips and cost, and a detail panel with the
 current → next effect; confirm buys). Callbacks `onBuy(id)` and `onClaimBoon(id)`. `screen()` may also
 return `'boon' | 'shrine'`. `hud.js` draws a chalk-charges chip, the siphon reserve under the fuel gauge,
@@ -1073,7 +1131,8 @@ the scroll-sense pulse and the lodestone needle; main.js raises notices for `emb
 An autopilot that plays through the **real input path**: main.js hands its axes to the reducer on
 the ordinary `tick`, so collision, fuel, pickups and the exit apply exactly as for a player. It lives
 in `src/state` because it is pure and Node-testable (it imports `core/rng`, `maze/constants` and
-`balance`). It plays the **fog honestly** — it only targets items on explored tiles. A plan is one
+`balance`). It plays the **fog honestly** — it only targets items on explored tiles, with exactly
+one documented exception, the **survival valve** below. A plan is one
 BFS over floor tiles from the player collecting, nearest first: a seen oil flask when the tank is
 below `AUTO.REFUEL_AT` (and any seen flask within `ITEM_DETOUR` below `TOPUP_AT`), a seen gem or map
 scroll within `AUTO.ITEM_DETOUR`, and frontier tiles (explored floor with an unexplored floor
@@ -1084,11 +1143,26 @@ whose route starts **behind** the player (first step against its facing) costs `
 path tiles, so a goal uncovered early does not turn it round on a corridor that still leads on. Past the
 wander budget with the exit still unseen (or low on oil with none in sight) the frontier choice turns
 greedy toward the exit's position over `SEEK_CHOICES` candidates (with the same backtrack cost).
+- **Oil is wanted on distance as well as on fraction.** A tank fraction alone is the wrong question:
+  half a tank is plenty three tiles from a flask and nowhere near enough eighty tiles from one. So a
+  flask is also wanted whenever the torch no longer covers `AUTO.REFUEL_MARGIN` (1.5×) the path to it
+  plus `AUTO.REFUEL_RESERVE_TILES` (16) of slack — one trip length, plus the leg out of that flask
+  toward the next one that the §1 placement guarantee sizes from a full flask, plus the turning and
+  backtracking a route costs over its path length.
+- **The survival valve** is the one place Auto Explore looks past the fog: below `AUTO.SMELL_AT`
+  (0.75) with no flask on any *explored* tile, it walks to the nearest flask **on the level**,
+  revealed or not. A fog-bound explorer in a 128×128 labyrinth strands itself reliably — it drinks
+  its neighbourhood dry, then explores until the torch dies with no flask in sight — and a watch
+  mode that runs the torch dry costs the player their saved run (main.js clears it on `gameOver`).
+  The threshold is high and measured: over levels 1–10 × 8 seeds, 74 % of runs cleared with no
+  valve, 91 % at 0.35, 95 % at 0.65, 98.75 % at 0.75. Higher still and it fetches oil it does not
+  need yet and stops exploring, which is what the mode is *for*.
 - **It moves like the title camera** (`step(state, out, dt)`), for watching rather than racing, and
   reads the `ATTRACT` table directly so the two cannot drift: cruise `ATTRACT.SPEED` (1.7 tiles/s, about
   half walking pace) scaled by `cos(err)^SPEED_FALLOFF` and eased at `SPEED_EASE_RATE`; a commanded
-  turn rate `err × TURN_GAIN` capped at `TURN_RATE` and eased at `TURN_EASE_RATE`, plus the `SWAY`
-  idle yaw. Unlike the title camera it aims by **pure pursuit**: the furthest point on the route's
+  turn rate `err × TURN_GAIN` capped at `TURN_RATE` and eased at `TURN_EASE_RATE`, plus the idle yaw
+  from the shared `balance.swayAt(t, err, speed)` — the one function both it and `sim.js`'s title
+  camera call, so the sway cannot drift between them (§4.2). Unlike the title camera it aims by **pure pursuit**: the furthest point on the route's
   centre-line polyline `AUTO.PURSUIT` (1.1) tiles from the body, so a corner pulls the aim round it and
   the turn starts before the corner (the older past-the-waypoint aim walked on toward the far wall and
   pivoted there: median 0.15 tiles past the corner centre, now ≈ −0.07; `autopilot.test.mjs` gates
@@ -1107,10 +1181,11 @@ greedy toward the exit's position over `SEEK_CHOICES` candidates (with the same 
   budget reached, or `STUCK_STEPS` without moving — and non-forced replans wait
   `REPLAN_COOLDOWN_STEPS`. Buffers are grow-only `Int32Array`s with a generation stamp (no clearing);
   `autopilot.test.mjs` asserts nothing survives a GC across 30 000 steps and hundreds of plans at the cap.
-- **Honest limit:** a fog-bound random explorer clears early floors reliably but still runs dry on
-  some deeper ones (measured in Node, 3 seeds each: depth 10 cleared 3/3, depth 5 2/3, depth 3 0/3):
-  it wanders further than the 2.0× feasibility model the flask chain is built for, and it slows into
-  corners below the cruise the burn is scaled to. It is a way to watch the game, not a solver.
+- **Honest limit:** it is a way to watch the game, not a solver — it wanders further than the 2.0×
+  feasibility model the flask chain is built for, and it slows into corners below the cruise the
+  burn is scaled to. Measured in Node, it now clears **79 of 80 runs over levels 1–10 × 8 seeds**
+  (39 of 40 on the test's own seeds), which `autopilot.test.mjs` gates at **95 %**. That is the
+  distance rule, `TOPUP_AT` and the survival valve together; the fraction rule alone cleared 74 %.
 - **Setting & controls:** `Settings.autoExplore` (boolean, default false, persisted) with an Options
   row; the `auto` `InputAction` (bit 10) on **O** toggles it in play with a HUD notice. On screen for the
   whole of play:
@@ -1118,7 +1193,15 @@ greedy toward the exit's position over `SEEK_CHOICES` candidates (with the same 
     dim when off, gold, outlined and breathing when on — and records its rectangle;
     `hud.hitAuto(clientX, clientY)` hit-tests the last frame's button, `hud.setAutoButton(on)` suppresses
     it. It is not drawn while paused, in the full map, in a **narrow** layout (a phone's band is ~130 UI
-    px, where the bottom centre belongs to the unlock chips and score pops) or when suppressed.
+    px, where the bottom centre belongs to the unlock chips and score pops) or when suppressed —
+    **nor while the pointer is locked with Auto Explore off**, where a fading `O  AUTO` key hint
+    (held, then dissolved; Reduced Motion cuts it) takes its place and `hitAuto` reports false. A
+    locked cursor is captured by the world and cannot reach the plaque, so for most of a mouse
+    player's session it was permanent clutter that no click could ever hit. Switching Auto Explore
+    *on* releases the lock, so the full button — the one that turns it off — is on screen exactly
+    when it can be clicked. A browser with no pointer-lock API reads as "not locked" and draws the
+    button, which is the safe way to be wrong. `main.js`'s `hud.setAutoButton(!input.isTouch)` call
+    is unchanged; the rule lives entirely inside `hud.js`.
   - **Touch bar** (touch): `touch-overlay.js` has an **AUTO** button, leftmost (so it never moves MAP or
     PAUSE), firing the `auto` action; dim (`0.7`) when off, full opacity with a gold `outline` and
     `aria-pressed="true"` when on — `outline`, because the press/release styling never touches it.
@@ -1177,11 +1260,12 @@ level is not stored: `(params, seed)` rebuilds it (§4.4), so a save records onl
   Save & Quit · Abandon Run* (Abandon keeps the existing confirm). Level complete is *(Choose a Boon ·)
   Descend · Shrine · Save & Quit* — no abandon there, which also keeps the expedition strip on the panel
   at 1280×720; Escape on the tally moves the cursor to Save & Quit, and Save & Quit shows a waiting boon
-  first, like Descend.
+  first, like Descend — or, after a *Decide Later*, the forfeit confirm (§4.9).
 - `window.__game` additionally exposes `autopilot()` (= `autopilot.info()`) and `savedRun()`.
 
 ## 5. Quality gates (automated)
-- `npm test` — every `src/*/*.test.mjs` (node:test) in its own process (**772 tests in 42 files**).
+- `npm test` — every `src/*/*.test.mjs` (node:test) in its own process (**808 tests in 44 files** —
+  core 86, input 101, maze 94, renderer 111, state 183, ui 233).
   Two of those files, `src/state/perf.test.mjs` and `src/state/feasibility.test.mjs`, import
   `src/maze` as a **test-only** dependency: the §2 runtime rule is unchanged (`src/state` still
   imports only `src/maze/constants.js` at runtime), but a feasibility proof over fake mazes would
@@ -1191,7 +1275,15 @@ level is not stored: `(params, seed)` rebuilds it (§4.4), so a save records onl
   250 real levels (1…25 × 10 seeds) with a 2.0× wander autopilot and requires **250/250** to reach
   the exit, with a negative control (the same autopilot on a flask-stripped level must die).
 - `node tools/validate-mazes.mjs` — 100 % solvability across the seed/size matrix plus the refuel
-  chain over the real campaign (**117 306 mazes + 750 levels, ~14 s**). `--quick` for a smoke.
+  chain over the real campaign (**81 434 mazes + 750 levels, ~63 s**). `--quick` for a smoke.
+  The matrix is **shapes, not counts**: it sweeps the degenerate extremes (1×1…2×2), long thin
+  corridors (1×300, 300×1, 300×7, 7×300 — deepest carve stack, least room for a shortcut or a
+  braid) and non-square prime/coprime grids (37×41, 101×103, 17×31, where a `cell ↔ tile`
+  arithmetic bug a square grid hides has nowhere to go), and it now sweeps **shortcut density**
+  beside the braid fractions, because every campaign level runs the shortcut pass and a matrix that
+  never passes `shortcuts` is not testing what the game builds. The total fell from 117 306 because
+  16 000 seeds of a 1×1/2×2 grid were 55 % of the old count and proved nothing the first 200 had
+  not; the time rose because shortcut builds cost several times a plain carve.
 - `node tools/stress.mjs` — extreme grid sizes (2000×2000), the gameplay maximum (128×128 braid 1,
   populated, 100 seeds), a 30-level campaign leak loop, a 1×4096 deepest-possible carve and the
   oversize `RangeError`: no throw, no stack overflow, bounded time and memory.
@@ -1233,13 +1325,14 @@ level is not stored: `(params, seed)` rebuilds it (§4.4), so a save records onl
 
 ## 6. Assumptions (documented, autonomous decisions)
 - Canvas 2D software raycaster rather than WebGL: at 240p internal resolution a typed-array
-  raycaster costs ~1 ms/frame (measured), is pixel-exact for the retro look, and works everywhere.
+  raycaster costs ~0.6 ms/frame in Node and ~2.2 ms in the browser on a real cap-size level
+  (measured), is pixel-exact for the retro look, and works everywhere.
 - Mazes are "thick-wall" tile mazes (`cols*2+1`) so walls are full blocks, like the reference.
 - **Massive mazes.** Level 1 = 16×16 cells (33×33 tiles), +8 cells per side per level, capped at
   128×128 cells (257×257 tiles, 16 384 cells) at level 15; stress tests go to 2000×2000.
   `LEVEL.MAX_CELLS` is the single knob and `CAP_LEVEL` is derived from
   `BASE_CELLS`/`GROWTH`/`MAX_CELLS`. Past the cap the maze stops growing and difficulty comes from
-  braid (which keeps rising to 0.6), a drain rising 1.5 %/level from level 5 to 1.35×, thinning oil and the score
+  braid (which keeps rising to 0.6), a drain rising 3.5 %/level from level 3 to 1.45×, thinning oil and the score
   multiplier — not from area. Size is purely a balance decision: generating **and** validating
   128×128 costs ~5 ms and a full `buildLevel` ~12–14 ms.
   _Measured caveat that shaped the braid ramp:_ the "~13 tiles per cell-side" path law only holds
@@ -1248,7 +1341,8 @@ level is not stored: `(params, seed)` rebuilds it (§4.4), so a save records onl
   128×128 at braid 0 measures 10 612. With a slow linear braid ramp, levels 3–8 would have been
   **longer than level 15**. The shipped fix is `BRAID_MAX` 0.6 over a 17-level ramp shaped by
   `BRAID_RAMP_SHAPE` 0.5 (square root, front-loaded), which also satisfies "braid keeps rising past
-  the cap" and yields a smooth 3.6 → 13.5 minute curve on real mazes.
+  the cap" and yields a smooth curve on real mazes: ~4 minutes at level 2 (the lean first floor is
+  shorter still, ~1–1.5) to ~13.5 at the deepest.
   _One constant reads stale on purpose:_ `LEVEL.PATH_TILES_PER_SIDE = 13` overestimates the shipped
   route at the deepest braid (≈ 7.1 tiles per cell-side measured at braid 0.6). It feeds only
   balance's `par` **floor**, and `populate.js` computes the real par from the real path and takes
@@ -1258,7 +1352,7 @@ level is not stored: `(params, seed)` rebuilds it (§4.4), so a save records onl
   assumption — "fuel is sized for a player who cannot see the maze, ~4× the optimal route, settling
   to ~3×" — cannot survive a 33 000-tile level: a budget that covers the maze turns it into one long
   countdown where the first two minutes are free and the last thirty seconds are the game. The tank
-  is 110–150 s **independent of maze area** (64× the area buys 1.36× the tank), a flask is 35 % of
+  is 95–150 s **independent of maze area** (64× the area buys 1.36× the tank), a flask is 35 % of
   it, and a level takes 7–22 refuels. Feasibility is proven rather than argued: 250/250 real levels
   cleared by a 2.0× wander autopilot, worst torch reserve 70 % of the tank across 750 campaign
   levels, and the same autopilot on a flask-stripped level correctly dies.

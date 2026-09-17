@@ -1,3 +1,4 @@
+// @ts-check
 // Tileset registry: every floor's surfaces obey the texture invariants the raycaster relies on.
 import test from 'node:test';
 import assert from 'node:assert/strict';

@@ -318,3 +318,82 @@ test('shortcuts draw from their own stream: the carve is untouched and results a
     assert.ok(validateMaze(m).fullyConnected, `${cols}×${rows}`);
   }
 });
+
+test('the route guard keeps its promise past its repair budget (the O(n) tail)', () => {
+  // Above ~600×600 the guard's repair budget runs out and it switches to the repair-free
+  // Lipschitz rule (see `RouteGuard`). The promise must be exactly as strong on that side of the
+  // switch: a 700×700 maze at the campaign's own shortcut density is the cheapest size that
+  // reaches it. It is also the complexity regression test — before the cap this build spent
+  // 21 µs per cell and rising; `tools/stress.mjs` asserts the per-cell number at 2000×2000.
+  const side = 700;
+  const carved = validateMaze(generateMaze({ cols: side, rows: side, seed: 5 })).pathLength;
+  const t0 = performance.now();
+  const m = generateMaze({
+    cols: side,
+    rows: side,
+    seed: 5,
+    shortcuts: (side * side) >> 2,
+    shortcutDetour: 4,
+    shortcutRouteKeep: 0.7,
+  });
+  const ms = performance.now() - t0;
+  const v = validateMaze(m);
+  assert.deepEqual(v.errors, []);
+  assert.ok(v.loops > 1000, `only ${v.loops} shortcuts landed past the budget`);
+  // Both routes are tile counts (2 per cell step + 1); the guarantee is stated in cell steps.
+  assert.ok(
+    (v.pathLength - 1) / 2 >= Math.ceil(((carved - 1) / 2) * 0.7),
+    `route ${v.pathLength} fell below 0.7 of the carved ${carved}`,
+  );
+  // 14 µs per cell is ~2× the measured 7.5 and well under the 21 µs the unbounded guard cost.
+  assert.ok(ms < 14 * side * side * 1e-3, `generation took ${Math.round(ms)} ms (${(ms * 1000) / (side * side)} µs/cell)`);
+});
+
+// ─── The braid route guard ───────────────────────────────────────────────────────────────────
+
+test('braidRouteKeep floors the route braiding is allowed to cut away', () => {
+  // Braiding is what shortens the route (that is its job in the difficulty curve), so the default
+  // is no floor at all. With one, the *final* route — after shortcuts and braid — must hold.
+  for (const [cols, rows, braid] of [[64, 64, 0.5], [96, 96, 0.6], [40, 40, 1]]) {
+    for (let seed = 1; seed <= 3; seed++) {
+      const params = { cols, rows, seed, shortcuts: (cols * rows) >> 2, shortcutDetour: 4, shortcutRouteKeep: 0.7 };
+      const preBraid = validateMaze(generateMaze({ ...params, braid: 0 })).pathLength;
+      const free = validateMaze(generateMaze({ ...params, braid })).pathLength;
+      for (const keep of [0.2, 0.5]) {
+        const v = validateMaze(generateMaze({ ...params, braid, braidRouteKeep: keep }));
+        assert.deepEqual(v.errors, []);
+        assert.ok(
+          (v.pathLength - 1) / 2 >= Math.ceil(((preBraid - 1) / 2) * keep),
+          `${cols}×${rows} seed ${seed} keep ${keep}: route ${v.pathLength} below ${keep} of ${preBraid}`,
+        );
+        assert.ok(v.pathLength >= free, 'a floor can only make the route longer');
+      }
+    }
+  }
+});
+
+test('braidRouteKeep defaults to off, and nonsense values fall back to the default', () => {
+  const params = { cols: 48, rows: 48, seed: 12, braid: 0.5, shortcuts: 500, shortcutDetour: 4 };
+  const base = generateMaze(params);
+  for (const bad of [undefined, null, NaN, 'x', {}]) {
+    const m = generateMaze({ ...params, braidRouteKeep: /** @type {number} */ (/** @type {unknown} */ (bad)) });
+    assert.deepEqual(Array.from(m.tiles), Array.from(base.tiles), `braidRouteKeep=${String(bad)} must behave as the default`);
+  }
+  // Out-of-range values clamp instead of throwing; 0 and a negative both mean "no floor".
+  assert.deepEqual(Array.from(generateMaze({ ...params, braidRouteKeep: -1 }).tiles), Array.from(base.tiles));
+  const capped = generateMaze({ ...params, braidRouteKeep: 5 });
+  assert.deepEqual(Array.from(capped.tiles), Array.from(generateMaze({ ...params, braidRouteKeep: 1 }).tiles));
+  // A guarded braid still removes dead ends, just fewer of them.
+  const guarded = validateMaze(generateMaze({ ...params, braidRouteKeep: 0.5 }));
+  assert.deepEqual(guarded.errors, []);
+  assert.ok(guarded.deadEnds > validateMaze(base).deadEnds, 'a route floor should leave more dead ends');
+  assert.ok(guarded.deadEnds < validateMaze(generateMaze({ ...params, braid: 0 })).deadEnds, 'but it must still braid');
+});
+
+test('the braid stream is untouched by the route floor being off, at every grid shape', () => {
+  // Degenerate shapes have no wall a guard could even consider; they must not throw or hang.
+  for (const [cols, rows] of [[1, 1], [1, 9], [9, 1], [2, 2]]) {
+    const m = generateMaze({ cols, rows, seed: 3, braid: 1, braidRouteKeep: 0.9, shortcuts: 5 });
+    assert.deepEqual(validateMaze(m).errors, [], `${cols}×${rows}`);
+  }
+});

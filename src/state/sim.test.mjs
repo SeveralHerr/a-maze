@@ -870,7 +870,8 @@ test('attract: a dead end is handled by turning around, not by getting stuck', (
  * @param {number} seconds
  * @param {(s: import('../core/types.js').GameState) => boolean} [counts] which steps to include in
  *   the yaw-rate statistics (all by default)
- * @returns {{maxAngAccel:number, maxLinAccel:number, maxAbsRate:number, travelled:number, counted:number}}
+ * @returns {{maxAngAccel:number, maxLinAccel:number, maxAbsRate:number, travelled:number,
+ *   counted:number, reversalsPerMin:number}}
  */
 function attractSmoothness(maze, hz, seconds, counts) {
   const s = createInitialState();
@@ -883,6 +884,11 @@ function attractSmoothness(maze, hz, seconds, counts) {
   let maxAbsRate = 0;
   let travelled = 0;
   let counted = 0;
+  // A "reversal" is the yaw rate changing sign, ignoring rates under 0.05 rad/s (a still shot
+  // crossing zero is not a reversal). Hunting shows up here and in nothing else: the acceleration
+  // stays small while the camera saws left and right.
+  let reversals = 0;
+  let lastSign = 0;
   const steps = Math.round(seconds * hz);
   for (let i = 0; i < steps; i++) {
     const a0 = s.player.angle;
@@ -903,10 +909,22 @@ function attractSmoothness(maze, hz, seconds, counts) {
       counted++;
       maxAbsRate = Math.max(maxAbsRate, Math.abs(rate));
     }
+    const sign = rate > 0.05 ? 1 : rate < -0.05 ? -1 : 0;
+    if (sign !== 0) {
+      if (lastSign !== 0 && sign !== lastSign) reversals++;
+      lastSign = sign;
+    }
     prevRate = rate;
     prevSpeed = speed;
   }
-  return { maxAngAccel, maxLinAccel, maxAbsRate, travelled, counted };
+  return {
+    maxAngAccel,
+    maxLinAccel,
+    maxAbsRate,
+    travelled,
+    counted,
+    reversalsPerMin: (reversals * 60) / seconds,
+  };
 }
 
 test('attract: turn rate and speed ease — no single-frame snap at corners or tiles', () => {
@@ -945,4 +963,67 @@ test('attract: a state with no level data is a no-op, not a crash', () => {
   const s = createInitialState();
   stepAttract(s, 1 / 60);
   assert.equal(s.player.x, 1.5);
+});
+
+test('attract: the shot glides down a straight — it does not hunt left and right', () => {
+  // The idle sway used to be added to the heading target whatever the camera was doing, so on a
+  // straight it fought the aim and the yaw rate sawed back and forth. It now fades out with the
+  // heading error and in with the speed (`balance.js` `swayAt`), so a settled straight carries only
+  // the sway itself: two sign changes per sway period, i.e. 2 × SWAY_HZ × 60 ≈ 16 a minute, which is
+  // the breath and not a correction. (On a *twisty* maze the rate reverses ~35 times a minute at
+  // every corner — that is the maze, not hunting, which is why this is measured on a straight.)
+  const row = '#S' + '.'.repeat(60) + '#';
+  const maze = mazeFrom(['#'.repeat(row.length), row, '#'.repeat(row.length)]);
+  maze.exit = { x: row.length - 2, y: 1 };
+  const perSwayPeriod = 2 * ATTRACT.SWAY_HZ * 60;
+  for (const hz of [30, 60, 144]) {
+    const r = attractSmoothness(maze, hz, 120);
+    assert.ok(
+      r.reversalsPerMin <= perSwayPeriod + 4,
+      `${hz} Hz: the camera reversed its turn ${r.reversalsPerMin.toFixed(1)} times a minute on a straight`,
+    );
+    assert.ok(r.travelled > 50, `${hz} Hz: and it did walk the corridor (${r.travelled.toFixed(0)} tiles)`);
+  }
+});
+
+test('the view stops when the turn key is let go', () => {
+  // `PLAYER.TURN_RELEASE_RATE`: with one shared ease rate the view coasted `TURN_SPEED / 18` =
+  // 0.22 rad (10.9° measured) past the moment the key came up — an overshoot to correct on every one
+  // of a maze made of 90° corners, where Wolfenstein and Doom stop dead.
+  const s = playing(mazeFrom(TWISTY));
+  s.player.angle = 0;
+  const input = { moveX: 0, moveY: 0, turn: 1, lookDX: 0 };
+  let turned = 0;
+  let steps = 0;
+  while (turned < Math.PI / 2 && steps < 600) {
+    stepPlaying(s, 1 / 60, input);
+    s.run.fuel = s.run.fuelMax;
+    turned = s.player.angle;
+    steps++;
+  }
+  assert.ok(turned >= Math.PI / 2, 'the 90° turn completed');
+  assert.ok(steps < 40, `a 90° turn should take well under 0.7 s (${(steps / 60).toFixed(2)} s)`);
+  const atRelease = s.player.angle;
+  input.turn = 0;
+  for (let i = 0; i < 120; i++) {
+    stepPlaying(s, 1 / 60, input);
+    s.run.fuel = s.run.fuelMax;
+  }
+  const coast = ((s.player.angle - atRelease) * 180) / Math.PI;
+  assert.ok(coast > 0.5, `a tap should still round off rather than snap (${coast.toFixed(1)}°)`);
+  assert.ok(coast < 6, `the view coasted ${coast.toFixed(1)}° past the released key`);
+});
+
+test('a tap of the turn key still eases in, it does not snap', () => {
+  // The other half of the same bargain: pressing is still smoothed at `TURN_EASE_RATE`, so the first
+  // frame of a turn is a fraction of the top rate rather than all of it.
+  const s = playing(mazeFrom(TWISTY));
+  s.player.angle = 0;
+  stepPlaying(s, 1 / 60, { moveX: 0, moveY: 0, turn: 1, lookDX: 0 });
+  const first = s.player.angle;
+  assert.ok(first > 0, 'the turn started');
+  assert.ok(
+    first < (PLAYER.TURN_SPEED / 60) * 0.5,
+    `the first frame took ${(first / (PLAYER.TURN_SPEED / 60)).toFixed(2)} of the top rate`,
+  );
 });

@@ -19,6 +19,8 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import v8 from 'node:v8';
+import vm from 'node:vm';
 
 import { createRaycaster } from './raycaster.js';
 import { createTextures } from './textures.js';
@@ -27,6 +29,23 @@ import { POSES, PREVIEW_TORCHES, buildPreviewMaze, previewItems } from './previe
 
 /** Painting textures costs ~20 ms; every test shares one set. */
 const textures = createTextures(7);
+
+/**
+ * A `gc()` handle without `--expose-gc` on the command line (the runner spawns each file as a plain
+ * `node file.mjs`), exactly as `src/state/perf.test.mjs` gets one. Null if the trick is ever
+ * disallowed, in which case the retained-heap assertion is skipped rather than silently passing.
+ * @returns {(() => void)|null}
+ */
+function getGc() {
+  try {
+    v8.setFlagsFromString('--expose-gc');
+    const fn = vm.runInNewContext('gc');
+    v8.setFlagsFromString('--no-expose-gc');
+    return typeof fn === 'function' ? fn : null;
+  } catch {
+    return null;
+  }
+}
 
 /** The same painted set with every torch frame blanked to the transparency key. */
 const noTorchArt = {
@@ -276,6 +295,123 @@ function previewScene(pose) {
     view: { player: { x, y, angle }, items: previewItems(), torches: PREVIEW_TORCHES.slice(), time: 12.5, light: 1 },
   };
 }
+
+// NOTE: this test runs FIRST in the file on purpose. Every later test renders a differently shaped
+// view (a null maze, a NaN clock, a fresh renderer per frame), which leaves the shared render path
+// polymorphic and one tier lower — measured from the bottom of the file the same frame "allocates"
+// 33 kB instead of 2.3 kB, and the bound below would have to be useless to pass. Run in a clean
+// process, as the runner does, the numbers are stable to a few bytes.
+test('rendering allocates nothing that survives a frame, and nothing per column', () => {
+  // Two measurements, because they catch different regressions and neither sees the other's.
+  //
+  //   1. **Retained** growth, with a GC forced at both ends of the block: anything the renderer
+  //      *keeps* — a per-frame array pushed onto a list, a closure stashed in a table — survives the
+  //      collection and shows up. With the collection forced a clean renderer measures ~0 B, so the
+  //      bound is 16 B/frame instead of the 1.5 kB/frame the old smoke test allowed.
+  //   2. **Transient** garbage, from the growth of V8's new space between frames, against a control
+  //      loop that mutates the same view and calls a no-op instead of `render`. This is what the old
+  //      test could not see at all: it measured `heapUsed`, which the scavenger resets, so a
+  //      short-lived object allocated *per column* passed it (docs/STATUS.json recorded exactly
+  //      that). New-space growth is stable to a byte or two per frame across runs, and at 426
+  //      columns one object per column is ~7 kB a frame — ten times the bound below.
+  //
+  // What the renderer still allocates is a handful of boxed doubles on paths that cross a module
+  // boundary (`particles.update(dt)`), plus the sprite queue's arguments. The lighting helpers used
+  // to add 76 kB a frame of the same thing; they now pass their doubles through a `Float64Array`
+  // (see `dbl` in raycaster.js), which is what makes a bound this tight possible.
+  //
+  // Mutation-checked both ways: an object built per wall column and stored where it escapes fails
+  // the transient bound (measured 8.9 kB/frame), and one appended to a list fails the retained one.
+  // An allocation V8's escape analysis removes outright is invisible here — and is not an
+  // allocation at run time either, which is why the bound is on bytes and not on syntax.
+  const gc = getGc();
+  const { rc } = makeRenderer(640, 480); // 320×240: the smallest framebuffer, so the blocks are quick
+  const maze = room();
+  const view = makeView(maze, {
+    player: { x: 2.5, y: 2.5, angle: 0 },
+    torches: [{ x: 4, y: 2, face: 2 }],
+    items: [{ id: 1, kind: 'gem', x: 3.2, y: 2.5, taken: false }],
+    // A nearly empty tank, so the guttering branch of the player's torch is on the measured path.
+    light: 0.15,
+  });
+  /** @param {any} v */
+  const noop = (v) => v;
+  /** @returns {number} bytes V8's new space is currently holding */
+  function newSpaceUsed() {
+    const spaces = v8.getHeapSpaceStatistics();
+    for (const s of spaces) if (s.space_name === 'new_space') return s.space_used_size;
+    return 0;
+  }
+  /**
+   * @param {number} frames
+   * @param {number} t0 clock offset so each block animates differently
+   * @param {boolean} draw false runs the control loop (same view writes, no render)
+   * @returns {number} new-space bytes allocated per frame
+   */
+  function allocPerFrame(frames, t0, draw) {
+    let prev = newSpaceUsed();
+    let sum = 0;
+    for (let i = 0; i < frames; i++) {
+      view.time = t0 + i * 0.016;
+      view.player.angle = i * 0.003;
+      if (draw) rc.render(view);
+      else noop(view);
+      // Only rises count: a scavenge in the middle of the block drops the figure back to near zero.
+      const now = newSpaceUsed();
+      if (now > prev) sum += now - prev;
+      prev = now;
+    }
+    return sum / frames;
+  }
+  /**
+   * Retained bytes per frame over one block, with a collection forced at both ends.
+   * @param {number} frames
+   * @param {number} t0
+   * @returns {number}
+   */
+  function retainedPerFrame(frames, t0) {
+    if (gc !== null) {
+      gc();
+      gc();
+    }
+    const before = process.memoryUsage().heapUsed;
+    for (let i = 0; i < frames; i++) {
+      view.time = t0 + i * 0.016;
+      view.player.angle = i * 0.003;
+      rc.render(view);
+    }
+    if (gc !== null) {
+      gc();
+      gc();
+    }
+    return (process.memoryUsage().heapUsed - before) / frames;
+  }
+
+  // Warm the JIT before anything is measured. Unsampled: `getHeapSpaceStatistics` costs more than
+  // the frame does, so the warm-up runs the plain loop.
+  for (let i = 0; i < 1500; i++) {
+    view.time = i * 0.016;
+    view.player.angle = i * 0.003;
+    rc.render(view);
+  }
+
+  // 1. Retained: the smallest of three blocks. A single block can catch an unrelated allocation (a
+  //    lazily compiled function, a fresh inline cache) that the next one no longer pays for.
+  let retained = Infinity;
+  for (let b = 0; b < 3; b++) retained = Math.min(retained, retainedPerFrame(1500, 200 + b * 97));
+  if (gc !== null) {
+    assert.ok(retained < 16, `the renderer retained ${retained.toFixed(1)} B per frame`);
+  }
+
+  // 2. Transient, minus the control loop's own cost (the sampling call allocates too).
+  const drawn = Math.min(allocPerFrame(500, 600, true), allocPerFrame(500, 700, true));
+  const control = Math.min(allocPerFrame(500, 800, false), allocPerFrame(500, 900, false));
+  const perFrame = drawn - control;
+  assert.ok(
+    perFrame < 2000,
+    `render allocates ${perFrame.toFixed(0)} B per frame (${drawn.toFixed(0)} − ${control.toFixed(0)} control)`,
+  );
+});
 
 test('internal resolution is 240 rows (up to 400 below 4:3), even, and clamped to 320…560 columns', () => {
   const { rc } = makeRenderer();
@@ -731,8 +867,12 @@ test("the player's torch throws a warm pool around the player that fades to cool
   // Playtest feedback: "the player doesn't appear to be emitting any light". The torch in hand used
   // to be deliberately untinted, so the corridor beside the player was the same blue-grey as the
   // shadow — it read as ambient light, not as a flame being carried. Guards against both that and
-  // the older overcorrection that warmed every material by brightness until the cobbles ahead read
-  // r−b +48…+83 (tan sand) and the whole corridor went orange.
+  // the two overcorrections since: warming every material by brightness until the cobbles ahead read
+  // r−b +48…+83 (tan sand), and then giving the torch in hand the *whole* sconce tint axis, which
+  // turned the near field to sandstone (near walls +8…+37 where the reference's stone is −21…−28).
+  // The pool is now a *warm-neutral* core inside blue-grey stone: measured near walls −13.6 against
+  // −21.3 three tiles on, near floor −2.8 (the reference's floor is +8), and the luminance falloff
+  // carries the rest.
   const maze = bareCorridor();
   const frame = renderScene(maze, { player: { x: 1.5, y: 1.5, angle: 0 }, exit: { x: 38, y: 1 }, light: 0.9 });
   const floorNear = regionStats(frame, (x, y) => isFloorPx(frame, x, y) && rowDistOf(frame, y) >= 1 && rowDistOf(frame, y) < 2.5);
@@ -743,10 +883,20 @@ test("the player's torch throws a warm pool around the player that fades to cool
   // A pool: bright near, falling off with distance.
   assert.ok(floorNear.lum > floorDark.lum * 1.4, `the floor pool must fall off (${floorNear.lum.toFixed(1)} → ${floorDark.lum.toFixed(1)})`);
   assert.ok(wallNear.lum > wallMid.lum * 1.25, `near stone must be lit harder than stone 3 tiles on (${wallNear.lum.toFixed(1)} vs ${wallMid.lum.toFixed(1)})`);
-  // …that is visibly firelight beside the player (measured: near walls r−b ≈ +8, floor ≈ +14)…
-  assert.ok(wallNear.rb >= 0, `stone beside the player must be warmed by the torch in hand (r-b ${wallNear.rb.toFixed(1)})`);
-  assert.ok(wallNear.rb >= wallFar.rb + 15, `the warmth must come from the player, not the whole corridor (near ${wallNear.rb.toFixed(1)} vs far ${wallFar.rb.toFixed(1)})`);
-  assert.ok(floorNear.rb > 0 && floorNear.rb < 30, `the lit floor is warm cobble, not tan sand (r-b ${floorNear.rb.toFixed(1)})`);
+  // …that is visibly warmer beside the player than the stone it fades into (measured +7.7)…
+  assert.ok(
+    wallNear.rb >= wallMid.rb + 5,
+    `the stone beside the player must be warmer than the stone the pool fades into (near ${wallNear.rb.toFixed(1)} vs 3 tiles on ${wallMid.rb.toFixed(1)})`,
+  );
+  // …without leaving the reference's blue-grey stone for sandstone (its pillars measure −21…−28)…
+  assert.ok(
+    wallNear.rb >= -18 && wallNear.rb <= 10,
+    `stone beside the player is firelit blue-grey, not sandstone (r-b ${wallNear.rb.toFixed(1)})`,
+  );
+  assert.ok(
+    floorNear.rb >= -12 && floorNear.rb <= 20,
+    `the lit floor is grey cobble, not tan sand (r-b ${floorNear.rb.toFixed(1)}; the reference's floor is +9)`,
+  );
   // …and fades back to the blue-grey shadow outside the pool.
   for (const [name, r] of /** @type {const} */ ([['mid', wallMid], ['far', wallFar]])) {
     assert.ok(r.rb <= -8, `${name} walls outside the pool must stay blue-grey (r-b ${r.rb.toFixed(1)})`);
@@ -775,7 +925,9 @@ test("the player's pool dims, shrinks and cools as the oil runs out", () => {
   const own = (/** @type {number} */ l) => l - low.far.lum;
   assert.ok(own(low.wall.lum) < own(full.wall.lum) * 0.55, `an empty tank must visibly dim the stone beside the player (${full.wall.lum.toFixed(1)} → ${low.wall.lum.toFixed(1)})`);
   assert.ok(full.wall.lum > half.wall.lum && half.wall.lum > low.wall.lum, 'brightness must fall steadily with the oil');
-  assert.ok(full.wall.rb >= low.wall.rb + 15, `the pool must cool as the flame weakens (r-b ${full.wall.rb.toFixed(1)} → ${low.wall.rb.toFixed(1)})`);
+  // The warm core is a fraction of the sconce tint (`PLAYER_WARM`), so the whole range it can cool
+  // over is a few r−b steps: measured −12.5 at a full tank → −19.9 at an empty one.
+  assert.ok(full.wall.rb >= low.wall.rb + 5, `the pool must cool as the flame weakens (r-b ${full.wall.rb.toFixed(1)} → ${low.wall.rb.toFixed(1)})`);
   assert.ok(full.mid.lum > low.mid.lum * 1.4, `the pool must shrink: stone 3 tiles out goes dark (${full.mid.lum.toFixed(1)} → ${low.mid.lum.toFixed(1)})`);
 });
 
@@ -818,19 +970,34 @@ test('a nearly empty torch gutters, a full one only flickers', () => {
 });
 
 test('the colour temperature of the preview corridor matches the reference', () => {
-  // `preview.html?pose=0` at a full tank: a long corridor with a sconce a tile behind the eye. The
-  // reference measures shadowed walls r−b −20…−27 with median luminance ~56 and floor r−b ≈ +9.
-  // Before the tint axis existed the same frame measured floor +48…+83 (tan sand). The stone beside
-  // the player is now warmed by the torch in hand and the sconce behind (measured +31, floor +45) —
-  // firelit stone, but still stone: the corridor ahead falls back to the reference's blue (−16).
+  // `preview.html?pose=0` at a full tank: a long corridor with a sconce a tile behind the eye.
+  //
+  // The reference (docs/art-reference.png) measures, over the matching regions: near walls r−b
+  // −21…−28 at median luminance ~56, floor +9, ceiling +18. The bounds below are the band between
+  // that and "still visibly firelit", and they are tight enough to catch both regressions this test
+  // has already had to catch: warming by brightness alone (floor +48…+83, tan sand) and giving the
+  // torch in hand the whole sconce tint axis (near walls +29/+37, floor +44, ceiling +37 — the
+  // sandstone look the gauntlet failed the renderer for). Measured now: walls −5.2 at median
+  // luminance 60, far walls −17.3, floor +22.0, ceiling +20.7.
   const scene = previewScene(0);
   const frame = renderScene(scene.maze, scene.view);
   const wallNear = regionStats(frame, (x, y) => frame.z[x] < 2 && isWallPx(frame, x, y));
   const wallFar = regionStats(frame, (x, y) => frame.z[x] > 4 && isWallPx(frame, x, y));
   const floorNear = regionStats(frame, (x, y) => isFloorPx(frame, x, y) && rowDistOf(frame, y) < 2.5);
-  assert.ok(wallNear.rb > 0 && wallNear.rb <= 45, `near stone must read firelit, not peach (r-b ${wallNear.rb.toFixed(1)})`);
+  const half = frame.h >> 1;
+  const ceilNear = regionStats(
+    frame,
+    (x, y) => y < half && !isWallPx(frame, x, y) && half / (half - y - 0.5) < 2.5,
+  );
+  assert.ok(
+    wallNear.rb >= -14 && wallNear.rb <= 8,
+    `near stone must read as firelit blue-grey, not sandstone (r-b ${wallNear.rb.toFixed(1)})`,
+  );
   assert.ok(wallFar.rb <= -8, `stone past the pool must fall back to blue-grey (r-b ${wallFar.rb.toFixed(1)})`);
-  assert.ok(floorNear.rb <= 50, `the near floor must not read as tan sand (r-b ${floorNear.rb.toFixed(1)})`);
+  // The floor and the ceiling are painted from warm-neutral cobble and brown timber, so they sit
+  // ~25–30 r−b above the stone in the reference too (+9 and +18 against −21…−28 there).
+  assert.ok(floorNear.rb <= 26, `the near floor must not read as tan sand (r-b ${floorNear.rb.toFixed(1)})`);
+  assert.ok(ceilNear.rb <= 28, `the near ceiling must stay dark timber, not amber (r-b ${ceilNear.rb.toFixed(1)})`);
   assert.ok(
     wallNear.lumP50 >= 35 && wallNear.lumP50 <= 75,
     `near stone keeps the reference's mid-grey brightness (median luminance ${wallNear.lumP50.toFixed(0)})`,
@@ -1083,48 +1250,6 @@ test('stats and internalSize are reused objects, not fresh allocations', () => {
   rc.resize(1280, 720, 1);
   assert.equal(rc.internalSize, size, 'internalSize is a live object');
   assert.equal(size.w, 426);
-});
-
-test('rendering does not allocate per frame', () => {
-  // A gross regression (an array or object created inside the frame) shows up as steady heap
-  // growth. This is a smoke test with a generous bound, not a precise allocation counter.
-  const { rc } = makeRenderer(640, 360);
-  const maze = room();
-  const view = makeView(maze, {
-    player: { x: 2.5, y: 2.5, angle: 0 },
-    torches: [{ x: 4, y: 2, face: 2 }],
-    items: [{ id: 1, kind: 'gem', x: 3.2, y: 2.5, taken: false }],
-    // A nearly empty tank, so the guttering branch of the player's torch is on the measured path.
-    light: 0.15,
-  });
-  for (let i = 0; i < 200; i++) {
-    view.time = i * 0.016;
-    rc.render(view);
-  }
-  /**
-   * Heap growth over one 2000-frame block.
-   * @param {number} t0 clock offset so each block animates differently
-   * @returns {number} bytes
-   */
-  function block(t0) {
-    const before = process.memoryUsage().heapUsed;
-    for (let i = 0; i < 2000; i++) {
-      view.time = t0 + i * 0.016;
-      view.player.angle = i * 0.003;
-      rc.render(view);
-    }
-    return process.memoryUsage().heapUsed - before;
-  }
-  // Up to six blocks, and the smallest counts. A single sample is at the mercy of where the collector
-  // happened to be, and of how far V8 has tiered the frame up: while hot helpers still run in a
-  // middle tier their doubles are boxed as short-lived garbage, and under CPU load (the runner
-  // starts every test file at once) that lasted past two blocks with no scavenge in between —
-  // 7–17 MB of `heapUsed` on a renderer that allocates nothing once optimised. A real per-frame
-  // allocation leaks in *every* block, so the minimum keeps the signal and drops that noise; the
-  // loop stops at the first clean block, so a passing run still measures only one or two.
-  let grown = Infinity;
-  for (let b = 0; b < 6 && grown >= 3_000_000; b++) grown = Math.min(grown, block(3.2 + b * 37.5));
-  assert.ok(grown < 3_000_000, `heap grew ${(grown / 1e6).toFixed(2)} MB over 2000 frames`);
 });
 
 test('a texture set can be swapped in without rebuilding the renderer', () => {

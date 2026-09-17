@@ -23,6 +23,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import v8 from 'node:v8';
 import vm from 'node:vm';
+import { execFile } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 import { buildLevel } from '../maze/level.js';
 import { TAU } from '../core/math.js';
@@ -238,57 +240,83 @@ test('100 000 ticks on a max-size level allocate nothing that survives a GC', ()
   );
 });
 
-test('transient garbage: a step allocates less than one object, turning or walking', () => {
+test('transient garbage: a step allocates nothing, whatever the JIT has already seen', async () => {
   // The retained-heap test above cannot see short-lived garbage, because the GC it forces collects
-  // it. This one measures heap growth with NO collection in between. `heapUsed` moves in whole pages
-  // (~200 kB here), so chunks are 400 000 ticks — resolution ≈ 0.5 B/tick; at 5 000 ticks one page
-  // read as a phantom ~16 B/tick that a long probe (logs/state-alloc-turn.mjs) showed was not there.
-  // A chunk that a scavenge interrupted shrinks the heap and is skipped.
+  // it. This one counts it — in **child processes**, because both halves of the old version of this
+  // test were flaky:
   //
-  // Regressions pinned: every float passed as a call argument to a function the compiler does not
-  // inline is boxed, and the step used to do that to `dt` and to `moveCircle`'s x/y/dx/dy — 48–64 B
-  // per tick even standing still, ~9 B/tick more while turning. The sim now passes them through
-  // typed-array slots (sim.js header), and the reducer empties `state.events` without releasing its
-  // backing store (game.js `clearEvents`). What is left while walking is the footstep event itself
-  // (~28 B every ~18 ticks). Turning in place must stay under 2 B/tick; one object created per tick
-  // would be ≥ 28 B/tick.
-  const gc = getGc();
-  const { state } = installed(levelParams(15), 20_240_607, 15);
-  const input = { moveX: 0, moveY: 0, turn: 1, lookDX: 0.02 };
-  const tick = { type: 'tick', dt: 1 / 60, input };
-  const CHUNK = 400_000;
+  // 1. *What was measured.* `heapUsed` moves in allocation-buffer and page steps, so the same code
+  //    read 0.5–4 B/tick depending on where a chunk boundary fell. Scavenges are exact instead:
+  //    with `--max-semi-space-size=1` the young generation fills every ~0.5 MB, so the count over a
+  //    million and a half ticks measures the garbage to within half a megabyte (calibrated in
+  //    `perf.alloc-probe.mjs`).
+  // 2. *What was being run.* Whether a step allocated depended on what the JIT had seen: a fresh
+  //    process inlined the float helpers and allocated ~0, a process that had dispatched other
+  //    shapes did not and turning allocated 5–9 B/tick. The probe therefore runs twice — default
+  //    flags, and `--no-turbo-inlining`, where nothing is inlined and every double crossing a call
+  //    boundary is boxed — over deliberately polluted type feedback. Both must pass, which is what
+  //    makes the guarantee a property of the code rather than of the session. On the code as it was
+  //    before this gate existed, the second run measured 203 B/tick against 0 for the first.
+  //
+  // Two budgets, because they are two different promises:
+  // - **the simulation step allocates nothing** — no boxed double, no scratch object; what is left
+  //   while walking is the footstep `GameEvent` itself (~28 B every ~18 ticks);
+  // - **a dispatch adds at most the action's own numbers** — reading `dt`, `turn` and `lookDX` out
+  //   of an action and an input frame boxes each one when those call sites have gone megamorphic
+  //   (three HeapNumbers, ~36 B), which is the protocol's cost and not the step's. No *object* is
+  //   created per tick: one would be ≥ 28 B on top of it.
+  const probe = fileURLToPath(new URL('./perf.alloc-probe.mjs', import.meta.url));
+  const TICKS = 1_500_000;
   /**
-   * @param {number} moveY
-   * @returns {number} median bytes per tick over the chunks no scavenge interrupted
+   * @param {string[]} flags
+   * @returns {Promise<any>}
    */
-  function measure(moveY) {
-    input.moveY = moveY;
-    for (let i = 0; i < 100_000; i++) {
-      state.run.fuel = state.run.fuelMax;
-      reducer(state, tick);
-    }
-    /** @type {number[]} */
-    const perTick = [];
-    for (let c = 0; c < 3; c++) {
-      if (gc !== null) gc();
-      const before = process.memoryUsage().heapUsed;
-      for (let i = 0; i < CHUNK; i++) {
-        state.run.fuel = state.run.fuelMax;
-        reducer(state, tick);
-      }
-      const grown = process.memoryUsage().heapUsed - before;
-      if (grown >= 0) perTick.push(grown / CHUNK);
-    }
-    perTick.sort((a, b) => a - b);
-    return perTick.length > 0 ? perTick[perTick.length >> 1] : 0;
+  function run(flags) {
+    return new Promise((resolve, reject) => {
+      execFile(
+        process.execPath,
+        [...flags, probe, String(TICKS)],
+        // The probe is ~15 s of arithmetic; a minute means something is wrong, and a hung child
+        // must fail the test rather than hang the run.
+        { maxBuffer: 1 << 20, timeout: 60_000 },
+        (err, stdout) => {
+          if (err) reject(new Error(`${err.message} — ${stdout}`));
+          else resolve(JSON.parse(stdout.trim().split(/\r?\n/).pop() || '{}'));
+        },
+      );
+    });
   }
-  const turning = measure(0);
-  // Walking in a circle emits a footstep every ~18 ticks; that event object is ~2–4 B/tick averaged.
-  const walking = measure(1);
-  console.log(`transient garbage: turning ${turning.toFixed(2)} B/tick, walking ${walking.toFixed(2)} B/tick`);
-  if (gc === null) return; // without a forced GC the chunks are not comparable
-  assert.ok(turning < 2, `turning in place allocates ${turning.toFixed(2)} B/tick`);
-  assert.ok(walking < 12, `walking allocates ${walking.toFixed(2)} B/tick`);
+  const [fresh, noInline] = await Promise.all([
+    run(['--max-semi-space-size=1']),
+    run(['--max-semi-space-size=1', '--no-turbo-inlining']),
+  ]);
+  for (const [name, r] of [
+    ['default', fresh],
+    ['--no-turbo-inlining', noInline],
+  ]) {
+    console.log(
+      `transient garbage (${name}): sim ${r.sim.turning.perTick.toFixed(2)} turning, ` +
+        `${r.sim.walking.perTick.toFixed(2)} walking · dispatch ${r.dispatch.turning.perTick.toFixed(2)} / ` +
+        `${r.dispatch.walking.perTick.toFixed(2)} B/tick`,
+    );
+    assert.equal(r.ticks, TICKS, `${name}: the probe ran the whole window`);
+    assert.ok(
+      r.sim.turning.perTick < 1.5,
+      `${name}: turning in place allocates ${r.sim.turning.perTick.toFixed(2)} B/tick`,
+    );
+    assert.ok(
+      r.sim.walking.perTick < 10,
+      `${name}: walking allocates ${r.sim.walking.perTick.toFixed(2)} B/tick`,
+    );
+    assert.ok(
+      r.dispatch.turning.perTick < 30,
+      `${name}: a dispatched turning tick allocates ${r.dispatch.turning.perTick.toFixed(2)} B/tick`,
+    );
+    assert.ok(
+      r.dispatch.walking.perTick < 36,
+      `${name}: a dispatched walking tick allocates ${r.dispatch.walking.perTick.toFixed(2)} B/tick`,
+    );
+  }
 });
 
 test('explored is allocated once per level, from a pool, and always correctly sized', () => {

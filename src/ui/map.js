@@ -281,6 +281,19 @@ export const MAP = Object.freeze({
 /** Shorthand for `MAP.MARGIN_DEV`, used on the full map's hot path. */
 const MAP_MARGIN_DEV = MAP.MARGIN_DEV;
 
+/** Side margin of a frameless (narrow) full map, in device pixels: a hairline's worth. */
+const BARE_MARGIN_DEV = 2;
+
+/** Between the two halves of the strips header, when they sit close enough to run together. */
+const HEAD_SEPARATOR = '·';
+
+/**
+ * Borders `drawPanel` paints: the outer edge and the bevelled frame body. Mirrored from `hud.js`
+ * (which is *above* this module in the import graph — `font/format/core → pixels → map → hud`), so
+ * a map window's contents can be inset clear of its own frame the way every HUD readout is.
+ */
+const FRAME_BORDERS = 2;
+
 // ─── Raster colours ──────────────────────────────────────────────────────────────────────────
 
 /**
@@ -502,15 +515,20 @@ export function fitBeats(a, b) {
  * @param {number} mw raster width
  * @param {number} mh raster height
  * @param {Int32Array} out length ≥ 2; receives the window's top-left tile
+ * @param {number} [pad] tiles of ground the window may show **beyond** the raster's edge. The start
+ *   tile is (1, 1) and the exit is usually on the far edge, so a window clamped hard to the raster
+ *   drew the player's arrow half outside its own frame; one or two tiles of slack keeps a marker on
+ *   a border tile fully inside the window. Defaults to 0 (the exact clamp the tests pin).
  * @returns {void}
  */
-export function cornerWindow(px, py, span, mw, mh, out) {
+export function cornerWindow(px, py, span, mw, mh, out, pad) {
   const half = (span - 1) / 2;
+  const slack = pad === undefined || !(pad > 0) ? 0 : Math.floor(pad);
   let x = Math.round(px - half);
   let y = Math.round(py - half);
   // A maze narrower than the window is centred rather than pinned to 0.
-  x = mw <= span ? Math.floor((mw - span) / 2) : clamp(x, 0, mw - span);
-  y = mh <= span ? Math.floor((mh - span) / 2) : clamp(y, 0, mh - span);
+  x = mw <= span ? Math.floor((mw - span) / 2) : clamp(x, -slack, mw - span + slack);
+  y = mh <= span ? Math.floor((mh - span) / 2) : clamp(y, -slack, mh - span + slack);
   out[0] = x;
   out[1] = y;
 }
@@ -981,13 +999,20 @@ export function createMapView(options) {
     const u = m.u;
     const pad = 3 * u;
     const span = m.narrow ? MAP.CORNER_TILES_NARROW : MAP.CORNER_TILES;
-    // The box is bounded by both axes: a third of the width, under a third of the height.
-    const room = Math.min(Math.floor(m.w * 0.34), Math.floor(m.h * 0.32));
+    // The box is bounded by both axes: a third of the width, under a third of the height — the
+    // stone frame included, so framing the window did not make the widget bigger.
+    const frame = Math.max(1, u);
+    const room = Math.min(Math.floor(m.w * 0.34), Math.floor(m.h * 0.32)) - frame * FRAME_BORDERS * 2;
     const zoom = clamp(Math.floor(room / span), MAP.CORNER_MIN_ZOOM, MAP.CORNER_MAX_ZOOM);
     const size = span * zoom;
-    const frame = Math.max(1, u);
-    const bx = m.w - pad - size - frame * 2;
-    const by = m.h - pad - size - frame * 2;
+    // `drawPanel` paints an outer edge, then the bevelled frame body: two borders thick, exactly like
+    // every other HUD panel. The window used to be blitted at one border in, straight over the bevel,
+    // so the corner map was the one panel on screen with no stone frame at all — a flat dark
+    // rectangle beside the gauge and the score plaque.
+    const chrome = frame * FRAME_BORDERS;
+    const box = size + chrome * 2;
+    const bx = m.w - pad - box;
+    const by = m.h - pad - box;
 
     // Stone, not iron: on a phone the corner map sits on the black control deck below the world,
     // where an iron frame (#2f343d) is invisible. The stone bevel's highlight reads on both the
@@ -995,14 +1020,16 @@ export function createMapView(options) {
     // No masonry behind a map (the courses read as corridors), no rivets. Reused options object:
     // a literal here was a heap allocation every frame the corner map was open.
     cornerPanel.border = frame;
-    drawPanel(ctx, bx, by, size + frame * 2, size + frame * 2, u, cornerPanel);
+    drawPanel(ctx, bx, by, box, box, u, cornerPanel);
 
-    const ox = bx + frame;
-    const oy = by + frame;
+    const ox = bx + chrome;
+    const oy = by + chrome;
     const p = state.player;
     // Whole tiles in: `span` is odd, so the window's `round(px - half)` equals `round(px) - half`,
     // and an integer argument is not boxed on the way into the call the way a position is.
-    cornerWindow(Math.round(p.x), Math.round(p.y), span, mw, mh, win);
+    // The overscan is the player marker's half-width in tiles: at a maze corner the window stops
+    // scrolling, and without it the arrow (three zoom steps wide) was cut by the frame.
+    cornerWindow(Math.round(p.x), Math.round(p.y), span, mw, mh, win, 2);
     blitWindow(ctx, ox, oy, size, win[0], win[1], span, zoom);
 
     // Exit, once its tile has been seen — it is the one thing worth over-drawing.
@@ -1027,7 +1054,7 @@ export function createMapView(options) {
       !reduced && clock % 1.1 >= 0.82,
     );
     if (timing) stats.drawMs = now() - t0;
-    return size + frame * 2;
+    return box;
   }
 
   /**
@@ -1133,8 +1160,21 @@ export function createMapView(options) {
     ctx.fillRect(0, 0, m.w, m.h);
 
     const margin = 3 * u;
-    const frame = Math.max(1, u);
     const dev = Math.max(1, m.px);
+    let frame = Math.max(1, u);
+    if (m.narrow) {
+      // A phone's full map is width-bound, and the fit is quantised to whole **device** pixels per
+      // tile: the stone frame costs `2 × frame × m.px` device pixels a side, which across a
+      // 257-tile map is a whole pixel per tile (2 instead of 3 — 66 % of a 390-pixel screen instead
+      // of 97 %). Where the frame is what costs that step it gives way to the map: the diagram is
+      // what the screen is for, and it draws its own hairline edge instead (below).
+      const across = maze.cols * 2 + 1;
+      const framed = Math.floor(((m.w - frame * 2) * dev - 2 * MAP_MARGIN_DEV) / across);
+      const bare = Math.floor((m.w * dev - 2 * BARE_MARGIN_DEV) / across);
+      if (bare > framed) frame = 0;
+    }
+    /** Side margin in device pixels: a frameless map keeps a hairline's worth. */
+    const marginDev = frame > 0 ? MAP_MARGIN_DEV : BARE_MARGIN_DEV;
     const gR = typeof gaugeRight === 'number' && gaugeRight > 0 ? gaugeRight : 0;
     const gB = typeof gaugeBottom === 'number' && gaugeBottom > 0 ? gaugeBottom : 0;
     const total = mw * mh;
@@ -1165,7 +1205,7 @@ export function createMapView(options) {
     // tile, so a margin paid on the chunky grid can cost a whole pixel per tile across a 257-tile
     // map (see `MAP.MARGIN_DEV` for the phone where it did). The map is a diagram measured on the device grid (see the note
     // under this one); its margin has to be measured there too.
-    const boxWDev = (m.w - frame * 2) * dev - 2 * MAP_MARGIN_DEV;
+    const boxWDev = (m.w - frame * 2) * dev - 2 * marginDev;
     const stripsOk = boxWDev >= 16 * dev && boxH >= 16;
 
     // The map is fitted in **device** pixels rather than in UI pixels.
@@ -1256,11 +1296,21 @@ export function createMapView(options) {
       py = Math.round(boxTop + (boxH + frame * 2 - panelH) / 2);
       drawAt(ctx, head, hx, headY, 'hud', headSize, 'hudGold');
       drawAt(ctx, mapped, m.w - margin, headY, 'hud', headSize, 'hudDim', 'right');
+      // A separator when the two runs are close enough to read as one ("128×128 MAPPED 91%"), in the
+      // same dot the depth plaque and this header's own `DEPTH n · size` use.
+      const headEnd = hx + measureAt(head, 'hud', headSize);
+      const mappedStart = m.w - margin - measureAt(mapped, 'hud', headSize);
+      const gap = mappedStart - headEnd;
+      if (gap > 4 * headSize && gap < 14 * headSize) {
+        drawAt(ctx, HEAD_SEPARATOR, Math.round((headEnd + mappedStart) / 2), headY, 'hud', headSize, 'hudDim', 'center');
+      }
     }
 
     // ── The map ──
-    fullPanel.border = frame;
-    drawPanel(ctx, px, py, panelW, panelH, u, fullPanel);
+    if (frame > 0) {
+      fullPanel.border = frame;
+      drawPanel(ctx, px, py, panelW, panelH, u, fullPanel);
+    }
     ctx.fillStyle = withAlpha(COLOR.stoneShadow, 0.92);
     ctx.fillRect(px + frame, py + frame, panelW - frame * 2, panelH - frame * 2);
 
@@ -1273,10 +1323,16 @@ export function createMapView(options) {
     // **outer** edge: a marker on a tile the inset could not fully clear (a phone whose fit left no
     // room) runs onto the stone frame instead of being cut off, and the crosshair's arms still never
     // draw a stray line across the legend.
+    // A frameless map (a phone, filling the width) has no stone to run a marker onto and only a
+    // couple of device pixels of inset, so the clip is grown by half a marker: the player's arrow on
+    // the maze's outermost tile stands proud of the map's edge instead of being cut in half. Half a
+    // marker only — the exit crosshair's long arms still stop at the edge rather than striping the
+    // black deck around it.
+    const clipPad = frame === 0 ? (marker >> 1) + dev : 0;
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, m.originX, m.originY);
     ctx.beginPath();
-    ctx.rect(px * dev, py * dev, panelW * dev, panelH * dev);
+    ctx.rect(px * dev - clipPad, py * dev - clipPad, panelW * dev + clipPad * 2, panelH * dev + clipPad * 2);
     ctx.clip();
 
     if (fit.res === 'tile') {
@@ -1287,6 +1343,17 @@ export function createMapView(options) {
       ctx.restore();
       if (timing) stats.drawMs = now() - t0;
       return;
+    }
+
+    // A frameless (narrow) map still needs an edge, or the labyrinth's outer wall bleeds into the
+    // black deck around it. One device pixel, drawn in raster space: at 3 device pixels per tile a
+    // UI-pixel frame would cover a tile of the maze.
+    if (frame === 0) {
+      ctx.fillStyle = withAlphaStep(COLOR.stoneBright, 26);
+      ctx.fillRect(ox - 1, oy - 1, drawW + 2, 1);
+      ctx.fillRect(ox - 1, oy + drawH, drawW + 2, 1);
+      ctx.fillRect(ox - 1, oy, 1, drawH);
+      ctx.fillRect(ox + drawW, oy, 1, drawH);
     }
 
     // Exit: a real glyph when there is room for one, otherwise a pulsing block **inside a
@@ -1460,7 +1527,9 @@ export function createMapView(options) {
     // measurements of five short strings.
     for (let size = Math.max(1, Math.min(u, maxSize)); size >= 1; size--) {
       const swatches = legendSwatchesWidth(state, size, u);
-      const right = measureAt(legendRightText(state), 'hud', size);
+      const right =
+        measureAt(legendRightText(state), 'hud', size) +
+        (exitSeen(state) ? ICON_SIZE.portal * size + 2 * u : 0);
       if (swatches + 5 * u + right <= room) {
         legendFit.size = size;
         legendFit.lines = 1;
@@ -1575,7 +1644,16 @@ export function createMapView(options) {
       drawAt(ctx, YOU_LABEL, cx, y, 'hud', size, 'hudBright');
     }
 
-    if (showRight) drawAt(ctx, rightText, m.w - x, rightY, 'hud', size, seen ? 'hudBright' : 'hudDim', 'right');
+    if (showRight) {
+      // Once the exit is known the swatch is dropped for room, but the distance still names it —
+      // so the icon travels with the number and the strip keeps its key to the crosshair on the map.
+      if (seen) {
+        const rightW = measureAt(rightText, 'hud', size);
+        const iconX = m.w - x - rightW - ICON_SIZE.portal * iconScale - 2 * u;
+        if (iconX > cx + 3 * u) drawPortalIcon(ctx, iconX, rightY, iconScale);
+      }
+      drawAt(ctx, rightText, m.w - x, rightY, 'hud', size, seen ? 'hudBright' : 'hudDim', 'right');
+    }
   }
 
   /**

@@ -28,6 +28,8 @@ import { populateLevel } from './populate.js';
  * @property {number} [shortcuts=0]  cross-section shortcuts to open (see `generateMaze`)
  * @property {number} [shortcutDetour] minimum path distance, in cells, a shortcut must bridge
  * @property {number} [shortcutRouteKeep] fraction of the start→exit route shortcuts must keep
+ * @property {number} [braidRouteKeep] fraction of the post-shortcut route braiding must keep
+ *   (0, the default, lets braiding shorten the route freely — see `generateMaze`)
  * @property {number} [gems=0]       gems to scatter
  * @property {number} [oil=0]        oil flasks to scatter
  * @property {number} [fuelSeconds=0] floor for the derived fuel budget (0 = derive entirely)
@@ -56,6 +58,7 @@ export function buildLevel(params, seed) {
     shortcuts: params.shortcuts,
     shortcutDetour: params.shortcutDetour,
     shortcutRouteKeep: params.shortcutRouteKeep,
+    braidRouteKeep: params.braidRouteKeep,
   });
   const validation = validateMaze(maze);
   assertMazeValid(maze, validation, params.braid);

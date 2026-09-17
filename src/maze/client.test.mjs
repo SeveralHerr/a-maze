@@ -35,8 +35,12 @@ after(() => {
 
 /**
  * A fake `Worker` that answers on a timer using the real worker-side handler.
- * @param {{delay?:number, silent?:boolean, crash?:boolean, garbage?:boolean, throwOnPost?:boolean}} [behaviour]
- * @returns {{ctor:new (url:URL|string, o?:{type?:string}) => any, made:{count:number, terminated:number, url:string}}}
+ * @typedef {{delay?:number, silent?:boolean, crash?:boolean, garbage?:boolean, throwOnPost?:boolean,
+ *   reportError?:{name:string, message:string}}} FakeBehaviour
+ *
+ * @param {FakeBehaviour} [behaviour]
+ * @returns {{ctor:new (url:URL|string, o?:{type?:string}) => any,
+ *   made:{count:number, terminated:number, url:string}, behaviour:FakeBehaviour}}
  */
 function fakeWorker(behaviour) {
   const b = behaviour || {};
@@ -68,6 +72,10 @@ function fakeWorker(behaviour) {
           this.onerror?.({ message: 'worker blew up' });
           return;
         }
+        if (b.reportError) {
+          this.onmessage?.({ data: { id: /** @type {{id:number}} */ (msg).id, ...b.reportError, error: b.reportError.message } });
+          return;
+        }
         if (b.garbage) {
           this.onmessage?.({ data: { id: /** @type {{id:number}} */ (msg).id, data: { nope: true } } });
           return;
@@ -75,16 +83,17 @@ function fakeWorker(behaviour) {
         const res = handleMazeRequest(msg);
         if (res) this.onmessage?.({ data: res.message });
       }, b.delay ?? 0);
-      if (typeof (/** @type {{unref?:() => void}} */ (t).unref) === 'function') {
-        /** @type {{unref:() => void}} */ (t).unref();
-      }
+      const handle = /** @type {{unref?:() => void}} */ (/** @type {unknown} */ (t));
+      if (typeof handle.unref === 'function') handle.unref();
     }
     terminate() {
       this.alive = false;
       made.terminated++;
     }
   }
-  return { ctor: /** @type {never} */ (FakeWorker), made };
+  // `behaviour` is handed back so a test can change what the worker does mid-run (answer, then
+  // go silent), which is how the "one hiccup is not a verdict" policy gets exercised.
+  return { ctor: /** @type {never} */ (FakeWorker), made, behaviour: b };
 }
 
 test('small mazes are built synchronously, large ones go to the worker', async () => {
@@ -135,10 +144,39 @@ test('a silent worker times out and the level is rebuilt synchronously', async (
   assert.ok(Date.now() - t0 >= 25, 'the timeout must actually be waited out');
   assert.deepEqual(data.validation.errors, []);
   assert.equal(made.terminated, 1, 'a worker that went silent must be terminated');
-  assert.equal(client.mode(), 'sync', 'and never used again');
+  assert.equal(client.mode(), 'worker', 'one timeout is a hiccup, not a verdict');
   const next = await client.build(BIG, 4);
-  assert.equal(made.count, 1, 'no second worker is spawned after a timeout');
+  assert.equal(made.count, 2, 'the next build gets a fresh worker');
   assert.deepEqual(next.validation.errors, []);
+  assert.equal(client.mode(), 'sync', 'two failures in a row and the worker idea is dropped');
+  const third = await client.build(BIG, 5);
+  assert.equal(made.count, 2, 'no third worker after the client has given up');
+  assert.deepEqual(third.validation.errors, []);
+  client.dispose();
+});
+
+test('a worker that answers between two failures never gets written off', async () => {
+  // A throttled background tab can blow one deadline and be fine on the next level; the client
+  // must not spend the rest of the run on the main thread because of it.
+  const { ctor, made, behaviour } = fakeWorker({ silent: true });
+  const client = createMazeClient({ WorkerCtor: ctor, timeoutMs: 30 });
+  await client.build(BIG, 21); // times out, worker #1 retired
+  behaviour.silent = false;
+  const good = await client.build(BIG, 22); // worker #2 answers
+  assert.deepEqual(good.validation.errors, []);
+  assert.equal(made.count, 2);
+  behaviour.silent = true;
+  await client.build(BIG, 23); // times out, worker #2 retired — but the streak was reset
+  assert.equal(client.mode(), 'worker', 'a good answer clears the failure streak');
+  assert.equal(made.terminated, 2);
+  client.dispose();
+});
+
+test('maxFailures is configurable, and one is enough to latch when asked', async () => {
+  const { ctor } = fakeWorker({ crash: true });
+  const client = createMazeClient({ WorkerCtor: ctor, maxFailures: 1 });
+  await client.build(BIG, 31);
+  assert.equal(client.mode(), 'sync');
   client.dispose();
 });
 
@@ -148,8 +186,34 @@ test('a crashing worker falls back without losing the in-flight request', async 
   const data = await client.build(BIG, 6);
   assert.deepEqual(data.validation.errors, []);
   assert.equal(made.terminated, 1);
-  assert.equal(client.mode(), 'sync');
+  assert.equal(client.mode(), 'worker');
+  const again = await client.build(BIG, 7);
+  assert.deepEqual(again.validation.errors, []);
+  assert.equal(client.mode(), 'sync', 'two crashes in a row retire the worker for good');
   client.dispose();
+});
+
+test('a reported build failure rejects with the same error class, without rebuilding it here', async () => {
+  // Rebuilding a deterministic failure costs up to ~230 ms at the cap purely to throw the same
+  // error again, so the client rebuilds the *error*, not the level. The proof: the worker reports
+  // a failure for parameters that build perfectly well — if the client rebuilt, this would resolve.
+  const reportError = { name: 'RangeError', message: 'generateMaze: cols must be 1..4096, got -1' };
+  const deterministic = fakeWorker({ reportError });
+  const client = createMazeClient({ WorkerCtor: deterministic.ctor, mode: 'always' });
+  await assert.rejects(() => client.build(BIG, 41), (err) => {
+    assert.ok(err instanceof RangeError, `expected a RangeError, got ${String(err)}`);
+    assert.match(err.message, /cols must be 1\.\.4096/);
+    return true;
+  });
+  assert.equal(client.mode(), 'worker', 'a reported bad level is not a broken worker');
+  client.dispose();
+
+  // An error that might have been the worker's own fault is still rebuilt here, and succeeds.
+  const flaky = fakeWorker({ reportError: { name: 'Error', message: 'out of memory' } });
+  const second = createMazeClient({ WorkerCtor: flaky.ctor, mode: 'always' });
+  const data = await second.build(BIG, 42);
+  assert.deepEqual(data.validation.errors, []);
+  second.dispose();
 });
 
 test('a malformed worker answer is treated as a failure, not as a level', async () => {

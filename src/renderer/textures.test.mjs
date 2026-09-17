@@ -271,12 +271,18 @@ test('emissive art is flagged, and only glow art carries a stipple mask', () => 
   for (const t of set.torch) assert.equal(t.emissive, true);
   for (const t of set.portal) assert.equal(t.emissive, true);
   for (const t of set.wall) assert.equal(t.emissive, false);
-  // The flame and the portal both have a stippled halo; the gem does not.
+  // The flame, the portal and the gem all wear a stippled halo — a gem four to six tiles off is
+  // otherwise a 5–8 px sliver in the gloom. The gem's crystal itself stays solid.
   assert.ok(set.torch.some((t) => t.stipple !== null), 'flame halo should be stippled');
   assert.ok(set.portal.every((t) => t.stipple !== null), 'portal glow should be stippled');
-  assert.ok(set.gem.every((t) => t.stipple === null), 'gems are solid');
+  assert.ok(set.gem.every((t) => t.stipple !== null), 'the gem should carry a stippled halo');
+  for (const t of set.gem) {
+    const st = /** @type {Uint8Array} */ (t.stipple);
+    // The middle column of the crystal, from the crown to the pavilion, is never dissolved.
+    for (let y = 20; y <= 44; y++) assert.equal(st[(y << 6) | 32], 0, `the crystal is stippled at row ${y}`);
+  }
   // A stippled texel must be a drawn texel, or the mask would do nothing.
-  for (const t of set.portal) {
+  for (const t of [...set.portal, ...set.gem]) {
     const st = /** @type {Uint8Array} */ (t.stipple);
     for (let p = 0; p < AREA; p++) {
       if (st[p] === 1) assert.notEqual(t.indices[p], 0, `stipple on a transparent texel at ${p}`);
@@ -413,15 +419,19 @@ test('block faces carry single-texel grain', () => {
         if (at(x - 1, y) === up || at(x + 1, y) === up) flecks++;
       }
     }
-    // Eight blocks per texture; the painter scatters 8–14 flecks on each, most of them measurable.
-    assert.ok(flecks >= 32, `wall[${i}] has only ${flecks} grain flecks`);
+    // Twelve blocks per texture; the painter scatters 22–37 flecks on each, of which the ones with a
+    // flat run above and below are measurable here — ~80 per variant. The gauntlet called the faces
+    // "big flat blotches" at the old 8–14 per block, so this floor is deliberately well above them.
+    assert.ok(flecks >= 60, `wall[${i}] has only ${flecks} grain flecks`);
   }
 });
 
-test('wall blocks are landscape, not square', () => {
+test('wall blocks are landscape, not square, and not slabs', () => {
   // A tile's 64 texels of width compress to 10-25 screen pixels on a grazing corridor wall while its
-  // 64 texels of height stay 60-240, so a square block lands on screen as a thin portrait sliver.
-  // The reference's blocks are ~1.6:1 or wider; measure face runs along the middle of each course.
+  // 64 texels of height stay 60-240, so a square block lands on screen as a thin portrait sliver —
+  // but a face much past 2:1 stops reading as masonry and starts reading as a brick or a slab, which
+  // is what the gauntlet measured at 2.2–3:1. The reference's blocks are ~1.4–1.6:1; the painter now
+  // lays three 20–24-texel cells per course (faces 17–21 × 13). Measure face runs along each course.
   const indices = set.wall[0].indices;
   const joints = mortarRows(indices);
   /** @type {number[]} */
@@ -450,8 +460,12 @@ test('wall blocks are landscape, not square', () => {
   const medianRun = runs[runs.length >> 1];
   const meanHeight = courseHeights.reduce((a, b) => a + b, 0) / courseHeights.length;
   assert.ok(
-    medianRun >= meanHeight * 1.6,
+    medianRun >= meanHeight * 1.2,
     `blocks are ${medianRun}×${meanHeight.toFixed(1)} texels — not landscape enough to survive foreshortening`,
+  );
+  assert.ok(
+    medianRun <= meanHeight * 2,
+    `blocks are ${medianRun}×${meanHeight.toFixed(1)} texels — long slabs, not the reference's ~1.5:1 masonry`,
   );
 });
 

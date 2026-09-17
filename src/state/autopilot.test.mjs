@@ -104,7 +104,7 @@ test('explores rather than dithering: a deep floor keeps uncovering new ground',
   assert.ok(s.run.distance > 100, `walked only ${s.run.distance.toFixed(0)} tiles`);
 });
 
-test('never heads for an item on a tile it has not revealed', () => {
+test('never heads for an item on a tile it has not revealed, above the survival valve', () => {
   const s = playing(3, 9);
   const ap = createAutopilot();
   const f = frame();
@@ -116,7 +116,12 @@ test('never heads for an item on a tile it has not revealed', () => {
     ap.step(s, f);
     const info = ap.info();
     if (info.goal === 'item' || info.goal === 'oil') {
-      assert.notEqual(s.explored[info.tile], 0, `goal ${info.goal} at tile ${info.tile} is still in the fog`);
+      // Below `AUTO.SMELL_AT` with nothing uncovered to drink, the pilot is allowed to walk to a
+      // flask still in the fog — the one exception (§4.10, `autopilot.js` survival valve), because a
+      // watch mode that runs the torch dry costs the player their saved run.
+      if (s.run.fuel / s.run.fuelMax >= AUTO.SMELL_AT) {
+        assert.notEqual(s.explored[info.tile], 0, `goal ${info.goal} at tile ${info.tile} is still in the fog`);
+      }
       targeted++;
     }
     reducer(s, tick);
@@ -305,4 +310,48 @@ test('the torch burns at the pilot’s pace only on steps the pilot drove', () =
   const auto = burn(true);
   assert.ok(Math.abs(normal - FUEL.DRAIN) < 1e-6, `a second of play burns ${normal}`);
   assert.ok(Math.abs(auto - normal * AUTO_DRAIN_SCALE) < 1e-6, `a second of Auto Explore burns ${auto}`);
+});
+
+test('clears at least 95 % of runs over levels 1–10 (Auto Explore must not lose the run)', () => {
+  // main.js clears the saved run on `gameOver`, so a watch mode that strands itself costs the player
+  // everything they had banked. Measured over 40 runs: the fraction-only refuel rule cleared 74 %
+  // (it walked past the last flask it could still reach, then explored until the torch died); with
+  // the distance rule, the lower `TOPUP_AT` (a flask drunk into a nearly full tank throws the
+  // overflow away) and the `SMELL_AT` survival valve it clears 97.5 %.
+  const seeds = [11, 22, 33, 44];
+  let runs = 0;
+  let cleared = 0;
+  /** @type {string[]} */
+  const lost = [];
+  for (let level = 1; level <= 10; level++) {
+    for (const seed of seeds) {
+      const s = playing(level, seed);
+      const ap = createAutopilot();
+      // Two hours of sim time: the pilot wanders ~7× par, and a deep floor's par is seven minutes.
+      drive(s, ap, 7200);
+      runs++;
+      if (s.phase === 'levelComplete') cleared++;
+      else lost.push(`L${level} seed ${seed} (${s.phase}, ${s.run.levelTime.toFixed(0)} s)`);
+    }
+  }
+  console.log(`Auto Explore cleared ${cleared}/${runs} runs${lost.length > 0 ? `; lost ${lost.join(', ')}` : ''}`);
+  assert.ok(
+    cleared >= Math.ceil(runs * 0.95),
+    `Auto Explore cleared only ${cleared}/${runs}: ${lost.join(', ')}`,
+  );
+});
+
+test('goes for a flask it can still reach rather than exploring on', () => {
+  // The distance rule: with the tank at 40 % and the nearest known flask far enough that the torch
+  // would not survive the trip and the leg after it, the plan must be a refuel trip, even though
+  // the fraction (`REFUEL_AT`) alone would not have asked for one.
+  const s = playing(6, 4242);
+  const ap = createAutopilot();
+  drive(s, ap, 120); // uncover some ground, and some flasks with it
+  s.run.fuel = s.run.fuelMax * 0.45;
+  const f = frame();
+  ap.interrupt();
+  ap.step(s, f);
+  const info = ap.info();
+  assert.equal(info.goal, 'oil', `a tank at 45 % with flasks in sight should be refuelling (${JSON.stringify(info)})`);
 });

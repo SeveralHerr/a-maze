@@ -363,6 +363,31 @@ const REPLACE_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
 /** Its note: what starting over costs. */
 const CONFIRM_NOTE_SAVED = 'YOUR SAVED RUN ENDS HERE';
 
+/**
+ * "Leave the boon unclaimed?" — asked when Descend or Save & Quit follows a *Decide Later* while the
+ * offer is still open (§4.9). Without it *Decide Later* led nowhere: both ways off the tally reopened
+ * the cards, so the only way out was to claim one. The safe answer (back to the cards) is first; the
+ * second row names what actually happens next, rather than a vague "Leave".
+ */
+const FORFEIT_NEXT_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
+  { id: 'boon', label: 'Choose a Boon', kind: 'action' },
+  { id: 'leave', label: 'Descend', kind: 'action' },
+]);
+/** The same dialog in front of Save & Quit. */
+const FORFEIT_QUIT_ITEMS = /** @type {ReadonlyArray<MenuItem>} */ ([
+  { id: 'boon', label: 'Choose a Boon', kind: 'action' },
+  { id: 'leave', label: 'Save & Quit', kind: 'action' },
+]);
+/**
+ * The forfeit dialog's heading, whole and as the two lines a phone draws it on, and its note. Short
+ * on purpose: at "Leave the boon unclaimed?" the heading only fitted the panel at ×1, under a ×2
+ * note, and the dialog read upside down.
+ */
+const FORFEIT_HEADING = 'Forfeit the boon?';
+const FORFEIT_TOP = 'Forfeit';
+const FORFEIT_BOTTOM = 'the boon?';
+const FORFEIT_NOTE = 'THE GIFT IS LOST';
+
 /** End-screen headings, whole and split (see `fitHeading`). */
 const HEADING_CLEARED = 'Cleared';
 const HEADING_OUT = 'Your torch has gone out';
@@ -430,6 +455,8 @@ const SCREENS = Object.freeze({
   title: Object.freeze({ id: 'title', items: TITLE_ITEMS }),
   titleSaved: Object.freeze({ id: 'title', items: TITLE_SAVED_ITEMS }),
   replace: Object.freeze({ id: 'confirm', items: REPLACE_ITEMS }),
+  forfeitNext: Object.freeze({ id: 'confirm', items: FORFEIT_NEXT_ITEMS }),
+  forfeitQuit: Object.freeze({ id: 'confirm', items: FORFEIT_QUIT_ITEMS }),
   pause: Object.freeze({ id: 'pause', items: PAUSE_ITEMS }),
   pauseAuto: Object.freeze({ id: 'pause', items: PAUSE_AUTO_ITEMS }),
   options: Object.freeze({ id: 'options', items: OPTION_ITEMS }),
@@ -629,17 +656,56 @@ const TOUCH_HINT = 'Touch: stick moves, drag looks';
  * A player holding a phone has no W key, no Shift and no Tab, so the keyboard table told them
  * nothing they could use — and its one touch line did not fit a phone's panel. On a device whose
  * primary pointer is a finger the panel shows this table instead. The two buttons carry
- * the labels `MAP` and `PAUSE`, and a `CHALK` button appears once the Chalk unlock is owned.
+ * the labels `MAP` and `PAUSE`, `AUTO` hands the walk to the pilot (§4.10), and a `CHALK` button
+ * appears once the Chalk unlock is owned — which is why the table comes in two.
+ */
+const TOUCH_MOVE = Object.freeze({ label: 'Move', keys: 'Left Stick' });
+const TOUCH_CHALK = Object.freeze({ label: 'Chalk', keys: 'Chalk Button' });
+const TOUCH_LOOK = Object.freeze({ label: 'Look', keys: 'Drag Right Side' });
+const TOUCH_MAP = Object.freeze({ label: 'Map', keys: 'Map Button' });
+const TOUCH_AUTO = Object.freeze({ label: 'Auto Explore', keys: 'Auto Button' });
+const TOUCH_PAUSE = Object.freeze({ label: 'Pause', keys: 'Pause Button' });
+const TOUCH_CHOOSE = Object.freeze({ label: 'Choose', keys: 'Tap' });
+
+/**
+ * The touch table with the chalk button, shown once the unlock is owned.
  * @type {ReadonlyArray<ControlHint>}
  */
 const TOUCH_CONTROL_HINTS = Object.freeze([
-  Object.freeze({ label: 'Move', keys: 'Left Stick' }),
-  Object.freeze({ label: 'Chalk', keys: 'Chalk Button' }),
-  Object.freeze({ label: 'Look', keys: 'Drag Right Side' }),
-  Object.freeze({ label: 'Map', keys: 'Map Button' }),
-  Object.freeze({ label: 'Pause', keys: 'Pause Button' }),
-  Object.freeze({ label: 'Choose', keys: 'Tap' }),
+  TOUCH_MOVE,
+  TOUCH_CHALK,
+  TOUCH_LOOK,
+  TOUCH_MAP,
+  TOUCH_AUTO,
+  TOUCH_PAUSE,
+  TOUCH_CHOOSE,
 ]);
+
+/**
+ * The same table before the Chalk unlock is owned: the chalk button only exists from rank 1
+ * (§4.9), so listing it told a new player about a button that is not on their screen. Both tables
+ * are built once — the panel picks one per frame and never allocates.
+ * @type {ReadonlyArray<ControlHint>}
+ */
+const TOUCH_CONTROL_HINTS_NO_CHALK = Object.freeze([
+  TOUCH_MOVE,
+  TOUCH_LOOK,
+  TOUCH_MAP,
+  TOUCH_AUTO,
+  TOUCH_PAUSE,
+  TOUCH_CHOOSE,
+]);
+
+/**
+ * Which touch table this player's screen actually shows.
+ * @param {GameState} state
+ * @returns {ReadonlyArray<ControlHint>}
+ */
+function touchHintsFor(state) {
+  const perks = /** @type {any} */ (state).perks;
+  const chalk = perks !== null && perks !== undefined ? perks.chalk : 0;
+  return typeof chalk === 'number' && chalk > 0 ? TOUCH_CONTROL_HINTS : TOUCH_CONTROL_HINTS_NO_CHALK;
+}
 
 /** The footer under the touch table. */
 const KEYBOARD_HINT = 'Keyboard and pad work too';
@@ -889,9 +955,26 @@ export function createMenus(overlayCanvas, callbacks) {
   let sub = null;
   /** Selected row on the current screen. */
   let index = 0;
+  /**
+   * The screen id `index` belongs to.
+   *
+   * WHY it exists: a screen change used to restore `index` from `savedIndex` unconditionally, one
+   * render after `openSub`/`closeSub` had already set it. That overwrote the row they chose, and any
+   * navigation between a `closeSub` and the next render (the preview's deep links walk the title
+   * exactly like that, and landed on Descend). Now `openSub`/`closeSub` claim the index for the
+   * screen they open, and the screen-change path only restores when nobody has.
+   */
+  let indexOwner = '';
   /** Selected row remembered per screen id, so leaving Options returns you where you were. */
   /** @type {Record<string, number>} */
   const savedIndex = Object.create(null);
+  /**
+   * Set when the boon was left with *Decide Later* (or back) on this level-complete visit: the next
+   * Descend or Save & Quit then asks before forfeiting it, instead of reopening the cards (§4.9).
+   */
+  let boonDeferred = false;
+  /** What the forfeit dialog proceeds with: 'next' or 'savequit'. */
+  let pendingLeave = '';
   /** Phase seen on the previous render, to detect transitions. */
   let lastPhase = '';
   /** Screen id seen on the previous render. */
@@ -1024,6 +1107,15 @@ export function createMenus(overlayCanvas, callbacks) {
   }
 
   /**
+   * The screen id a sub-screen draws as (the dialogs share one: `'confirm'`).
+   * @param {string} id
+   * @returns {string}
+   */
+  function subScreenId(id) {
+    return id === 'replace' || id === 'forfeit' ? 'confirm' : id;
+  }
+
+  /**
    * The saved run the composition root reports, or null (§4.10). A throwing or missing callback is
    * "no saved run", so the title can never lose its menu to it.
    * @returns {{level:number, score:number}|null}
@@ -1055,8 +1147,9 @@ export function createMenus(overlayCanvas, callbacks) {
       case 'loading':
         return SCREENS.loading;
       case 'levelComplete':
-        // The abandon confirmation, the Shrine and the Boon open over the tally.
+        // The forfeit confirmation, the Shrine and the Boon open over the tally.
         if (sub === 'confirm') return SCREENS.confirm;
+        if (sub === 'forfeit') return pendingLeave === 'savequit' ? SCREENS.forfeitQuit : SCREENS.forfeitNext;
         if (sub === 'shrine') return shrineScreen;
         if (sub === 'boon') return SCREENS.boon;
         return boonIdAt(state, 0) !== '' ? SCREENS.completeBoon : SCREENS.complete;
@@ -1134,9 +1227,11 @@ export function createMenus(overlayCanvas, callbacks) {
   function openSub(id) {
     savedIndex[currentScreenId] = index;
     sub = id;
-    // The confirmation always opens on its safe answer; every other sub-screen remembers its row.
-    if (id === 'confirm' || id === 'replace') savedIndex[id] = 0;
-    index = savedIndex[id] !== undefined ? savedIndex[id] : 0;
+    const target = subScreenId(id);
+    // A dialog always opens on its safe answer; every other sub-screen remembers its row.
+    if (target === 'confirm') savedIndex[target] = 0;
+    index = savedIndex[target] !== undefined ? savedIndex[target] : 0;
+    indexOwner = target;
   }
 
   /**
@@ -1145,9 +1240,12 @@ export function createMenus(overlayCanvas, callbacks) {
    */
   function closeSub() {
     if (sub === null) return;
-    savedIndex[sub] = index;
+    // Leaving the cards without claiming one is a decision to decide later (§4.9).
+    if (sub === 'boon') boonDeferred = true;
+    savedIndex[subScreenId(sub)] = index;
     sub = null;
     index = savedIndex[currentBaseId] !== undefined ? savedIndex[currentBaseId] : 0;
+    indexOwner = currentBaseId;
   }
 
   /** Id of the screen drawn last frame (used by openSub/closeSub for the index memory). */
@@ -1173,6 +1271,39 @@ export function createMenus(overlayCanvas, callbacks) {
           : state.phase === 'gameOver'
             ? 'gameover'
             : 'title';
+    if (screen.id === lastScreen) return;
+    // A new screen. Here rather than in `render`, so a keypress that arrives before the frame that
+    // would draw it moves the new screen's selection rather than being overwritten by it.
+    lastScreen = screen.id;
+    anim.enterT = 0;
+    if (indexOwner !== screen.id) index = savedIndex[screen.id] !== undefined ? savedIndex[screen.id] : 0;
+    indexOwner = screen.id;
+    const count = syncEnabled(screen, state);
+    if (count > 0 && (index >= count || index < 0 || !rowEnabled[index])) index = menuStep(rowEnabled, -1, 1, count);
+    // Ask the device question again on every screen: a hybrid tablet that has just gained a
+    // mouse should stop being told to tap. One media query per screen entry, never per frame.
+    coarsePointer = -1;
+    touchscreen = -1;
+    if (screen.id === 'controls') padSeenAt = -1;
+    if (screen.id === 'shrine') shrineTop = 0;
+    screenSerial++;
+  }
+
+  /**
+   * Descend or Save & Quit was chosen on the tally while a boon is still on offer (§4.9). The first
+   * time the cards are shown instead — nobody should lose a free gift by reflex. Once the player has
+   * looked at them and chosen *Decide Later*, the choice is theirs: one confirmation, safe answer
+   * first, and then the way out they picked goes ahead.
+   * @param {'next'|'savequit'} action
+   * @returns {void}
+   */
+  function leaveWithBoon(action) {
+    if (!boonDeferred) {
+      openSub('boon');
+      return;
+    }
+    pendingLeave = action;
+    openSub('forfeit');
   }
 
   /**
@@ -1238,13 +1369,23 @@ export function createMenus(overlayCanvas, callbacks) {
         return true;
       case 'savequit':
         sound('uiConfirm');
-        // Same guard as quitting: a free boon is shown, not silently forfeited.
+        // Same guard as Descend: a free boon is shown, not silently forfeited.
         if (screen.id === 'complete' && boonIdAt(state, 0) !== '') {
-          openSub('boon');
+          leaveWithBoon('savequit');
           return true;
         }
         invoke(cb.onSaveQuit, 'onSaveQuit');
         return true;
+      case 'leave': {
+        // The forfeit dialog's second row: go on without the boon, the way the player asked to.
+        sound('uiConfirm');
+        const then = pendingLeave;
+        pendingLeave = '';
+        closeSub();
+        if (then === 'savequit') invoke(cb.onSaveQuit, 'onSaveQuit');
+        else invoke(cb.onNextLevel, 'onNextLevel');
+        return true;
+      }
       case 'options':
         sound('uiConfirm');
         openSub('options');
@@ -1293,7 +1434,7 @@ export function createMenus(overlayCanvas, callbacks) {
         // A boon still waiting is shown rather than forfeited: descending past a free gift by
         // reflex is the one mistake this screen can make for the player (§4.9).
         if (boonIdAt(state, 0) !== '') {
-          openSub('boon');
+          leaveWithBoon('next');
           return true;
         }
         invoke(cb.onNextLevel, 'onNextLevel');
@@ -1334,6 +1475,9 @@ export function createMenus(overlayCanvas, callbacks) {
         // name a different item: land on Descend, which is what comes next.
         savedIndex.complete = 0;
         closeSub();
+        // Claiming is not deferring: if a host's `onClaimBoon` leaves the offer open, the next
+        // Descend should show the cards again rather than ask about forfeiting them.
+        boonDeferred = false;
         invoke(cb.onClaimBoon, 'onClaimBoon', id);
         return true;
       }
@@ -1677,7 +1821,16 @@ export function createMenus(overlayCanvas, callbacks) {
     const state = lastState;
     if (state === null) return false;
     const screen = screenFor(state);
+    noteScreen(state, screen);
     if (screen.id === 'none' || screen.id === 'loading') return false;
+    // The recorded rows belong to the screen the last frame drew. A press that opened a sub-screen
+    // leaves them describing the old one until the next frame, and a hover in between would select a
+    // row of the new screen by the old one's geometry.
+    if (screen !== layoutScreen) {
+      pressedRow = -1;
+      dragRow = -1;
+      return false;
+    }
 
     // A slider drag owns the pointer until it is released, even outside the track.
     if (dragRow >= 0 && (type === 'pointermove' || type === 'mousemove')) {
@@ -1808,6 +1961,8 @@ export function createMenus(overlayCanvas, callbacks) {
   /** The state passed to the last `render`, so pointer events can be resolved between frames. */
   /** @type {GameState|null} */
   let lastState = null;
+  /** The screen whose rows the last `render` recorded (see `handlePointer`). @type {Screen|null} */
+  let layoutScreen = null;
 
   /**
    * @param {number} cssW
@@ -1854,32 +2009,17 @@ export function createMenus(overlayCanvas, callbacks) {
   }
 
   /**
-   * Advance the animation clock and per-screen timers.
+   * Advance the animation clock and per-screen timers. (A screen *change* is handled by
+   * {@link noteScreen}, which both `render` and `handleInput` call first.)
    * @param {GameState} state
-   * @param {Screen} screen
    * @returns {void}
    */
-  function advance(state, screen) {
+  function advance(state) {
     const now = state.time;
     let dt = anim.lastTime < 0 ? 0 : now - anim.lastTime;
     if (!(dt >= 0) || dt > MAX_FRAME_DT) dt = dt > MAX_FRAME_DT ? MAX_FRAME_DT : 0;
     anim.lastTime = now;
     anim.clock += dt;
-
-    if (screen.id !== lastScreen) {
-      lastScreen = screen.id;
-      anim.enterT = 0;
-      index = savedIndex[screen.id] !== undefined ? savedIndex[screen.id] : 0;
-      const count = syncEnabled(screen, state);
-      if (count > 0 && !rowEnabled[index]) index = menuStep(rowEnabled, -1, 1, count);
-      // Ask the device question again on every screen: a hybrid tablet that has just gained a
-      // mouse should stop being told to tap. One media query per screen entry, never per frame.
-      coarsePointer = -1;
-      touchscreen = -1;
-      if (screen.id === 'controls') padSeenAt = -1;
-      if (screen.id === 'shrine') shrineTop = 0;
-      screenSerial++;
-    }
     anim.enterT += dt;
     if (buyFlash.t >= 0) {
       buyFlash.t += dt;
@@ -1922,14 +2062,18 @@ export function createMenus(overlayCanvas, callbacks) {
       dragRow = -1;
     }
     lastPhase = state.phase;
-    if (state.phase === 'levelComplete' || state.phase === 'gameOver') {
-      // An end screen opens on its first row ("Descend", "Try Again") every time, whatever was
-      // selected when the last one closed.
-      savedIndex.complete = 0;
-      savedIndex.gameover = 0;
-    }
+    // Every base screen opens on its first row ("Resume", "Descend"/"Continue", "Try Again") each
+    // time its phase is entered, whatever was selected when it last closed. Pause remembering the
+    // row a sub-screen was opened from meant that after Esc → Options → Esc → Resume, the next
+    // reflexive Esc, Enter opened Options instead of resuming.
+    savedIndex.pause = 0;
+    savedIndex.title = 0;
+    savedIndex.complete = 0;
+    savedIndex.gameover = 0;
     if (state.phase === 'levelComplete') {
       boonShown = false;
+      boonDeferred = false;
+      pendingLeave = '';
       tallyDoneClock = -1;
       // The tally belongs to the phase, not to the screen: opening the abandon dialog over it and
       // cancelling must not roll it again.
@@ -1968,8 +2112,9 @@ export function createMenus(overlayCanvas, callbacks) {
     }
     const screen = screenFor(state);
     noteScreen(state, screen);
-    advance(state, screen);
+    advance(state);
 
+    layoutScreen = screen;
     const ctx = surface.beginFrameIfClosed();
     if (ctx === null) {
       rowCount = 0;
@@ -2142,6 +2287,10 @@ export function createMenus(overlayCanvas, callbacks) {
     const u = m.u;
     const cx = Math.round(m.w / 2);
     const count = syncEnabled(screen, state);
+    // A row's hit box is its label with the gap to the next row shared out evenly above and below.
+    // It used to start one unit above the ink and take the whole gap below, so a click a few pixels
+    // above "Options" selected the row over it.
+    const halfGap = Math.max(0, rowH - heightAt('display', scale)) >> 1;
     let y = top;
     for (let i = 0; i < count; i++) {
       const item = items[i];
@@ -2164,7 +2313,7 @@ export function createMenus(overlayCanvas, callbacks) {
       }
 
       const rowW = Math.max(w + 16 * u, m.w * 0.5);
-      recordRow(i, cx - rowW / 2, y - u, rowW, rowH);
+      recordRow(i, cx - rowW / 2, y - halfGap, rowW, rowH);
       y += rowH;
     }
     rowCount = count;
@@ -2275,6 +2424,21 @@ export function createMenus(overlayCanvas, callbacks) {
       if (fits < scale) scale = fits;
     }
     return Math.max(1, scale);
+  }
+
+  /**
+   * The size of a sub-screen's way out (Back, Decide Later).
+   *
+   * One rule for every panel: never louder than the heading it sits under, never above the layout
+   * unit — and a step below that on a phone, where a full-unit word in the heavy display face reads
+   * as a second heading. The Shrine used to compute its own and drew Back as large as "Shrine",
+   * twice the size of the Back on Controls or Options.
+   * @param {SurfaceMetrics} m
+   * @param {number} headScale the panel heading's scale
+   * @returns {number}
+   */
+  function backScaleFor(m, headScale) {
+    return Math.max(1, Math.min(m.narrow ? m.u - 1 : m.u, headScale - 1));
   }
 
   // ── Title ──
@@ -2494,36 +2658,46 @@ export function createMenus(overlayCanvas, callbacks) {
     const cx = Math.round(m.w / 2);
     drawScrim(ctx, m, 0.78);
 
+    const forfeit = screen === SCREENS.forfeitNext || screen === SCREENS.forfeitQuit;
+    const heading = forfeit ? FORFEIT_HEADING : CONFIRM_HEADING;
+    const headTop = forfeit ? FORFEIT_TOP : CONFIRM_TOP;
+    const headBottom = forfeit ? FORFEIT_BOTTOM : CONFIRM_BOTTOM;
     const panelW = Math.round(Math.min(m.w - 8 * u, Math.max(100 * u, m.w * 0.56)));
     const headW = panelW - 12 * u;
-    const headScale = fitHeading(CONFIRM_HEADING, CONFIRM_TOP, CONFIRM_BOTTOM, headW, Math.max(2, u + 1), m.narrow);
-    const headSplit = headingSplits(CONFIRM_HEADING, headW, headScale);
+    // Rows first: on a phone the heading is capped one step above them (see `fitHeading`).
+    const itemScale = fitItemScale(screen, panelW - 8 * u, u, Math.min(scaleCap(m, 150), Math.max(2, u + 1)));
+    const headScale = fitHeading(heading, headTop, headBottom, headW, Math.max(2, u + 1), m.narrow, itemScale + 1);
+    const headSplit = headingSplits(heading, headW, headScale);
     const headH = headingHeight(headScale, headSplit, u);
     // The replace dialog (§4.10) talks about the saved run, not the title's demo state.
     const saved = screen === SCREENS.replace ? savedSummary() : null;
-    const status =
-      saved !== null ? statusMemo(saved.level, Math.floor(saved.score)) : statusMemo(state.level, Math.floor(state.run.score));
-    const note = screen === SCREENS.replace ? CONFIRM_NOTE_SAVED : CONFIRM_NOTE_RUN;
+    const status = forfeit
+      ? boonNoteMemo(state.level)
+      : saved !== null
+        ? statusMemo(saved.level, Math.floor(saved.score))
+        : statusMemo(state.level, Math.floor(state.run.score));
+    const note = forfeit ? FORFEIT_NOTE : screen === SCREENS.replace ? CONFIRM_NOTE_SAVED : CONFIRM_NOTE_RUN;
     const noteScale = Math.min(
       fitScaleAt(status, panelW - 12 * u, 'hud', u),
       fitScaleAt(note, panelW - 12 * u, 'hud', u),
     );
     const noteH = heightAt('hud', noteScale);
-    const itemScale = fitScaleAt('Keep Going', panelW * 0.7, 'display', Math.min(scaleCap(m, 150), headScale), 1);
-    const rowH = heightAt('display', itemScale) + 5 * u;
+    // …and never louder than the heading.
+    const rowScale = Math.min(itemScale, headScale);
+    const rowH = heightAt('display', rowScale) + 5 * u;
     const panelH = headH + 12 * u + 2 * noteH + 2 * u + 6 * u + rowH * screen.items.length + 3 * u;
     const px = Math.round(cx - panelW / 2);
     const py = Math.max(2 * u, Math.round((m.h - panelH) / 2)) + panelSlide(enter, u, reduced);
 
     drawPanel(ctx, px, py, panelW, panelH, u, PANEL_END);
-    drawHeading(ctx, cx, py + 5 * u, CONFIRM_HEADING, CONFIRM_TOP, CONFIRM_BOTTOM, headScale, headSplit, u);
+    drawHeading(ctx, cx, py + 5 * u, heading, headTop, headBottom, headScale, headSplit, u);
     drawRule(ctx, cx, py + 5 * u + headH + 3 * u, Math.round(panelW * 0.32), u);
     let y = py + headH + 12 * u;
     drawAt(ctx, status, cx, y, 'hud', noteScale, 'hudGold', 'center');
     y += noteH + 2 * u;
     drawAt(ctx, note, cx, y, 'hud', noteScale, 'hudDim', 'center');
     y += noteH + 6 * u;
-    drawItemList(ctx, m, state, screen, y, itemScale, rowH, reduced);
+    drawItemList(ctx, m, state, screen, y, rowScale, rowH, reduced);
   }
 
   // ── Options ──
@@ -2636,14 +2810,11 @@ export function createMenus(overlayCanvas, callbacks) {
         const w = measureAt(item.label, 'display', labelScale);
         drawAt(ctx, item.label, cx, rowY, 'display', labelScale, labelColor, 'center');
         if (selected) {
+          // A pair, like every other list in the game: one flame read as a bullet, not a cursor.
           const fs = Math.max(1, Math.round(labelScale * 0.8));
-          drawFlame(
-            ctx,
-            cx - Math.round(w / 2) - ICON_SIZE.flameW * fs - 2 * u,
-            rowY - fs,
-            fs,
-            reduced ? 0 : ((anim.clock * 11) | 0) % 3,
-          );
+          const frame = reduced ? 0 : ((anim.clock * 11) | 0) % 3;
+          drawFlame(ctx, cx - Math.round(w / 2) - ICON_SIZE.flameW * fs - 2 * u, rowY - fs, fs, frame);
+          drawFlame(ctx, cx + Math.round(w / 2) + 2 * u, rowY - fs, fs, frame + 1);
         }
         y += rowH;
         continue;
@@ -2816,7 +2987,7 @@ export function createMenus(overlayCanvas, callbacks) {
     creditsGold = [];
     for (let i = 0; i < CREDITS_LINES.length; i++) {
       const line = CREDITS_LINES[i];
-      const parts = line === '' ? [''] : wrapText(line, width, { font: 'hud', size: scale });
+      const parts = line === '' ? [''] : wrapText(line, width, { font: 'text', size: scale });
       for (let k = 0; k < parts.length; k++) {
         creditsLines.push(parts[k]);
         creditsGold.push(i === 0);
@@ -2843,14 +3014,14 @@ export function createMenus(overlayCanvas, callbacks) {
     // font pixel per UI pixel "Engine, maze generator, bitmap fonts" is wider than a 390-pixel phone
     // and ran off both edges of the screen.
     let widest = 0;
-    for (let i = 0; i < CREDITS_LINES.length; i++) widest = Math.max(widest, measureAt(CREDITS_LINES[i], 'hud', 1));
+    for (let i = 0; i < CREDITS_LINES.length; i++) widest = Math.max(widest, measureAt(CREDITS_LINES[i], 'text', 1));
     const panelW = Math.round(Math.min(m.w - 6 * u, Math.max(110 * u, m.w * 0.7, widest * u + 14 * u)));
     const textW = panelW - 12 * u;
     const headScale = fitScaleAt('Credits', panelW * 0.6, 'display', Math.max(2, u + 1), 1);
     const headH = heightAt('display', headScale);
     // The way out is never louder than the heading it sits under (a phone drew a ×3 Back under a
     // heading width-bound to ×2).
-    const itemScale = Math.max(1, Math.min(u, headScale - 1));
+    const itemScale = backScaleFor(m, headScale);
     const rowH = heightAt('display', itemScale) + 4 * u;
     // The fitted scale is remembered with the surface it was fitted to. Re-running the fit each frame
     // alternated the wrap cache's key between two scales on a phone and re-wrapped the copy — about
@@ -2861,15 +3032,15 @@ export function createMenus(overlayCanvas, callbacks) {
       creditsScale = clamp(Math.floor(textW / Math.max(1, widest)), Math.max(1, u - 1), u);
       for (;;) {
         layoutCredits(textW, creditsScale);
-        const pitch = heightAt('hud', creditsScale) + creditsScale;
+        const pitch = heightAt('text', creditsScale) + creditsScale;
         if (headH + 11 * u + creditsLines.length * pitch + rowH + 8 * u <= m.h - 4 * u || creditsScale <= 1) break;
         creditsScale--;
       }
     }
     const lineScale = creditsScale;
     layoutCredits(textW, lineScale);
-    // The HUD face's line pitch: its height plus one row of leading.
-    const lineH = heightAt('hud', lineScale) + lineScale;
+    // The prose face's line pitch: its height plus one row of leading.
+    const lineH = heightAt('text', lineScale) + lineScale;
     const panelH = headH + 11 * u + creditsLines.length * lineH + rowH + 8 * u;
     const px = Math.round(cx - panelW / 2);
     const py = Math.max(2 * u, Math.round((m.h - panelH) / 2)) + panelSlide(enter, u, reduced);
@@ -2882,7 +3053,7 @@ export function createMenus(overlayCanvas, callbacks) {
     for (let i = 0; i < creditsLines.length; i++) {
       const line = creditsLines[i];
       if (line.length > 0) {
-        drawAt(ctx, line, cx, Math.round(y), 'hud', lineScale, creditsGold[i] ? 'hudGold' : 'hud', 'center');
+        drawAt(ctx, line, cx, Math.round(y), 'text', lineScale, creditsGold[i] ? 'hudGold' : 'hud', 'center');
       }
       y += lineH;
     }
@@ -2919,7 +3090,7 @@ export function createMenus(overlayCanvas, callbacks) {
       padSeenAt = anim.clock;
       padShown = gamepadConnected();
     }
-    const hints = touch ? TOUCH_CONTROL_HINTS : controlHints;
+    const hints = touch ? touchHintsFor(state) : controlHints;
     const withPad = !touch && padShown && hintsHavePad(hints);
     // The other kind of device, named only where it could be used: a touch player learns a keyboard
     // works; a keyboard player is told how touch plays only where touch is not a fine-pointer
@@ -2931,7 +3102,7 @@ export function createMenus(overlayCanvas, callbacks) {
     const headH = heightAt('display', headScale);
     // The way out is never louder than the heading it sits under (a phone drew a ×3 Back under a
     // heading width-bound to ×2).
-    const itemScale = Math.max(1, Math.min(u, headScale - 1));
+    const itemScale = backScaleFor(m, headScale);
     const rowH = heightAt('display', itemScale) + 4 * u;
 
     // One scale for every row, then the whole panel is shrunk until it fits the surface — ten rows
@@ -3452,18 +3623,26 @@ export function createMenus(overlayCanvas, callbacks) {
    * The largest display scale, up to `cap`, for a panel heading — on one line, or on a narrow
    * surface on two (`top` over `bottom`) when splitting buys a size. A phone could only fit
    * "Depth 15 Cleared" at ×1, which left the tally's TOTAL louder than the heading above it.
+   *
+   * On a narrow surface the heading is also held to **one step above the panel's rows**
+   * (`rankCap`), and it only splits when one line cannot be set at ×2. Splitting to the largest
+   * size that fitted drew "Depth 3 / Cleared" at ×3 over ×1 buttons: two lines, ~18 % of a 390×844
+   * phone, each font pixel three times the size of every other pixel on the panel.
    * @param {string} text the one-line heading
    * @param {string} top first half
    * @param {string} bottom second half
    * @param {number} maxW UI pixels
    * @param {number} cap
    * @param {boolean} narrow
+   * @param {number} [rankCap] narrow only: the largest scale the heading may take (rows' scale + 1)
    * @returns {number}
    */
-  function fitHeading(text, top, bottom, maxW, cap, narrow) {
-    const one = fitScaleAt(text, maxW, 'display', cap);
-    if (!narrow) return one;
-    const two = Math.min(fitScaleAt(top, maxW, 'display', cap), fitScaleAt(bottom, maxW, 'display', cap));
+  function fitHeading(text, top, bottom, maxW, cap, narrow, rankCap) {
+    if (!narrow) return fitScaleAt(text, maxW, 'display', cap);
+    const limit = rankCap === undefined ? cap : Math.max(1, Math.min(cap, rankCap));
+    const one = fitScaleAt(text, maxW, 'display', limit);
+    if (one >= Math.min(2, limit)) return one;
+    const two = Math.min(fitScaleAt(top, maxW, 'display', limit), fitScaleAt(bottom, maxW, 'display', limit));
     return Math.max(one, two);
   }
 
@@ -3583,10 +3762,12 @@ export function createMenus(overlayCanvas, callbacks) {
     let totalScale = Math.min(rowScale + totalBoost, totalFit);
     const headTop = clearedTopMemo(level);
     const headW = panelW - 12 * u;
-    let headScale = fitHeading(headText, headTop, HEADING_CLEARED, headW, Math.max(2, u + 1), m.narrow);
+    // The buttons are measured first, because on a phone the heading is held to one step above them
+    // (`fitHeading`) — and then they are held to the heading, so neither outranks the other.
+    let itemScale = fitItemScale(screen, panelW - 8 * u, u, Math.min(scaleCap(m, 150), totalScale + 1, Math.max(2, u + 1)));
+    let headScale = fitHeading(headText, headTop, HEADING_CLEARED, headW, Math.max(2, u + 1), m.narrow, itemScale + 1);
     let headSplit = false;
-    // The buttons are never louder than the heading they sit under.
-    let itemScale = fitItemScale(screen, panelW - 8 * u, u, Math.min(scaleCap(m, 150), totalScale + 1, headScale));
+    itemScale = Math.min(itemScale, headScale);
     let stripScale = stripScaleFor(left, right, u, rowScale);
     let statsShown = statRows > 0;
     let rowLineH = 0;
@@ -3779,10 +3960,12 @@ export function createMenus(overlayCanvas, callbacks) {
     let scoreBoost = 1;
     let scoreScale = Math.min(rowScale + scoreBoost, scoreFit);
     const headW = panelW - 12 * u;
-    let headScale = fitHeading(headText, HEADING_OUT_TOP, HEADING_OUT_BOTTOM, headW, Math.max(2, u + 1), m.narrow);
+    // Buttons first, then the heading (capped one step above them on a phone), then the buttons
+    // held to the heading — the same order as `drawComplete`.
+    let itemScale = fitItemScale(screen, panelW - 8 * u, u, Math.min(scaleCap(m, 150), scoreScale + 1, Math.max(2, u + 1)));
+    let headScale = fitHeading(headText, HEADING_OUT_TOP, HEADING_OUT_BOTTOM, headW, Math.max(2, u + 1), m.narrow, itemScale + 1);
     let headSplit = false;
-    // The buttons are never louder than the heading they sit under.
-    let itemScale = fitItemScale(screen, panelW - 8 * u, u, Math.min(scaleCap(m, 150), scoreScale + 1, headScale));
+    itemScale = Math.min(itemScale, headScale);
     let stripScale = stripScaleFor(left, right, u, rowScale);
     let statsShown = statRows > 0;
     let bestScale = 0;
@@ -3956,17 +4139,15 @@ export function createMenus(overlayCanvas, callbacks) {
     const purse = purseOf(state);
 
     const panelW = Math.round(Math.min(m.w - 4 * u, Math.max(narrow ? 92 * u : 150 * u, m.w * (narrow ? 0.94 : 0.84))));
-    const panelH = Math.round(m.h - 4 * u);
     const px = Math.round(cx - panelW / 2);
-    const py = 2 * u + panelSlide(enter, u, reduced);
-    drawPanel(ctx, px, py, panelW, panelH, u, PANEL_OPTIONS);
 
-    // Heading, rule, purse.
+    // ── Measure before anything is drawn ──
+    // Every height here is independent of where the panel ends up, which is what lets a phone's
+    // panel be **fitted to its content**: with eleven unlocks and room for fifteen rows the old
+    // full-height panel left ~250 css px of empty brick between the last row and the detail plaque
+    // pinned to its foot.
     const headScale = fitScaleAt(SHRINE_HEADING, panelW * 0.5, 'display', Math.max(2, u + 1), 1);
     const headH = heightAt('display', headScale);
-    drawAt(ctx, SHRINE_HEADING, cx, py + 4 * u, 'display', headScale, 'gothic', 'center');
-    const ruleY = py + 4 * u + headH + 2 * u;
-    drawRule(ctx, cx, ruleY, Math.round(panelW * 0.28), u);
     const textSize = narrow ? Math.max(1, u - 1) : u;
     // The purse is the number every purchase on this screen is measured against, so it stands a step
     // above the list — it used to be the smallest number on the panel.
@@ -3974,33 +4155,52 @@ export function createMenus(overlayCanvas, callbacks) {
     const purseText = purseMemo(purse);
     const gemS = purseSize;
     const purseW = ICON_SIZE.gem * gemS + 2 * u + measureAt(purseText, 'hud', purseSize);
-    const purseY = ruleY + 4 * u;
     const purseH = Math.max(heightAt('hud', purseSize), ICON_SIZE.gem * gemS);
-    drawGemIcon(ctx, cx - (purseW >> 1), purseY + ((heightAt('hud', purseSize) - ICON_SIZE.gem * gemS) >> 1), gemS);
-    drawAt(ctx, purseText, cx - (purseW >> 1) + ICON_SIZE.gem * gemS + 2 * u, purseY, 'hud', purseSize, 'hudGem');
-
     const left = px + 6 * u;
     const right = px + panelW - 6 * u;
-    const bodyTop = purseY + purseH + 5 * u;
-    // 56 % on a wide panel: at 52 % "Dead-End Whisper" left no room for the pip column on any row.
-    const listW = narrow ? right - left : Math.round((right - left) * 0.56);
+    // 58 % on a wide panel: at 52 % "Dead-End Whisper" left no room for the pip column on any row,
+    // and at 56 % it missed by a hair — every desktop row lost its pips while a phone's kept them,
+    // so the one screen that is *about* ranks did not show them where there was most room.
+    const listW = narrow ? right - left : Math.round((right - left) * 0.58);
     fitShrineRows(listW, textSize, u);
     const rowText = shrineFit.text;
     const pip = shrineFit.pip;
-    // Back row at the bottom of the panel, like every other sub-screen's way out. A phone keeps it
-    // at least a step above the list's words, so the way out never reads as the smallest thing.
-    const backScale = Math.max(1, Math.min(u, headScale - 1), narrow ? Math.min(2, headScale) : 1);
+    // Back at the bottom of the panel, at the size every other sub-screen draws its way out —
+    // it used to be drawn as large as the "Shrine" heading, twice the Back of Controls or Options.
+    const backScale = backScaleFor(m, headScale);
     const backH = heightAt('display', backScale) + 4 * u;
-    const backY = py + panelH - 3 * u - backH;
     // The detail plaque: beside the list on a wide panel, under it on a narrow one (three lines at
     // the list's own size: NOW, NEXT, and the price with its prompt).
     const lineH = heightAt('hud', textSize) + 2 * u;
     const rowLineH = heightAt('hud', rowText) + 2 * u;
-    const detailH = narrow ? 3 * rowLineH + 6 * u : 0;
-    const listBottom = backY - 3 * u - detailH;
+    const detailH = narrow && rows > 0 ? 3 * rowLineH + 6 * u : 0;
     const iconS = rowText;
     const iconW = UNLOCK_ICON * iconS;
     const rowH = Math.max(iconW, heightAt('hud', rowText)) + 4 * u;
+    /** Panel top to the first list row. */
+    const headBlockH = headH + purseH + 15 * u;
+    /** Everything under the list: its gap, the plaque, and the way out. */
+    const footBlockH = 6 * u + detailH + backH;
+    const maxPanelH = Math.round(m.h - 4 * u);
+    // A wide panel keeps the full height: its plaque stands beside the list and uses it.
+    const panelH =
+      narrow ? Math.min(maxPanelH, headBlockH + rows * rowH + footBlockH) : maxPanelH;
+    const py =
+      panelH >= maxPanelH ? 2 * u + panelSlide(enter, u, reduced) : Math.max(2 * u, Math.round((m.h - panelH) / 2)) + panelSlide(enter, u, reduced);
+
+    drawPanel(ctx, px, py, panelW, panelH, u, PANEL_OPTIONS);
+
+    // Heading, rule, purse.
+    drawAt(ctx, SHRINE_HEADING, cx, py + 4 * u, 'display', headScale, 'gothic', 'center');
+    const ruleY = py + 4 * u + headH + 2 * u;
+    drawRule(ctx, cx, ruleY, Math.round(panelW * 0.28), u);
+    const purseY = ruleY + 4 * u;
+    drawGemIcon(ctx, cx - (purseW >> 1), purseY + ((heightAt('hud', purseSize) - ICON_SIZE.gem * gemS) >> 1), gemS);
+    drawAt(ctx, purseText, cx - (purseW >> 1) + ICON_SIZE.gem * gemS + 2 * u, purseY, 'hud', purseSize, 'hudGem');
+
+    const bodyTop = py + headBlockH;
+    const backY = py + panelH - 3 * u - backH;
+    const listBottom = backY - 3 * u - detailH;
     const visible = Math.max(1, Math.floor((listBottom - bodyTop) / rowH));
     shrineVisible = visible;
     if (shrineTop > Math.max(0, rows - visible)) shrineTop = Math.max(0, rows - visible);
@@ -4119,7 +4319,7 @@ export function createMenus(overlayCanvas, callbacks) {
         const nameW = inW - UNLOCK_ICON * bigS - 3 * u;
         let nameScale = fitScaleAt(shrineFit.longestWord, nameW, 'display', Math.max(1, u), 1);
         let nameLines = wrapped(sel * 64 + 5, info.name, nameW, nameScale, 'display');
-        const blurb = wrapped(sel * 64, info.blurb, inW, textSize);
+        const blurb = wrapped(sel * 64, info.blurb, inW, textSize, 'text');
         const groupH = lineH + 2 * u;
         const blurbH = blurb.length * lineH;
         const room = effectsFloor - 2 * u - y;
@@ -4166,7 +4366,7 @@ export function createMenus(overlayCanvas, callbacks) {
         let effectsY = effectsFloor;
         if (showBlurb) {
           for (let k = 0; k < blurb.length; k++) {
-            drawAt(ctx, blurb[k], dx + (dw >> 1), y, 'hud', textSize, 'hud', 'center');
+            drawAt(ctx, blurb[k], dx + (dw >> 1), y, 'text', textSize, 'hud', 'center');
             y += lineH;
           }
         } else {
@@ -4332,13 +4532,20 @@ export function createMenus(overlayCanvas, callbacks) {
     const promptW = measureAt(prompt, 'hud', size);
     const blink = affordable && !reduced ? 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(anim.clock * 3.6)) : 1;
     const style = affordable ? 'hudGold' : 'hudAlarm';
+    drawGemIcon(ctx, left, y, gemS);
+    drawAt(ctx, costText, left + ICON_SIZE.gem * gemS + 2 * u, y, 'hud', size, affordable ? 'hudGem' : 'hudDim');
     if (costW + 4 * u + promptW <= right - left) {
-      drawGemIcon(ctx, left, y, gemS);
-      drawAt(ctx, costText, left + ICON_SIZE.gem * gemS + 2 * u, y, 'hud', size, affordable ? 'hudGem' : 'hudDim');
       drawAt(ctx, prompt, right, y, 'hud', size, style, 'right', 'top', blink);
-    } else {
-      drawAt(ctx, prompt, left, y, 'hud', fitScaleAt(prompt, right - left, 'hud', size, 1), style, 'left', 'top', blink);
+      return;
     }
+    // The price is the fact this line exists for; the prompt is a hint. On a narrow plaque the hint
+    // gives way — first a size, then entirely — rather than the number (it used to be the other way
+    // round, and the plaque showed "ENTER TO BUY" with nothing to say what it would cost).
+    const room = right - left - costW - 3 * u;
+    const small = fitScaleAt(prompt, room, 'hud', size, 1);
+    if (measureAt(prompt, 'hud', small) > room) return;
+    const dy = (heightAt('hud', size) - heightAt('hud', small)) >> 1;
+    drawAt(ctx, prompt, right, y + dy, 'hud', small, style, 'right', 'top', blink);
   }
 
   // ── Boon (§4.9) ──
@@ -4395,7 +4602,7 @@ export function createMenus(overlayCanvas, callbacks) {
     drawAt(ctx, noteLine, cx, y, 'hud', noteSize, 'hudDim', 'center');
     y += heightAt('hud', noteSize) + 6 * u;
 
-    const laterScale = Math.max(1, Math.min(u, headScale - 1));
+    const laterScale = backScaleFor(m, headScale);
     const laterH = heightAt('display', laterScale) + 4 * u;
     const laterY = m.h - 4 * u - laterH;
     const areaTop = y;
@@ -4427,19 +4634,37 @@ export function createMenus(overlayCanvas, callbacks) {
     let bigS = 1;
     let nameScale = 1;
     let eSize = textSize;
+    let bSize = textSize;
     let showBlurbs = true;
     if (!narrow) {
-      bigS = Math.max(2, Math.min(4 * u, Math.floor((cardW * 0.36) / UNLOCK_ICON)));
+      // The icon is capped at 3u rather than 4u: at 4u a card spent well over a third of its height
+      // on the picture and the sentence that says what the boon *does* was the first thing dropped.
+      bigS = Math.max(2, Math.min(3 * u, Math.floor((cardW * 0.36) / UNLOCK_ICON)));
       nameScale = fitScaleAt(longestName, cardW - 10 * u, 'display', Math.max(1, u), 1);
-      const fixed = 6 * u + UNLOCK_ICON * bigS + 4 * u + heightAt('display', nameScale) + 3 * u + pip + 4 * u + u + 3 * u;
-      for (let k = 0; k < BOON_CARDS; k++) {
-        const other = rowEnabled[k] ? unlockInfo(boonIdAt(state, k)) : null;
-        if (other === null) continue;
-        const ui = unlocks.indexOf(other);
-        const r = rankOf(state, other.id);
-        const e = wrapped((ui * 16 + r) * 4 + 2, other.ranks[Math.min(r, other.max - 1)], cardW - 10 * u, textSize);
-        const b = wrapped(ui * 64 + 1, other.blurb, cardW - 10 * u, textSize);
-        if (fixed + (e.length + b.length) * lineH > cardH) showBlurbs = false;
+      // What gives way, in order: the blurb's size (one step, still a readable line), then the
+      // icon, and only then the blurb itself. A card with a quarter of it empty and no sentence on
+      // it leaves a new player guessing what "Dead-End Whisper" is.
+      const minIcon = Math.max(2, Math.min(2 * u, Math.floor((cardW * 0.36) / UNLOCK_ICON)));
+      for (;;) {
+        const fixed = 6 * u + UNLOCK_ICON * bigS + 4 * u + heightAt('display', nameScale) + 3 * u + pip + 4 * u + u + 3 * u;
+        const blurbLineH = heightAt('hud', bSize) + 2 * u;
+        let fits = true;
+        for (let k = 0; k < BOON_CARDS; k++) {
+          const other = rowEnabled[k] ? unlockInfo(boonIdAt(state, k)) : null;
+          if (other === null) continue;
+          const ui = unlocks.indexOf(other);
+          const r = rankOf(state, other.id);
+          const e = wrapped((ui * 16 + r) * 4 + 2, other.ranks[Math.min(r, other.max - 1)], cardW - 10 * u, textSize);
+          const b = wrapped(ui * 64 + 1 + (bSize === textSize ? 0 : 2), other.blurb, cardW - 10 * u, bSize, 'text');
+          if (fixed + e.length * lineH + b.length * blurbLineH > cardH) fits = false;
+        }
+        if (fits) break;
+        if (bSize > 1 && bSize === textSize) bSize--;
+        else if (bigS > minIcon) bigS--;
+        else {
+          showBlurbs = false;
+          break;
+        }
       }
     } else {
       bigS = Math.max(1, Math.min(3 * u, Math.floor((cardH - 6 * u) / UNLOCK_ICON)));
@@ -4467,7 +4692,7 @@ export function createMenus(overlayCanvas, callbacks) {
         const ui = unlocks.indexOf(other);
         const r = rankOf(state, other.id);
         const e = wrapped((ui * 16 + r) * 4 + 3, other.ranks[Math.min(r, other.max - 1)], tw, eSize).length;
-        const b = wrapped(ui * 64 + 1, other.blurb, tw, eSize).length;
+        const b = wrapped(ui * 64 + 1, other.blurb, tw, eSize, 'text').length;
         if ((e + b) * pitchE + 2 * u > room) showBlurbs = false;
       }
     }
@@ -4522,8 +4747,20 @@ export function createMenus(overlayCanvas, callbacks) {
       recordRow(i, x, cy, w, h);
 
       if (!narrow) {
-        let ty = drawY + 6 * u;
         const bigW = UNLOCK_ICON * bigS;
+        // Keys: (catalogue index * 16 + rank) * 4 + kind, because the effect text changes with rank;
+        // the blurb's key moves with its size so two faces of the same sentence cannot share a
+        // cache entry.
+        const ui = unlocks.indexOf(info);
+        const blurbLineH = heightAt('hud', bSize) + 2 * u;
+        const effect = wrapped((ui * 16 + rank) * 4 + 2, info.ranks[Math.min(rank, info.max - 1)], w - 10 * u, textSize);
+        const blurb = wrapped(ui * 64 + 1 + (bSize === textSize ? 0 : 2), info.blurb, w - 10 * u, bSize, 'text');
+        // The card's contents are centred in it rather than stacked from the top: the cards are cut
+        // to one height for the row, so a short one used to stand a fifth empty under its words.
+        const contentH =
+          bigW + 4 * u + heightAt('display', nameScale) + 3 * u + pip + 4 * u + effect.length * lineH +
+          (showBlurbs ? u + blurb.length * blurbLineH : 0);
+        let ty = drawY + Math.max(6 * u, (h - contentH) >> 1);
         drawUnlockIcon(ctx, info.id, x + ((w - bigW) >> 1), ty, bigS);
         ty += bigW + 4 * u;
         drawAt(ctx, info.name, x + (w >> 1), ty, 'display', nameScale, selected ? 'gothicHot' : 'gothic', 'center');
@@ -4531,20 +4768,16 @@ export function createMenus(overlayCanvas, callbacks) {
         const pw = pipsWidth(info.max, pip);
         drawPips(ctx, x + ((w - pw) >> 1), ty, rank, info.max, pip, true);
         ty += pip + 4 * u;
-        const ui = unlocks.indexOf(info);
-        // Keys: (catalogue index * 16 + rank) * 4 + kind, because the effect text changes with rank.
-        const effect = wrapped((ui * 16 + rank) * 4 + 2, info.ranks[Math.min(rank, info.max - 1)], w - 10 * u, textSize);
         for (let k = 0; k < effect.length && ty + lineH <= drawY + h - 4 * u; k++) {
           drawAt(ctx, effect[k], x + (w >> 1), ty, 'hud', textSize, 'hudBright', 'center');
           ty += lineH;
         }
-        const blurb = wrapped(ui * 64 + 1, info.blurb, w - 10 * u, textSize);
         ty += u;
         // Shown on every card or on none (decided in the pre-pass), and never cut mid-sentence.
-        if (showBlurbs && ty + blurb.length * lineH <= drawY + h - 3 * u) {
+        if (showBlurbs && ty + blurb.length * blurbLineH <= drawY + h - 3 * u) {
           for (let k = 0; k < blurb.length; k++) {
-            drawAt(ctx, blurb[k], x + (w >> 1), ty, 'hud', textSize, 'hudDim', 'center');
-            ty += lineH;
+            drawAt(ctx, blurb[k], x + (w >> 1), ty, 'text', bSize, 'hudDim', 'center');
+            ty += blurbLineH;
           }
         }
       } else {
@@ -4555,7 +4788,15 @@ export function createMenus(overlayCanvas, callbacks) {
         drawUnlockIcon(ctx, info.id, ix, drawY + ((h - bigW) >> 1), bigS);
         const tx = ix + bigW + 4 * u;
         const tw = x + w - 4 * u - tx;
-        let ty = drawY + 4 * u;
+        // Centred in the card, like the wide layout's: a phone's cards are cut to one height too.
+        const ui1 = unlocks.indexOf(info);
+        const ePitch = heightAt('hud', eSize) + u;
+        const eLines = wrapped((ui1 * 16 + rank) * 4 + 3, info.ranks[Math.min(rank, info.max - 1)], tw, eSize).length;
+        const bLines = showBlurbs ? wrapped(ui1 * 64 + 1, info.blurb, tw, eSize, 'text').length : 0;
+        const contentH =
+          heightAt('display', nameScale) + 2 * u + pip + 3 * u + eLines * ePitch +
+          (bLines > 0 ? 2 * u + bLines * ePitch : 0);
+        let ty = drawY + Math.max(4 * u, (h - contentH) >> 1);
         drawAt(ctx, info.name, tx, ty, 'display', nameScale, selected ? 'gothicHot' : 'gothic');
         ty += heightAt('display', nameScale) + 2 * u;
         drawPips(ctx, tx, ty, rank, info.max, pip, true);
@@ -4568,10 +4809,10 @@ export function createMenus(overlayCanvas, callbacks) {
           ty += heightAt('hud', eSize) + u;
         }
         if (showBlurbs) {
-          const blurb = wrapped(unlocks.indexOf(info) * 64 + 1, info.blurb, tw, eSize);
+          const blurb = wrapped(unlocks.indexOf(info) * 64 + 1, info.blurb, tw, eSize, 'text');
           ty += 2 * u;
           for (let k = 0; k < blurb.length && ty + heightAt('hud', eSize) <= drawY + h - 2 * u; k++) {
-            drawAt(ctx, blurb[k], tx, ty, 'hud', eSize, 'hudDim');
+            drawAt(ctx, blurb[k], tx, ty, 'text', eSize, 'hudDim');
             ty += heightAt('hud', eSize) + u;
           }
         }

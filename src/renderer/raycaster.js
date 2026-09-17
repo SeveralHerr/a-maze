@@ -41,10 +41,22 @@
  *
  * ── Performance contract ──────────────────────────────────────────────────────────────────────
  * Zero allocations per frame: every buffer, light slot, sprite slot and camera struct is allocated
- * in `createRaycaster` or in `resize` and reused forever. `stats().ms` reports the measured render
- * time. The budget is < 4 ms at 480×240 on a desktop; the current build measures ≈1.3 ms there in
- * headless Chrome, with the floor/ceiling pass the dominant cost (it is the only pass that touches
- * every pixel of the frame).
+ * in `createRaycaster` or in `resize` and reused forever, and the lighting helpers pass their
+ * doubles through a `Float64Array` rather than as arguments, because an argument V8 cannot inline
+ * away is boxed (see `dbl`: that alone was 76 kB of garbage a frame). `stats().ms` reports the
+ * measured render time.
+ *
+ * The budget is < 4 ms at 480×240 on a desktop. Measured on a real level 15 (128×128 cells, the
+ * gameplay cap) at 426×240, sweeping the camera along its corridors: **0.58 ms** a frame in Node
+ * (walls 0.41, floor/ceiling 0.16, everything else under 0.03), against 0.95 ms before the passes
+ * below were reworked. In the real game in headless Chrome, autopilot walking the cap level,
+ * A/B against the previous build on the same machine minutes apart: **2.14–2.26 ms** a frame
+ * against 2.60–2.82, and with the renderer's CPU throttled 4× (the mid-tier device `tools/verify.mjs`
+ * gates on) **14.4 ms** against 18.0. The three changes that bought it: the floor/ceiling pass now
+ * skips, per 12-pixel segment, every row the wall covers (0.52 → 0.16 ms in Node); the lighting
+ * helpers pass doubles through a `Float64Array` instead of as arguments (76.6 → 0.7 kB of garbage a
+ * frame); and the frame is composed in a plain array and copied into the `ImageData` once (see
+ * `buf`). The wall pass is what is left, and it is down to arithmetic and two table reads a pixel.
  *
  * Coordinates: world units are tiles; `angle` 0 = +x (east), π/2 = +y (south), y grows downward
  * (screen-style), matching `src/core/types.js`.
@@ -416,7 +428,8 @@ const PLAYER_TORCH_LEAN = 0.3;
 
 /**
  * Firelight tint of the player's own torch at the heart of its pool, as a fraction of the full
- * sconce tint (`WARM_STEPS - 1`), at a full tank.
+ * sconce tint (`WARM_STEPS - 1`), at a full tank. Weighted by the **square** of the torch's own
+ * attenuation (`pa²` in `illumWall` / `illumFlat`), so it lives in the core of the pool only.
  *
  * WHY the torch in hand is warm at all: it used to be deliberately untinted (blue-grey stone at full
  * light, orange only under wall sconces), and playtesters read that as "the player isn't emitting
@@ -424,13 +437,16 @@ const PLAYER_TORCH_LEAN = 0.3;
  * A warm core that fades to the cool stone at the pool's edge makes the light visibly *come from
  * the player*, and because it scales with `view.light` the oil left is readable in the world.
  *
- * The tint follows the torch's own attenuation (the leaning plateau, times `playerWarmFx`), so it
- * is strongest beside the player and gone at the pool's edge, where the stone keeps its blue. The
- * surfaces the player actually sees are a tile or more away, so it lands well short of a sconce's
- * amber — measured on a bare corridor at a full tank: near walls r−b ≈ +12, stone 3 tiles out −8,
- * against ≈ +31 on a wall under a sconce. Measure before retuning (`raycaster.test.mjs`).
+ * WHY only 0.35 of the axis, and squared: the first version gave the torch in hand the *whole* sconce
+ * axis (1, linear in `pa`), gamma reversal included, and the near field turned to sandstone — at
+ * preview pose 0 near walls r−b +29/+37, near floor +44, ceiling +37, against the reference's
+ * −21…−28 walls, +8 floor and +18 ceiling — and a sconce's pool no longer stood out from the stone
+ * the player was carrying light to. At 0.35 × `pa²` the same frame measures near walls −7/−3, floor
+ * +22, ceiling +21, stone past the pool −17, while a wall facing a sconce keeps +31 and its floor
+ * +30 (pose 3): the player's pool is a warm-neutral core fading to blue-grey, and amber belongs to
+ * the sconces again. Measure the preview poses before retuning (`raycaster.test.mjs`).
  */
-const PLAYER_WARM = 1;
+const PLAYER_WARM = 0.35;
 
 /**
  * Brightness of the player's torch at an empty tank, as a fraction of a full one. The radius shrinks
@@ -573,6 +589,20 @@ const ALPHA_MASK = LITTLE_ENDIAN ? 0xff000000 : 0x000000ff;
 
 /** 1 / 2^32 — hash → [0,1). */
 const INV_U32 = 2.3283064365386963e-10;
+
+// Slots of the `dbl` scratch the lighting helpers pass doubles through (see `dbl`).
+/** World x of the point being lit, or the start of a floor/ceiling row. */
+const D_X = 0;
+/** World y of the same point. */
+const D_Y = 1;
+/** World x of the far end of a floor/ceiling row (`cullRowLights`). */
+const D_BX = 2;
+/** World y of the far end of that row. */
+const D_BY = 3;
+/** Illumination before fog: written by `illumFlat`/`illumWall`, read by `levelFx`. */
+const D_ILLUM = 4;
+/** Distance from the eye in tiles, read by `levelFx`. */
+const D_DIST = 5;
 
 /**
  * Wall variant per tile: 16 buckets hashed from the tile coordinate. Plain stone dominates (half
@@ -860,13 +890,40 @@ export function createRaycaster(canvas, options) {
   let dpr = 1;
   /** @type {ImageData|null} */
   let image = null;
-  /** @type {Uint32Array} */
+  /**
+   * The framebuffer every pass writes: a **plain** `Uint32Array`, copied into the `ImageData` in one
+   * `set()` at the end of the frame.
+   *
+   * WHY not write straight into the `ImageData` (which is what this did): in Chrome the backing
+   * store of an `ImageData` that has been handed to `putImageData` is not plain memory any more, and
+   * the scattered writes of the next frame pay for that. Measured in headless Chrome at 426×240,
+   * over 300 iterations of a full-frame column-major fill: writing into the `ImageData` and putting
+   * it costs 0.401 ms a frame, while filling a plain array, `set()`-ing it into the `ImageData` and
+   * putting that costs 0.250 ms — the bulk copy is ~0.02 ms and pays for itself six times over. In
+   * Node (the unit tests' fake canvas) the two are identical, which is why this never showed up
+   * anywhere but in the browser's frame time.
+   */
   let buf = new Uint32Array(0);
+  /** `Uint32Array` view of `image`'s bytes: the destination of that one copy. */
+  let imgBuf = new Uint32Array(0);
 
   // ── Per-column scratch, sized to MAX_W so `resize` never reallocates ──
   const zbuf = new Float32Array(MAX_W);
   const wallTop = new Int32Array(MAX_W);
   const wallBot = new Int32Array(MAX_W);
+  /**
+   * Per `LIGHT_SEG`-pixel segment of columns: the lowest `wallBot` and the highest `wallTop` in it,
+   * refilled after the wall pass. A floor/ceiling row can skip a whole segment — its lighting as
+   * well as its pixels — when the wall covers that row in every column of the segment.
+   */
+  const segMinBot = new Int32Array(Math.ceil(MAX_W / LIGHT_SEG));
+  const segMaxTop = new Int32Array(Math.ceil(MAX_W / LIGHT_SEG));
+  /** The highest `wallBot` and lowest `wallTop` in each segment — "is any of it hidden?". */
+  const segMaxBot = new Int32Array(Math.ceil(MAX_W / LIGHT_SEG));
+  const segMinTop = new Int32Array(Math.ceil(MAX_W / LIGHT_SEG));
+  /** Per-wall-column dither thresholds and colormap tint blocks, indexed by `y & 3`. */
+  const colBayer = new Int32Array(4);
+  const colTint = new Int32Array(4);
 
   // ── Light slots ──
   const lightX = new Float32Array(MAX_LIGHTS);
@@ -887,6 +944,22 @@ export function createRaycaster(canvas, options) {
    * is what keeps those two calls allocation-free.
    */
   let illumWarmFx = 0;
+
+  /**
+   * Scratch slots the lighting helpers pass their doubles through, instead of as arguments.
+   *
+   * WHY, and it is not style: a double handed to a function V8 did not inline is **boxed as a heap
+   * number at the call site**, and so is a double returned from one. `illumFlat`, `illumWall`,
+   * `levelFx` and `cullRowLights` all have loops, so none of them is inlined, and between them they
+   * run thousands of times a frame — measured on the preview room at 320×240, the frame allocated
+   * 76.6 kB of such boxes (new-space growth per frame, against a control loop that only mutates the
+   * view). That is garbage the scavenger has to walk several times a second for no reason, and it
+   * made "zero allocations per frame" false in the one place the file claims it loudest. Passing the
+   * point, the distance and the illumination through a `Float64Array` is the same trick `src/state`
+   * uses on its hot path, and it brings the frame down to ~1 kB. Integer arguments (a light count, a
+   * wall normal of ±1, a 16.16 tint) are Smis and are never boxed, so they stay arguments.
+   */
+  const dbl = new Float64Array(6);
 
   // ── Per-torch light visibility ──
   // One `VIS_AREA`-byte window per torch of the current level, baked lazily the first time the torch
@@ -1094,8 +1167,10 @@ export function createRaycaster(canvas, options) {
     canvas.width = width;
     canvas.height = height;
     image = ctx.createImageData(width, height);
-    buf = new Uint32Array(image.data.buffer);
+    imgBuf = new Uint32Array(image.data.buffer);
+    buf = new Uint32Array(width * height);
     buf.fill(fogPacked);
+    imgBuf.set(buf);
   }
 
   // ── Spatial index ───────────────────────────────────────────────────────────────────────────
@@ -1537,13 +1612,16 @@ export function createRaycaster(canvas, options) {
    * The caller passes a pre-culled list because this runs once per 12-pixel segment of every
    * floor/ceiling row — several thousand times a frame — and most lights are irrelevant to any
    * given row (see `cullRowLights`). Also leaves the sconce tint of the point in `illumWarmFx`.
-   * @param {number} wx world x
-   * @param {number} wy world y
+   *
+   * Reads the point from `dbl[D_X]`/`dbl[D_Y]` and leaves its illumination in `dbl[D_ILLUM]`
+   * instead of taking and returning doubles — see `dbl`.
    * @param {Int32Array} list light indices
    * @param {number} n entries in `list`
-   * @returns {number} 0..ILLUM_MAX before fog
+   * @returns {void}
    */
-  function illumFlat(wx, wy, list, n) {
+  function illumFlat(list, n) {
+    const wx = dbl[D_X];
+    const wy = dbl[D_Y];
     const dx = wx - camX;
     const dy = wy - camY;
     const d = Math.sqrt(dx * dx + dy * dy);
@@ -1573,16 +1651,20 @@ export function createRaycaster(canvas, options) {
       const dl = Math.sqrt(d2);
       sconce += attFlatLut[(dl * INV_TORCH_RADIUS * ATT_LUT_N) | 0] * lightPow[i];
     }
-    return mixLight(own, sconce, (pa * playerWarmFx) | 0);
+    mixLight(own, sconce, (pa * pa * playerWarmFx) | 0);
   }
 
   /**
-   * Sum the player's and the sconces' light, record the firelight tint in `illumWarmFx`, and clamp.
+   * Sum the player's and the sconces' light, record the firelight tint in `illumWarmFx`, clamp, and
+   * leave the result in `dbl[D_ILLUM]`.
+   *
+   * `own` and `sconce` are doubles, but this is only ever called from the two `illum*` functions —
+   * which V8 does inline, being one call deep and tiny — so no heap number is boxed for them.
    * @param {number} own ambient + player torch
    * @param {number} sconce sum of wall-torch contributions
    * @param {number} pw the player torch's firelight tint at this point, 16.16 tint steps — an integer,
    *   so passing it never boxes a heap number
-   * @returns {number} 0..ILLUM_MAX
+   * @returns {void}
    */
   function mixLight(own, sconce, pw) {
     const total = own + sconce;
@@ -1600,7 +1682,7 @@ export function createRaycaster(canvas, options) {
     // point harder wins, so a sconce's amber is never diluted by standing next to it.
     if (pw > illumWarmFx) illumWarmFx = pw;
     // A NaN (a corrupt light) must not reach the level maths: the comparison fails and it becomes 0.
-    return total < ILLUM_MAX ? (total > 0 ? total : 0) : ILLUM_MAX;
+    dbl[D_ILLUM] = total < ILLUM_MAX ? (total > 0 ? total : 0) : ILLUM_MAX;
   }
 
   /**
@@ -1609,15 +1691,14 @@ export function createRaycaster(canvas, options) {
    * A row is a straight segment in world space, so a light matters only if it lies within
    * `TORCH_RADIUS` of that segment. Testing eight lights once per row (about 2 000 cheap tests a
    * frame) removes them from the per-segment inner loop, where they would cost twenty times more.
-   * @param {number} ax segment start x
-   * @param {number} ay segment start y
-   * @param {number} bx segment end x
-   * @param {number} by segment end y
+   * Reads the row's two ends from `dbl[D_X]`/`dbl[D_Y]` and `dbl[D_BX]`/`dbl[D_BY]` — see `dbl`.
    * @returns {number} number of entries written into `rowLights`
    */
-  function cullRowLights(ax, ay, bx, by) {
-    const ex = bx - ax;
-    const ey = by - ay;
+  function cullRowLights() {
+    const ax = dbl[D_X];
+    const ay = dbl[D_Y];
+    const ex = dbl[D_BX] - ax;
+    const ey = dbl[D_BY] - ay;
     const len2 = ex * ex + ey * ey;
     const invLen2 = len2 > 1e-9 ? 1 / len2 : 0;
     let n = 0;
@@ -1639,13 +1720,15 @@ export function createRaycaster(canvas, options) {
    * Illumination of a wall point with outward normal `(nx, ny)`. Adds a Lambert term so a face
    * lit edge-on stays dark — without it, corridors look like flat cutouts. Also leaves the sconce
    * tint of the point in `illumWarmFx`.
-   * @param {number} wx world x (already nudged off the face into the tile it faces)
-   * @param {number} wy world y
+   * Reads the point from `dbl[D_X]`/`dbl[D_Y]` and leaves the result in `dbl[D_ILLUM]` (see `dbl`);
+   * the normal stays an argument because ±1 and 0 are small integers, which are never boxed.
    * @param {number} nx normal x (-1, 0 or 1)
    * @param {number} ny normal y (-1, 0 or 1)
-   * @returns {number} 0..ILLUM_MAX before fog
+   * @returns {void}
    */
-  function illumWall(wx, wy, nx, ny) {
+  function illumWall(nx, ny) {
+    const wx = dbl[D_X];
+    const wy = dbl[D_Y];
     const dx = camX - wx;
     const dy = camY - wy;
     const d = Math.sqrt(dx * dx + dy * dy);
@@ -1677,18 +1760,19 @@ export function createRaycaster(canvas, options) {
       if (face > 1) face = 1;
       sconce += attLut[(dl * INV_TORCH_RADIUS * ATT_LUT_N) | 0] * lightPow[i] * face;
     }
-    return mixLight(own, sconce, (pa * playerWarmFx) | 0);
+    mixLight(own, sconce, (pa * pa * playerWarmFx) | 0);
   }
 
   /**
-   * Convert an illumination and a distance into a clamped 16.16 shade level.
-   * @param {number} illum 0..ILLUM_MAX
-   * @param {number} dist tiles from the eye
-   * @param {number} scale extra multiplier (side shading, ceiling dimming)
+   * Convert the illumination in `dbl[D_ILLUM]` and the distance in `dbl[D_DIST]` into a clamped
+   * 16.16 shade level (see `dbl`). The result is an integer, so returning it boxes nothing.
+   * @param {number} scale extra multiplier (side shading, ceiling dimming) — always one of a handful
+   *   of module constants, and a constant double is allocated once, not per call
    * @returns {number} level in [0, LEVEL_FX_MAX]
    */
-  function levelFx(illum, dist, scale) {
-    let fi = (dist * FOG_SCALE) | 0;
+  function levelFx(scale) {
+    const illum = dbl[D_ILLUM];
+    let fi = (dbl[D_DIST] * FOG_SCALE) | 0;
     if (fi < 0) fi = 0;
     else if (fi > FOG_LUT_MAX) fi = FOG_LUT_MAX;
     const v = illum * fogLut[fi] * scale * INV_ILLUM_MAX;
@@ -1814,22 +1898,29 @@ export function createRaycaster(canvas, options) {
       const hitX = camX + dist * rdx + nx * 0.02;
       const hitY = camY + dist * rdy + ny * 0.02;
       const shade = side === 1 ? SIDE_SHADE : 1;
-      let illum = illumWall(hitX, hitY, nx, ny);
+      dbl[D_X] = hitX;
+      dbl[D_Y] = hitY;
+      illumWall(nx, ny);
+      let illum = dbl[D_ILLUM];
       // Dead-End Whisper (§4.9): the face borders a floor tile that only leads back.
       if (whisperOn) {
         const ft = (mapY + ny) * mw + mapX + nx;
         if (ft >= 0 && ft < mw * mh && whisperMask[ft] !== 0) illum *= WHISPER_DIM;
       }
+      dbl[D_ILLUM] = illum;
+      dbl[D_DIST] = dist;
       // Sconce tint for the whole column: which light reaches a wall does not change up its height.
       const warmFx = illumWarmFx;
-      const lvl = levelFx(illum, dist, shade);
+      const lvl = levelFx(shade);
       // Vertical falloff. Lights live at eye height, so the top and bottom of a wall are further
       // from every one of them than its middle is: the extra distance for a point half a tile off
       // centre is `0.5/dist` in relative terms, and applying that as an inverse-square factor is
       // what stops a near wall reading as one flat rectangle of colour. The effect vanishes with
       // distance on its own, which is exactly right.
       const edgeFactor = 1 / (1 + 1.2 * (0.25 / (dist * dist)));
-      const lvlEdge = levelFx(illum * edgeFactor, dist, shade);
+      dbl[D_ILLUM] = illum * edgeFactor;
+      const lvlEdge = levelFx(shade);
+      dbl[D_ILLUM] = illum;
       const drop = lvl - lvlEdge;
 
       // The tile's hash picks which wall variant it wears — and nothing else. Every variant of a set
@@ -1860,6 +1951,16 @@ export function createRaycaster(canvas, options) {
       const stepTex = TEX / lineH;
       const stepFx = (stepTex * FX_ONE) | 0;
       const bayerCol = x & 3;
+      // Both dithers depend on the pixel only through `y & 3` once the column is fixed, and the
+      // sconce tint of a wall column is constant up its height (`warmFx`), so the four dither
+      // thresholds and the four colormap tint blocks are hoisted out of the pixel loop. Byte-exact:
+      // the same four values the loop used to recompute per pixel, and with `warmFx` 0 the tint
+      // block is 0, which is what the old "no sconce here" fast path wrote.
+      for (let j = 0; j < 4; j++) {
+        const bk = (j << 2) | bayerCol;
+        colBayer[j] = BAYER16[bk];
+        colTint[j] = ((warmFx + BAYER_W[bk]) >> 16) << WARM_SHIFT;
+      }
       // Level ramp for the vertical falloff, in level units per screen row. The column is drawn in
       // two runs — above and below the horizon — because the ramp mirrors there; writing it as two
       // runs of one loop body keeps a per-pixel `abs` (and a branch) out of the inner loop.
@@ -1884,9 +1985,9 @@ export function createRaycaster(canvas, options) {
           for (let y = from; y < to; y++) {
             const ty = (texPos >> 16) & (TEX - 1);
             texPos += stepFx;
-            const bk = ((y & 3) << 2) | bayerCol;
+            const j = y & 3;
             const chalkIdx = decal[(ty << 6) | decalX];
-            let level = (cur + (chalkIdx !== 0 ? CHALK_LIFT_FX : 0) + BAYER16[bk]) >> 16;
+            let level = (cur + (chalkIdx !== 0 ? CHALK_LIFT_FX : 0) + colBayer[j]) >> 16;
             if (level < 0) level = 0;
             else if (level > LEVEL_MAX) level = LEVEL_MAX;
             // Chalk takes no firelight tint: under the torch's warm core a tinted white read as
@@ -1894,34 +1995,23 @@ export function createRaycaster(canvas, options) {
             buf[pi] =
               chalkIdx !== 0
                 ? colormap[(level << 8) | chalkIdx]
-                : colormap[(((warmFx + BAYER_W[bk]) >> 16) << WARM_SHIFT) | (level << 8) | tIdx[(ty << 6) | texX]];
-            cur += curStep;
-            pi += w;
-          }
-        } else if (warmFx === 0) {
-          // No sconce reaches this column — most of them, most frames — so skip the tint dither.
-          for (let y = from; y < to; y++) {
-            const ty = (texPos >> 16) & (TEX - 1);
-            texPos += stepFx;
-            // `(level + dither) >> 16 << 8` is the colormap row; the palette index picks the column.
-            let level = (cur + BAYER16[((y & 3) << 2) | bayerCol]) >> 16;
-            if (level < 0) level = 0;
-            else if (level > LEVEL_MAX) level = LEVEL_MAX;
-            buf[pi] = colormap[(level << 8) | tIdx[(ty << 6) | texX]];
+                : colormap[colTint[j] | (level << 8) | tIdx[(ty << 6) | texX]];
             cur += curStep;
             pi += w;
           }
         } else {
+          // `(level + dither) >> 16 << 8` is the colormap row, `colTint` the tint block it sits in,
+          // and the palette index picks the column: one table read per pixel. (Caching the texel
+          // across the rows that share it — three to six of them on a near wall — was measured and
+          // is slower: the texture is 4 kB and sits in L1, so the branch costs more than the read.)
           for (let y = from; y < to; y++) {
             const ty = (texPos >> 16) & (TEX - 1);
             texPos += stepFx;
-            // As above, plus `(warm + dither') >> 16`: the tint block the level row sits in.
-            const bk = ((y & 3) << 2) | bayerCol;
-            let level = (cur + BAYER16[bk]) >> 16;
+            const j = y & 3;
+            let level = (cur + colBayer[j]) >> 16;
             if (level < 0) level = 0;
             else if (level > LEVEL_MAX) level = LEVEL_MAX;
-            buf[pi] =
-              colormap[(((warmFx + BAYER_W[bk]) >> 16) << WARM_SHIFT) | (level << 8) | tIdx[(ty << 6) | texX]];
+            buf[pi] = colormap[colTint[j] | (level << 8) | tIdx[(ty << 6) | texX]];
             cur += curStep;
             pi += w;
           }
@@ -1960,6 +2050,37 @@ export function createRaycaster(canvas, options) {
     // Rows this far from the horizon are within ~1.5 tiles of the eye (see `BAYER_NEAR`).
     const nearD = ((maxD * 0.7 * INTERNAL_H) / h) | 0;
 
+    // Where the walls leave room for floor and ceiling, per lighting segment and for the frame.
+    // WHY: in a corridor most rows near the horizon are wall in every column, and the rows that are
+    // not are wall across most of their width. The pixel loop already skipped those pixels, but each
+    // segment still paid two lighting evaluations (`illumFlat` + `levelFx`), which measured about
+    // half the pass. A segment the wall covers entirely now costs a fixed-point advance, and a row it
+    // covers entirely costs nothing. The output is byte-identical: a skipped segment's walk advances
+    // by the same integer steps, and the next visible segment evaluates its light at the very world
+    // point the unskipped walk would have handed it.
+    const segs = ((w + LIGHT_SEG - 1) / LIGHT_SEG) | 0;
+    let frameMinBot = h;
+    let frameMaxTop = -1;
+    for (let s = 0; s < segs; s++) {
+      let lo = h;
+      let hi = -1;
+      let hiBot = -1;
+      let loTop = h;
+      const xEnd = s * LIGHT_SEG + LIGHT_SEG < w ? s * LIGHT_SEG + LIGHT_SEG : w;
+      for (let x = s * LIGHT_SEG; x < xEnd; x++) {
+        if (wallBot[x] < lo) lo = wallBot[x];
+        if (wallTop[x] > hi) hi = wallTop[x];
+        if (wallBot[x] > hiBot) hiBot = wallBot[x];
+        if (wallTop[x] < loTop) loTop = wallTop[x];
+      }
+      segMinBot[s] = lo;
+      segMaxTop[s] = hi;
+      segMaxBot[s] = hiBot;
+      segMinTop[s] = loTop;
+      if (lo < frameMinBot) frameMinBot = lo;
+      if (hi > frameMaxTop) frameMaxTop = hi;
+    }
+
     for (let d = 0; d < maxD; d++) {
       const yF = horizon + d;
       const yC = horizon - 1 - d;
@@ -1969,6 +2090,12 @@ export function createRaycaster(canvas, options) {
 
       const rowDist = posZ / (d + 0.5);
       if (rowDist > FAR) continue; // already fog; the frame was cleared to exactly that colour
+      // Off-screen rows are handled by poisoning the comparison rather than by a per-pixel flag:
+      // `wallBot` is ≥ -1 and `wallTop` is ≤ h, so these values can never pass the test.
+      const yFc = onF ? yF : -1;
+      const yCc = onC ? yC : h;
+      // Wall in every column, above and below: nothing of this row pair is visible.
+      if (yFc <= frameMinBot && yCc >= frameMaxTop) continue;
 
       const stepX = rowDist * spanX;
       const stepY = rowDist * spanY;
@@ -1985,12 +2112,13 @@ export function createRaycaster(canvas, options) {
       const bayerC = (yC & 3) << 2;
       // Picked per row, so the pixel loop gains no branch.
       const bayer = d > nearD ? BAYER_NEAR : BAYER16;
-      // Off-screen rows are handled by poisoning the comparison rather than by a per-pixel flag:
-      // `wallBot` is ≥ -1 and `wallTop` is ≤ h, so these values can never pass the test.
-      const yFc = onF ? yF : -1;
-      const yCc = onC ? yC : h;
 
-      const rowN = cullRowLights(wx, wy, wx + stepX * w, wy + stepY * w);
+      dbl[D_X] = wx;
+      dbl[D_Y] = wy;
+      dbl[D_BX] = wx + stepX * w;
+      dbl[D_BY] = wy + stepY * w;
+      dbl[D_DIST] = rowDist;
+      const rowN = cullRowLights();
 
       // Cache the tile the row is currently over: the variant hash is far too expensive per pixel
       // but changes only when the walk crosses a tile boundary.
@@ -2002,20 +2130,43 @@ export function createRaycaster(canvas, options) {
       let cIdx = ceilTex[0].indices;
 
       let segStart = 0;
-      let illum = illumFlat(wx, wy, rowLights, rowN);
-      let warm = illumWarmFx;
-      let levF = levelFx(illum, rowDist, FLOOR_DIM);
-      let levC = levelFx(illum, rowDist, CEIL_DIM);
+      let seg = 0;
+      // Light at the current segment's start point; stale (and re-evaluated) after a skipped segment.
+      let startValid = false;
+      let warm = 0;
+      let levF = 0;
+      let levC = 0;
       while (segStart < w) {
         let segEnd = segStart + LIGHT_SEG;
         if (segEnd > w) segEnd = w;
         const n = segEnd - segStart;
         const ex = wx + stepX * n;
         const ey = wy + stepY * n;
-        const illum2 = illumFlat(ex, ey, rowLights, rowN);
+        if (yFc <= segMinBot[seg] && yCc >= segMaxTop[seg]) {
+          // Wall covers this row pair in every column of the segment: walk past it unlit.
+          fx += fxStep * n;
+          fy += fyStep * n;
+          wx = ex;
+          wy = ey;
+          segStart = segEnd;
+          seg++;
+          startValid = false;
+          continue;
+        }
+        if (!startValid) {
+          dbl[D_X] = wx;
+          dbl[D_Y] = wy;
+          illumFlat(rowLights, rowN);
+          warm = illumWarmFx;
+          levF = levelFx(FLOOR_DIM);
+          levC = levelFx(CEIL_DIM);
+        }
+        dbl[D_X] = ex;
+        dbl[D_Y] = ey;
+        illumFlat(rowLights, rowN);
         const warm2 = illumWarmFx;
-        const levF2 = levelFx(illum2, rowDist, FLOOR_DIM);
-        const levC2 = levelFx(illum2, rowDist, CEIL_DIM);
+        const levF2 = levelFx(FLOOR_DIM);
+        const levC2 = levelFx(CEIL_DIM);
         // Light is smooth; interpolating it across the segment is indistinguishable from
         // evaluating it per pixel and an order of magnitude cheaper.
         const slopeF = ((levF2 - levF) / n) | 0;
@@ -2025,9 +2176,14 @@ export function createRaycaster(canvas, options) {
         // dither table keeps it 0 without a second copy of this loop.
         const bayerW = (warm | warm2) === 0 ? BAYER_NONE : BAYER_W;
 
+        // With the eye at half the room height the wall span is symmetric about the horizon, so a
+        // row pair is almost always either wholly in front of the wall or wholly behind it across a
+        // whole segment; only the segments the silhouette actually crosses need the per-pixel test.
+        const openAll = yFc > segMaxBot[seg] && yCc < segMinTop[seg];
+
         for (let x = segStart; x < segEnd; x++) {
-          const drawF = yFc > wallBot[x];
-          const drawC = yCc < wallTop[x];
+          const drawF = openAll || yFc > wallBot[x];
+          const drawC = openAll || yCc < wallTop[x];
           // Pixels hidden behind a wall skip the tile lookup entirely and only pay the walk.
           if (drawF || drawC) {
             const cx = fx >> 16;
@@ -2053,8 +2209,9 @@ export function createRaycaster(canvas, options) {
               cIdx = eastWest ? ceilAcross[beam] : ceilTex[beam].indices;
             }
             const ti = (((fy >> 10) & 63) << 6) | ((fx >> 10) & 63);
+            const col = x & 3;
             if (drawF) {
-              const bk = bayerF | (x & 3);
+              const bk = bayerF | col;
               buf[rowF + x] =
                 colormap[
                   (((warm + bayerW[bk]) >> 16) << WARM_SHIFT) |
@@ -2063,7 +2220,7 @@ export function createRaycaster(canvas, options) {
                 ];
             }
             if (drawC) {
-              const bk = bayerC | (x & 3);
+              const bk = bayerC | col;
               buf[rowC + x] =
                 colormap[
                   (((warm + bayerW[bk]) >> 16) << WARM_SHIFT) | (((levC + bayer[bk]) >> 16) << 8) | cIdx[ti]
@@ -2083,6 +2240,8 @@ export function createRaycaster(canvas, options) {
         levC = levC2;
         warm = warm2;
         segStart = segEnd;
+        seg++;
+        startValid = true;
       }
     }
   }
@@ -2255,13 +2414,16 @@ export function createRaycaster(canvas, options) {
           // height, where a real wall bracket sits. Passing the mounting face is what stops the
           // billboard being sliced by the wall it is bolted to at a grazing angle (see
           // `renderSprites`).
+          // Distance 0: `vis` already carries the flame's own (thinner) fog.
+          dbl[D_ILLUM] = flick * vis;
+          dbl[D_DIST] = 0;
           addSprite(
             x,
             y,
             torchFrames[view * TORCH_FRAMES + frame],
             TORCH_SPRITE_SCALE,
             -0.17,
-            levelFx(flick * vis, 0, 1), // distance 0: `vis` already carries the flame's own fog
+            levelFx(1),
             flameWarm,
             d2,
             face,
@@ -2326,7 +2488,12 @@ export function createRaycaster(canvas, options) {
             const mapFrames = textures.map;
             if (!mapFrames || mapFrames.length === 0) continue;
             // `illumFlat` sets `illumWarmFx` as a side effect, so it must run first.
-            const mapLvl = levelFx(illumFlat(it.x, it.y, allLights, lightN) * MAP_LIGHT_GAIN, d, 1);
+            dbl[D_X] = it.x;
+            dbl[D_Y] = it.y;
+            illumFlat(allLights, lightN);
+            dbl[D_ILLUM] *= MAP_LIGHT_GAIN;
+            dbl[D_DIST] = d;
+            const mapLvl = levelFx(1);
             addSprite(
               it.x,
               it.y,
@@ -2348,7 +2515,12 @@ export function createRaycaster(canvas, options) {
           // it does neither: a bob would lift the shadow off the cobbles with it.
           const spin = isGem ? ((time * 6 + phase) | 0) % frames.length : 0;
           const bobZ = isGem ? Math.sin(time * 2.2 + phase) * 0.045 : 0;
-          let lvl = levelFx(illumFlat(it.x, it.y, allLights, lightN) * (isGem ? 1.25 : 1.1), d, 1);
+          dbl[D_X] = it.x;
+          dbl[D_Y] = it.y;
+          illumFlat(allLights, lightN);
+          dbl[D_ILLUM] *= isGem ? 1.25 : 1.1;
+          dbl[D_DIST] = d;
+          let lvl = levelFx(1);
           // Oil Sense (§4.9): a flask in range is drawn through walls, and never darker than its ghost.
           const sensed = !isGem && d2 <= oilSense2;
           if (sensed && lvl < OIL_GHOST_LEVEL * FX_ONE) lvl = OIL_GHOST_LEVEL * FX_ONE;
@@ -2387,13 +2559,15 @@ export function createRaycaster(canvas, options) {
       if (d2 <= far2) {
         const frame = ((time * 9) | 0) % textures.portal.length;
         const open = view.portalOpen !== false;
+        dbl[D_ILLUM] = open ? 1 : 0.45;
+        dbl[D_DIST] = Math.sqrt(d2);
         addSprite(
           ex,
           ey,
           textures.portal[frame],
           open ? 0.95 : 0.7,
           0.02,
-          levelFx(open ? 1 : 0.45, Math.sqrt(d2), 1),
+          levelFx(1),
           0, // emissive: the vortex is its own light
           d2,
           -1, // free-standing in the exit tile: no mounting surface
@@ -2644,6 +2818,7 @@ export function createRaycaster(canvas, options) {
     const maze = view && view.maze;
     if (!maze || !maze.tiles || maze.width <= 0 || maze.height <= 0 || !view.player) {
       buf.fill(fogPacked);
+      imgBuf.set(buf);
       ctx.putImageData(image, 0, 0);
       statsObj.ms = now() - t0;
       statsObj.frames++;
@@ -2739,6 +2914,7 @@ export function createRaycaster(canvas, options) {
       applyFlash(flash.r, flash.g, flash.b, flash.a > 1 ? 1 : flash.a);
     }
 
+    imgBuf.set(buf);
     ctx.putImageData(image, 0, 0);
 
     const ms = now() - t0;
@@ -2755,8 +2931,10 @@ export function createRaycaster(canvas, options) {
   // ── Public surface ──────────────────────────────────────────────────────────────────────────
 
   /**
-   * Swap in a different texture set (e.g. repainted for a new run seed). The colormap does not
-   * depend on the textures, so nothing else has to be rebuilt.
+   * Swap in a different texture set (e.g. repainted for a new run seed, or the next floor's
+   * tileset). The shade table depends on the set only through its `fog` colour and its `warmth`, so
+   * it is rebuilt (a few milliseconds, once per floor) exactly when one of those two differs and is
+   * kept otherwise; the transposed ceilings are rebuilt every time, being cheap and per-painting.
    * @param {TextureSet} set
    * @returns {void}
    */
@@ -2823,6 +3001,7 @@ export function createRaycaster(canvas, options) {
   function dispose() {
     image = null;
     buf = new Uint32Array(0);
+    imgBuf = new Uint32Array(0);
     ctx = null;
     particles.clear();
   }

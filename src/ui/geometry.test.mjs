@@ -298,6 +298,32 @@ test('level complete: the tally is never the smallest text on the screen', () =>
   }
 });
 
+test('phone headings never outrank the panel they head by more than a step', () => {
+  // The level-complete heading used to be split onto two lines at ×3 over ×1 buttons on a 390×844
+  // phone: ~18 % of the screen, and each of its font pixels three times the size of every other
+  // pixel on the panel. A heading leads its panel; it does not become the panel.
+  for (const vp of VIEWPORTS.filter((v) => v.h > v.w * 1.15)) {
+    for (const [screen, headStart] of [['complete', 'Depth'], ['gameover', 'Your torch'], ['confirm', 'Abandon']]) {
+      const { boxes, menus } = screenBoxes(vp, screen);
+      const m = menus.surface.metrics;
+      assert.equal(m.narrow, true, `${vp.name}: this is the narrow layout`);
+      const texts = boxes.filter((b) => b.kind === 'text');
+      const heading = texts.find((b) => b.label.startsWith(headStart));
+      const rows = texts.filter((b) => b.h === 12 * b.unit && b !== heading && /^[A-Z]/.test(b.label));
+      assert.ok(heading !== undefined, `${vp.name} ${screen}: the heading is drawn`);
+      assert.ok(rows.length > 0, `${vp.name} ${screen}: the buttons are drawn`);
+      const itemScale = Math.max(...rows.map((b) => b.unit));
+      assert.ok(
+        heading.unit <= itemScale + 1,
+        `${vp.name} ${screen}: heading ×${heading.unit} ≤ buttons ×${itemScale} + 1`,
+      );
+      // And a split heading is only ever the *fallback*: two lines mean one would not fit at ×2.
+      const headLines = texts.filter((b) => b.h === heading.h && b.unit === heading.unit && b.y !== heading.y && Math.abs(b.y - heading.y) <= 3 * heading.h);
+      if (headLines.length > 0) assert.ok(heading.unit >= 2, `${vp.name} ${screen}: a split heading is at least ×2`);
+    }
+  }
+});
+
 test('end screens at 1280×720 and itch\'s 960×540: the expedition strip survives a boon offer', () => {
   // The critic's find: with the "Choose a Boon" row the level-complete panel dropped the strip
   // entirely at both sizes, and without it shrank the strip to ×1 while the heading kept its ×3.

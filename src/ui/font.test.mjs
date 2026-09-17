@@ -31,8 +31,8 @@ const ASCII = (() => {
   return s;
 })();
 
-test('both faces cover all printable ASCII plus the punctuation the UI uses', () => {
-  for (const font of /** @type {const} */ (['hud', 'display'])) {
+test('every face covers all printable ASCII plus the punctuation the UI uses', () => {
+  for (const font of /** @type {const} */ (['hud', 'display', 'text'])) {
     for (const ch of ASCII) {
       assert.ok(hasGlyph(font, ch), `${font} is missing ${JSON.stringify(ch)}`);
     }
@@ -231,6 +231,36 @@ test('the middle dot is a dot, not a dash', () => {
   }
 });
 
+test('the prose face is the HUD face, set proportionally (§4.6)', () => {
+  const hud = faceInfo('hud');
+  const text = faceInfo('text');
+  // Same cell, so a line of prose sits on the same grid as the readouts beside it.
+  assert.equal(text.height, hud.height);
+  assert.equal(text.ascent, hud.ascent);
+  assert.equal(text.glyphCount, hud.glyphCount);
+  assert.equal(text.monospace, false);
+  assert.equal(hud.monospace, true);
+  // Narrow letters are narrow: the whole point of the face.
+  const i = measureLine('i', { font: 'text' });
+  const w = measureLine('W', { font: 'text' });
+  assert.ok(i < w, `i (${i}) is narrower than W (${w})`);
+  assert.equal(measureLine('i', { font: 'hud' }), measureLine('W', { font: 'hud' }), 'the HUD face stays fixed-width');
+  // The same ink: a glyph's mask is the HUD glyph with its blank columns removed.
+  const hudMask = glyphMask('hud', 'A');
+  const textMask = glyphMask('text', 'A');
+  assert.ok(hudMask !== null && textMask !== null);
+  assert.equal(textMask.h, hudMask.h);
+  assert.ok(textMask.w <= hudMask.w);
+  let hudInk = 0;
+  let textInk = 0;
+  for (const v of hudMask.mask) hudInk += v;
+  for (const v of textMask.mask) textInk += v;
+  assert.equal(textInk, hudInk, 'trimming loses no ink');
+  // A sentence is shorter than in the typewriter face, and wraps to fewer lines in the same box.
+  const line = 'Passages that lead nowhere grow dark.';
+  assert.ok(measureLine(line, { font: 'text' }) < measureLine(line, { font: 'hud' }));
+});
+
 test('the atlas cache stays bounded however many raw colours are drawn', async () => {
   // Build real atlases: give Node a document that can make canvases.
   const g = /** @type {any} */ (globalThis);
@@ -252,14 +282,16 @@ test('the atlas cache stays bounded however many raw colours are drawn', async (
     for (let i = 0; i < 40; i++) {
       const hex = `#${(i * 37).toString(16).padStart(2, '0')}40${(255 - i).toString(16).padStart(2, '0')}`;
       drawText(ctx, 'A', 0, 0, { font: i % 2 === 0 ? 'hud' : 'display', color: hex });
-      assert.ok(fontCacheSize() <= 16, `after ${i + 1} colours the cache holds ${fontCacheSize()} atlases`);
+      // The cap is `MAX_ATLASES` in font.js: three faces × the styles in steady use, with room
+      // to spare so a frame that draws all of them never evicts one it is about to need.
+      assert.ok(fontCacheSize() <= 24, `after ${i + 1} colours the cache holds ${fontCacheSize()} atlases`);
     }
     // Named styles in steady use survive the churn of one-off colours.
     drawText(ctx, 'A', 0, 0, { font: 'hud', color: 'hud' });
     const before = fontCacheSize();
     for (let i = 0; i < 20; i++) drawText(ctx, 'A', 0, 0, { font: 'hud', color: `#0000${(i + 16).toString(16)}` });
-    assert.ok(fontCacheSize() <= 16);
-    assert.ok(before <= 16);
+    assert.ok(fontCacheSize() <= 24);
+    assert.ok(before <= 24);
   } finally {
     delete g.document;
     clearFontCache();

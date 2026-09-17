@@ -583,3 +583,45 @@ test('tension: the torch runs measurably lower deep in the curve, and every walk
   // ~0.47 to ~0.55 and the alarm stopped firing in these runs; the easier curve was accepted. The
   // depth trend above is still enforced.
 });
+
+test('tension: the curve is in order — each band of the descent is tighter than the one before', () => {
+  // The trend test above compares two bands; this one walks the whole shape, because the curve was
+  // not only flat but *out of order*: measured over levels 1–12 the lean first floor was the tightest
+  // of the first four (lowest tank 0.49 against 0.65–0.74 on levels 2–4), level 10 was no tenser than
+  // level 5, and the only real squeeze was at level 12. A player is promised floors that get harder,
+  // and the first one should be the kindest in the game.
+  const BANDS = [[1], [4, 5], [8, 9], [12]];
+  const SEEDS_PER_LEVEL = 4;
+  /** @type {number[]} */
+  const means = [];
+  for (const levels of BANDS) {
+    let sum = 0;
+    let runs = 0;
+    for (const level of levels) {
+      for (let k = 0; k < SEEDS_PER_LEVEL; k++) {
+        const seed = 15_485_863 * (level + 1) + 32_452_843 * k;
+        const r = reducerWalk(level, seed, FUEL.WANDER);
+        assert.ok(r.won, `BLOCKER — level ${level}, seed ${seed}: a ${FUEL.WANDER}× walker ran dry`);
+        sum += r.minFraction;
+        runs++;
+      }
+    }
+    means.push(sum / runs);
+  }
+  console.log(
+    `curve order (lowest tank, ${FUEL.WANDER}× wander): ` +
+      BANDS.map((b, i) => `L${b.join('/')} ${means[i].toFixed(3)}`).join(' → '),
+  );
+  for (let i = 1; i < means.length; i++) {
+    // Not strictly monotone — four seeds of a random maze carry a few points of noise — but a band
+    // may never read *easier* than the one above it by more than that noise.
+    assert.ok(
+      means[i] <= means[i - 1] + 0.03,
+      `band L${BANDS[i].join('/')} (${means[i].toFixed(3)}) is easier than L${BANDS[i - 1].join('/')} (${means[i - 1].toFixed(3)})`,
+    );
+  }
+  assert.ok(
+    means[0] - means[means.length - 1] >= 0.15,
+    `the descent must tighten overall: ${means[0].toFixed(3)} → ${means[means.length - 1].toFixed(3)}`,
+  );
+});

@@ -16,6 +16,16 @@
  * synchronously so the error the caller sees is the real one with a real stack.
  *
  * `build()` therefore never throws synchronously, and never rejects for infrastructure reasons.
+ *
+ * Two details that only show up under load:
+ *  - A build failure the worker *reports* is rebuilt here only when it might have been the worker's
+ *    fault. A `RangeError` (bad parameters) or a `buildLevel:` failure is deterministic — rebuilding
+ *    it costs up to ~230 ms at the 128×128 cap to throw the very same error, so those reject with an
+ *    `Error` rebuilt from the worker's `name`/`message` instead.
+ *  - One timeout retires the worker but does not condemn the session: a background tab throttled
+ *    mid-build would otherwise push every later level onto the main thread for good. The client
+ *    starts a fresh worker on the next build and only gives up after
+ *    `MAX_WORKER_FAILURES` consecutive failures with nothing in between that worked.
  */
 
 import { createLogger } from '../core/log.js';
@@ -42,6 +52,8 @@ import { buildLevel } from './level.js';
  * @property {number} [threshold=400] cell count (`cols*rows`) above which the worker is used
  * @property {number} [timeoutMs=10000] how long to wait for a worker answer before giving up on it
  * @property {'auto'|'always'|'never'} [mode='auto'] force the worker on or off (tests, diagnostics)
+ * @property {number} [maxFailures=2] consecutive worker failures after which the worker is given
+ *   up on for the lifetime of the client
  * @property {new (url:URL|string, opts?:{type?:string}) => WorkerLike} [WorkerCtor] worker
  *   constructor override; defaults to the global `Worker` when one exists
  */
@@ -57,6 +69,40 @@ import { buildLevel } from './level.js';
 
 /** Default time budget for a worker answer, milliseconds (ARCHITECTURE.md §4.4). */
 const DEFAULT_TIMEOUT_MS = 10000;
+
+/**
+ * Consecutive worker failures (crash, timeout, uncloneable answer, constructor throw) after which
+ * the client stops trying. Two, because one is a hiccup — a throttled background tab, a GC pause
+ * on a cold machine — and the cost of being wrong is one more stutter, while the cost of latching
+ * after a single hiccup is every remaining level of the run built on the main thread.
+ */
+const MAX_WORKER_FAILURES = 2;
+
+/**
+ * Error names and message prefixes that mean "this build will fail again wherever it runs".
+ * @param {string} name
+ * @param {string} message
+ * @returns {boolean}
+ */
+function isDeterministicBuildFailure(name, message) {
+  return name === 'RangeError' || name === 'TypeError' || message.startsWith('buildLevel:');
+}
+
+/**
+ * Rebuild an `Error` from the `{name, message}` pair a worker posts. Structured clone strips the
+ * prototype, so the constructor is chosen by name — a caller catching `RangeError` for bad
+ * parameters must keep catching it when the build happened in the worker.
+ * @param {string} name
+ * @param {string} message
+ * @returns {Error}
+ */
+function rebuildError(name, message) {
+  if (name === 'RangeError') return new RangeError(message);
+  if (name === 'TypeError') return new TypeError(message);
+  const err = new Error(message);
+  if (name && name !== 'Error') err.name = name;
+  return err;
+}
 
 /**
  * Coerce an unknown thrown value into an `Error` without losing information.
@@ -81,6 +127,9 @@ export function createMazeClient(options) {
     ? Number(opts.timeoutMs)
     : DEFAULT_TIMEOUT_MS;
   const mode = opts.mode === 'always' || opts.mode === 'never' ? opts.mode : 'auto';
+  const maxFailures = Number.isFinite(Number(opts.maxFailures)) && Number(opts.maxFailures) > 0
+    ? Math.floor(Number(opts.maxFailures))
+    : MAX_WORKER_FAILURES;
   const WorkerCtor =
     opts.WorkerCtor ||
     (typeof (/** @type {{Worker?:unknown}} */ (globalThis).Worker) === 'function'
@@ -103,7 +152,9 @@ export function createMazeClient(options) {
   const pending = new Map();
   /** @type {WorkerLike|null} */
   let worker = null;
-  /** Once true the worker is never retried for the lifetime of this client. */
+  /** Consecutive worker failures; reset by every answer that arrives intact. */
+  let workerFailures = 0;
+  /** True once the worker has failed `maxFailures` times in a row, or cannot be constructed. */
   let workerUnavailable = false;
   let disposed = false;
   let nextId = 1;
@@ -149,7 +200,10 @@ export function createMazeClient(options) {
    * @returns {void}
    */
   function retireWorker(why) {
-    workerUnavailable = true;
+    workerFailures++;
+    // One failure retires *this* worker; `maxFailures` in a row retire the idea of a worker. The
+    // next build constructs a fresh one, which is what makes a single throttled build survivable.
+    if (workerFailures >= maxFailures) workerUnavailable = true;
     const w = worker;
     worker = null;
     if (w) {
@@ -176,8 +230,18 @@ export function createMazeClient(options) {
     if (!p) return;
 
     if (typeof msg.error === 'string') {
-      // A real build failure. Reproduce it synchronously so the caller gets a proper Error with a
-      // stack, and so a transient worker glitch cannot fail a level that would build fine here.
+      const name = typeof msg.name === 'string' ? msg.name : 'Error';
+      if (isDeterministicBuildFailure(name, msg.error)) {
+        // This build fails the same way everywhere: rebuilding it here would cost up to ~230 ms at
+        // the 128×128 cap purely to throw the same error again. Hand the caller that error instead.
+        pending.delete(id);
+        clearTimeout(p.timer);
+        workerFailures = 0; // the worker did its job — it reported a bad level, it did not break
+        p.reject(rebuildError(name, msg.error));
+        return;
+      }
+      // Anything else might have been the worker's fault: reproduce it synchronously, so a
+      // transient glitch cannot fail a level that would build fine here.
       fallbackToSync(id, `reported "${msg.error}"`);
       return;
     }
@@ -188,6 +252,7 @@ export function createMazeClient(options) {
     }
     pending.delete(id);
     clearTimeout(p.timer);
+    workerFailures = 0; // a clean answer clears the streak
     p.resolve(data);
   }
 
@@ -208,6 +273,8 @@ export function createMazeClient(options) {
       worker = w;
       log.debug('module worker started');
     } catch (err) {
+      // A constructor that throws is an environment verdict (no module workers, blocked origin,
+      // strict CSP), not a hiccup: retrying it every build would cost a throw per level.
       workerUnavailable = true;
       worker = null;
       log.warn('worker unavailable, using synchronous generation:', toError(err).message);
@@ -235,10 +302,10 @@ export function createMazeClient(options) {
       // request riding on it (not just this one) is rebuilt here. Anything else risks a queue of
       // levels all waiting on a worker that will never answer.
       const timer = setTimeout(() => retireWorker(`timed out after ${timeoutMs} ms`), timeoutMs);
-      // Do not let a pending timeout hold a Node process (or a test run) open.
-      if (typeof (/** @type {{unref?:() => void}} */ (timer).unref) === 'function') {
-        /** @type {{unref:() => void}} */ (timer).unref();
-      }
+      // Do not let a pending timeout hold a Node process (or a test run) open. `setTimeout` is
+      // typed as returning a `number` under the DOM lib, so the cast goes through `unknown`.
+      const handle = /** @type {{unref?:() => void}} */ (/** @type {unknown} */ (timer));
+      if (typeof handle.unref === 'function') handle.unref();
       pending.set(id, { resolve, reject, params, seed, timer });
       try {
         w.postMessage({ id, params, seed });

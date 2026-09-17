@@ -864,3 +864,49 @@ test('the AUTO button: on screen in play, hit-testable, lit when on, and absent 
   for (let y = 0; y < 844; y += 4) for (let x = 0; x < 390; x += 4) hit = hit || narrowHud.hitAuto(x, y);
   assert.equal(hit, false, 'a narrow layout has no HUD button anywhere');
 });
+
+test('the AUTO button yields to a key hint while the pointer is locked (§4.10)', () => {
+  const g = /** @type {any} */ (globalThis);
+  const restore = installFakeDocument();
+  const canvas = drawableCanvas(1280, 720);
+  const hud = createHud(canvas, { map: 'off' });
+  hud.resize(1280, 720, 1);
+  const state = playingState();
+  state.settings.autoExplore = false;
+  hud.render(state, null, 0);
+  /** @param {any} h @returns {boolean} */
+  const clickable = (h) => {
+    for (let y = 600; y < 720; y += 2) for (let x = 560; x < 720; x += 2) if (h.hitAuto(x, y)) return true;
+    return false;
+  };
+  assert.equal(clickable(hud), true, 'unlocked: the button is there to be clicked');
+
+  // A locked pointer cannot reach it, so the plaque gives way to the key that does the same thing.
+  g.document.pointerLockElement = canvas;
+  try {
+    const boxes = collectLayout(() => hud.render(state, null, 0));
+    assert.equal(clickable(hud), false, 'locked: nothing to click');
+    assert.ok(
+      boxes.some((b) => b.kind === 'text' && b.label.includes('AUTO')),
+      'locked: the O key hint is shown instead',
+    );
+    // It fades out after a few seconds of play rather than sitting there for the whole level.
+    for (let i = 0; i < 60 * 6; i++) {
+      state.time += 1 / 60;
+      hud.render(state, null, 0);
+    }
+    const later = collectLayout(() => {
+      state.time += 1 / 60;
+      hud.render(state, null, 0);
+    });
+    assert.equal(later.some((b) => b.kind === 'text' && b.label.includes('AUTO')), false, 'the hint fades');
+
+    // With Auto Explore on, the full button is kept: main.js releases the lock while it drives, and
+    // the button is how a mouse player stops it.
+    state.settings.autoExplore = true;
+    hud.render(state, null, 0);
+    assert.equal(clickable(hud), true, 'the button is back to switch it off');
+  } finally {
+    restore();
+  }
+});

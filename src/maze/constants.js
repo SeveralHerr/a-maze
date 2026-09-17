@@ -84,7 +84,8 @@ export const DIRS = Object.freeze({
  * RSS. That is the point where the next doubling stops being merely slow and starts failing to
  * allocate in a browser tab. Anything larger is a caller bug (a NaN that floored to a huge number,
  * a unit mix-up), so the generator throws `RangeError` rather than trying and dying with OOM.
- * Gameplay sizes are three orders of magnitude below this (ARCHITECTURE.md §6: up to 40×40).
+ * Gameplay sizes are two orders of magnitude below this: the shipped curve caps at
+ * `LEVEL.MAX_CELLS` = 128×128 cells (ARCHITECTURE.md §6), and `tools/stress.mjs` goes to 2000×2000.
  */
 export const MAX_CELLS_PER_SIDE = 4096;
 

@@ -20,7 +20,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { drawableCanvas, installFakeDocument, playingState } from './layout-audit.test-util.mjs';
+import { drawableCanvas, installFakeDocument, playingState, UNLOCK_FIXTURE } from './layout-audit.test-util.mjs';
 
 installFakeDocument();
 
@@ -187,6 +187,44 @@ test('every menu screen stays inside the per-frame allocation budget', { skip },
         menus.render(state);
       }
       assert.equal(menus.screen(), screen);
+      const bytes = await bytesPerFrame(() => {
+        state.time += 1 / 60;
+        menus.render(state);
+      });
+      assert.ok(
+        bytes <= BUDGET_BYTES_PER_FRAME,
+        `menus ${screen} ${w}x${h}: ${bytes.toFixed(1)} B allocated per frame (budget ${BUDGET_BYTES_PER_FRAME})`,
+      );
+    }
+  }
+});
+
+test('the Shrine and the Boon stay inside the budget too (the busiest screens there are)', { skip }, async () => {
+  // Both lay out a catalogue every frame — wrapped prose, fitted columns, pips — which is exactly
+  // the kind of screen a per-frame `wrapText` or a fresh options literal hides in.
+  for (const [w, h, dpr] of [[1280, 720, 1], [390, 844, 3]]) {
+    for (const screen of ['shrine', 'boon']) {
+      const menus = createMenus(drawableCanvas(w, h), { unlocks: UNLOCK_FIXTURE });
+      menus.resize(w, h, dpr);
+      const state = /** @type {any} */ (playingState(screen === 'boon' ? 'levelComplete' : 'title'));
+      state.progress = { purse: 140, ranks: { reservoir: 2, chalk: 1 }, boonLevel: 0 };
+      state.offer =
+        screen === 'boon'
+          ? { open: true, level: 15, ids: ['whisper', 'appraiser', 'ember'] }
+          : { open: false, level: 0, ids: [] };
+      menus.render(state);
+      if (screen === 'shrine') {
+        menus.handleInput(/** @type {any} */ ({ pressed: new Set(['down']) }), state);
+        menus.handleInput(/** @type {any} */ ({ pressed: new Set(['confirm']) }), state);
+      } else {
+        menus.handleInput(/** @type {any} */ ({ pressed: new Set(['confirm']) }), state); // skip the tally
+      }
+      // Past the entry fade, the tally and (for the boon) the hold before the cards open themselves.
+      for (let i = 0; i < 60 * 6; i++) {
+        state.time += 1 / 60;
+        menus.render(state);
+      }
+      assert.equal(menus.screen(), screen, `${w}x${h}: reached ${screen}`);
       const bytes = await bytesPerFrame(() => {
         state.time += 1 / 60;
         menus.render(state);

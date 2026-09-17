@@ -306,13 +306,19 @@ const MORTAR = 3;
 /**
  * Block cell width in texels, including the mortar groove: `BLOCK_W_MIN … +BLOCK_W_SPREAD-1`.
  *
- * Two blocks across a 64-texel tile face, so a face is ~29 × 13 texels (≈2.2:1 landscape). On a
- * grazing corridor wall a tile's 64 texels of width compress to 10–25 screen pixels while its 64
- * texels of height occupy 60–240, so a *square* texel block lands on screen as a 1:5 portrait
- * sliver; starting from 2.2:1 is what keeps it reading as a block after that foreshortening.
+ * **Three** blocks across a 64-texel tile face, so a face is 17–21 × 13 texels (1.3–1.6:1). That is
+ * the reference's proportion, measured off its pillars (~1.4–1.6:1). Two blocks across (28–39 cells,
+ * faces 25–36 × 13, i.e. 2.2–3:1) read as long slabs or bricks rather than as masonry.
+ *
+ * The range is not free: a course has to sum to exactly 64 for the painting to wrap, so widths must
+ * divide 64 into three parts. 20–24 does (the first block leaves 40–44, which is at least two more
+ * minimum blocks); 22–29, say, does not — three minimum blocks would already be 66. On a grazing
+ * corridor wall a tile's 64 texels of width compress to 10–25 screen pixels while its 64 texels of
+ * height occupy 60–240, so the *courses* are what survive foreshortening; the blocks read face-on,
+ * which is where the eye judges their shape.
  */
-const BLOCK_W_MIN = 28;
-const BLOCK_W_SPREAD = 12;
+const BLOCK_W_MIN = 20;
+const BLOCK_W_SPREAD = 5;
 
 /**
  * Texels from a tile edge inside which every variant of a surface paints the same thing.
@@ -407,25 +413,52 @@ function paintBlock(buf, mask, bx, by, bw, bh, seed, rng) {
     }
   }
 
-  // Grain: 8–14 undithered 1×1 and 2×1 flecks per block, one ramp step off the texel under them —
-  // mostly pits, a few bright crystals. Within a tile and a half of the eye a block face covers
-  // hundreds of screen pixels, and the flat patches above alone read there as smeared concrete; the
-  // reference's stone is granular at exactly that range. Kept off the two bevel rows and columns so
-  // the chiselled edge stays clean, and never dithered, so each fleck stays one crisp texel.
+  // A stain: one larger, darker blotch per block, two ramp steps down and irregular at the edges —
+  // the damp patch or soot smear every worn block in the reference carries somewhere on its face.
+  // Bigger than the weathering clusters and darker than them, so it breaks the face's flat middle.
   const stone = RAMPS.stone;
-  const flecks = 8 + rng.int(7);
+  {
+    const sw = 4 + rng.int(5);
+    const sh = 3 + rng.int(3);
+    const sx = 2 + rng.int(Math.max(1, fw - sw - 3));
+    const sy = 2 + rng.int(Math.max(1, fh - sh - 2));
+    for (let y = 0; y < sh; y++) {
+      for (let x = 0; x < sw; x++) {
+        // Ragged corners: a rectangle reads as a sticker, a chewed edge as a stain.
+        if ((x === 0 || x === sw - 1) && (y === 0 || y === sh - 1)) continue;
+        if (sx + x >= fw - 1 || sy + y >= fh - 1) continue;
+        const at = (((by + sy + y) & MASK) << 6) | ((bx + sx + x) & MASK);
+        const step = stone.indexOf(buf[at]);
+        if (step < 4) continue; // already dark: a stain on shadow is invisible and only muddies it
+        buf[at] = stone[step - 2];
+      }
+    }
+  }
+
+  // Grain: 22–37 undithered flecks per block, one ramp step off the texel under them — mostly pits
+  // (1×1, 2×1 and the occasional 2×2), a few bright crystals. Within a tile and a half of the eye a
+  // block face covers hundreds of screen pixels, and the flat patches above alone read there as
+  // smeared concrete; the reference's stone is pitted granite at exactly that range, which is what
+  // this density buys (8–14 flecks left the faces smooth enough for the gauntlet to call them out).
+  // Kept off the two bevel rows and columns so the chiselled edge stays clean, and never dithered,
+  // so each fleck stays a crisp texel.
+  const flecks = 22 + rng.int(16);
   for (let i = 0; i < flecks; i++) {
     const fx = 2 + rng.int(fw - 5);
     const fy = 2 + rng.int(fh - 4);
     const bright = rng.chance(0.22);
-    const len = rng.chance(0.35) ? 2 : 1;
-    for (let k = 0; k < len; k++) {
-      const at = (((by + fy) & MASK) << 6) | ((bx + fx + k) & MASK);
-      const step = stone.indexOf(buf[at]);
-      const next = bright ? step + 1 : step - 1;
-      // Never into the mortar tones (steps 0–1): a pit must not read as a hole in the joint grid.
-      if (step < 0 || next < 2 || next >= stone.length) continue;
-      buf[at] = stone[next];
+    const wide = rng.chance(0.35);
+    const tall = !bright && rng.chance(0.3); // 2×2 pits only, so a crystal stays a spark
+    for (let k = 0; k < (wide ? 2 : 1); k++) {
+      for (let j = 0; j < (tall ? 2 : 1); j++) {
+        if (fy + j >= fh - 1) continue;
+        const at = (((by + fy + j) & MASK) << 6) | ((bx + fx + k) & MASK);
+        const step = stone.indexOf(buf[at]);
+        const next = bright ? step + 1 : step - 1;
+        // Never into the mortar tones (steps 0–1): a pit must not read as a hole in the joint grid.
+        if (step < 0 || next < 2 || next >= stone.length) continue;
+        buf[at] = stone[next];
+      }
     }
   }
 }
@@ -479,10 +512,15 @@ function paintWall(seed, opts, edgeSeed) {
   const layout = createRng(edgeSeed);
 
   // 1. Mortar bed. Everything starts as a dark navy groove; blocks are laid on top.
+  //    Undithered (`rampPickFlat`): the bed sits between ramp steps 0 and 1, so an ordered dither
+  //    there is not smoothing a gradient — it paints a 2×2-texel checkerboard into every joint,
+  //    which at one tile from the eye is a 6–12 px chessboard running along the wall. Quantising the
+  //    (already chunky) noise instead gives flat `stoneMortar` with scattered `stoneShadow` pits,
+  //    for the same reason the block faces are undithered (see `rampPickFlat`).
   for (let y = 0; y < SIZE; y++) {
     for (let x = 0; x < SIZE; x++) {
       const n = fbmChunky(x, y, edgeSeed ^ 0x51a7);
-      buf[(y << 6) | x] = rampPickChunky(RAMPS.stone, 0.015 + n * 0.14, x, y);
+      buf[(y << 6) | x] = rampPickFlat(RAMPS.stone, 0.015 + n * 0.14);
       mask[(y << 6) | x] = 1;
     }
   }
@@ -501,7 +539,8 @@ function paintWall(seed, opts, edgeSeed) {
     let remaining = SIZE;
     let b = 0;
     while (remaining > 0) {
-      let bw = remaining <= 50 ? remaining : BLOCK_W_MIN + layout.int(BLOCK_W_SPREAD);
+      let bw =
+        remaining <= BLOCK_W_MIN + BLOCK_W_SPREAD - 1 ? remaining : BLOCK_W_MIN + layout.int(BLOCK_W_SPREAD);
       // Never leave a sliver: if the remainder would be unusably thin, take it now.
       if (remaining - bw > 0 && remaining - bw < BLOCK_W_MIN) bw = remaining - BLOCK_W_MIN;
       const x0 = x & MASK;
@@ -1027,12 +1066,19 @@ function paintPortal(seed, frame, stipple) {
 /**
  * Paint one spin frame of a gem: a faceted crystal whose apparent width follows |cos θ| so eight
  * frames read as a full rotation, with the specular highlight tracking the facet that faces the
- * light.
+ * light, inside a stippled cyan halo.
+ *
+ * Sized for the range it matters at: the billboard is 0.34 tiles, so four to six tiles down a
+ * corridor the whole sprite is 14–20 screen pixels tall. At the old 8–24 texels of width that left a
+ * 5–8 px sliver, which read as a figurine rather than a gem; 12–30 texels plus the halo (which the
+ * flame and the portal already use to be seen from a distance) keeps the crystal shape and its glow
+ * readable there, and the silhouette still narrows as it turns.
  * @param {number} seed
  * @param {number} frame 0..7
+ * @param {Uint8Array} stipple out-param: halo texels are marked 1
  * @returns {Uint8Array}
  */
-function paintGem(seed, frame) {
+function paintGem(seed, frame, stipple) {
   const buf = new Uint8Array(AREA);
   const theta = (frame / 8) * Math.PI * 2;
   const cosT = Math.cos(theta);
@@ -1040,7 +1086,7 @@ function paintGem(seed, frame) {
   const topY = 16;
   const midY = 30;
   const botY = 47;
-  const halfW = 4 + Math.abs(cosT) * 8; // 4..12 texels — never edge-on, so it stays readable
+  const halfW = 6 + Math.abs(cosT) * 9; // 6..15 texels — never edge-on, so it stays readable
   const crease = cx + cosT * halfW * 0.45; // the vertical facet edge sweeps across the face
 
   for (let y = topY; y <= botY; y++) {
@@ -1079,6 +1125,27 @@ function paintGem(seed, frame) {
   putClip(buf, sx + 1, sy + 1, C.gemBright);
   // Girdle flash on the opposite side.
   putClip(buf, Math.round(cx + halfW * 0.6), midY + 2, C.gemPale);
+
+  // ── Halo ── a stippled cyan glow, thickest around the girdle, exactly like the flame's: it is
+  // what carries the pickup out of the gloom at the distance a player decides to walk over to it.
+  const hy = (topY + botY) >> 1;
+  const rx = halfW + 9;
+  const ry = 21;
+  for (let y = Math.max(0, hy - ry); y < Math.min(SIZE, hy + ry); y++) {
+    for (let x = Math.max(0, cx - rx) | 0; x < Math.min(SIZE, cx + rx + 1); x++) {
+      const i = (y << 6) | x;
+      if (buf[i] !== 0) continue;
+      const dx = (x - cx) / rx;
+      const dy = (y - hy) / ry;
+      const d = dx * dx + dy * dy;
+      if (d > 1) continue;
+      // Thinning outward: the noise threshold rises with the distance, so the glow dissolves
+      // rather than ending on a ring.
+      if (h01(x >> 1, (y >> 1) + frame * 11, seed ^ 0x3b1f) < d * 0.95) continue;
+      buf[i] = d > 0.5 ? C.gemDeep : d > 0.22 ? C.gemMid : C.gemBright;
+      stipple[i] = 1;
+    }
+  }
 
   return buf;
 }
@@ -1137,6 +1204,25 @@ function flaskMesh() {
 const OIL_CONTACT = 14.5;
 
 /**
+ * Ramp picker for the flask: undithered on the **glass** (materials 0 and 1, the only ones painted
+ * from `RAMPS.oil`), chunky-dithered on everything else.
+ *
+ * WHY: the bottle is a big smooth lathe, so a dither across its amber body alternates two ramp steps
+ * over the whole surface — at one or two tiles from the eye each texel is 3–6 screen pixels, so that
+ * reads as a checkerboard painted onto the glass rather than as a gradient. Quantising instead gives
+ * the flat banded highlight pixel-art glass is made of. The cork, twine, label and seal are small
+ * and matte, where the dither still buys smoothness.
+ * @param {Uint8Array} ramp
+ * @param {number} t
+ * @param {number} x
+ * @param {number} y
+ * @returns {number} palette index
+ */
+function oilPick(ramp, t, x, y) {
+  return ramp === RAMPS.oil ? rampPickFlat(ramp, t) : rampPickChunky(ramp, t, x, y);
+}
+
+/**
  * Paint the modelled oil flask, shadowed: the handle, twine and cork shade the bottle, and the
  * flask casts a shadow on the floor with a darker contact ring under its base.
  * @param {Uint8Array} stipple out-param: half-shade shadow texels are marked 1
@@ -1159,7 +1245,7 @@ function paintOil(stipple) {
       shadows: true,
       ground: { index: C.void, contact: OIL_CONTACT, stipple },
     },
-    rampPickChunky,
+    oilPick,
     buf,
   );
   return buf;
@@ -1545,7 +1631,7 @@ export function createTextures(seed = 0xa11a2e) {
   const gemSeed = s('gem');
   /** @type {Texture[]} */
   const gem = [];
-  for (let f = 0; f < 8; f++) gem.push(finish(paintGem(gemSeed, f), null, false));
+  for (let f = 0; f < 8; f++) gem.push(finishStippled((st) => paintGem(gemSeed, f, st), false));
 
   // One still frame (`OIL_YAW`), an array like every other field.
   /** @type {Texture[]} */

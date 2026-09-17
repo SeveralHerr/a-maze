@@ -20,8 +20,16 @@
  *      measured cost of one `Item`. This is the number that decides whether the size cap is a
  *      balance decision or an engineering one — it is a balance decision.
  *
- * Timing is *reported*, not asserted, except for a 60 s per-maze sanity ceiling: this runs on CI
- * machines of wildly different speed, and a flaky performance gate is worse than none.
+ * Timing is *reported*, not asserted, except for two deliberately loose ceilings: 60 s per maze,
+ * and — on the cases that ask for **shortcuts** — {@link MAX_US_PER_CELL} µs per cell. This runs on
+ * CI machines of wildly different speed and a flaky performance gate is worse than none, so the
+ * per-cell ceiling sits ~2.5× above the measured cost (7.5 µs per cell for 2000×2000 at the
+ * campaign's own shortcut density). It exists because the shortcut pass is the one part of
+ * generation whose cost is not obviously linear: its route guard repairs two distance fields after
+ * every accepted wall, which used to make a 2000×2000 build take 91 s — 22.8 µs per cell, against
+ * 2.7 at the 128×128 gameplay cap, on an O(n) contract (ARCHITECTURE.md §4.4). The generator now
+ * caps that repair work per cell, and this is the gate that keeps it capped. Nothing else in the
+ * suite exercises shortcuts at scale, which is how that regression stayed invisible.
  *
  * Results are written to `logs/stress.json`. Exit code is 1 on any failure.
  * Flags: `--quick` (stop at 1000×1000, 200 small levels and 20 gameplay-max builds).
@@ -43,6 +51,12 @@ const QUICK = process.argv.includes('--quick');
 /** Per-maze wall-clock ceiling, milliseconds. Generous on purpose — see the file header. */
 const MAX_MS_PER_MAZE = 60000;
 
+/**
+ * Per-cell generation ceiling for the shortcut cases, microseconds. ~2.5× the measured cost, so it
+ * catches a return to superlinear scaling without failing on a slow CI box (see the file header).
+ */
+const MAX_US_PER_CELL = 20;
+
 /** Number of small levels built in the leak loop. */
 const LEAK_ITERATIONS = QUICK ? 200 : 2000;
 
@@ -58,14 +72,24 @@ const GAMEPLAY_LEAK_ITERATIONS = QUICK ? 5 : 30;
 /** Heap growth over the leak loop that counts as a leak, in MiB. */
 const LEAK_LIMIT_MB = 24;
 
-/** The big cases: [cols, rows, braid]. */
+/**
+ * The big cases: `[cols, rows, braid, shortcuts?, shortcutDetour?, shortcutRouteKeep?]`. The last
+ * three mirror what `levelParams()` asks for at the size cap (one shortcut per 4 cells, detour 4,
+ * route keep 0.7) — the pass every shipped level runs, at 60× the shipped area.
+ */
 const CASES = QUICK
-  ? [[500, 500, 0], [1000, 1000, 0.25]]
+  ? [
+      [500, 500, 0],
+      [1000, 1000, 0.25],
+      [500, 500, 0.6, (500 * 500) >> 2, 4, 0.7],
+    ]
   : [
       [1000, 1000, 0],
       [1000, 1000, 0.25],
       [2000, 2000, 0],
       [2000, 2000, 0.25],
+      [1000, 1000, 0.6, (1000 * 1000) >> 2, 4, 0.7],
+      [2000, 2000, 0.6, (2000 * 2000) >> 2, 4, 0.7],
     ];
 
 /** @type {string[]} */
@@ -123,19 +147,25 @@ function mb(bytes) {
  * @param {number} cols
  * @param {number} rows
  * @param {number} braid
- * @returns {{cols:number, rows:number, braid:number, cells:number, tiles:number, genMs:number,
- *   validateMs:number, totalMs:number, rssMb:number, heapMb:number, buffersMb:number,
- *   pathLength:number, floorCount:number, deadEnds:number, loops:number, ok:boolean, error:string|null}}
+ * @param {number} [shortcuts=0]
+ * @param {number} [shortcutDetour]
+ * @param {number} [shortcutRouteKeep]
+ * @returns {{cols:number, rows:number, braid:number, shortcuts:number, cells:number, tiles:number,
+ *   genMs:number, genUsPerCell:number, validateMs:number, totalMs:number, rssMb:number, heapMb:number,
+ *   buffersMb:number, pathLength:number, floorCount:number, deadEnds:number, loops:number,
+ *   ok:boolean, error:string|null}}
  */
-function runCase(cols, rows, braid) {
-  const label = `${cols}×${rows} braid=${braid}`;
+function runCase(cols, rows, braid, shortcuts = 0, shortcutDetour = undefined, shortcutRouteKeep = undefined) {
+  const label = `${cols}×${rows} braid=${braid}${shortcuts > 0 ? ` shortcuts=${shortcuts}` : ''}`;
   const result = {
     cols,
     rows,
     braid,
+    shortcuts,
     cells: cols * rows,
     tiles: (cols * 2 + 1) * (rows * 2 + 1),
     genMs: 0,
+    genUsPerCell: 0,
     validateMs: 0,
     totalMs: 0,
     rssMb: 0,
@@ -151,12 +181,13 @@ function runCase(cols, rows, braid) {
 
   try {
     const t0 = performance.now();
-    const maze = generateMaze({ cols, rows, seed: cols * 31 + rows, braid });
+    const maze = generateMaze({ cols, rows, seed: cols * 31 + rows, braid, shortcuts, shortcutDetour, shortcutRouteKeep });
     const t1 = performance.now();
     const v = validateMaze(maze);
     const t2 = performance.now();
 
     result.genMs = Math.round(t1 - t0);
+    result.genUsPerCell = Math.round(((t1 - t0) * 1000) / (cols * rows) * 100) / 100;
     result.validateMs = Math.round(t2 - t1);
     result.totalMs = Math.round(t2 - t0);
     const mem = process.memoryUsage();
@@ -169,7 +200,16 @@ function runCase(cols, rows, braid) {
     result.loops = v.loops;
 
     if (v.errors.length > 0) failures.push(`${label}: ${v.errors.join('; ')}`);
-    if (braid === 0 && v.loops !== 0) failures.push(`${label}: perfect maze reported ${v.loops} loops`);
+    if (braid === 0 && shortcuts === 0 && v.loops !== 0) failures.push(`${label}: perfect maze reported ${v.loops} loops`);
+    if (shortcuts > 0) {
+      if (v.loops <= 0) failures.push(`${label}: asked for ${shortcuts} shortcuts and got ${v.loops} loops`);
+      if (result.genUsPerCell > MAX_US_PER_CELL) {
+        failures.push(
+          `${label}: generation cost ${result.genUsPerCell} µs/cell, over the ${MAX_US_PER_CELL} µs ceiling ` +
+            '— the shortcut pass has stopped being linear (see the file header)',
+        );
+      }
+    }
     if (result.totalMs > MAX_MS_PER_MAZE) {
       failures.push(`${label}: took ${result.totalMs} ms, over the ${MAX_MS_PER_MAZE} ms ceiling`);
     }
@@ -183,16 +223,21 @@ function runCase(cols, rows, braid) {
 }
 
 console.log(`\nA-MAZE generation stress${QUICK ? ' (quick)' : ''}  —  node ${process.version}, gc ${gc ? 'available' : 'unavailable'}\n`);
-console.log(`  ${'case'.padEnd(20)}${'cells'.padStart(10)}${'tiles'.padStart(12)}${'gen ms'.padStart(9)}${'val ms'.padStart(8)}${'rss MB'.padStart(9)}${'bufs MB'.padStart(9)}`);
-console.log(`  ${'-'.repeat(77)}`);
+console.log(
+  `  ${'case'.padEnd(26)}${'cells'.padStart(10)}${'tiles'.padStart(12)}${'gen ms'.padStart(9)}${'µs/cell'.padStart(9)}` +
+    `${'val ms'.padStart(8)}${'rss MB'.padStart(9)}${'bufs MB'.padStart(9)}`,
+);
+console.log(`  ${'-'.repeat(92)}`);
 
 const cases = [];
-for (const [cols, rows, braid] of CASES) {
-  const r = runCase(cols, rows, braid);
+for (const [cols, rows, braid, shortcuts, detour, keep] of CASES) {
+  const r = runCase(cols, rows, braid, shortcuts, detour, keep);
   cases.push(r);
+  const name = `${cols}×${rows} b=${braid}${shortcuts ? ` sc=${shortcuts}` : ''}`;
   console.log(
-    `  ${`${cols}×${rows} b=${braid}`.padEnd(20)}${String(r.cells).padStart(10)}${String(r.tiles).padStart(12)}` +
-      `${String(r.genMs).padStart(9)}${String(r.validateMs).padStart(8)}${String(r.rssMb).padStart(9)}${String(r.buffersMb).padStart(9)}` +
+    `  ${name.padEnd(26)}${String(r.cells).padStart(10)}${String(r.tiles).padStart(12)}` +
+      `${String(r.genMs).padStart(9)}${r.genUsPerCell.toFixed(2).padStart(9)}` +
+      `${String(r.validateMs).padStart(8)}${String(r.rssMb).padStart(9)}${String(r.buffersMb).padStart(9)}` +
       `${r.error ? `   ${r.error}` : ''}`,
   );
   // Let the previous case's buffers go before the next one allocates its own.

@@ -416,7 +416,7 @@ const EXTRA_GLYPHS = /** @type {const} */ ([
 /**
  * A compiled face.
  * @typedef {Object} Face
- * @property {string} name          `'hud'` or `'display'`
+ * @property {string} name          `'hud'`, `'display'` or `'text'`
  * @property {number} height        rows per glyph, including the descender zone
  * @property {number} ascent        rows above the baseline
  * @property {number} descent       rows below the baseline
@@ -476,7 +476,7 @@ function compileFace(name, height, ascent, lineGap, spacing, rows, monospace) {
 
   for (let i = 0; i < EXTRA_GLYPHS.length; i++) {
     const [code, hudRows, displayRows] = EXTRA_GLYPHS[i];
-    const glyph = compileGlyph(name, code, height, name === 'hud' ? hudRows : displayRows);
+    const glyph = compileGlyph(name, code, height, name === 'display' ? displayRows : hudRows);
     if (glyph === null) continue;
     face.extra.set(code, glyph);
     if (glyph.w > face.maxWidth) face.maxWidth = glyph.w;
@@ -567,12 +567,79 @@ DISPLAY_FACE.extra.forEach((g) => {
 }
 
 /**
- * The two faces by name.
+ * The **prose** face: the same 5×7 letterforms in the same 8-row cell, set proportionally.
+ *
+ * WHY a third face: the HUD face is monospace on purpose — a rolling score counter must not shift
+ * sideways as its digits change — but monospace is a typewriter, and every sentence in the game
+ * (the credits, an unlock's blurb, "Your torch burns oil…") was set in it. Beside the hand-lettered
+ * gothic display face that reads as a terminal window: `i` and `l` sit in the middle of a 5-column
+ * cell, so lowercase runs ~25 % wider than its own ink with holes around the narrow letters.
+ *
+ * Each glyph keeps its bitmap and loses the blank columns either side of its ink, so the face is
+ * the same drawing, tighter — no second set of letterforms to maintain, and a sentence set in it is
+ * unmistakably the same typeface as the readouts beside it. Numbers stay on the HUD face.
+ * @type {Face}
+ */
+const TEXT_FACE = proportionalize(compileFace('text', 8, 7, 1, 1, HUD_ROWS, false));
+
+/**
+ * Trim every glyph of a face to its own ink and give it an advance to match.
+ *
+ * Runs **once**, at import, over ~100 small masks. A glyph with no ink at all (the space) keeps a
+ * single blank column and is given a word-gap advance instead.
+ * @param {Face} face
+ * @returns {Face} the same object, edited in place
+ */
+function proportionalize(face) {
+  face.maxWidth = 0;
+  /** @param {Glyph|null} g @returns {void} */
+  const trim = (g) => {
+    if (g === null) return;
+    let first = g.w;
+    let last = -1;
+    for (let c = 0; c < g.w; c++) {
+      for (let r = 0; r < g.h; r++) {
+        if (g.mask[r * g.w + c] === 1) {
+          if (c < first) first = c;
+          if (c > last) last = c;
+          break;
+        }
+      }
+    }
+    if (last < first) {
+      // Blank (the space): one column, and a gap wide enough to read as a word break.
+      g.mask = new Uint8Array(g.h);
+      g.w = 1;
+      g.adv = 3;
+    } else {
+      const w = last - first + 1;
+      const mask = new Uint8Array(w * g.h);
+      for (let r = 0; r < g.h; r++) {
+        for (let c = 0; c < w; c++) mask[r * w + c] = g.mask[r * g.w + first + c];
+      }
+      g.mask = mask;
+      g.w = w;
+      g.adv = w + face.spacing;
+    }
+    if (g.w > face.maxWidth) face.maxWidth = g.w;
+  };
+  for (let i = 0; i < face.ascii.length; i++) trim(face.ascii[i]);
+  face.extra.forEach(trim);
+  const space = face.ascii[0];
+  face.spaceAdv = space !== null ? space.adv : 3;
+  return face;
+}
+
+/**
+ * The faces by name.
  * @type {Readonly<Record<string, Face>>}
  */
-const FACES = Object.freeze({ hud: HUD_FACE, display: DISPLAY_FACE });
+const FACES = Object.freeze({ hud: HUD_FACE, display: DISPLAY_FACE, text: TEXT_FACE });
 
-/** Face names accepted by every function here. @typedef {'hud'|'display'} FontName */
+/**
+ * Face names accepted by every function here.
+ * @typedef {'hud'|'display'|'text'} FontName
+ */
 
 /**
  * Resolve a face name, defaulting to the HUD face for anything unknown so a typo degrades to
@@ -581,7 +648,9 @@ const FACES = Object.freeze({ hud: HUD_FACE, display: DISPLAY_FACE });
  * @returns {Face}
  */
 function faceOf(name) {
-  return name === 'display' ? DISPLAY_FACE : HUD_FACE;
+  if (name === 'display') return DISPLAY_FACE;
+  if (name === 'text') return TEXT_FACE;
+  return HUD_FACE;
 }
 
 /**
@@ -770,8 +839,14 @@ function styleOf(color, shadow) {
  */
 const atlasCache = new Map();
 
-/** Upper bound on cached atlases across all faces (each is ≈ 60 KB of pixels). */
-const MAX_ATLASES = 16;
+/**
+ * Upper bound on cached atlases across all faces (each is ≈ 60 KB of pixels).
+ *
+ * Three faces × the styles in steady use is 13 (HUD 6, display 4, prose 3); the cap is above that
+ * so a frame that draws all of them never evicts an atlas it is about to need again — an eviction
+ * is a rebuild, i.e. a frame's worth of work, and thrashing one would show as a stutter.
+ */
+const MAX_ATLASES = 24;
 
 /** Number of cached atlases, tracked so eviction does not have to walk the map. */
 let atlasCount = 0;
@@ -1176,7 +1251,7 @@ export function probeLayout(kind, x, y, w, h, unit, label) {
 /**
  * Text drawing options. Every field is optional.
  * @typedef {Object} TextOptions
- * @property {FontName} [font]   `'hud'` (default) or `'display'`
+ * @property {FontName} [font]   `'hud'` (default), `'display'` or `'text'`
  * @property {number} [size]     integer pixel scale, 1 = one font pixel per surface pixel (default 1)
  * @property {number} [scale]    alias of `size`, for callers that prefer the name
  * @property {string} [color]    a `FONT_STYLES` name (default `'hud'`) or any CSS colour

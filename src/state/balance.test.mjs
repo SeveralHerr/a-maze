@@ -66,7 +66,14 @@ test('levelParams: level 1 is the lean first floor — small, unbraided, a short
   assert.ok(p.fuelSeconds < FUEL.TANK_START, 'shorter than level 2');
   assert.equal(p.drain, 1, 'no extra drain before the ramp');
   assert.equal(p.gems, LEVEL.FIRST_GEM_MIN, 'a handful of gems');
-  assert.equal(p.oil, LEVEL.FIRST_OIL_MIN, 'a few scatter flasks on top of the refuel chain');
+  // A few scatter flasks on top of the refuel chain — by density (`FIRST_OIL_CELLS`), with
+  // `FIRST_OIL_MIN` only as the floor under it.
+  assert.equal(p.oil, Math.round(p.cells / LEVEL.FIRST_OIL_CELLS));
+  assert.ok(p.oil >= LEVEL.FIRST_OIL_MIN && p.oil <= 6, `a handful of flasks, not a stockpile (${p.oil})`);
+  assert.ok(
+    p.oil / p.cells < levelParams(2).oil / levelParams(2).cells,
+    'still thinner pickings than the curve proper',
+  );
   // Level 2 is exactly where the massive-maze curve always had it.
   const p2 = levelParams(2);
   assert.equal(p2.cols, LEVEL.BASE_CELLS + LEVEL.GROWTH);

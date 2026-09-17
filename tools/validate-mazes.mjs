@@ -54,13 +54,41 @@ const SEED_OVERRIDE = Number((process.argv.find((a) => a.startsWith('--seeds='))
 /** Wall-clock budget for the matrix half of the run, milliseconds (the campaign half is bounded by its own size). */
 const TIME_BUDGET_MS = QUICK ? 8000 : 45000;
 
-/** The size matrix (cols × rows), from the degenerate extremes up to 512×512. */
+/**
+ * The size matrix (cols × rows). Three kinds of shape are in here on purpose:
+ * the degenerate extremes (1×1 … 2×2), **long thin corridors** (1×300, 300×1, 300×7, 7×300 — where
+ * the carve stack is deepest and where a shortcut or a braid has almost no room to work), and
+ * **non-square, coprime, prime-sided grids** (37×41, 101×103, 17×31) where a bug in the
+ * `cell ↔ tile` arithmetic that a square grid hides has nowhere left to hide.
+ */
 const SIZES = QUICK
-  ? [[1, 1], [2, 2], [6, 6], [17, 31], [64, 64]]
-  : [[1, 1], [1, 2], [2, 1], [2, 2], [3, 7], [6, 6], [10, 10], [17, 31], [40, 40], [64, 64], [128, 128], [256, 256], [512, 512]];
+  ? [[1, 1], [2, 2], [6, 6], [17, 31], [1, 300], [64, 64]]
+  : [
+      [1, 1], [1, 2], [2, 1], [2, 2], [3, 7], [6, 6], [10, 10], [17, 31],
+      [1, 300], [300, 1], [300, 7], [7, 300], [37, 41], [101, 103],
+      [40, 40], [64, 64], [128, 128], [256, 256], [512, 512],
+    ];
 
 /** Braid fractions: 0 must give a perfect maze, 1 must still be fully connected. */
 const BRAIDS = [0, 0.1, 0.5, 1];
+
+/**
+ * Shortcut densities swept beside the braid fractions: none, and the density the deepest shipped
+ * level asks for (one per 4 cells, detour 4, route keep 0.7). Every campaign level runs the
+ * shortcut pass, so a matrix that never passes `shortcuts` is not testing what the game builds.
+ * Shortcut builds cost several times a plain carve, so they get {@link SHORTCUT_SEED_DIVISOR} of
+ * the seed budget.
+ */
+const SHORTCUTS = [0, 0.25];
+
+/** How much of a size's seed budget the shortcut sweep gets (it is the expensive one). */
+const SHORTCUT_SEED_DIVISOR = 6;
+
+/** Seeds for a size with ≤ this many cells are capped: a 1×1 maze has one shape, not 4 000. */
+const TINY_CELLS = 4;
+
+/** Seed cap for a {@link TINY_CELLS}-or-smaller size. */
+const TINY_SEEDS = 200;
 
 /** Levels built end-to-end through `buildLevel`. */
 const LEVELS = 30;
@@ -84,6 +112,9 @@ function seedsFor(cells) {
   // Roughly constant work per size: the numerator is "cells per size" and the caps keep the small
   // end from ballooning and the huge end from being skipped entirely.
   const n = Math.round((QUICK ? 24000 : 400000) / Math.max(1, cells));
+  // A 1×1, 1×2, 2×1 or 2×2 grid has a handful of possible mazes; 16 000 seeds of it were 55 % of
+  // the old matrix total and proved nothing the first 200 had not. Coverage is shapes, not counts.
+  if (cells <= TINY_CELLS) return Math.min(QUICK ? 40 : TINY_SEEDS, Math.max(2, n));
   return Math.max(2, Math.min(QUICK ? 40 : 4000, n));
 }
 
@@ -129,6 +160,15 @@ function checkMaze(maze, braid, where) {
   if (!v.bordersSealed) fail(where, 'border not sealed');
   if (braid === 0 && v.loops !== 0) fail(where, `perfect maze reported ${v.loops} loops`);
   if (v.loops < 0) fail(where, `negative loop count ${v.loops}`);
+  if (braid === 0) {
+    // Independent of `loops`, which is computed from the same edge scan: a spanning tree over n
+    // cells carves exactly n cells + (n−1) gaps, so `2n − 1` floor tiles is the whole maze. If the
+    // validator's edge count and this count ever disagree, one of them is lying.
+    const perfectFloor = 2 * maze.cols * maze.rows - 1;
+    if (v.floorCount !== perfectFloor) {
+      fail(where, `perfect maze has ${v.floorCount} floor tiles, not the ${perfectFloor} a spanning tree carves`);
+    }
+  }
 
   for (const [name, p] of /** @type {const} */ ([['start', maze.start], ['exit', maze.exit]])) {
     if (!(p.x & 1) || !(p.y & 1)) fail(where, `${name} (${p.x},${p.y}) is off the odd cell lattice`);
@@ -159,30 +199,37 @@ function runMatrix(deadline) {
     const t0 = performance.now();
     const failuresBefore = failures.length;
 
-    outer: for (const braid of BRAIDS) {
-      for (let s = 0; s < seeds; s++) {
-        if (performance.now() > deadline) {
-          truncated = true;
-          break outer;
-        }
-        const seed = s * 2654435761 + cells;
-        const where = `${key} braid=${braid} seed=${seed}`;
-        let maze;
-        try {
-          maze = generateMaze({ cols, rows, seed, braid });
-        } catch (err) {
-          fail(where, `generateMaze threw ${String(err)}`);
-          continue;
-        }
-        checkMaze(maze, braid, where);
-        mazes++;
-        entry.mazes++;
+    outer: for (const density of SHORTCUTS) {
+      const shortcuts = Math.round(cells * density);
+      const budget = density > 0 ? Math.max(2, Math.round(seeds / SHORTCUT_SEED_DIVISOR)) : seeds;
+      for (const braid of BRAIDS) {
+        for (let s = 0; s < budget; s++) {
+          if (performance.now() > deadline) {
+            truncated = true;
+            break outer;
+          }
+          const seed = s * 2654435761 + cells;
+          const where = `${key} braid=${braid} shortcuts=${shortcuts} seed=${seed}`;
+          /** @type {import('../src/maze/generator.js').GenerateParams} */
+          const params = { cols, rows, seed, braid, shortcuts, shortcutDetour: 4, shortcutRouteKeep: 0.7 };
+          let maze;
+          try {
+            maze = generateMaze(params);
+          } catch (err) {
+            fail(where, `generateMaze threw ${String(err)}`);
+            continue;
+          }
+          // Shortcuts add loops exactly as braid does, so only a maze with neither is a tree.
+          checkMaze(maze, braid + shortcuts, where);
+          mazes++;
+          entry.mazes++;
 
-        // Determinism: re-roll the first seed of each combination, plus a periodic sample.
-        if (s === 0 || s % 17 === 0) {
-          const again = generateMaze({ cols, rows, seed, braid });
-          if (hashTiles(maze.tiles) !== hashTiles(again.tiles)) fail(where, 'same seed produced different tiles');
-          if (again.exit.x !== maze.exit.x || again.exit.y !== maze.exit.y) fail(where, 'same seed produced a different exit');
+          // Determinism: re-roll the first seed of each combination, plus a periodic sample.
+          if (s === 0 || s % 17 === 0) {
+            const again = generateMaze(params);
+            if (hashTiles(maze.tiles) !== hashTiles(again.tiles)) fail(where, 'same seed produced different tiles');
+            if (again.exit.x !== maze.exit.x || again.exit.y !== maze.exit.y) fail(where, 'same seed produced a different exit');
+          }
         }
       }
     }
@@ -438,6 +485,7 @@ function runLevels() {
   for (let level = 1; level <= LEVELS; level++) {
     const params = levelParams(level);
     let pathSum = 0;
+    let manhattanSum = 0;
     let walkedSum = 0;
     let reserveWorst = 1;
     let gapWorst = 0;
@@ -471,6 +519,11 @@ function runLevels() {
       const r = checkLevel(data, params, where);
 
       pathSum += data.validation.pathLength;
+      // How much longer the real route is than walking straight from start to exit. It is the one
+      // number that says whether a deep level is *bigger* or only *wider*: braiding cuts the route
+      // hard on purpose (it is the difficulty curve's brake), and this is where that shows.
+      manhattanSum +=
+        Math.abs(data.maze.exit.x - data.maze.start.x) + Math.abs(data.maze.exit.y - data.maze.start.y) + 1;
       walkedSum += r.walk.walked;
       reserveWorst = Math.min(reserveWorst, r.walk.minFuelFraction);
       gapWorst = Math.max(gapWorst, r.walk.maxGap);
@@ -502,6 +555,8 @@ function runLevels() {
       size: `${params.cols}x${params.rows}`,
       cells: params.cols * params.rows,
       path: Math.round(pathSum / n),
+      straight: Math.round(manhattanSum / n),
+      routeRatio: manhattanSum > 0 ? Math.round((pathSum / manhattanSum) * 100) / 100 : 0,
       tank: params.fuelSeconds,
       gems,
       oils,
@@ -553,15 +608,15 @@ console.log(
   `  density fields supplied by balance.js: ${hasDensity.length > 0 ? hasDensity.join(', ') : 'none (src/maze fallbacks in use)'}\n`,
 );
 console.log(
-  `  ${'lvl'.padEnd(4)}${'size'.padEnd(9)}${'path'.padStart(6)}${'tank'.padStart(6)}${'gems'.padStart(6)}${'oil'.padStart(6)}` +
+  `  ${'lvl'.padEnd(4)}${'size'.padEnd(9)}${'path'.padStart(6)}${'/straight'.padStart(10)}${'tank'.padStart(6)}${'gems'.padStart(6)}${'oil'.padStart(6)}` +
     `${'chain'.padStart(7)}${'torch'.padStart(7)}${'maxgap'.padStart(7)}${'limit'.padStart(7)}${'walked'.padStart(8)}${'reserve'.padStart(9)}${'feas'.padStart(7)}${'ms'.padStart(7)}` +
     `${'map min/med/max'.padStart(17)}`,
 );
-console.log(`  ${'-'.repeat(112)}`);
+console.log(`  ${'-'.repeat(122)}`);
 for (const l of campaign.levels) {
   if (l.level > 12 && l.level % 3 !== 0 && l.level !== LEVELS) continue; // keep the table readable
   console.log(
-    `  ${String(l.level).padEnd(4)}${l.size.padEnd(9)}${String(l.path).padStart(6)}${String(l.tank).padStart(6)}` +
+    `  ${String(l.level).padEnd(4)}${l.size.padEnd(9)}${String(l.path).padStart(6)}${`${l.routeRatio}×`.padStart(10)}${String(l.tank).padStart(6)}` +
       `${String(l.gems).padStart(6)}${String(l.oils).padStart(6)}${String(l.chainFlasks).padStart(7)}${String(l.torches).padStart(7)}` +
       `${String(l.maxGap).padStart(7)}${String(l.gapLimit).padStart(7)}${String(l.walked).padStart(8)}${`${(l.reserve * 100).toFixed(0)}%`.padStart(9)}` +
       `${l.feasibility.toFixed(2).padStart(7)}${l.msPerBuild.toFixed(1).padStart(7)}` +
@@ -581,6 +636,20 @@ console.log(
   `\n  worst torch reserve across the campaign: ${(campaign.worstReserve * 100).toFixed(1)} % of the tank` +
     `   ·   worst walked/available fuel: ${campaign.worstFeasibility.toFixed(2)}`,
 );
+{
+  // `path/straight` is the route against the straight-line (Manhattan) distance from start to
+  // exit. Deep levels stop growing in route length long before they stop growing in area — that is
+  // the braid ramp doing its job (`LEVEL.BRAID_MAX`, a balance decision), but it belongs in the
+  // report rather than folded invisibly into "path".
+  const first = campaign.levels[0];
+  const last = campaign.levels[campaign.levels.length - 1];
+  const deepest = campaign.levels.reduce((a, b) => (b.path > a.path ? b : a), first);
+  console.log(
+    `  route vs straight line: level 1 ${first.routeRatio}× (${first.path} tiles), ` +
+      `level ${last.level} ${last.routeRatio}× (${last.path} tiles), ` +
+      `longest route at level ${deepest.level} (${deepest.path} tiles)`,
+  );
+}
 
 const report = {
   total: matrix.mazes + campaign.built,

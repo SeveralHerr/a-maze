@@ -19,6 +19,7 @@ import { createRng } from '../core/rng.js';
 import { clamp, clamp01, wrapAngle } from '../core/math.js';
 import { createHud } from './hud.js';
 import { createMenus } from './menus.js';
+import { PREVIEW_SCREENS, reachScreen } from './preview-nav.js';
 import { COLOR, drawText, faceInfo, fontMetrics, glyphMask } from './font.js';
 
 /** @typedef {import('../core/types.js').GameState} GameState */
@@ -376,70 +377,23 @@ let uiSoundCount = 0;
  * @returns {void}
  */
 function setScreen(name) {
-  switch (name) {
-    case 'title':
-      state.phase = 'title';
-      break;
-    case 'loading':
-      state.phase = 'loading';
-      break;
-    case 'pause':
-      state.phase = 'paused';
-      break;
-    case 'confirm':
-      // Pause → Quit to Title opens the abandon dialog. Pause rows: Resume, Options, Controls, Quit.
-      state.phase = 'paused';
-      menus.render(state);
-      menus.handleInput(frameWith('up'), state);
-      menus.handleInput(frameWith('confirm'), state);
-      break;
-    case 'complete':
-      state.phase = 'levelComplete';
-      state.run.levelScore = 500 * state.level + Math.floor(state.run.fuel) * 10 * state.level;
-      state.run.score += state.run.levelScore;
-      break;
-    case 'gameover':
-      state.phase = 'gameOver';
-      state.run.fuel = 0;
-      state.run.score = 13100;
-      state.best.score = 13100;
-      break;
-    case 'options':
-    case 'controls':
-    case 'credits':
-    case 'shrine': {
-      // The sub-screens are internal to `menus`; reach them the way a player does — Down to a row and
-      // confirm — and find the row by what it opens rather than by a remembered position: the step
-      // counts this used to hard-code went stale when the Shrine joined the title list, and every
-      // sub-screen deep link then showed its neighbour. Row 0 (Descend) would start a run: skipped.
-      state.phase = 'title';
-      menus.render(state);
-      for (let row = 1; row < 8; row++) {
-        for (let i = 0; i < row; i++) menus.handleInput(frameWith('down'), state);
-        menus.handleInput(frameWith('confirm'), state);
-        menus.render(state);
-        if (menus.screen() === name) break;
-        // Wrong row: back out to the title (which remembers the row) and walk back up to Descend.
-        if (menus.screen() !== 'title') menus.handleInput(frameWith('back'), state);
-        for (let i = 0; i < row; i++) menus.handleInput(frameWith('up'), state);
-        menus.render(state);
-      }
-      break;
-    }
-    case 'boon':
-      // Level complete with a boon waiting: skip the tally, then take the "Choose a Boon" row.
-      state.phase = 'levelComplete';
-      state.run.levelScore = 500 * state.level + Math.floor(state.run.fuel) * 10 * state.level;
-      menus.render(state);
-      menus.handleInput(frameWith('confirm'), state);
-      menus.render(state);
-      menus.handleInput(frameWith('confirm'), state);
-      break;
-    case 'font':
-      break;
-    default:
-      state.phase = 'playing';
-      break;
+  // The numbers each screen needs; the navigation itself is `reachScreen`, which is shared with
+  // `preview-nav.test.mjs` so that every documented value is proven to land where it says.
+  if (name === 'complete') {
+    state.run.levelScore = 500 * state.level + Math.floor(state.run.fuel) * 10 * state.level;
+    state.run.score += state.run.levelScore;
+  } else if (name === 'boon') {
+    state.run.levelScore = 500 * state.level + Math.floor(state.run.fuel) * 10 * state.level;
+  } else if (name === 'gameover') {
+    state.run.fuel = 0;
+    state.run.score = 13100;
+    state.best.score = 13100;
+  }
+  const reached = reachScreen(menus, state, name, frameWith);
+  const want = /** @type {any} */ (PREVIEW_SCREENS)[name];
+  if (want !== undefined && reached !== want) {
+    // Loud, not silent: a screenshot of the wrong screen is worse than no screenshot.
+    console.error(`preview: ?screen=${name} reached "${reached}", expected "${want}"`);
   }
   state.phaseTime = 0;
 }

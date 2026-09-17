@@ -667,6 +667,103 @@ function findRowY(h, key) {
   return -1;
 }
 
+test('pause reopens on Resume after a visit to Options (the reflex Esc, Enter)', () => {
+  const { menus, log } = harness();
+  const state = makeState('paused');
+  menus.render(state);
+  // Down to Options (rows: Resume, Auto Explore, Options, ...), open it, come back.
+  menus.handleInput(press('down'), state);
+  menus.handleInput(press('down'), state);
+  menus.handleInput(press('confirm'), state);
+  menus.render(state);
+  assert.equal(menus.screen(), 'options');
+  menus.handleInput(press('back'), state);
+  // Navigation between closing a sub-screen and the next frame must survive it: two ups from
+  // Options is Resume, and the frame that follows used to restore the remembered row over them.
+  menus.handleInput(press('up'), state);
+  menus.handleInput(press('up'), state);
+  menus.render(state);
+  assert.equal(menus.screen(), 'pause');
+  log.length = 0;
+  menus.handleInput(press('confirm'), state);
+  assert.deepEqual(log.filter((e) => e === 'resume'), ['resume'], 'Enter resumes, it does not reopen Options');
+
+  // Back into play and paused again: the pause screen opens on Resume, whatever was last selected.
+  state.phase = 'playing';
+  menus.render(state);
+  state.phase = 'paused';
+  menus.render(state);
+  log.length = 0;
+  menus.handleInput(press('confirm'), state);
+  assert.deepEqual(log.filter((e) => e === 'resume'), ['resume'], 'Esc then Enter resumes');
+  assert.equal(menus.screen(), 'pause');
+});
+
+test('the abandon dialog always opens on Keep Going, even after a replace dialog', () => {
+  const { menus, log } = harness({ level: 4, score: 900 });
+  const state = makeState('title');
+  menus.render(state);
+  // New Descent → the replace dialog; move to "Start Over" and leave without pressing it.
+  menus.handleInput(press('down'), state);
+  menus.handleInput(press('confirm'), state);
+  menus.render(state);
+  assert.equal(menus.screen(), 'confirm');
+  menus.handleInput(press('down'), state);
+  menus.handleInput(press('back'), state);
+  menus.render(state);
+  // The abandon dialog shares the screen id; it must still open on its safe answer.
+  state.phase = 'paused';
+  menus.render(state);
+  for (let i = 0; i < 5; i++) menus.handleInput(press('down'), state);
+  menus.handleInput(press('confirm'), state); // Abandon Run
+  menus.render(state);
+  assert.equal(menus.screen(), 'confirm');
+  menus.handleInput(press('confirm'), state);
+  menus.render(state);
+  assert.equal(menus.screen(), 'pause', 'the first row is Keep Going');
+  assert.equal(log.includes('quit'), false);
+  assert.equal(log.includes('newGame'), false);
+});
+
+test('title rows: the gap between two labels belongs to the nearer of them', () => {
+  const canvas = liveCanvas(1280, 720);
+  const menus = createMenus(canvas, { onUiSound: () => {} });
+  menus.resize(1280, 720, 1);
+  const state = makeState('title');
+  menus.render(state);
+  /** @type {any[]} */
+  const boxes = [];
+  setLayoutProbe((kind, x, y, w, h, unit, label) => boxes.push({ kind, x, y, w, h, unit, label }));
+  try {
+    menus.render(state);
+  } finally {
+    setLayoutProbe(null);
+  }
+  const shrine = boxes.find((b) => b.kind === 'text' && b.label === 'Shrine');
+  const options = boxes.find((b) => b.kind === 'text' && b.label === 'Options');
+  assert.ok(shrine !== undefined && options !== undefined, 'both rows were laid out');
+  const m = menus.surface.metrics;
+  const toClientY = (/** @type {number} */ uiY) => ((uiY + 0.5) * m.px * m.cssH) / m.devH;
+  const toClientX = (/** @type {number} */ uiX) => ((uiX + 0.5) * m.px * m.cssW) / m.devW;
+  const mid = (shrine.y + shrine.h + options.y) / 2;
+  const x = toClientX(Math.round(m.w / 2));
+  /** @param {number} uiY @returns {string} */
+  const clickAt = (uiY) => {
+    const fresh = createMenus(liveCanvas(1280, 720), { onUiSound: () => {} });
+    fresh.resize(1280, 720, 1);
+    const st = makeState('title');
+    fresh.render(st);
+    const y = toClientY(uiY);
+    fresh.handlePointer({ type: 'pointerdown', clientX: x, clientY: y });
+    fresh.handlePointer({ type: 'pointerup', clientX: x, clientY: y });
+    fresh.render(st);
+    return fresh.screen();
+  };
+  assert.equal(clickAt(Math.floor(mid) - 1), 'shrine', 'just above the midpoint is still Shrine');
+  assert.equal(clickAt(Math.ceil(mid) + 1), 'options', 'just below it is Options');
+  assert.equal(clickAt(options.y - 1), 'options', 'a pixel over the "Options" ink is Options');
+});
+
 test('options: clicking a word of the Map row writes THAT value, not the next one', () => {
   resetMapMode();
   const h = optionsHarness(1280, 720, 1);
@@ -1167,11 +1264,15 @@ test('boon: opens itself after the tally, claims the chosen card, and Descend ne
   menus.handleInput(press('back'), state); // Decide Later
   menus.render(state);
   assert.equal(menus.screen(), 'complete');
-  // First row is now "Choose a Boon"; Descend (second row) shows the boon instead of forfeiting it.
+  // First row is now "Choose a Boon"; Descend (second row) asks before leaving the gift behind.
   menus.handleInput(press('down'), state);
   menus.handleInput(press('confirm'), state);
   menus.render(state);
   assert.equal(log.includes('nextLevel'), false);
+  assert.equal(menus.screen(), 'confirm', 'Descend after a Decide Later asks first');
+  // Its safe answer is the cards.
+  menus.handleInput(press('confirm'), state);
+  menus.render(state);
   assert.equal(menus.screen(), 'boon');
   menus.handleInput(press('right'), state);
   menus.handleInput(press('confirm'), state);
@@ -1181,6 +1282,49 @@ test('boon: opens itself after the tally, claims the chosen card, and Descend ne
   assert.equal(menus.screen(), 'complete');
   menus.handleInput(press('confirm'), state);
   assert.ok(log.includes('nextLevel'), 'with the boon claimed, Descend descends');
+});
+
+test('boon: Decide Later really defers — the next Descend confirms, then goes (§4.9)', () => {
+  for (const [row, verb] of [[1, 'nextLevel'], [3, 'saveQuit']]) {
+    const log = /** @type {string[]} */ ([]);
+    const menus = createMenus(null, {
+      unlocks: CATALOGUE,
+      onClaimBoon: (id) => log.push(`claim:${id}`),
+      onNextLevel: () => log.push('nextLevel'),
+      onSaveQuit: () => log.push('saveQuit'),
+      onUiSound: (t) => log.push(`sfx:${t}`),
+    });
+    const state = /** @type {any} */ (makeState('levelComplete'));
+    state.settings.reducedMotion = true; // no tally to skip
+    state.progress = { purse: 0, ranks: {}, boonLevel: 0 };
+    state.offer = { open: true, level: 3, ids: ['reservoir', 'chalk', 'magnet'] };
+    menus.render(state);
+    // Rows: Choose a Boon, Descend, Shrine, Save & Quit. The first attempt shows the cards.
+    for (let i = 0; i < row; i++) menus.handleInput(press('down'), state);
+    menus.handleInput(press('confirm'), state);
+    menus.render(state);
+    assert.equal(menus.screen(), 'boon', `${verb}: the cards are shown before anything is lost`);
+    menus.handleInput(press('back'), state); // Decide Later
+    menus.render(state);
+    assert.equal(menus.screen(), 'complete');
+    // Second attempt: one confirmation, safe answer first.
+    menus.handleInput(press('confirm'), state);
+    menus.render(state);
+    assert.equal(menus.screen(), 'confirm');
+    assert.equal(log.includes(verb), false, `${verb}: nothing happens until the dialog is answered`);
+    // Back cancels it and keeps the boon.
+    menus.handleInput(press('back'), state);
+    menus.render(state);
+    assert.equal(menus.screen(), 'complete');
+    assert.equal(log.includes(verb), false);
+    // And the second row goes on without it, exactly once.
+    menus.handleInput(press('confirm'), state);
+    menus.render(state);
+    menus.handleInput(press('down'), state);
+    menus.handleInput(press('confirm'), state);
+    assert.deepEqual(log.filter((e) => e === verb), [verb], `${verb}: leaves when asked to`);
+    assert.equal(log.some((e) => e.startsWith('claim')), false, 'nothing was claimed');
+  }
 });
 
 test('title with a saved run: Continue first, and New Descent asks before overwriting it (§4.10)', () => {

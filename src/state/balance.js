@@ -21,9 +21,10 @@
  * derived from `PLAYER.WALK_SPEED` so re-tuning the walk speed keeps the game coherent.
  *
  * ## Massive mazes (design change)
- * Levels are now 16×16 cells (33×33 tiles) growing to 128×128 cells (257×257 tiles, ≈ 33 000 floor
- * tiles) at `CAP_LEVEL`, and the torch is a **small tank you keep refilling** rather than a budget
- * for the whole level. The two tables that carry that change are `LEVEL` (size, braid, item
+ * Levels are now 10×10 cells on the lean first floor and 24×24 (49×49 tiles) at level 2, growing to
+ * 128×128 cells (257×257 tiles, ≈ 33 000 floor tiles) at `CAP_LEVEL`, and the torch is a **small tank
+ * you keep refilling** (95 s on level 1, 113 s on level 2, 150 s at the cap) rather than a budget for
+ * the whole level. The two tables that carry that change are `LEVEL` (size, braid, item
  * densities) and `FUEL` (tank, flask value, the chainability arithmetic). Read those two doc
  * comments before touching a number in either.
  */
@@ -71,6 +72,15 @@ export const PLAYER = Object.freeze({
    * immediate, low enough to round off the first and last frame of a tap — the "slight ease".
    */
   TURN_EASE_RATE: 18,
+  /**
+   * Smoothing rate (1/s) used instead of `TURN_EASE_RATE` when the turn command drops or reverses
+   * (the key was let go, or the other one pressed). With one shared 18/s ease a released turn key
+   * coasted the view on by `TURN_SPEED / 18` = 0.22 rad (10.9° measured from a 90° turn) — in a game
+   * made of 90° corners that is an overshoot to correct on every one, where Wolfenstein and Doom stop
+   * dead. At 45/s the coast is `4 / 45` ≈ 0.09 rad (≈ 5°), still rounded rather than a snap.
+   * `sim.test.mjs` pins the coast under 6°.
+   */
+  TURN_RELEASE_RATE: 45,
   /**
    * Maximum displacement per collision substep, in tiles. Must be < RADIUS so that a body flush
    * against a wall can never push its centre past the wall's mid-plane in one substep, and well
@@ -189,8 +199,9 @@ export const SIM = Object.freeze({
  * A tank sized to cover a level turns a big maze into one long countdown: the first two minutes
  * are free and the last thirty seconds are the game. With mazes up to 128×128 cells (≈ 33 000
  * floor tiles) that failure mode is total — a level-15 budget would have to be ~11 minutes of
- * fuel, and nothing would ever be tense. So the tank is **fixed at ~110 s (level 1) rising to
- * ~150 s (the size cap)** whatever the maze measures, and *oil flasks are the economy*: their
+ * fuel, and nothing would ever be tense. So the tank is **fixed at 95 s on the lean first floor,
+ * 113 s on level 2 and 150 s at the size cap** whatever the maze measures (a flask is 33 s on
+ * level 1, 40 s on level 2 and 66 s at the cap), and *oil flasks are the economy*: their
  * count scales with area so their density is roughly constant, and the player is always 60–90 s
  * from darkness no matter how deep they are.
  *
@@ -214,7 +225,7 @@ export const FUEL = Object.freeze({
   /**
    * Fraction of `fuelMax` at or below which `derived.lowFuel` is true (mirrored by `src/ui/hud.js`
    * as `LOW_FUEL_FRACTION` — §4.6; raise both together).
-   * On the tank that is 27 s at level 1 and 37 s at the cap — ~88–120 tiles of walking, i.e.
+   * On the tank that is 24 s at level 1 and 37 s at the cap — ~78–120 tiles of walking, i.e.
    * a warning long enough to reach the next flask but short enough to feel like an alarm.
    * Raised from 0.20: measured on real levels the tank bottomed out at 24–41 % on a competent run,
    * so at 0.20 the heartbeat, the red vignette, the HUD LOW chip and the torch-radius collapse were
@@ -231,7 +242,8 @@ export const FUEL = Object.freeze({
   /**
    * Fuel-seconds an oil flask restores, as a fraction of the tank, **on level 1's tank**
    * (`TANK_START`). The fraction climbs to `OIL_FRACTION_END` as the tank grows to `TANK_END`, so a
-   * flask is 38 s at level 1 and 66 s at the size cap (see `oilFuel`).
+   * flask is 40 s on level 2 and 66 s at the size cap (see `oilFuel`). The lean first floor has its
+   * own, smaller tank (`LEVEL.FIRST_TANK`, 95 s), so a flask there is 33 s.
    */
   OIL_FRACTION: 0.35,
   /**
@@ -257,13 +269,17 @@ export const FUEL = Object.freeze({
   OIL_MIN: 25,
   /** Upper clamp on an oil flask's value, in fuel-seconds (above the curve's 66 s at the cap). */
   OIL_MAX: 70,
-  /** Tank size on level 1, in fuel-seconds. */
+  /**
+   * Tank size the size curve starts from, in fuel-seconds — **level 2's tank**, not level 1's: the
+   * lean first floor has its own, shorter one (`LEVEL.FIRST_TANK`, 95 s) and level 2 sits one step
+   * up the ramp at 113 s. `oilFuel` prices a flask against this number too.
+   */
   TANK_START: 110,
   /** Tank size once the maze stops growing (`CAP_LEVEL`), in fuel-seconds. */
   TANK_END: 150,
   /**
-   * Extra drain per level once the ramp starts (`LEVEL.DRAIN_RAMP_START`): 1.15× on level 10,
-   * 1.3× at the size cap, `DRAIN_MAX` from level 17.
+   * Extra drain per level once the ramp starts (`LEVEL.DRAIN_RAMP_START`): 1.25× on level 10 and
+   * `DRAIN_MAX` (1.35×) from level 13.
    *
    * The ramp used to start at `CAP_LEVEL`, which meant drain was exactly 1 across the entire
    * playable curve — and because the tank (110→150 s) and the flask (35 % of the tank) scale
@@ -279,18 +295,33 @@ export const FUEL = Object.freeze({
    * scatter flasks); the depth trend proper comes from `OIL_FRACTION_END`, `GAP_SAFETY_END`,
    * and `LEVEL.OIL_CELLS_END` together.
    *
-   * Measured with the real reducer (60 Hz, 15 seeds × levels 1–20, a 2× wanderer that makes 20-tile
-   * side excursions and a walker that never leaves the solution path): the wanderer's lowest tank
-   * averages ~0.66 on levels 1–2 and ~0.49 on levels 10–12 and ~0.40 past the cap, `lowFuel` starts
-   * firing around level 8, and the wanderer won all of its runs. The path-only walker — which ignores
-   * even a flask one tile off the path — lost 1 run in ~400 (it had walked past the early flasks on a
-   * full tank). `feasibility.test.mjs` pins the trend. Thinner scatter (`OIL_CELLS_END` 36–60) or
-   * more chain headroom (0.85–0.9) deepened the dip further but lost several percent of the
-   * path-only runs from level 14 on, which is where tense turns into unfair.
+   * Retuned (0.015 → 0.03 → 0.035, and the ramp's start `CAP_LEVEL` → 5 → 3) because the curve
+   * measured flat *and out of order*. Over levels 1–12 (3 seeds each, driven through the real
+   * reducer with keyboard turning, a 2× wanderer making 16-tile side excursions) the lowest tank was
+   * 0.49 on level 1, 0.65–0.74 on levels 2–4 and 0.40–0.56 on levels 5–11: the lean first floor was
+   * the tightest of the early floors, level 10 was no tenser than level 5, and the `lowFuel` alarm
+   * never fired between levels 2 and 11.
+   *
+   * With the ramp starting at level 3 at 0.035 — and the first floor's tank and flask density raised
+   * (`LEVEL.FIRST_TANK`, `LEVEL.FIRST_OIL_CELLS`) and the chain headroom flattened (`GAP_SAFETY`) —
+   * the same measurement reads 0.62 on level 1, 0.65–0.73 on levels 2–4, 0.38–0.59 on levels 5–8 and
+   * 0.36–0.49 on levels 11–12, with the alarm firing from level 6 down. `feasibility.test.mjs` pins
+   * the trend and that every 2× wanderer still wins.
+   *
+   * Steeper measured as unfair rather than tense: at 0.045 from level 2, a walker who never steps off
+   * the solution path — and so never takes a flask one tile beside it — lost 3 of 3 runs on levels 11
+   * and 12, against 2 of 36 runs here.
    */
-  DRAIN_PER_LEVEL: 0.03,
-  /** Hard ceiling on the drain multiplier — past this the game is unreadable, not hard. */
-  DRAIN_MAX: 1.35,
+  DRAIN_PER_LEVEL: 0.035,
+  /**
+   * Hard ceiling on the drain multiplier — past this the game is unreadable, not hard. Raised from
+   * 1.35 with the earlier, steeper ramp: at 1.35 the drain saturated at level 13, *before* the size
+   * cap, so every floor past the cap burned exactly the same and `oilTargetGap` stopped narrowing.
+   * At 1.45 the ramp finishes at level 16, one floor past the cap, which keeps the post-cap tail
+   * (where the maze can no longer grow) tightening for one more floor before density and braid are
+   * all that is left.
+   */
+  DRAIN_MAX: 1.45,
   /**
    * How far a player who cannot see the maze walks, as a multiple of the optimal route. 2.0 is
    * the figure the feasibility autopilot is held to: it walks the real solution path and spends
@@ -303,18 +334,25 @@ export const FUEL = Object.freeze({
    */
   TRAVEL_OVERHEAD: 1.18,
   /**
-   * Headroom on `oilTargetGap` **on level 1**: the placement guarantee is 30 % tighter than the
+   * Headroom on `oilTargetGap` **on level 1**: the placement guarantee is 38 % tighter than the
    * distance a flask strictly pays for, so a new player who arrives at a flask on fumes still has
    * slack for the next leg. Ramps to `GAP_SAFETY_END` over the size curve (`gapSafety`).
+   *
+   * Tightened from 0.7/0.8, and flattened, when the drain ramp took over the depth trend: the chain
+   * is what a player who walks the route actually lives on, and spending its generosity at depth
+   * *and* burning faster at depth is the same lever pulled twice. At 0.62 flat the deep floors keep
+   * their tension from the drain (lowest tank 0.36–0.49 on levels 11–12) while the path-only
+   * walker's losses fell from 3 runs in 36 to 2 (see `DRAIN_PER_LEVEL`).
    */
-  GAP_SAFETY: 0.7,
+  GAP_SAFETY: 0.62,
   /**
    * Headroom on `oilTargetGap` at the size cap. Always < 1, so the guarantee still closes with slack
-   * at every depth — the ramp only spends the *generosity*, never the proof. `src/maze/populate.js`
-   * applies its own 0.9 chain safety under this (it may only tighten), so values above ~0.9 buy
-   * nothing. 0.85 measured as deaths for a flask-blind walker past the cap (see `DRAIN_PER_LEVEL`).
+   * at every depth. `src/maze/populate.js` applies its own 0.9 chain safety under this (it may only
+   * tighten), so values above ~0.9 buy nothing, and 0.85 measured as deaths for a flask-blind walker
+   * past the cap (see `DRAIN_PER_LEVEL`). Equal to `GAP_SAFETY` now that the drain carries the depth
+   * trend; they stay two knobs because `gapSafety` ramps between them.
    */
-  GAP_SAFETY_END: 0.8,
+  GAP_SAFETY_END: 0.62,
   /**
    * Par-time wander factor. `levelParams().par` is only a **floor** — `src/maze/populate.js` knows
    * the level's real shortest path and derives the honest par from it — so this stays deliberately
@@ -362,12 +400,41 @@ export const SCORE = Object.freeze({
 export const AUTO = Object.freeze({
   /** Tank fraction below which the nearest known oil flask outranks everything else. */
   REFUEL_AT: 0.5,
-  /** Tank fraction below which a seen flask within `ITEM_DETOUR` is picked up on the way. */
-  TOPUP_AT: 0.75,
+  /**
+   * Tank fraction below which a seen flask within `ITEM_DETOUR` is picked up on the way. Not higher:
+   * a flask drunk into a nearly full tank loses the overflow (`takeItem` clamps the gain to the
+   * tank), and at 0.9 the pilot spent its detours filling a quarter of a flask at a time — measured
+   * over levels 1–10 × 8 seeds that alone dropped the clear rate from 74 % to 60 %.
+   */
+  TOPUP_AT: 0.6,
+  /**
+   * How many times the distance to the nearest known flask the tank must still cover for the pilot
+   * to keep exploring instead of going for it. The trip is one length; the second is the leg out of
+   * the flask toward the next one, which the placement guarantee (§1) sizes from a full flask.
+   */
+  REFUEL_MARGIN: 1.5,
+  /**
+   * Tiles of slack added to that rule, for the turning and backtracking a route costs over its path
+   * length. Measured over levels 1–10 × 8 seeds, the fraction rule alone cleared 74 % of runs; the
+   * distance rule, this margin, `TOPUP_AT` and the `SMELL_AT` valve together clear 79 of 80.
+   */
+  REFUEL_RESERVE_TILES: 16,
   /** Hysteresis above `REFUEL_AT` at which a refuel trip is abandoned (the tank is fine again). */
   REFUEL_HYSTERESIS: 0.15,
   /** Tank fraction below which, with no known flask, the exit (if seen) is taken at once. */
   DESPERATE_AT: 0.2,
+  /**
+   * Tank fraction below which, with no flask on any *explored* tile, the pilot walks to the nearest
+   * flask on the level whether or not the fog has lifted off it (autopilot.js's survival valve). The
+   * one place Auto Explore looks past the fog: a watch mode that runs the torch dry costs the player
+   * their saved run, and a fog-bound explorer in a 128×128 labyrinth reliably strands itself — it
+   * drinks its neighbourhood dry, then explores until the torch dies with no flask in sight.
+   *
+   * High, and measured: over levels 1–10 × 8 seeds the clear rate went 74 % (no valve) → 91 % at
+   * 0.35 → 95 % at 0.65 → 98.75 % at 0.75. Above that it fetches oil it does not need yet and
+   * stops exploring, which is what the mode is *for*.
+   */
+  SMELL_AT: 0.75,
   /** Path tiles a seen gem or the map scroll may be off the way to still be worth a detour. */
   ITEM_DETOUR: 14,
   /** Nearest frontier tiles the planner collects before choosing among the tied ones. */
@@ -461,6 +528,19 @@ export const ATTRACT = Object.freeze({
   SWAY_AMP: 0.045,
   /** Frequency (Hz) of the idle yaw sway. */
   SWAY_HZ: 0.13,
+  /**
+   * Heading error (radians) beyond which the sway has faded out completely (`swayAt`): the sway is a
+   * breath on a shot already on its line, not a second steering input, so it contributes nothing
+   * while the camera is turning into a corner or standing still (it fades in with speed too).
+   *
+   * Measured, in case the same suspicion comes round again: the title camera's turn rate reverses
+   * ~35 times a minute over six minutes of a real level-3 demo maze — with the sway gated (35.2),
+   * added flat as it used to be (34.8) and switched off entirely (34.8). Those reversals are the
+   * *maze's corners* (470 tiles walked, a turn every two or three), not the sway and not hunting;
+   * `sim.test.mjs` therefore gates the hunting where it would actually show, on a long straight,
+   * where the only sign changes left are the sway's own two per period.
+   */
+  SWAY_SETTLED: 0.1,
   /** Relative weight given to "keep going straight" when choosing the next corridor tile. */
   STRAIGHT_WEIGHT: 3,
   /** Relative weight given to a turn. */
@@ -472,9 +552,10 @@ export const ATTRACT = Object.freeze({
 /**
  * Maze size / contents curve — **massive mazes** (supersedes the 6×6…40×40 curve).
  *
- * Level 1 is 16×16 cells (33×33 tiles, ≈ 4× the area of the old level 1) and every level adds 8
- * cells per side up to `MAX_CELLS` = 128 (257×257 tiles, 16 384 cells, ≈ 33 000 floor tiles),
- * reached at `CAP_LEVEL`. Generating **and** validating a 128×128 maze measures ~5 ms, and
+ * Level 1 is the lean first floor — 10×10 cells (21×21 tiles), cleared in about 1–1.5 minutes. The
+ * curve proper starts at level 2 with `BASE_CELLS + GROWTH` = 24×24 cells and adds 8 cells per side
+ * per level up to `MAX_CELLS` = 128 (257×257 tiles, 16 384 cells, ≈ 33 000 floor tiles), reached at
+ * `CAP_LEVEL`. Generating **and** validating a 128×128 maze measures ~5 ms, and
  * `tools/stress.mjs` proves the engine to 2000×2000 cells, so the cap is purely a balance
  * decision: `MAX_CELLS` is the single documented knob for it.
  */
@@ -485,15 +566,26 @@ export const LEVEL = Object.freeze({
    */
   BASE_CELLS: 16,
   /**
-   * The first floor (unlocks wave, ARCHITECTURE.md §1): a small 10×10-cell labyrinth with a short
-   * tank and thin pickings, so a new player learns the torch loop in about a minute and the first
-   * boon arrives quickly. Only level 1 reads the `FIRST_*` numbers.
+   * The first floor (unlocks wave, ARCHITECTURE.md §1): a small 10×10-cell labyrinth with thinner
+   * pickings than the curve, cleared in about 1–1.5 minutes, so a new player learns the torch loop
+   * quickly and the first boon arrives soon after. Only level 1 reads the `FIRST_*` numbers.
    */
   FIRST_CELLS: 10,
-  /** Tank on the first floor, seconds (the curve's `FUEL.TANK_START` resumes on level 2). */
-  FIRST_TANK: 80,
-  /** Cells per scatter flask on the first floor (the refuel chain still places what it needs). */
-  FIRST_OIL_CELLS: 34,
+  /**
+   * Tank on the first floor, seconds (the curve's `FUEL.TANK_START` resumes on level 2). Raised from
+   * 80: at 80 the *first* floor was the tightest of the first four — a 2× wanderer's lowest tank
+   * averaged 0.49 there against 0.65–0.74 on levels 2–4, and one seed reached 16 % — which is the
+   * wrong end of the curve to put the first squeeze on. At 95 it measures 0.62, the most generous
+   * floor in the game, as the first floor should be (`FUEL.DRAIN_PER_LEVEL` has the measurements).
+   */
+  FIRST_TANK: 95,
+  /**
+   * Cells per scatter flask on the first floor (the refuel chain still places what it needs).
+   * Denser than the curve's `OIL_CELLS_START` on purpose: a 10×10 floor is 100 cells, so this is the
+   * difference between three scatter flasks and four on the floor where the player is still learning
+   * what a flask is for.
+   */
+  FIRST_OIL_CELLS: 26,
   /** Scatter-flask floor on the first floor (the level curve's `OIL_MIN` is 6). */
   FIRST_OIL_MIN: 3,
   /** Gem floor on the first floor (the level curve's `GEM_MIN` is 6). */
@@ -570,7 +662,7 @@ export const LEVEL = Object.freeze({
    * measurements exposed: with a linear ramp, levels 3–4 carried 765- and 1048-tile routes (up to
    * 18 minutes) against level 15's 1014, because the maze was still nearly perfect while the side
    * was already 32–40 cells. A square-root ramp brings those two down to ≈ 490 and ≈ 505 tiles and
-   * leaves the curve rising from ~4 minutes (level 1) to ~14 (the cap).
+   * leaves the curve rising from ~1–1.5 minutes (the lean first floor) and ~4 (level 2) to ~14 (the cap).
    */
   BRAID_RAMP_SHAPE: 0.5,
   /**
@@ -597,10 +689,12 @@ export const LEVEL = Object.freeze({
   /**
    * First level at which the torch's drain multiplier starts climbing (`FUEL.DRAIN_PER_LEVEL`).
    * Levels 1…`DRAIN_RAMP_START` burn at exactly 1×, which is the "generous" half of the curve;
-   * from here on the same route costs measurably more torch. Deliberately well before `CAP_LEVEL`
-   * so the ramp is felt inside the playable curve rather than only in the post-cap tail.
+   * from here on the same route costs measurably more torch. Lowered from 5 to 3: at 5 the pressure
+   * only actually arrived at level 12, so levels 5–10 all played the same
+   * (`FUEL.DRAIN_PER_LEVEL` carries the measurements). Three floors at 1× is the teaching run — the
+   * lean first floor and the two full-size ones after it.
    */
-  DRAIN_RAMP_START: 5,
+  DRAIN_RAMP_START: 3,
   /** Cells per oil flask on level 1 (density ≈ one flask per 20 cells). */
   OIL_CELLS_START: 20,
   /**
@@ -678,6 +772,26 @@ export function drainRate(level) {
   const lv = levelNumber(level);
   const past = Math.max(0, lv - LEVEL.DRAIN_RAMP_START);
   return Math.min(FUEL.DRAIN_MAX, 1 + past * FUEL.DRAIN_PER_LEVEL);
+}
+
+/**
+ * The idle yaw sway to add to a heading error, in radians: full amplitude on a settled shot at
+ * cruise, nothing while the camera is turning into a corner or standing still.
+ *
+ * Lives here, with the numbers, because both the title camera (`sim.js` `stepAttractBody`) and Auto
+ * Explore (`autopilot.js`) sway — and ARCHITECTURE.md §4.10 requires the pilot to move like the
+ * title camera, which it cannot do if the two compute their sway differently.
+ * @param {number} t seconds of sway clock
+ * @param {number} err heading error, radians
+ * @param {number} speed current forward speed, tiles/s
+ * @returns {number} radians
+ */
+export function swayAt(t, err, speed) {
+  const e = err < 0 ? -err : err;
+  if (!(e < ATTRACT.SWAY_SETTLED)) return 0;
+  const settled = 1 - e / ATTRACT.SWAY_SETTLED;
+  const moving = clamp01(speed / ATTRACT.SPEED);
+  return Math.sin(t * Math.PI * 2 * ATTRACT.SWAY_HZ) * ATTRACT.SWAY_AMP * settled * moving;
 }
 
 /**

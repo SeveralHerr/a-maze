@@ -9,17 +9,24 @@
  * scratch lives in module-level typed arrays, reused across calls — safe because a step is a
  * single synchronous call and the game is single-threaded.
  *
- * That includes most **number boxing**, which is the easy one to miss. JS calls use a tagged
- * convention, so a non-integer passed as an argument to a function the compiler does not inline
- * becomes a fresh HeapNumber on every call. The big per-step functions (`stepPlaying`,
- * `stepAttract`, `moveCircle`, `hasLineOfSight`) are therefore thin exported wrappers that park their
- * floats in module-level `Float64Array` slots and call a body that reads them back, and the reducer
- * hands `dt` over the same way (`stepDt`), and the reducer empties `state.events` without releasing
- * its backing store (`game.js` `clearEvents`). Measured without GC over 400 000-tick chunks, a step
- * standing still or turning in place allocates < 1 B (it was 48–64 B, and ~9 B more while turning);
- * what remains while walking is the footstep `GameEvent` itself, ~2–4 B/tick averaged. That is
- * short-lived young-generation garbage; `perf.test.mjs` pins turning < 2 B/tick and walking below
- * the cost of one object per step, and separately proves that 100 000 steps retain nothing.
+ * That includes all **number boxing**, which is the easy one to miss. JS calls use a tagged
+ * convention, so a non-integer passed as an argument to — or returned from — a function the compiler
+ * does not inline becomes a fresh HeapNumber on every call. Two rules keep the step clear of it:
+ * - the big per-step functions (`stepPlaying`, `stepAttract`, `moveCircle`, `hasLineOfSight`) are thin
+ *   exported wrappers that park their floats in module-level `Float64Array` slots and call a body
+ *   that reads them back, and the reducer hands `dt` over the same way (`stepDt`, set in the `tick`
+ *   case itself — reading `a.dt` and passing it on measured 8 B/tick once that call site had gone
+ *   megamorphic). `game.js` `clearEvents` empties `state.events` without releasing its backing store;
+ * - every small float helper on the step path — `damp`, `wrapAngle`, `clamp01`, `mod`, `dist`,
+ *   `dist2`, `smoothstep`, `clamp`, `Number.isFinite` — is **written out by hand**, bit for bit,
+ *   rather than called. Whether such a call is inlined depends on what the JIT has already compiled,
+ *   so the same code allocated 0 B/tick in a fresh process and 5–9 B/tick in one that had run other
+ *   input shapes first: a guarantee that holds only in a fresh process is not a guarantee.
+ * Measured by counting scavenges (`perf.alloc-probe.mjs`), over deliberately polluted type feedback,
+ * with default flags and again with inlining switched off entirely: **a step allocates nothing while
+ * turning in place** (0 B/tick both ways, against 203 B/tick without inlining before this) and
+ * ~3 B/tick while walking, which is the footstep `GameEvent` itself (~28 B every ~18 ticks).
+ * `perf.test.mjs` pins both, and separately proves that 100 000 steps retain nothing.
  *
  * ## Coordinate invariants
  * - World units are tiles; tile (tx,ty) spans [tx,tx+1)×[ty,ty+1) and its centre is (tx+.5, ty+.5).
@@ -57,10 +64,8 @@ import {
   clamp,
   clamp01,
   damp,
-  dist,
   dist2,
   mod,
-  smoothstep,
   wrapAngle,
 } from '../core/math.js';
 import { createRng } from '../core/rng.js';
@@ -74,6 +79,7 @@ import {
   SCORE,
   SIPHON,
   WORLD,
+  swayAt,
   BOON_CHOICES,
   boonCandidates,
   computePerks,
@@ -817,7 +823,9 @@ export function revealAround(state) {
     const ty = y0 + ((i / span) | 0);
     const idx = ty * w + tx;
     if (explored[idx] !== 0) continue;
-    if (dist2(px, py, tx + 0.5, ty + 0.5) > r2) continue;
+    const ddx = tx + 0.5 - px;
+    const ddy = ty + 0.5 - py;
+    if (ddx * ddx + ddy * ddy > r2) continue;
     if (budget <= 0) {
       sim.revealCursor = i; // resume here next step
       sim.revealSeen = seen + k;
@@ -879,9 +887,11 @@ function collectAround(state) {
   // A non-finite position would clamp to the whole grid below and turn this into the O(items) scan
   // the grid exists to avoid. It cannot happen (the reducer sanitises input and `moveCircle` only
   // returns finite values), which is exactly why the guard is one comparison rather than a fix-up.
-  if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) return;
+  // `v - v === 0` is `Number.isFinite` without a builtin call, which boxed both coordinates once
+  // the call site's feedback had gone polymorphic (see stepPlayingBody).
   const x1 = p.x;
   const y1 = p.y;
+  if (!(x1 - x1 === 0) || !(y1 - y1 === 0)) return;
   // Segment start = where this step began (`stepPlayingBody` snapshots px/py before moving). A
   // non-finite or implausibly distant snapshot degrades to the plain disc test at the end point, so
   // the bounding box below can never grow into a scan of the whole grid.
@@ -1032,7 +1042,9 @@ export function updateDerived(state) {
   if (level !== null && perks.scrollSense > 0 && !state.run.mapFound && state.sim.scrollIdx >= 0) {
     const scroll = level.items[state.sim.scrollIdx];
     if (scroll !== undefined && !scroll.taken) {
-      const sd = dist(state.player.x, state.player.y, scroll.x, scroll.y);
+      const sdx = scroll.x - state.player.x;
+      const sdy = scroll.y - state.player.y;
+      const sd = Math.sqrt(sdx * sdx + sdy * sdy);
       sense = sd < perks.scrollSense ? 1 - sd / perks.scrollSense : 0;
     }
   }
@@ -1040,9 +1052,15 @@ export function updateDerived(state) {
   if (level !== null) {
     const ex = level.maze.exit.x + 0.5;
     const ey = level.maze.exit.y + 0.5;
-    d.exitDist = dist(state.player.x, state.player.y, ex, ey);
+    // `dist` and `smoothstep`, written out so no double crosses a call boundary (see stepPlayingBody).
+    const edx = ex - state.player.x;
+    const edy = ey - state.player.y;
+    const exitDist = Math.sqrt(edx * edx + edy * edy);
+    d.exitDist = exitDist;
     // Reversed edges: 0 at NEAR_EXIT_RANGE tiles away, 1 once standing on the portal.
-    d.nearExit = smoothstep(WORLD.NEAR_EXIT_RANGE, WORLD.EXIT_RADIUS, d.exitDist);
+    const nt = (exitDist - WORLD.NEAR_EXIT_RANGE) / (WORLD.EXIT_RADIUS - WORLD.NEAR_EXIT_RANGE);
+    const nc = !(nt >= 0) ? 0 : nt > 1 ? 1 : nt;
+    d.nearExit = nc * nc * (3 - 2 * nc);
   } else {
     d.exitDist = Infinity;
     d.nearExit = 0;
@@ -1226,10 +1244,21 @@ export function stepPlayingBody(state, input) {
 
   run.levelTime += dt;
   run.totalTime += dt;
-  if (sim.bumpCd > 0) sim.bumpCd = Math.max(0, sim.bumpCd - dt);
+  if (sim.bumpCd > 0) {
+    const cd = sim.bumpCd - dt;
+    sim.bumpCd = cd > 0 ? cd : 0;
+  }
   // Shake decays at the top of the step, so an impulse added by a bump below lands at full
-  // strength this frame and only starts fading on the next one.
-  p.shake = damp(p.shake, 0, BOB.SHAKE_DECAY, dt);
+  // strength this frame and only starts fading on the next one. Every `damp`/`wrapAngle`/`clamp01`
+  // on this path is written out by hand (same formula, bit for bit): a helper the compiler declines
+  // to inline boxes each double it is passed or returns, and whether it inlines depends on what the
+  // JIT has seen elsewhere — which is how this step used to allocate 0–9 B/tick depending on the
+  // session. `perf.test.mjs` measures the step with inlining switched off to keep it that way.
+  const shake = p.shake;
+  if (shake !== 0) {
+    const ks = 1 - Math.exp(-BOB.SHAKE_DECAY * dt);
+    p.shake = shake * (1 - ks);
+  }
   if (sim.comboTimer > 0) {
     sim.comboTimer -= dt;
     if (sim.comboTimer <= 0) {
@@ -1241,9 +1270,23 @@ export function stepPlayingBody(state, input) {
   // ── Aim ──────────────────────────────────────────────────────────────────────────────────
   // Mouse yaw is applied raw: smoothing a pointer delta is indistinguishable from input lag.
   // The keyboard/stick turn gets a short ease so tapping a turn key does not snap.
-  const turnTop = PLAYER.TURN_SPEED;
-  sim.turnVel = damp(sim.turnVel, input.turn * turnTop, PLAYER.TURN_EASE_RATE, dt);
-  p.angle = wrapAngle(p.angle + input.lookDX + sim.turnVel * dt);
+  // Press and release ease at different rates (`PLAYER.TURN_RELEASE_RATE`): the gentle press rate
+  // rounds a tap off, the fast release stops a corner where the key was let go.
+  const turnTarget = input.turn * PLAYER.TURN_SPEED;
+  const turnVel0 = sim.turnVel;
+  // Easing toward a smaller rate or the other way is a release (a stick let back toward centre
+  // included); building up toward the command is a press.
+  const releasing = turnTarget * turnVel0 < 0 || Math.abs(turnTarget) < Math.abs(turnVel0);
+  if (turnVel0 !== turnTarget) {
+    const kt = 1 - Math.exp(-(releasing ? PLAYER.TURN_RELEASE_RATE : PLAYER.TURN_EASE_RATE) * dt);
+    sim.turnVel = turnVel0 * (1 - kt) + turnTarget * kt;
+  }
+  const a0 = p.angle + input.lookDX + sim.turnVel * dt;
+  // wrapAngle, inlined (see above).
+  let aw = a0 - TAU * Math.floor((a0 + Math.PI) / TAU);
+  if (aw >= Math.PI) aw -= TAU;
+  else if (aw < -Math.PI) aw += TAU;
+  p.angle = aw;
 
   // ── Velocity ─────────────────────────────────────────────────────────────────────────────
   let ix = input.moveX;
@@ -1306,7 +1349,8 @@ export function stepPlayingBody(state, input) {
     ) {
       sim.bumpCd = BUMP.COOLDOWN;
       const strength = clamp01(lost / PLAYER.WALK_SPEED);
-      p.shake = clamp01(p.shake + lost * BUMP.SHAKE_PER_SPEED);
+      const sh = p.shake + lost * BUMP.SHAKE_PER_SPEED;
+      p.shake = sh > 1 ? 1 : sh;
       state.events.push({ type: 'bump', strength });
     }
   }
@@ -1316,8 +1360,13 @@ export function stepPlayingBody(state, input) {
   // Odometer for the run (§3 RunStats). This is the distance *actually covered* after collision,
   // not the distance commanded, so scraping along a wall does not inflate it.
   run.distance += moved;
-  const speedNow = moved / dt;
-  p.bobAmp = damp(p.bobAmp, clamp01(speedNow / PLAYER.WALK_SPEED), BOB.AMP_RATE, dt);
+  const speedFrac = moved / dt / PLAYER.WALK_SPEED;
+  const bobTarget = !(speedFrac >= 0) ? 0 : speedFrac > 1 ? 1 : speedFrac;
+  const bobAmp0 = p.bobAmp;
+  if (bobAmp0 !== bobTarget) {
+    const kb = 1 - Math.exp(-BOB.AMP_RATE * dt);
+    p.bobAmp = bobAmp0 * (1 - kb) + bobTarget * kb;
+  }
   if (moved > 0) {
     const before = p.bob;
     const after = before + moved * (TAU / BOB.STRIDE_TILES);
@@ -1327,7 +1376,9 @@ export function stepPlayingBody(state, input) {
       sim.footCount = (sim.footCount + 1) & 0x3fffffff;
       state.events.push({ type: 'footstep', foot });
     }
-    p.bob = mod(after, TAU);
+    // mod(after, TAU), inlined: `after` is ≥ 0, so only the remainder and its round-up edge matter.
+    const rb = after % TAU;
+    p.bob = rb > 0 ? rb : 0;
   }
 
   // ── Pickups ──────────────────────────────────────────────────────────────────────────────
@@ -1361,9 +1412,9 @@ export function stepPlayingBody(state, input) {
 
   // ── Exit, then fuel-out ──────────────────────────────────────────────────────────────────
   revealAround(state);
-  const ex = maze.exit.x + 0.5;
-  const ey = maze.exit.y + 0.5;
-  if (dist2(p.x, p.y, ex, ey) <= WORLD.EXIT_RADIUS * WORLD.EXIT_RADIUS) {
+  const exx = maze.exit.x + 0.5 - p.x;
+  const exy = maze.exit.y + 0.5 - p.y;
+  if (exx * exx + exy * exy <= WORLD.EXIT_RADIUS * WORLD.EXIT_RADIUS) {
     completeLevel(state);
     updateDerived(state);
     return;
@@ -1609,8 +1660,12 @@ export function stepAttractBody(state) {
   const ay = sim.atTy + 0.5 + legY * ATTRACT.LOOKAHEAD;
 
   sim.atSway += dt;
-  const sway = Math.sin(sim.atSway * TAU * ATTRACT.SWAY_HZ) * ATTRACT.SWAY_AMP;
-  const err = angleDiff(p.angle, Math.atan2(ay - p.y, ax - p.x) + sway);
+  // The idle sway is a *breath on a settled shot*, not a second steering input: `swayAt` fades it
+  // out with the heading error, so it adds nothing while the camera is turning into a corner, and in
+  // with the speed, so a stopped camera does not wobble. (It is not what makes the shot reverse on a
+  // twisty maze — that is the corners; `ATTRACT.SWAY_SETTLED` carries the measurement.)
+  const aimErr = angleDiff(p.angle, Math.atan2(ay - p.y, ax - p.x));
+  const err = aimErr + swayAt(sim.atSway, aimErr, sim.atSpeed);
   // Second-order steering. The proportional term is the *commanded* turn rate (rad/s, capped at
   // TURN_RATE); the actual rate eases toward it at TURN_EASE_RATE, exactly like the player's
   // keyboard turn. Assigning the command directly (the old controller) put a step change in the

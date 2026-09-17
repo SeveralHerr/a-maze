@@ -19,7 +19,9 @@
  *   zero neighbours and is *not* counted (it is reported as a connectivity error instead).
  * - `loops` — `edges - (nodes - 1)` over the **cell** graph: 0 for a perfect maze, one per
  *   independent cycle otherwise. Can go negative only if the maze is disconnected, which always
- *   comes with a `fullyConnected` error.
+ *   comes with a `fullyConnected` error. It describes the real topology only while the thick-wall
+ *   lattice holds, which is why a floor tile on a (even, even) pillar position is an error of its
+ *   own: such a tile joins corridors the cell graph knows nothing about.
  *
  * ## Cost
  * Time O(width·height). Memory: `Int32Array(width·height)` for BFS parents plus
@@ -128,6 +130,22 @@ export function validateMaze(maze) {
   }
   if (badValues > 0) {
     errors.push(`${badValues} tile(s) hold values other than FLOOR(0)/WALL(1)`);
+  }
+
+  // Pillars: the thick-wall lattice puts a permanent wall block at every (even, even) tile. A FLOOR
+  // there joins corridors *diagonally past* the cell graph, so `edges`/`loops` below would no
+  // longer describe the maze's real topology and the "perfect maze" assertion could pass on a map
+  // that is not one. The generator cannot produce one; a hand-built or corrupted map can. The
+  // outer ring is skipped — it is the border check's business, and reporting it twice helps nobody.
+  let pillarHoles = 0;
+  for (let y = 2; y < height - 1; y += 2) {
+    const row = y * width;
+    for (let x = 2; x < width - 1; x += 2) {
+      if (tiles[row + x] === TILE.FLOOR) pillarHoles++;
+    }
+  }
+  if (pillarHoles > 0) {
+    errors.push(`${pillarHoles} pillar tile(s) are floor: the thick-wall lattice is broken`);
   }
 
   let borderHoles = 0;

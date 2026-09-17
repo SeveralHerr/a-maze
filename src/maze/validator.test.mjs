@@ -181,3 +181,27 @@ test('validation is allocation-bounded and fast on a large maze', () => {
   assert.deepEqual(v.errors, []);
   assert.ok(ms < 2000, `validation took ${ms.toFixed(0)} ms`);
 });
+
+test('a floor tile on a pillar position is reported: the thick-wall lattice is a contract', () => {
+  // `loops` counts edges of the *cell* graph. A FLOOR at an (even, even) pillar joins corridors
+  // outside that graph, so a map with one is not the maze its loop count claims — even when it is
+  // still connected and solvable. The generator never makes one (117 k mazes checked); a corrupt
+  // save or a hand-built fixture can.
+  const maze = generateMaze({ cols: 6, rows: 6, seed: 4, braid: 1 });
+  assert.deepEqual(validateMaze(maze).errors, []);
+  const pillar = 2 * maze.width + 2; // tile (2,2)
+  maze.tiles[pillar] = TILE.FLOOR;
+  const v = validateMaze(maze);
+  assert.equal(v.errors.length, 1, v.errors.join('; '));
+  assert.match(v.errors[0], /1 pillar tile\(s\) are floor/);
+  assert.ok(v.solvable, 'the map is still walkable — the lattice error is the only complaint');
+
+  // Several, and the count is right; the outer ring stays the border check's business.
+  maze.tiles[4 * maze.width + 4] = TILE.FLOOR;
+  assert.match(validateMaze(maze).errors[0], /2 pillar tile\(s\) are floor/);
+  const sealed = generateMaze({ cols: 5, rows: 5, seed: 2 });
+  sealed.tiles[0] = TILE.FLOOR; // a corner of the border, not an interior pillar
+  const border = validateMaze(sealed).errors;
+  assert.equal(border.filter((e) => e.includes('pillar')).length, 0);
+  assert.equal(border.filter((e) => e.includes('border is not sealed')).length, 1);
+});
