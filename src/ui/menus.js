@@ -671,8 +671,10 @@ const DEFAULT_CONTROL_HINTS = Object.freeze([
   Object.freeze({ label: 'Strafe', keys: 'A D', pad: 'Left stick' }),
   Object.freeze({ label: 'Turn', keys: 'Q E / Left Right', pad: 'Right stick' }),
   Object.freeze({ label: 'Look', keys: 'Mouse', pad: 'Right stick' }),
+  Object.freeze({ label: 'Attack', keys: 'F / Space', pad: 'RT' }),
   Object.freeze({ label: 'Chalk', keys: 'C', pad: 'X' }),
   Object.freeze({ label: 'Map', keys: 'M / Tab', pad: 'View' }),
+  Object.freeze({ label: 'Auto Explore', keys: 'O' }),
   Object.freeze({ label: 'Pause', keys: 'Esc / P', pad: 'Menu' }),
   Object.freeze({ label: 'Mute', keys: 'N', pad: 'Y' }),
   Object.freeze({ label: 'Confirm', keys: 'Enter / Space', pad: 'A' }),
@@ -700,6 +702,8 @@ const TOUCH_CHALK = Object.freeze({ label: 'Chalk', keys: 'Chalk Button' });
 const TOUCH_LOOK = Object.freeze({ label: 'Look', keys: 'Drag Right Side' });
 const TOUCH_MAP = Object.freeze({ label: 'Map', keys: 'Map Button' });
 const TOUCH_AUTO = Object.freeze({ label: 'Auto Explore', keys: 'Auto Button' });
+/** New Descent's sword (§4.11). The AUTO button is hidden in that mode and this one takes its slot. */
+const TOUCH_ATTACK = Object.freeze({ label: 'Attack', keys: 'Attack Button' });
 const TOUCH_PAUSE = Object.freeze({ label: 'Pause', keys: 'Pause Button' });
 const TOUCH_CHOOSE = Object.freeze({ label: 'Choose', keys: 'Tap' });
 
@@ -713,6 +717,26 @@ const TOUCH_CONTROL_HINTS = Object.freeze([
   TOUCH_LOOK,
   TOUCH_MAP,
   TOUCH_AUTO,
+  TOUCH_PAUSE,
+  TOUCH_CHOOSE,
+]);
+
+/**
+ * The same two tables in New Descent, where `touch-overlay.js` hides the AUTO button and shows an
+ * ATTACK one instead (§4.11).
+ *
+ * Four tables rather than a branch inside the draw, for the reason the other two exist: the panel
+ * picks one per frame and must not allocate. Getting this wrong was a real defect — the one screen
+ * that teaches the mode's core verb described a button that is not on the player's phone and never
+ * mentioned the one that is.
+ * @type {ReadonlyArray<ControlHint>}
+ */
+const TOUCH_CONTROL_HINTS_COMBAT = Object.freeze([
+  TOUCH_MOVE,
+  TOUCH_ATTACK,
+  TOUCH_CHALK,
+  TOUCH_LOOK,
+  TOUCH_MAP,
   TOUCH_PAUSE,
   TOUCH_CHOOSE,
 ]);
@@ -732,15 +756,36 @@ const TOUCH_CONTROL_HINTS_NO_CHALK = Object.freeze([
   TOUCH_CHOOSE,
 ]);
 
+/** New Descent without the Chalk unlock: the commonest table a new player of the mode will see. */
+const TOUCH_CONTROL_HINTS_COMBAT_NO_CHALK = Object.freeze([
+  TOUCH_MOVE,
+  TOUCH_ATTACK,
+  TOUCH_LOOK,
+  TOUCH_MAP,
+  TOUCH_PAUSE,
+  TOUCH_CHOOSE,
+]);
+
 /**
  * Which touch table this player's screen actually shows.
+ *
+ * Exported for `menus.test.mjs`: which table the Controls screen *draws* depends on the device
+ * (a coarse pointer with no fine one), which a Node test cannot fake, so the choice is asserted
+ * here rather than through a screen that will always render the keyboard table in a test.
  * @param {GameState} state
  * @returns {ReadonlyArray<ControlHint>}
  */
-function touchHintsFor(state) {
+export function touchHintsFor(state) {
   const perks = /** @type {any} */ (state).perks;
   const chalk = perks !== null && perks !== undefined ? perks.chalk : 0;
-  return typeof chalk === 'number' && chalk > 0 ? TOUCH_CONTROL_HINTS : TOUCH_CONTROL_HINTS_NO_CHALK;
+  const hasChalk = typeof chalk === 'number' && chalk > 0;
+  // The mode decides which BUTTONS are on the bar (§4.11), so it has to decide which rows describe
+  // them. Reading the table without reading the mode is how this screen came to teach a phone
+  // player about a button their phone does not show.
+  if (/** @type {any} */ (state).mode === 'combat') {
+    return hasChalk ? TOUCH_CONTROL_HINTS_COMBAT : TOUCH_CONTROL_HINTS_COMBAT_NO_CHALK;
+  }
+  return hasChalk ? TOUCH_CONTROL_HINTS : TOUCH_CONTROL_HINTS_NO_CHALK;
 }
 
 /** The footer under the touch table. */

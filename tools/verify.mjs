@@ -1252,15 +1252,41 @@ try {
     if (foes.length === 0) return;
     const e = foes[0];
     const p = st.player;
-    // Placed in front of it and LEFT ASLEEP: the creature has to notice the player on its own, so
-    // the wake path is exercised rather than stubbed. Force-waking it here made the gate assert
-    // that a wake event fires while guaranteeing one never could.
-    p.x = e.x - 2.2;
-    p.y = e.y;
+    // Step BACK from the creature along whichever of the four directions has room, and stop at the
+    // last clear point. Dropping the player at a fixed `e.x - 2.2` put them inside the masonry
+    // beside the creature about as often as not, which broke line of sight — the gate then reported
+    // 23 swings, 0 connected, 0 wakes and blamed the combat code for a bug in its own harness.
+    const tiles = st.levelData.maze.tiles;
+    const w = st.levelData.maze.width;
+    const solid = (x, y) => tiles[Math.floor(y) * w + Math.floor(x)] !== 0;
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+    let bx = e.x;
+    let by = e.y;
+    let bestReach = 0;
+    for (const [dx, dy] of dirs) {
+      let reach = 0;
+      for (let d = 0.5; d <= 2.5; d += 0.5) {
+        const x = e.x + dx * d;
+        const y = e.y + dy * d;
+        if (x < 1 || y < 1 || solid(x, y)) break;
+        reach = d;
+      }
+      if (reach > bestReach) {
+        bestReach = reach;
+        bx = e.x + dx * reach;
+        by = e.y + dy * reach;
+      }
+    }
+    if (bestReach === 0) return;
+    // Left ASLEEP on purpose: the creature has to notice the player by itself, so the wake path is
+    // exercised rather than stubbed. Force-waking it here made the gate assert that a wake event
+    // fires while guaranteeing one never could.
+    p.x = bx;
+    p.y = by;
     p.px = p.x;
     p.py = p.y;
-    p.angle = 0;
-    p.pangle = 0;
+    p.angle = Math.atan2(e.y - p.y, e.x - p.x);
+    p.pangle = p.angle;
   });
   /** @type {any} */
   const combatSeen = { swings: 0, enemyHits: 0, playerHits: 0, kills: 0, wakes: 0, winds: 0 };

@@ -8,9 +8,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { cellsForLevel, createMenus, hitTest, menuStep, sliderValueAt } from './menus.js';
+import { cellsForLevel, createMenus, hitTest, menuStep, sliderValueAt, touchHintsFor } from './menus.js';
 import { resetMapMode, setMapMode } from './map.js';
 import { setLayoutProbe } from './font.js';
+import { CONTROL_HINTS } from '../input/bindings.js';
 
 // ─── Pure helpers ────────────────────────────────────────────────────────────────────────────
 
@@ -1426,4 +1427,58 @@ test('pause: the Auto Explore row switches it over and resumes, whether it is on
   menus2.handleInput(press('down'), on);
   menus2.handleInput(press('confirm'), on);
   assert.deepEqual(log, ['toggleAuto', 'resume']);
+});
+
+
+// ─── Controls (ARCHITECTURE.md §4.11) ────────────────────────────────────────────────────────
+
+test('controls: the touch table describes the buttons the mode actually draws', () => {
+  // The one screen that teaches the mode's core verb was describing an AUTO button that
+  // `touch-overlay.js` hides in New Descent, and never mentioning the ATTACK button it shows.
+  for (const chalk of [0, 2]) {
+    const combat = makeState('title');
+    /** @type {any} */ (combat).mode = 'combat';
+    /** @type {any} */ (combat).perks = { chalk };
+    const classic = makeState('title');
+    /** @type {any} */ (classic).mode = 'classic';
+    /** @type {any} */ (classic).perks = { chalk };
+
+    const inCombat = touchHintsFor(combat).map((h) => h.label);
+    const inClassic = touchHintsFor(classic).map((h) => h.label);
+
+    assert.ok(inCombat.includes('Attack'), `combat (chalk ${chalk}) names Attack: ${inCombat.join('|')}`);
+    assert.equal(inCombat.includes('Auto Explore'), false, 'combat hides the AUTO button, so it must not list it');
+    assert.ok(inClassic.includes('Auto Explore'), `classic names Auto Explore: ${inClassic.join('|')}`);
+    assert.equal(inClassic.includes('Attack'), false, 'classic has no attack button');
+    // The Chalk row follows the unlock in both modes, exactly as it always did.
+    assert.equal(inCombat.includes('Chalk'), chalk > 0);
+    assert.equal(inClassic.includes('Chalk'), chalk > 0);
+  }
+});
+
+test('controls: the keyboard fallback lists every action the real bindings do', () => {
+  // The mirror had gone stale — it was missing Attack and Auto Explore while its own comment
+  // claimed it was spelled exactly as `describeControls` spells the default layout.
+  const real = CONTROL_HINTS.map((h) => h.label);
+  const menus = createMenus(liveCanvas(1280, 720), { onUiSound: () => {} });
+  menus.resize(1280, 720, 1);
+  const state = makeState('title');
+  menus.render(state);
+  menus.handleInput(press('up'), state);
+  menus.handleInput(press('up'), state);
+  menus.handleInput(press('confirm'), state);
+  menus.render(state);
+  assert.equal(menus.screen(), 'controls');
+  const labels = [];
+  setLayoutProbe((kind, x, y, w, h, unit, label) => labels.push(String(label)));
+  try {
+    menus.render(state);
+  } finally {
+    setLayoutProbe(null);
+  }
+  menus.dispose();
+  // Every action the bindings module publishes has to appear on the screen that teaches them.
+  for (const label of real) {
+    assert.ok(labels.includes(label), `the Controls screen lists "${label}" (has ${labels.join('|')})`);
+  }
 });

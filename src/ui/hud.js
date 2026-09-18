@@ -675,6 +675,12 @@ function intWidth(n, size) {
  * @property {(text:string) => void} notice  show a short centred one-line notice (~1.6 s) — e.g.
  *   `'NO MAP - FIND THE SCROLL'` when the map hotkey is pressed while locked. Replaces whatever
  *   banner is up. Store a constant string: the HUD keeps the reference, it does not copy it.
+ * @property {(clientX:number, clientY:number) => boolean} hitAttack  true when a pointer at these
+ *   client coordinates is over the ATTACK plaque drawn last frame (New Descent, §4.11)
+ * @property {(on:boolean) => void} setAttackButton  allow or suppress the ATTACK plaque (main.js
+ *   turns it off on touch, where the touch bar owns it)
+ * @property {(bearing:number) => void} hurtFrom  note the direction a blow came from, in radians
+ *   relative to the player's facing, for the directional damage wedge (§4.11)
  * @property {(clientX:number, clientY:number) => boolean} hitAuto  true when a pointer at these
  *   client coordinates is over the AUTO button drawn in the last frame (§4.10); false whenever the
  *   button is not on screen (paused, full map, narrow layout, disabled, any other phase, or the

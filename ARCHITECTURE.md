@@ -1455,9 +1455,19 @@ tiles/second along the blow for `KNOCKBACK_TIME`, and the player's camera takes
 #### UI
 
 - `hud.js` — in `'combat'` it additionally draws a **health bar** under the fuel gauge (the same
-  panel language, `RAMPS.blood`), and an **ATTACK** plaque at the **bottom right** of the world band
+  panel language, labelled `LIFE n/max` — it is the only readout on screen and a bar with neither a
+  label nor a number reads as a second, broken loading bar), and an **ATTACK** plaque at the
+  **bottom centre** of the world band, lifted `ATTACK_LIFT` units clear of its bottom edge
   (`hud.hitAttack(clientX, clientY)`, `hud.setAttackButton(on)` — main.js suppresses it on touch,
-  where the touch bar owns it). The **AUTO button is never drawn in `'combat'`**, key hint included.
+  where the touch bar owns it). Centre and not the bottom **right**, which is where it started: the
+  right is where the sword is drawn, so the plaque sat under the blade and the one moment it was
+  most worth looking at — mid-swing — was the one moment it was behind the weapon. It is also the
+  slot the AUTO button vacates, since New Descent never draws that one.
+  `hud.hurtFrom(bearing)` records which way a blow came from and the HUD draws a fading red wedge on
+  that edge of the world band: being hit from behind otherwise looked identical to being hit from in
+  front, in a mode whose whole threat is things arriving out of the dark.
+  The **AUTO button is never drawn in `'combat'`**, key hint included, and the phone's Controls
+  screen swaps its AUTO row for an **Attack** one, because `touch-overlay.js` swaps the buttons.
 - **The corner map moves to the top right in `'combat'`** — tucked under the score panel — because
   the bottom right now belongs to the attack button. In `'classic'` it stays exactly where it was
   (bottom right). `map.js` `drawCorner` gains a `corner` argument (`'br'` default, `'tr'`), and
