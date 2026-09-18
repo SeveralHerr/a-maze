@@ -1539,6 +1539,28 @@ export const COMBAT = Object.freeze({
   CORPSE_SECONDS: 1.1,
 
   /**
+   * Seconds an enemy cannot be staggered again after being staggered once.
+   *
+   * THIS IS WHAT STOPS THE FIGHT BEING FREE. Without it every non-killing hit re-staggered, and a
+   * stagger (0.28 s / 0.42 s) plus a fresh wind-up (0.34 s / 0.60 s) is longer than the sword's
+   * whole 0.44 s cycle — so a player swinging on rhythm took *literally zero damage* from either
+   * creature, for ever. 1.25 s is comfortably longer than one swing cycle, so an interrupt is a
+   * thing you spend and time rather than a button you hold.
+   */
+  STAGGER_IMMUNE: 1.25,
+
+  /**
+   * How long a press is remembered while the sword is busy.
+   *
+   * A press in the recovery window is the player asking for the next swing at the earliest moment
+   * it is legal, and dropping it makes the weapon feel like it is ignoring them. The window only
+   * ages once the sword is free again (see `stepSword`), so this is the grace *after* a swing ends
+   * rather than a race against the recovery's remaining time — a press buys the next swing whatever
+   * moment of the recovery it arrived in.
+   */
+  ATTACK_BUFFER: 0.22,
+
+  /**
    * The player's sword. A swing is windUp → strike → recover; the strike window resolves once,
    * against everything inside `REACH` and within `ARC` radians of the view with line of sight.
    * The whole swing is 0.44 s, which is fast enough that fighting is a rhythm rather than a queue.

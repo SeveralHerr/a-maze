@@ -1377,7 +1377,12 @@ silently spending the last-played mode's purse.
 Everything above lives in `balance.js`'s frozen `COMBAT` table: `MAX_ENEMIES` (40), `WAKE_TILES`,
 `LOSE_TILES`, `PLAYER_HP`, `HEAL_PER_OIL`, `KILL_SCORE`, `DENSITY_START`/`DENSITY_END` (enemies per
 100 cells, ramped to `CAP_LEVEL`), `SWING` and the two per-kind blocks (`hp`, `speed`, `radius`,
-`reach`, `damage`, `windUp`, `strike`, `recover`, `stagger`, `score`). `combatParams(level) →
+`reach`, `damage`, `windUp`, `strike`, `recover`, `stagger`, `score`). **How big a creature stands
+on screen is NOT here**: `ENEMY_ART` in `src/renderer/enemies.js` owns the billboard scale and the
+card's floor row, because those are properties of the painting rather than of the balance — move the
+origin row and the same numbers would put the creature underground — and `src/renderer` may not
+import `src/state` in any case (§2). `raycaster.js` derives the vertical offset from that pair with
+the map scroll's formula (§4.5), so the art and its placement cannot drift apart. `combatParams(level) →
 {count, hpMult, damageMult}` is the per-level curve, and it is the **only** thing that scales with
 depth — the flask chain and the tank are untouched, so §1's placement guarantee is exactly as valid
 in New Descent as in Classic.

@@ -297,7 +297,9 @@ export function createInput(canvasEl, opts) {
   /** @type {Set<InputAction>} */
   const pressed = new Set();
   /** @type {InputFrame} */
-  const frame = { moveX: 0, moveY: 0, turn: 0, lookDX: 0, pressed };
+  // `attackHeld` is present from construction, like every other field: the frame's SHAPE must never
+  // change, or every consumer's property access goes polymorphic (§4.3 "poll() allocates nothing").
+  const frame = { moveX: 0, moveY: 0, turn: 0, lookDX: 0, attackHeld: false, pressed };
 
   // ── Device state ──────────────────────────────────────────────────────────────────────────
   /** Press counts per hold slot: two keys bound to the same slot must both be released to stop. */
@@ -410,6 +412,20 @@ export function createInput(canvasEl, opts) {
     pendingMask |= ACTION_BIT[action] | 0;
   };
 
+  /** True while the touch bar's ATTACK button is held down (see `frame.attackHeld`). */
+  let overlayAttackHeld = false;
+
+  /**
+   * Route an overlay button's press/release into the hold state. Only the sword needs it — every
+   * other overlay button is a one-shot.
+   * @param {InputAction} action
+   * @param {boolean} held
+   * @returns {void}
+   */
+  const holdAction = (action, held) => {
+    if (action === 'attack') overlayAttackHeld = held;
+  };
+
   /**
    * Create the on-screen controls the first time we are sure the device is touch-driven.
    * Deferred (rather than built at construction) so a desktop with a touchscreen never gets a
@@ -423,7 +439,8 @@ export function createInput(canvasEl, opts) {
       (target && target.parentNode) ||
       doc.body;
     if (!root) return;
-    overlay = createTouchOverlay(root, { onAction: fireAction, document: doc });
+    overlay = createTouchOverlay(root, { onAction: fireAction,
+      onHold: holdAction, document: doc });
     log.debug('touch overlay created');
   }
 
@@ -524,6 +541,9 @@ export function createInput(canvasEl, opts) {
   function clearHeld() {
     heldCodes.clear();
     hold.fill(0);
+    // The overlay's own press state is DOM-side, so `hold.fill(0)` does not reach it: a finger still
+    // on the ATTACK button when the tab is hidden would otherwise leave the sword swinging for ever.
+    overlayAttackHeld = false;
     lookAccum = 0;
     lastFreeMoveMs = -1e9;
     releaseStick();
@@ -1191,6 +1211,12 @@ export function createInput(canvasEl, opts) {
 
     frame.lookDX = clamp(lookAccum, -MAX_LOOK_PER_POLL, MAX_LOOK_PER_POLL);
     lookAccum = 0;
+
+    // The sword is a HOLD as well as an edge (New Descent, §4.11): `pressed` carries the press, this
+    // carries the fact that the button is still down, so the sim can swing again when the recovery
+    // ends. Keyboard and pad share the hold slot; the touch bar reports its own button separately,
+    // because an overlay press is a DOM event rather than a key.
+    frame.attackHeld = hold[HOLD.SWING] > 0 || overlayAttackHeld;
 
     pressed.clear();
     if (pendingMask !== 0) {

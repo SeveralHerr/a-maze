@@ -594,6 +594,12 @@ const HEALTH_EASE_RATE = 9;
 /** Seconds the health panel's edge flashes white after a hit lands. */
 const HEALTH_FLASH_S = 0.28;
 
+/** Fraction of health below which the readout turns to the alarm colour and the panel pulses. */
+const HEALTH_LOW = 0.28;
+
+/** The health readout's label — the same shape as the fuel gauge's `OIL`. */
+const LIFE_LABEL = 'LIFE';
+
 /**
  * What the plaque becomes while the mouse is captured: the key that does the same thing. A locked
  * cursor cannot be aimed at a button, so a drawn one is clutter that cannot be clicked.
@@ -768,6 +774,14 @@ export function createHud(overlayCanvas, options) {
   /** The fuel panel's box and its parts. */
   let fuelPanelW = 0;
   let fuelPanelH = 0;
+  /**
+   * Height of the health panel including the gap above it, or 0 when the mode has no health.
+   *
+   * Measured in `layoutTopRow` and read by BOTH the health bar and the depth panel, because on a
+   * phone they want the same slot — directly under the fuel gauge — and the first pass drew them
+   * straight through each other there. One number, measured once, owns that column.
+   */
+  let healthPanelH = 0;
   let fuelBarW = 0;
   let fuelBarH = 0;
   let fuelIconScale = 1;
@@ -794,6 +808,8 @@ export function createHud(overlayCanvas, options) {
   let attackButtonEnabled = true;
   /** This frame's clamped delta, written by `advance` and read by the draw pass. */
   let lastDt = 0;
+  /** Text size of the health readout, set by `layoutTopRow`. */
+  let healthSize = 1;
   /** Health shown on the bar, eased toward `run.hp` so a hit drains rather than jumps. */
   let shownHp = -1;
   /** `anim.clock` of the last time health actually fell — drives the bar's alarm flash. */
@@ -811,6 +827,7 @@ export function createHud(overlayCanvas, options) {
   const depthText = createTextMemo((lv) => formatDepth(lv));
   const sizeText = createTextMemo((c, r) => formatLabyrinth(c, r));
   const chalkText = createTextMemo((n) => '×' + n);
+  const healthText = createTextMemo((hp, max) => hp + '/' + max);
 
   /** @type {Pop[]} */
   const pops = new Array(MAX_POPS);
@@ -1318,6 +1335,9 @@ export function createHud(overlayCanvas, options) {
         Math.max(scoreWidth(scoreLine, run.score, scoreSize), gemsWidth(gemsLine, gemSize), 16 * u);
     }
     fuelPanelH = 2 * insetY + Math.max(fuelContentH, scoreContentH);
+    // ── Health (New Descent, §4.11) ──
+    healthSize = m.narrow ? Math.max(1, u - 1) : u;
+    healthPanelH = isCombat(state) ? 2 * insetY + Math.max(HEALTH_BAR_UNITS * u, heightAt('hud', healthSize)) + u : 0;
   }
 
   /**
@@ -1596,14 +1616,16 @@ export function createHud(overlayCanvas, options) {
       if (px < gapL || px + panelW > gapR) {
         // No gap at all (a 4:3 window near the narrow boundary): under the gauge instead.
         px = pad;
-        py = pad + fuelPanelH + 2 * u;
+        py = pad + fuelPanelH + healthPanelH + 2 * u;
       }
       panelH = 2 * insetY + heightAt('hud', size);
     } else {
       const column = fuelPanelW;
       // The band's top edge, when the page has told the surface where the world is.
       const floor = m.viewY > py + fuelPanelH ? m.viewY - 2 * u : m.h;
-      py = pad + fuelPanelH + 2 * u;
+      // Below the health bar when there is one (§4.11): on a phone both want this column, and the
+      // first pass of New Descent drew the two straight through each other.
+      py = pad + fuelPanelH + healthPanelH + 2 * u;
       for (;;) {
         const oneW = 2 * insetX + depthLineWidth(depth, dims, size);
         twoLines = hasMaze && oneW > column;
@@ -1804,12 +1826,13 @@ export function createHud(overlayCanvas, options) {
    * @returns {void}
    */
   function drawHealthBar(ctx, state, m, reduced) {
-    if (!isCombat(state)) {
+    if (!isCombat(state) || healthPanelH === 0) {
       shownHp = -1;
       return;
     }
     const run = state.run;
     const u = m.u;
+    const pad = 3 * u;
     if (shownHp < 0) shownHp = run.hp;
     if (run.hp < shownHp - 0.01) hurtAt = anim.clock;
     // Eased in both directions: a flask's mend climbs as visibly as a claw's bite falls.
@@ -1817,9 +1840,8 @@ export function createHud(overlayCanvas, options) {
     if (Math.abs(run.hp - shownHp) < 0.4) shownHp = run.hp;
 
     const frac = run.hpMax > 0 ? Math.max(0, Math.min(1, shownHp / run.hpMax)) : 0;
-    const pad = 3 * u;
     const w = fuelPanelW;
-    const h = 2 * insetY + HEALTH_BAR_UNITS * u;
+    const h = healthPanelH - u;
     const x = pad;
     const y = pad + fuelPanelH + u;
     panelOpts.frame = 'stone';
@@ -1827,27 +1849,32 @@ export function createHud(overlayCanvas, options) {
     panelOpts.rivets = false;
     drawPanel(ctx, x, y, w, h, u, panelOpts);
 
-    const bx = x + insetX;
-    const by = y + insetY;
-    const bw = w - 2 * insetX;
-    const bh = h - 2 * insetY;
-    drawWell(ctx, bx, by, bw, bh, u);
-    const fill = Math.round(bw * frac);
+    // A LABEL and a NUMBER, like the fuel gauge above it. Without them the mode's central new stat
+    // was the only readout on screen with neither, and at a glance it read as a second, broken
+    // loading bar rather than as the thing standing between the player and a lost run.
+    const low = frac <= HEALTH_LOW;
+    const label = LIFE_LABEL;
+    const value = healthText(Math.round(shownHp), run.hpMax);
+    const labelW = measureAt(label, 'hud', healthSize);
+    const valueW = measureAt(value, 'hud', healthSize);
+    const textH = heightAt('hud', healthSize);
+    const barX = x + insetX + labelW + 2 * u;
+    const barW = Math.max(4 * u, w - insetX * 2 - labelW - valueW - 4 * u);
+    const barH = HEALTH_BAR_UNITS * u;
+    const midY = y + ((h - barH) >> 1);
+    const textY = y + ((h - textH) >> 1);
+
+    drawAt(ctx, label, x + insetX, textY, 'hud', healthSize, low ? 'hudAlarm' : 'hudDim');
+    drawWell(ctx, barX, midY, barW, barH, u, COLOR.void, low ? COLOR.fireDeep : COLOR.ironDark);
+    const fill = Math.round(barW * frac);
     if (fill > 0) {
-      // Three bands so the bar reads at a glance without a number: full is a clean red, a third is
-      // the colour of trouble, and the last sliver pulses.
-      ctx.fillStyle = frac > 0.55 ? COLOR.alarm : frac > 0.28 ? COLOR.fireEmber : COLOR.fireDeep;
-      ctx.fillRect(bx, by, fill, bh);
-      // A lit top edge, exactly like the fuel bar's, so the two read as the same instrument.
-      ctx.fillStyle = frac > 0.28 ? COLOR.fireHot : COLOR.fireEmber;
-      ctx.fillRect(bx, by, fill, Math.max(1, u >> 1));
+      // Three bands, so the bar reads at a glance even before the number is looked at.
+      ctx.fillStyle = frac > 0.55 ? COLOR.alarm : frac > HEALTH_LOW ? COLOR.fireEmber : COLOR.fireDeep;
+      ctx.fillRect(barX, midY, fill, barH);
+      ctx.fillStyle = frac > HEALTH_LOW ? COLOR.fireHot : COLOR.fireEmber;
+      ctx.fillRect(barX, midY, fill, Math.max(1, u >> 1));
     }
-    // Quarter graduations, matching the fuel gauge's.
-    ctx.fillStyle = COLOR.void;
-    for (let k = 1; k < 4; k++) {
-      const gx = bx + Math.round((bw * k) / 4);
-      ctx.fillRect(gx, by, Math.max(1, u >> 1), bh);
-    }
+    drawAt(ctx, value, x + w - insetX, textY, 'hud', healthSize, low ? 'hudAlarm' : 'hudBright', 'right');
 
     const hurt = anim.clock - hurtAt;
     if (hurt < HEALTH_FLASH_S) {
@@ -1856,7 +1883,7 @@ export function createHud(overlayCanvas, options) {
       ctx.fillStyle = COLOR.white;
       strokeRect(ctx, x, y, w, h, Math.max(1, border >> 1));
       ctx.globalAlpha = before;
-    } else if (frac <= 0.28 && !reduced) {
+    } else if (low && !reduced) {
       // A low-health alarm on the panel edge, the twin of the low-tank one above it.
       const before = ctx.globalAlpha;
       ctx.globalAlpha = before * (0.45 + 0.4 * Math.sin(anim.clock * 5.5));
@@ -1890,17 +1917,19 @@ export function createHud(overlayCanvas, options) {
     const chipH = 2 * insetY + 3 * u + heightAt('hud', size);
     const w = 2 * padX + measureAt(ATTACK_TEXT, 'hud', size);
     const x = m.viewX + m.viewW - 3 * u - w;
-    void reduced;
     const y = m.viewY + m.viewH - 3 * u - chipH;
     panelOpts.frame = 'stone';
     panelOpts.border = border;
     panelOpts.rivets = false;
     drawPanel(ctx, x, y, w, chipH, u, panelOpts);
     const before = ctx.globalAlpha;
-    // Lit while the swing is actually running, so the button is also the weapon's cooldown readout.
+    // Lit while the swing is actually running, so the plaque doubles as the weapon's cooldown
+    // readout — a player learns the rhythm off the button as much as off the blade.
     if (swinging) {
+      if (!reduced) ctx.globalAlpha = before * (0.75 + 0.25 * Math.sin(anim.clock * 22));
       ctx.fillStyle = COLOR.goldLight;
       strokeRect(ctx, x, y, w, chipH, Math.max(1, border >> 1));
+      ctx.globalAlpha = before;
     }
     drawAt(ctx, ATTACK_TEXT, x + (w >> 1), y + (chipH >> 1), 'hud', size, swinging ? 'hudBright' : 'hudGold', 'center', 'middle');
     ctx.globalAlpha = before;

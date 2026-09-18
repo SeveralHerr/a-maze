@@ -131,6 +131,13 @@ export const AUDIO = Object.freeze({
   NOISE_SECONDS: 2,
   /** Scheduling safety margin: never schedule exactly at `currentTime` (causes clicks). */
   LEAD: 0.008,
+  /**
+   * Resting gain of the ambient drone, and how much of itself the nearest awake creature adds to it
+   * (New Descent, §4.11). 1.4 is loud enough to be felt under a fight and quiet enough that it is
+   * never mistaken for a cue with a meaning of its own.
+   */
+  DRONE_GAIN: 0.11,
+  THREAT_SWELL: 1.4,
   /** Look-ahead window for the generative scheduler, seconds. */
   LOOKAHEAD: 0.3,
   /** Master compressor. Transparent until cues stack up. */
@@ -1229,7 +1236,7 @@ export function createAudio(options) {
 
   /** Low sustained drone under the generative plucks. */
   function buildDrone() {
-    droneGain = keep(newGain(0.11));
+    droneGain = keep(newGain(AUDIO.DRONE_GAIN));
     const tone = keep(newFilter('lowpass', AUDIO.MUSIC.droneCut, 0.8));
     droneTone = tone;
     connect(tone, droneGain);
@@ -1634,6 +1641,61 @@ export function createAudio(options) {
       sfxNoise('bandpass', f, f, 2.5, t + 0.3 + i * 0.06 + rng.range(0, 0.03), 0.002, 0.04, 0.18, PRI.CUE, 0.1);
     }
     sfx('triangle', degreeHz(3), degreeHz(7), t + 0.25, 0.08, 0.9, 0.12, PRI.STING, 0.4);
+  }
+
+  // ─── New Descent (ARCHITECTURE.md §4.11) ───────────────────────────────────────────────────
+
+  /**
+   * The sword cutting air: one short band-passed noise sweep falling in pitch, which is what a
+   * swung blade actually is. Deliberately quiet and dry — it fires several times a second in a
+   * fight, so anything with a tail or a tone in it becomes a machine gun inside two exchanges.
+   * A swing that connects is not voiced here; the impact speaks for it.
+   * @param {boolean} hit
+   */
+  function playSwing(hit) {
+    const t = now();
+    const top = 2600 * rng.range(0.92, 1.08);
+    sfxNoise('bandpass', top, top * 0.3, 1.1, t, 0.006, hit ? 0.09 : 0.15, hit ? 0.1 : 0.14, PRI.CUE, 0.03);
+  }
+
+  /**
+   * The sword landing. Two different impacts, because the two creatures are two different
+   * materials and the mode's whole read is telling them apart: a crawler is a dry shell that
+   * CRACKS, a wraith is cloth and cold air that gives with a low sigh and no crack at all.
+   * A kill adds a longer, lower tail underneath so a death is audibly a death and not a fourth hit.
+   * @param {'crawler'|'wraith'} kind
+   * @param {boolean} killed
+   * @param {number} [pan]
+   */
+  function playEnemyHit(kind, killed, pan = 0) {
+    const t = now();
+    if (kind === 'wraith') {
+      sfxNoise('lowpass', 900, 260, 0.9, t, 0.004, 0.2, 0.2, PRI.STING, 0.16, pan);
+      sfx('sine', 190, 120, t, 0.006, 0.22, 0.1, PRI.CUE, 0.2, 0, 0, pan);
+    } else {
+      // The crack: a hard, short, high burst over a dry body thump.
+      sfxNoise('bandpass', 3100 * rng.range(0.9, 1.1), 900, 2.4, t, 0.001, 0.07, 0.24, PRI.STING, 0.08, pan);
+      sfxNoise('lowpass', 420, 180, 0.9, t, 0.002, 0.13, 0.2, PRI.CUE, 0.06, pan);
+    }
+    if (killed) {
+      // A falling minor third into the reverb, in the level's key, so a kill reads as resolved.
+      sfx('triangle', degreeHz(3), degreeHz(0), t + 0.03, 0.01, 0.55, 0.13, PRI.STING, 0.42, 0, 0, pan);
+      sfxNoise('lowpass', 500, 120, 0.7, t + 0.02, 0.01, 0.42, 0.16, PRI.CUE, 0.24, pan);
+    }
+  }
+
+  /**
+   * Something landing a blow on the PLAYER. The one cue in the mode that must never be missed, so
+   * it is the loudest thing in it and sits where nothing else does: a hard low thud with a detuned
+   * minor second over it — the same interval the low-fuel warning uses, because both mean the same
+   * thing to a player, which is that the run is in danger.
+   * @param {number} [pan]
+   */
+  function playPlayerHit(pan = 0) {
+    const t = now();
+    sfxNoise('lowpass', 260, 90, 1.1, t, 0.001, 0.26, 0.42, PRI.STING, 0.12, pan);
+    sfx('sawtooth', 124, 96, t, 0.002, 0.3, 0.16, PRI.STING, 0.3, 0, 0, pan);
+    sfx('sawtooth', 131, 101, t + 0.01, 0.002, 0.28, 0.12, PRI.STING, 0.3, 0, 0, pan);
   }
 
   /**
@@ -2155,6 +2217,19 @@ export function createAudio(options) {
           case 'ember':
             if (!muted) playEmber();
             break;
+          // New Descent (§4.11). Positioned like every other world event, off the bearing helper the
+          // pickups and the portal already share, so a creature on your left dies on your left.
+          case 'swing':
+            if (!muted) playSwing(e.hit === true);
+            break;
+          case 'enemyHit':
+            if (!muted) {
+              playEnemyHit(e.kind === 'wraith' ? 'wraith' : 'crawler', e.killed === true, pickupPan(e.x, e.y, state));
+            }
+            break;
+          case 'playerHit':
+            if (!muted) playPlayerHit(pickupPan(e.x, e.y, state));
+            break;
           case 'unlock':
             if (!muted) playUnlock(e.boon === true);
             break;
@@ -2320,8 +2395,15 @@ export function createAudio(options) {
 
       // ── Generative ambience ──────────────────────────────────────────────────────────────
       const musicOn = music > 0.0005 && !silent() && phaseMusic > 0.05;
-      const droneWant = musicOn ? 0.11 : 0;
-      if (droneWant !== droneAt) {
+      // New Descent (§4.11): the drone swells with the nearest awake creature. It is the mode's only
+      // warning that something has noticed you and is behind you — the corridor gives no other —
+      // and it rides the ambience that is already there rather than adding a stinger, so it reads
+      // as the room changing rather than as a sound effect. Always 0 in Classic Descent.
+      const threat =
+        playing && d && typeof d.threat === 'number' && Number.isFinite(d.threat) ? clamp01(d.threat) : 0;
+      // Squared, like the portal hum: subliminal across a room, unmistakable in the last few tiles.
+      const droneWant = musicOn ? AUDIO.DRONE_GAIN * (1 + AUDIO.THREAT_SWELL * threat * threat) : 0;
+      if (Math.abs(droneWant - droneAt) > 0.002) {
         droneAt = droneWant;
         pTarget(droneGain.gain, droneWant, t, AUDIO.TC.music);
       }

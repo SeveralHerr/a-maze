@@ -130,6 +130,8 @@ function createEnemy(id) {
     hurt: 0,
     damage: 0,
     awake: false,
+    // Seconds before this one can be staggered again (see `COMBAT.STAGGER_IMMUNE`).
+    poise: 0,
   };
 }
 
@@ -246,6 +248,7 @@ export function spawnEnemies(state) {
     e.lky = e.y;
     e.hunt = 0;
     e.hurt = 0;
+    e.poise = 0;
     e.awake = false;
   }
 }
@@ -262,12 +265,20 @@ export function spawnEnemies(state) {
  * @returns {boolean} true when a swing actually started
  */
 export function startAttack(state) {
-  if (state.mode !== 'combat') return false;
   const atk = state.attack;
-  if (!atk || atk.st !== SW_IDLE) return false;
+  if (!atk) return false;
+  if (atk.st !== SW_IDLE) {
+    // Busy. Remember the press instead of dropping it: a press during the recovery window is the
+    // player asking for the next swing at the first legal moment, and swallowing it is what makes a
+    // weapon feel like it is ignoring the button. Only the recovery buffers — buffering during the
+    // wind-up or the strike would queue a swing the player has not seen the result of yet.
+    if (atk.st === SW_RECOVER) atk.buffer = COMBAT.ATTACK_BUFFER;
+    return false;
+  }
   atk.st = SW_WIND;
   atk.t = 0;
   atk.hits = 0;
+  atk.buffer = 0;
   return true;
 }
 
@@ -281,9 +292,26 @@ export function startAttack(state) {
  * @param {number} dt
  * @returns {void}
  */
-function stepSword(state, dt) {
+function stepSword(state, dt, held) {
   const atk = state.attack;
-  if (!atk || atk.st === SW_IDLE) return;
+  if (!atk) return;
+  if (atk.st === SW_IDLE) {
+    // Held down, or a press buffered during the last recovery: swing again. Holding the button is
+    // how every player tests a weapon, and one swing per press-and-hold reads as a broken control.
+    if (held || atk.buffer > 0) {
+      startAttack(state);
+      return;
+    }
+    // Only ages while the sword is FREE, so a press lands whatever moment of the recovery it
+    // arrived in. Ticking it down during the swing made the window a race against the recovery's
+    // remaining time: the same press bought a swing early in the recovery and was silently dropped
+    // late in it, which is exactly the inconsistency a buffer exists to remove.
+    if (atk.buffer > 0) {
+      atk.buffer -= dt;
+      if (atk.buffer < 0) atk.buffer = 0;
+    }
+    return;
+  }
   atk.t += dt;
   const S = COMBAT.SWING;
   if (atk.st === SW_WIND) {
@@ -361,6 +389,9 @@ function damageEnemy(state, e, amount) {
   e.hp -= amount;
   e.hurt = 1;
   e.awake = true;
+  if (e.poise > 0) {
+    // Already reeling from the last one: this hit hurts but does not interrupt (see STAGGER_IMMUNE).
+  }
   const killed = e.hp <= 0;
   if (killed) {
     e.hp = 0;
@@ -374,10 +405,13 @@ function damageEnemy(state, e, amount) {
     // Descent's economy has to reward the thing New Descent is about.
     const progress = state.progress;
     if (progress) progress.purse += state.perks ? state.perks.gemPurse : 1;
-  } else {
-    // Staggered out of whatever it was doing — including its own wind-up.
+  } else if (e.poise <= 0) {
+    // Staggered out of whatever it was doing — including its own wind-up — and then immune to being
+    // staggered again for `STAGGER_IMMUNE`, which is what stops a rhythm-swinger locking it down
+    // for ever. The next hit still lands; it simply does not interrupt.
     e.st = /** @type {EnemyState} */ (ST_STAGGER);
     e.t = 0;
+    e.poise = COMBAT.STAGGER_IMMUNE;
   }
   state.events.push({ type: 'enemyHit', kind: e.kind, x: e.x, y: e.y, damage: amount, killed });
 }
@@ -419,7 +453,7 @@ export function stepCombat(state) {
     run.iframes -= dt;
     if (run.iframes < 0) run.iframes = 0;
   }
-  stepSword(state, dt);
+  stepSword(state, dt, state.sim.attackHeld === true);
 
   const list = state.enemies;
   const level = state.levelData;
@@ -445,6 +479,10 @@ export function stepCombat(state) {
     if (e.cool > 0) {
       e.cool -= dt;
       if (e.cool < 0) e.cool = 0;
+    }
+    if (e.poise > 0) {
+      e.poise -= dt;
+      if (e.poise < 0) e.poise = 0;
     }
 
     const dx = p.x - e.x;
@@ -534,8 +572,17 @@ function stepEnemy(state, e, dt, dx, dy, d2, sees) {
   if (st === ST_STAGGER) {
     // Knocked back a little, so a hit reads as an impact rather than as a number going down.
     if (e.t >= stats.stagger) {
-      e.st = /** @type {EnemyState} */ (ST_CHASE);
       e.t = 0;
+      // Coming out of a stagger inside its own reach, it hits back immediately rather than walking
+      // in again: standing in front of something you have just interrupted has to cost something,
+      // or the interrupt is a free stun rather than a trade.
+      const back = stats.reach + PLAYER.RADIUS;
+      if (sees && d2 <= back * back) {
+        e.st = /** @type {EnemyState} */ (ST_WIND);
+        e.cool = stats.windUp + stats.strike + stats.recover;
+      } else {
+        e.st = /** @type {EnemyState} */ (ST_CHASE);
+      }
     } else {
       const d = Math.sqrt(d2);
       if (d > 1e-6) moveEnemy(state, e, (-dx / d) * stats.speed * 0.55, (-dy / d) * stats.speed * 0.55, dt);

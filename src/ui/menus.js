@@ -917,7 +917,8 @@ const PICK_PALETTE = Object.freeze([
  * Callbacks into the composition root. Every one is optional; a missing callback makes the
  * corresponding row inert rather than throwing.
  * @typedef {Object} MenuCallbacks
- * @property {() => void} [onNewGame]    start a run (title "Descend", game-over "Try Again")
+ * @property {(mode:import('../core/types.js').Mode) => void} [onNewGame]  start a run. The title's
+ *   two rows pass the mode they name (§4.11); "Try Again" repeats the mode the run that ended was in
  * @property {() => void} [onResume]     leave the pause screen
  * @property {() => void} [onQuit]       abandon the run and return to the title
  * @property {() => void} [onSaveQuit]   keep the run as a saved run and return to the title (§4.10)

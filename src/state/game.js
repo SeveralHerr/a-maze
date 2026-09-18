@@ -92,7 +92,7 @@ const log = createLogger('state');
  * escapes the synchronous reducer call.
  * @type {SimInput}
  */
-const _input = { moveX: 0, moveY: 0, turn: 0, lookDX: 0, chalk: false, attack: false, auto: false };
+const _input = { moveX: 0, moveY: 0, turn: 0, lookDX: 0, chalk: false, attack: false, attackHeld: false, auto: false };
 
 /**
  * Phases from which `newGame` is honoured. See the phase-machine note in the file header.
@@ -142,7 +142,7 @@ export function createInitialState(settings, best, progress, profiles) {
     profiles: allProfiles,
     // Pooled, and empty until a combat level is installed (§4.11).
     enemies: [],
-    attack: { st: 0, t: 0, hits: 0 },
+    attack: { st: 0, t: 0, hits: 0, buffer: 0 },
     time: 0,
     phaseTime: 0,
     level: 1,
@@ -323,6 +323,7 @@ function readInput(src) {
     _input.lookDX = 0;
     _input.chalk = false;
     _input.attack = false;
+    _input.attackHeld = false;
     return _input;
   }
   const f = /** @type {Record<string, unknown>} */ (src);
@@ -350,6 +351,7 @@ function readInput(src) {
   const hasSet = pressed !== null && typeof pressed === 'object' && typeof pressed.has === 'function';
   _input.chalk = hasSet && pressed.has('chalk') === true;
   _input.attack = hasSet && pressed.has('attack') === true;
+  _input.attackHeld = f.attackHeld === true;
   return _input;
 }
 

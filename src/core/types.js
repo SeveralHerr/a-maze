@@ -138,6 +138,8 @@
  * @property {number} moveY           forward -1..1 (forward +)
  * @property {number} turn            keyboard/stick turn -1..1 (right +), scaled by dt in sim
  * @property {number} lookDX          accumulated mouse/touch yaw delta in radians since last poll (already sensitivity-scaled)
+ * @property {boolean} attackHeld   the sword button is DOWN this poll, not merely pressed (§4.11).
+ *   `pressed` can only carry an edge, and a held weapon has to keep swinging.
  * @property {Set<InputAction>} pressed   edge-triggered this poll
  */
 

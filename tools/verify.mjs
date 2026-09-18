@@ -26,6 +26,17 @@ const TAG = opt('--tag', 'verify');
 const URL = opt('--url', 'http://localhost:5173').replace(/\/$/, '');
 const OUT = path.resolve(ROOT, opt('--out', 'logs'));
 const SEED = Number(opt('--seed', '1337')) >>> 0;
+/**
+ * Which mode the run drives: `classic` (the default) or `combat` — New Descent (ARCHITECTURE.md
+ * §4.11).
+ *
+ * This exists because the gate did not cover the mode it was written for. Every `newGame` here
+ * omitted `mode`, so the fps, render, heap, frame-gap and screenshot assertions all measured
+ * Classic Descent, and the ~270 lines of enemy and weapon rendering that shipped with New Descent
+ * reached review completely unexercised. `--mode combat` puts the same gates on the mode that
+ * actually has monsters and a sword in it.
+ */
+const MODE = opt('--mode', 'classic') === 'combat' ? 'combat' : 'classic';
 const SOAK_S = Number(opt('--soak', '20'));
 const FPS_S = Number(opt('--fps', '5'));
 const KEEP_OPEN = args.includes('--keep-open');
@@ -117,6 +128,7 @@ const report = {
   tag: TAG,
   url: URL,
   seed: SEED,
+  mode: MODE,
   startedAt: new Date().toISOString(),
   chrome: null,
   loadMs: 0,
@@ -574,7 +586,7 @@ async function measureVsyncFps(executablePath) {
     await p.goto(`${URL}/?headless=1`, { waitUntil: 'load', timeout: 30000 });
     await waitForState(p, () => window.__game && window.__game.ready === true, 20000, 'vsync run ready');
     await p.evaluate(installAutopilot);
-    await p.evaluate((seed) => window.__game.dispatch({ type: 'newGame', seed }), SEED);
+    await p.evaluate(({ seed, mode }) => window.__game.dispatch({ type: 'newGame', seed, mode }), { seed: SEED, mode: MODE });
     await waitForState(p, () => window.__game.state().phase === 'playing', 15000, 'vsync run playing');
     await p.evaluate(() => window.__ap.start(1));
     await sleep(1200);
@@ -720,7 +732,7 @@ try {
   });
 
   // ── Level 1 ──
-  await page.evaluate((seed) => window.__game.dispatch({ type: 'newGame', seed }), SEED);
+  await page.evaluate(({ seed, mode }) => window.__game.dispatch({ type: 'newGame', seed, mode }), { seed: SEED, mode: MODE });
   await waitForState(page, () => window.__game.state().phase === 'playing', 15000, 'phase playing (level 1)');
   await page.evaluate(() => window.__ap.start(2));
 
@@ -1188,7 +1200,7 @@ try {
   await page.evaluate(installAutopilot);
   await sleep(1500);
   await shot(page, 'mobile-title');
-  await page.evaluate((seed) => window.__game.dispatch({ type: 'newGame', seed }), SEED);
+  await page.evaluate(({ seed, mode }) => window.__game.dispatch({ type: 'newGame', seed, mode }), { seed: SEED, mode: MODE });
   await waitForState(page, () => window.__game.state().phase === 'playing', 15000, 'mobile playing');
   await page.evaluate(() => window.__ap.start(1));
   await sleep(4000);

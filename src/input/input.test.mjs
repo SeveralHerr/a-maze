@@ -1254,7 +1254,10 @@ test('poll() reuses one frame object and one Set (no per-step allocation)', () =
 test('the frame always carries the exact contract shape', () => {
   const t = setup();
   const f = t.input.poll();
-  assert.deepEqual(Object.keys(f).sort(), ['lookDX', 'moveX', 'moveY', 'pressed', 'turn']);
+  // `attackHeld` joined the contract with New Descent (§4.11): the sword is a hold as well as an
+  // edge, and `pressed` can only ever carry the edge.
+  assert.deepEqual(Object.keys(f).sort(), ['attackHeld', 'lookDX', 'moveX', 'moveY', 'pressed', 'turn']);
+  assert.equal(typeof f.attackHeld, 'boolean');
   assert.equal(typeof f.moveX, 'number');
   assert.equal(typeof f.moveY, 'number');
   assert.equal(typeof f.turn, 'number');

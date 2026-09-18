@@ -122,6 +122,7 @@ const BASE_PERKS = Object.freeze(computePerks(null));
  * @property {number} lookDX  mouse/touch yaw delta in radians for this step
  * @property {boolean} [chalk] the `chalk` action was pressed this step (ARCHITECTURE.md §4.9)
  * @property {boolean} [attack] the `attack` action was pressed this step (New Descent, §4.11)
+ * @property {boolean} [attackHeld] the sword button is still down (§4.11): the swing repeats
  * @property {boolean} [auto]  Auto Explore wrote this step's axes (§4.10): the torch burns at
  *   `AUTO_DRAIN_SCALE` — its calm pace over the walking pace — so oil per tile matches normal play
  */
@@ -148,6 +149,7 @@ const BASE_PERKS = Object.freeze(computePerks(null));
  * @property {number} flaskBase    a flask's base value on this level (`oilFuel` of the base tank), or 0
  *   for "derive it from `run.fuelMax`" (a state installed without `levelReady`)
  * @property {number} scrollIdx    index of this level's map scroll in `levelData.items`, or −1
+ * @property {boolean} attackHeld  the sword button is down this step (New Descent, §4.11)
  * @property {LevelData|null} gridFor the level the item grid was built for (identity check)
  * @property {number} gridW        item-grid buckets across
  * @property {number} gridH        item-grid buckets down
@@ -247,6 +249,7 @@ export function createSimScratch() {
     drain: 1,
     flaskBase: 0,
     scrollIdx: -1,
+    attackHeld: false,
     gridFor: null,
     gridW: 0,
     gridH: 0,
@@ -291,6 +294,7 @@ export function resetSimScratch(sim) {
   sim.drain = 1;
   sim.flaskBase = 0;
   sim.scrollIdx = -1;
+  sim.attackHeld = false;
   // Drops the reference to the previous level's data — and forces a rebuild before the next query.
   sim.gridFor = null;
   sim.gridW = 0;
@@ -1412,6 +1416,9 @@ export function stepPlayingBody(state, input) {
   // on a classic step from the version that called through and returned.
   if (state.mode === 'combat') {
     if (input.attack === true) startAttack(state);
+    // Parked on the scratch rather than passed down: `stepCombat` takes no arguments by design
+    // (see `combatDt`), and the held state must survive into the sword's own step.
+    sim.attackHeld = input.attackHeld === true;
     combatDt[0] = dt;
     stepCombat(state);
   }

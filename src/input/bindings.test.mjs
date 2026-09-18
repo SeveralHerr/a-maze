@@ -128,7 +128,9 @@ test('gamepad standard mapping: A/B/Start/Back and the d-pad', () => {
   assert.equal(GAMEPAD_BUTTON_ACTION[15], ACTION_BIT.right);
   assert.equal(GAMEPAD_BUTTON_HOLD[12], HOLD.FORWARD);
   assert.equal(GAMEPAD_BUTTON_HOLD[14], HOLD.TURN_L);
-  for (const b of [4, 6, 7, 10]) assert.equal(GAMEPAD_BUTTON_HOLD[b], undefined, `button ${b} no longer sprints`);
+  // 7 is the right trigger: it holds the SWING slot now (§4.11), so a held trigger keeps swinging.
+  for (const b of [4, 6, 10]) assert.equal(GAMEPAD_BUTTON_HOLD[b], undefined, `button ${b} no longer sprints`);
+  assert.equal(GAMEPAD_BUTTON_HOLD[7], HOLD.SWING, 'the right trigger is a hold as well as an edge');
   assert.equal(GAMEPAD_BUTTON_ACTION[2], ACTION_BIT.chalk, 'X chalks');
   assert.equal(GAMEPAD_BUTTON_ACTION[7], ACTION_BIT.attack, 'right trigger swings');
   // Unbound buttons must read as undefined, never as 0 (= slot FORWARD). Button 5 stays unbound on

@@ -38,9 +38,13 @@ function run(mode, lv = 1, seed = 4242) {
   return s;
 }
 
-/** One tick with no input. @param {any} s @param {number} [n] @param {string[]} [press] */
-function tick(s, n = 1, press = []) {
-  const input = { moveX: 0, moveY: 0, turn: 0, lookDX: 0, pressed: new Set(press) };
+/**
+ * One tick. `press` are the edges this step; `held` is the sword button still being down, which the
+ * real input funnel reports separately because `pressed` can only carry an edge (§4.11).
+ * @param {any} s @param {number} [n] @param {string[]} [press] @param {boolean} [held]
+ */
+function tick(s, n = 1, press = [], held = false) {
+  const input = { moveX: 0, moveY: 0, turn: 0, lookDX: 0, pressed: new Set(press), attackHeld: held };
   for (let i = 0; i < n; i++) reducer(s, { type: 'tick', dt: 1 / 60, input });
 }
 
@@ -146,20 +150,51 @@ function faceFirstEnemy(s, d) {
   return e;
 }
 
-test('sword: a press opens one swing, and holding the button does not queue another', () => {
+test('sword: a press opens one swing, and a HELD button keeps swinging', () => {
   const s = run('combat', 1);
   faceFirstEnemy(s, 3);
-  tick(s, 1, ['attack']);
+  tick(s, 1, ['attack'], true);
   assert.equal(s.attack.st, 1, 'wind-up');
   const S = COMBAT.SWING;
-  // Hold it down for the whole swing: the state machine must run exactly once and return to idle.
-  const steps = Math.ceil((S.WIND_UP + S.STRIKE + S.RECOVER) * 60) + 2;
+  const cycle = S.WIND_UP + S.STRIKE + S.RECOVER;
+  // Hold it down for three cycles' worth of steps. Holding a weapon's button is what every player
+  // does first, and one swing per press-and-hold reads as a broken control.
   let swings = 0;
-  for (let i = 0; i < steps; i++) {
-    tick(s, 1, ['attack']);
+  for (let i = 0; i < Math.ceil(cycle * 3 * 60); i++) {
+    tick(s, 1, [], true);
     swings += events(s, 'swing').length;
   }
-  assert.equal(swings, 1, 'one press-and-hold is one swing');
+  assert.ok(swings >= 2, `a held button keeps swinging (${swings} in three cycles)`);
+
+  // Let go, and it stops at the end of the swing in flight.
+  let after = 0;
+  for (let i = 0; i < Math.ceil(cycle * 2 * 60); i++) {
+    tick(s, 1, [], false);
+    after += events(s, 'swing').length;
+  }
+  assert.ok(after <= 1, 'releasing stops it');
+  assert.equal(s.attack.st, 0, 'and the sword comes back to rest');
+});
+
+test('sword: a press during the recovery is remembered, not dropped', () => {
+  const s = run('combat', 1);
+  faceFirstEnemy(s, 3);
+  const S = COMBAT.SWING;
+  tick(s, 1, ['attack']);
+  // Land inside the recovery window and press there. Tapping on the beat is how a player asks for
+  // the next swing, and swallowing that press makes the weapon feel like it is ignoring them.
+  tick(s, Math.ceil((S.WIND_UP + S.STRIKE) * 60) + 1);
+  assert.equal(s.attack.st, 3, 'recovering');
+  tick(s, 1, ['attack']);
+  assert.ok(s.attack.buffer > 0, 'the press was buffered');
+  // Long enough for the recovery to finish AND the queued swing to reach its own strike window,
+  // which is where the `swing` event is emitted.
+  let swings = 0;
+  for (let i = 0; i < Math.ceil((S.RECOVER + S.WIND_UP + S.STRIKE) * 60) + 6; i++) {
+    tick(s, 1);
+    swings += events(s, 'swing').length;
+  }
+  assert.equal(swings, 1, 'the buffered press became exactly one further swing');
 });
 
 test('sword: the strike window resolves once, and only within reach and arc', () => {
@@ -206,6 +241,24 @@ test('sword: a kill scores, fills the purse and leaves a corpse that stops being
   const hp = s.run.hp;
   tick(s, 240);
   assert.equal(s.run.hp, hp, 'a corpse cannot hit back');
+});
+
+test('enemies: a staggered one cannot be stun-locked by swinging on rhythm', () => {
+  // THE bug the gauntlet found: every non-killing hit re-staggered, and stagger + wind-up is longer
+  // than the sword's whole cycle for both kinds — so a player holding the button took literally zero
+  // damage, for ever, from anything. `COMBAT.STAGGER_IMMUNE` is what buys the fight back.
+  const s = run('combat', 1);
+  const e = faceFirstEnemy(s, 0.85);
+  e.awake = true;
+  // Give it enough health that it survives the whole exchange, so this measures the loop and not
+  // a lucky kill.
+  e.hpMax = 4000;
+  e.hp = 4000;
+  let guard = 0;
+  const hp0 = s.run.hp;
+  while (s.run.hp === hp0 && guard++ < 60 * 25) tick(s, 1, ['attack'], true);
+  assert.ok(s.run.hp < hp0, 'swinging on rhythm does NOT make the player invulnerable');
+  assert.ok(guard < 60 * 25, `it got a hit in within ${(guard / 60).toFixed(1)}s`);
 });
 
 test('sword: interrupting a wind-up hits harder than a clean swing', () => {

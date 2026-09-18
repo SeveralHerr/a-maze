@@ -89,10 +89,22 @@ export const HOLD = Object.freeze({
   STRAFE_R: 3,
   TURN_L: 4,
   TURN_R: 5,
+  /**
+   * The sword (New Descent, §4.11). A hold slot rather than only the `attack` action bit, because
+   * an action is an EDGE: holding the button down gave exactly one swing, which is what every
+   * player does first when they pick up a weapon and is what made it read as a broken control.
+   */
+  SWING: 6,
 });
 
-/** Number of hold slots; the size of the press-count array in `input.js`. */
-export const HOLD_COUNT = 6;
+/**
+ * Number of hold slots; the size of the press-count array in `input.js`.
+ *
+ * Derived from {@link HOLD} rather than typed, because the two going out of step is silent:
+ * a slot past the end of an `Int32Array` swallows every write, so the key would simply never
+ * register and nothing anywhere would say why.
+ */
+export const HOLD_COUNT = Object.keys(HOLD).length;
 
 // ─── Keyboard tables ─────────────────────────────────────────────────────────────────────────
 
@@ -103,7 +115,7 @@ export const HOLD_COUNT = 6;
  * `backward` so it can never be confused with the `back` action.
  * @type {readonly string[]}
  */
-export const HOLD_NAMES = Object.freeze(['forward', 'backward', 'strafeLeft', 'strafeRight', 'turnLeft', 'turnRight']);
+export const HOLD_NAMES = Object.freeze(['forward', 'backward', 'strafeLeft', 'strafeRight', 'turnLeft', 'turnRight', 'swing']);
 
 /**
  * A keyboard remap: `KeyboardEvent.code` → the controls that key drives, by name (a hold name from
@@ -139,13 +151,13 @@ export const DEFAULT_KEY_BINDINGS = Object.freeze({
   KeyE: Object.freeze(['turnRight']),
   ArrowRight: Object.freeze(['turnRight', 'right']),
   KeyC: Object.freeze(['chalk']),
-  KeyF: Object.freeze(['attack']),
+  KeyF: Object.freeze(['attack', 'swing']),
   Enter: Object.freeze(['confirm']),
   NumpadEnter: Object.freeze(['confirm']),
   // Space is both, the way Escape is both `back` and `pause`: `menus.handleInput` returns false
   // during play, so `confirm` is dead there and the swing has the key every player reaches for.
   // Consumers disambiguate by phase, exactly as §4.3 says.
-  Space: Object.freeze(['confirm', 'attack']),
+  Space: Object.freeze(['confirm', 'attack', 'swing']),
   Escape: Object.freeze(['back', 'pause']),
   Backspace: Object.freeze(['back']),
   KeyP: Object.freeze(['pause']),
@@ -329,6 +341,8 @@ GAMEPAD_BUTTON_HOLD[12] = HOLD.FORWARD;
 GAMEPAD_BUTTON_HOLD[13] = HOLD.BACK;
 GAMEPAD_BUTTON_HOLD[14] = HOLD.TURN_L;
 GAMEPAD_BUTTON_HOLD[15] = HOLD.TURN_R;
+// The right trigger both fires the edge and counts as held, so a held trigger keeps swinging.
+GAMEPAD_BUTTON_HOLD[7] = HOLD.SWING;
 Object.freeze(GAMEPAD_BUTTON_HOLD);
 
 // ─── Pure math shared by every analogue source ───────────────────────────────────────────────

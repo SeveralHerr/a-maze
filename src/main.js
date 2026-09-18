@@ -46,7 +46,7 @@ import { createMazeClient } from './maze/client.js';
 import { createRaycaster } from './renderer/raycaster.js';
 import { createTextures } from './renderer/textures.js';
 import { createTilesetTextures, tilesetIndexById, tilesetIndexForLevel } from './renderer/tilesets/index.js';
-import { SWORD_FRAMES, createCombatTextures } from './renderer/enemies.js';
+import { SWORD_FRAMES, startCombatTextures } from './renderer/enemies.js';
 import { createPost } from './renderer/post.js';
 import { PARTICLE, PARTICLE_COLORS } from './renderer/particles.js';
 
@@ -93,6 +93,15 @@ const LOAD_TIMEOUT_S = 12;
  * on the loading phase, never a delay added to a slow build.
  */
 const MIN_LOAD_S = 0.8;
+
+/**
+ * Sprite frames of New Descent's art painted per simulation step (§4.11).
+ *
+ * The set is 66 frames and ~130 ms in total. At 2 a step that is ~4 ms of work per step and ~0.55 s
+ * of loading screen — inside {@link MIN_LOAD_S}, and small enough per step that nothing is discarded.
+ * Painting all 66 at once froze the thread for 233 ms and lost eight steps.
+ */
+const COMBAT_PAINT_BUDGET = 2;
 
 /**
  * Milliseconds after a fullscreen request during which losing pointer lock does not pause. Chrome
@@ -369,16 +378,35 @@ function boot() {
    * @type {import('./renderer/enemies.js').CombatTextures|null}
    */
   let combatTextures = null;
+  /**
+   * The paint in progress, or null. Painting the whole set at once cost a **233 ms freeze and eight
+   * discarded sim steps** the first time a player chose New Descent, because it ran synchronously
+   * inside a store subscriber inside `step()`. It is a budgeted job now ({@link COMBAT_PAINT_BUDGET}),
+   * spent on the loading screen — which has an 800 ms floor to hide it behind.
+   * @type {ReturnType<typeof startCombatTextures>|null}
+   */
+  let combatPaint = null;
 
   /**
-   * Make sure the renderer has the combat art if this run needs it, and does not if it does not.
-   * One identity compare per level install, never per frame.
+   * Start (or finish) painting the combat art if this run needs it. One compare per level install.
    * @param {string} mode
    * @returns {void}
    */
   function syncCombatArt(mode) {
-    if (mode !== 'combat') return;
-    if (combatTextures === null) combatTextures = createCombatTextures(keepTextures.seed);
+    if (mode !== 'combat' || combatTextures !== null) return;
+    if (combatPaint === null) combatPaint = startCombatTextures(keepTextures.seed);
+  }
+
+  /**
+   * Spend one step's budget on the combat art, and install it once every frame exists. Called from
+   * `step()` while loading, so the cost lands where the loading screen already is.
+   * @returns {void}
+   */
+  function advanceCombatPaint() {
+    if (combatPaint === null) return;
+    if (!combatPaint.step(COMBAT_PAINT_BUDGET)) return;
+    combatTextures = combatPaint.set;
+    combatPaint = null;
     raycaster.setCombatTextures(combatTextures);
   }
 
@@ -1359,10 +1387,12 @@ function boot() {
     // phase machine has no exit from `loading` (documented in ARCHITECTURE.md §4.2).
     if (store.getState().phase === 'loading') {
       loadWait += dt;
+      // A few more sprite frames while the labyrinth is being carved (§4.11).
+      advanceCombatPaint();
       if (pendingLevel !== null) {
         // A built level is in hand — install it once the loading screen has had its moment. The
         // token is re-checked here because a retry may have superseded this answer while it waited.
-        if (loadWait >= MIN_LOAD_S) {
+        if (loadWait >= MIN_LOAD_S && combatPaint === null) {
           const data = pendingLevel;
           const token = pendingToken;
           pendingLevel = null;

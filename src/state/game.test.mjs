@@ -204,7 +204,8 @@ test('createInitialState: a clean, valid, contract-shaped state', () => {
   });
   assert.equal(s.mode, 'classic', 'a fresh state is Classic Descent until a title row says otherwise');
   assert.deepEqual(s.enemies, []);
-  assert.deepEqual(s.attack, { st: 0, t: 0, hits: 0 });
+  // `buffer` remembers a press made while the sword was busy (§4.11).
+  assert.deepEqual(s.attack, { st: 0, t: 0, hits: 0, buffer: 0 });
   // `best` and `progress` are live references into the mode's profile, not copies (§4.11).
   assert.equal(s.best, s.profiles.classic.best);
   assert.equal(s.progress, s.profiles.classic.progress);

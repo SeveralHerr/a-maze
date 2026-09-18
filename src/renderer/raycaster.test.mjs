@@ -26,6 +26,7 @@ import { createRaycaster } from './raycaster.js';
 import { createTextures } from './textures.js';
 import { C } from './palette.js';
 import { POSES, PREVIEW_TORCHES, buildPreviewMaze, previewItems } from './preview-scene.js';
+import { createCombatTextures } from './enemies.js';
 
 /** Painting textures costs ~20 ms; every test shares one set. */
 const textures = createTextures(7);
@@ -1678,4 +1679,169 @@ test('the oil flask is a still image: it neither spins nor bobs off its shadow',
   // Across a spin period and a bob phase the flask covers exactly the same pixels (their colours
   // may breathe with the player's torch flicker).
   for (const t of [0.9, 1.7, 3.1]) assert.deepEqual(frame(t), first, `the flask moved at t=${t}`);
+});
+
+
+// ─── New Descent: enemies and the weapon (ARCHITECTURE.md §4.11) ─────────────────────────────
+//
+// These exist because the combat rendering shipped with no coverage at all, and the gap let a
+// `healthText.get is not a function` crash reach a live build and throw 97 286 times in one run.
+// Anything drawn only in one mode needs a test that enters that mode.
+
+/** The combat art, painted once for this file. */
+const combat = createCombatTextures(7);
+
+/**
+ * One enemy, in the pooled shape `combat.js` produces.
+ * @param {Partial<import('../core/types.js').Enemy>} [over]
+ * @returns {any}
+ */
+function foe(over = {}) {
+  return {
+    id: 0, kind: 'crawler', x: 3.5, y: 2.5, px: 3.5, py: 2.5, angle: Math.PI,
+    hp: 30, hpMax: 30, st: 1, t: 0, cool: 0, anim: 0, lkx: 0, lky: 0,
+    hunt: 0, hurt: 0, damage: 9, awake: true, poise: 0, ...over,
+  };
+}
+
+/** How many pixels of the frame differ between two reads. */
+function diffCount(a, b) {
+  let n = 0;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) n++;
+  return n;
+}
+
+test('combat: an enemy is only drawn once the art is installed, and then it is', () => {
+  const maze = room();
+  const { rc, read } = makeRenderer();
+  const view = makeView(maze, { player: { x: 1.5, y: 2.5, angle: 0 } });
+
+  rc.render(view);
+  const bare = read().slice();
+
+  // With enemies but no art, nothing changes: a Classic session never receives a combat set.
+  /** @type {any} */ (view).enemies = [foe()];
+  rc.render(view);
+  assert.equal(diffCount(bare, read()), 0, 'no art installed, nothing drawn');
+
+  rc.setCombatTextures(combat);
+  rc.render(view);
+  assert.ok(diffCount(bare, read()) > 200, 'with the art installed the creature is on screen');
+
+  // And forgetting the art puts it back exactly as it was.
+  rc.setCombatTextures(null);
+  rc.render(view);
+  assert.equal(diffCount(bare, read()), 0, 'setCombatTextures(null) forgets it');
+  rc.dispose();
+});
+
+test('combat: a dead enemy stops being drawn once its corpse timer is up', () => {
+  const maze = room();
+  const { rc, read } = makeRenderer();
+  rc.setCombatTextures(combat);
+  const view = makeView(maze, { player: { x: 1.5, y: 2.5, angle: 0 } });
+  rc.render(view);
+  const bare = read().slice();
+
+  /** @type {any} */ (view).enemies = [foe({ st: 6, t: 0.2 })];
+  rc.render(view);
+  assert.ok(diffCount(bare, read()) > 100, 'a fresh corpse is still on the cobbles');
+
+  /** @type {any} */ (view).enemies = [foe({ st: 6, t: 99 })];
+  rc.render(view);
+  assert.equal(diffCount(bare, read()), 0, 'a long-dead one is gone');
+  rc.dispose();
+});
+
+test('combat: the two creatures draw differently, and both read against the wall', () => {
+  const maze = room();
+  const { rc, read } = makeRenderer();
+  rc.setCombatTextures(combat);
+  const view = makeView(maze, { player: { x: 1.5, y: 2.5, angle: 0 } });
+  rc.render(view);
+  const bare = read().slice();
+
+  /** @type {any} */ (view).enemies = [foe({ kind: 'crawler' })];
+  rc.render(view);
+  const crawler = read().slice();
+  /** @type {any} */ (view).enemies = [foe({ kind: 'wraith' })];
+  rc.render(view);
+  const wraith = read().slice();
+
+  assert.ok(diffCount(bare, crawler) > 200, 'the crawler is visible');
+  assert.ok(diffCount(bare, wraith) > 200, 'the wraith is visible');
+  assert.ok(diffCount(crawler, wraith) > 200, 'and they are not the same picture');
+  rc.dispose();
+});
+
+test('combat: the weapon draws only when the view asks for it, and every pose is safe', () => {
+  const maze = room();
+  const { rc, read } = makeRenderer();
+  rc.setCombatTextures(combat);
+  const view = makeView(maze, { player: { x: 2.5, y: 2.5, angle: 0 } });
+  rc.render(view);
+  const bare = read().slice();
+
+  /** @type {any} */ (view).weapon = { st: 0, frame: 0, phase: 0, kick: 0, sweep: 0 };
+  rc.render(view);
+  assert.ok(diffCount(bare, read()) > 150, 'the sword is in the frame');
+
+  // Every frame of the swing, plus values a malformed view could carry. None may throw, and none
+  // may leave the blit reading off the end of a texture.
+  for (const w of [
+    { st: 1, frame: 2, phase: 0.5, kick: -0.45, sweep: 0 },
+    { st: 2, frame: 3, phase: 0.2, kick: 1, sweep: 0.4 },
+    { st: 2, frame: 4, phase: 0.9, kick: 1, sweep: 1 },
+    { st: 3, frame: 7, phase: 0.8, kick: 0.2, sweep: 0.1 },
+    { st: 0, frame: 999, phase: 0, kick: 99, sweep: 99 },
+    { st: 0, frame: -5, phase: 0, kick: -99, sweep: -99 },
+    { st: 0, frame: NaN, phase: NaN, kick: NaN, sweep: NaN },
+  ]) {
+    /** @type {any} */ (view).weapon = w;
+    rc.render(view);
+    assert.ok(read().length > 0);
+  }
+
+  /** @type {any} */ (view).weapon = null;
+  rc.render(view);
+  assert.equal(diffCount(bare, read()), 0, 'a null weapon draws nothing at all');
+  rc.dispose();
+});
+
+/** Heap after a forced collection, or -1 when no `gc()` handle is available. */
+function gcHeap() {
+  const g = getGc();
+  if (g === null) return -1;
+  g();
+  g();
+  return process.memoryUsage().heapUsed;
+}
+
+test('combat: the enemy pass allocates nothing per frame once it has run once', () => {
+  const maze = room();
+  const { rc } = makeRenderer();
+  rc.setCombatTextures(combat);
+  const enemies = [];
+  for (let i = 0; i < 40; i++) enemies.push(foe({ id: i, x: 1.2 + (i % 3) * 0.9, y: 1.2 + (i % 3) * 0.9 }));
+  const view = makeView(maze, { player: { x: 2.5, y: 2.5, angle: 0 } });
+  /** @type {any} */ (view).enemies = enemies;
+  /** @type {any} */ (view).weapon = { st: 2, frame: 3, phase: 0.5, kick: 1, sweep: 0.5 };
+
+  // Warm up: the spatial index allocates to its high-water mark on the first build, and never after.
+  for (let i = 0; i < 40; i++) rc.render(view);
+  const before = gcHeap();
+  if (before < 0) {
+    // No `gc()` handle on this runtime: skip rather than assert on unforced heap noise.
+    rc.dispose();
+    return;
+  }
+  for (let i = 0; i < 400; i++) {
+    view.time += 1 / 60;
+    rc.render(view);
+  }
+  const grew = gcHeap() - before;
+  // 400 frames of 40 enemies. The index is rebuilt EVERY frame here (§4.11), which is only legal
+  // because the population is capped — so this is the test that the rebuild really is free.
+  assert.ok(grew < 200 * 1024, `enemy rendering grew the heap by ${(grew / 1024).toFixed(1)} kB over 400 frames`);
+  rc.dispose();
 });

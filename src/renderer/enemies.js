@@ -232,10 +232,12 @@ const CRAWLER_MATS = [
   // along the shell's ridge instead of a broad sheen, and that band is the only thing separating
   // three domes from one orange blob at the size the creature is actually seen.
   { ramp: RAMPS.chitin, albedo: 0.58, spec: 1.25, shine: 42, ambient: 0.2 },
-  // 1 legs and underside: matte and much darker than the shell. The gap between these two albedos
-  // IS the read — the first pass sat them 0.62/0.34 apart with a soft highlight, and the legs
-  // disappeared into the body they were supposed to be in front of.
-  { ramp: RAMPS.chitin, albedo: 0.2, spec: 0.08, ambient: 0.12 },
+  // 1 legs and underside: matte, and DARKER THAN THE SHELL BUT NOT DARK. Pushing this to 0.2 to
+  // separate the legs did the exact opposite at corridor distance: the colormap crushes its dark end,
+  // so legs, body shadow, outline and cast shadow all landed on the same two ramp steps and the
+  // creature became a brown blob with two orange eyes. A lit leg has to sit a couple of ramp steps
+  // ABOVE `chitinShadow`; the one-texel dark outline is what separates one limb from the next.
+  { ramp: RAMPS.chitin, albedo: 0.46, spec: 0.25, shine: 18, ambient: 0.26 },
   // 2 mandibles: bone-pale against the shell, which is what makes the front end read as a head.
   { ramp: RAMPS.map, albedo: 0.92, spec: 0.5, shine: 20, ambient: 0.38 },
 ];
@@ -650,22 +652,24 @@ function paintCreature(kind, yaw, gait, action, seed, tilt, stipple) {
 /**
  * The sword's anchor and its length, in texels.
  *
- * These two are what keep every pose readable. The origin is the pommel, and it sits **below the
- * card** (row 68 of a 64-row sprite) on purpose: the hand and the pommel are not what a player
- * looks at, the blade is, so the card spends all 64 of its rows on steel instead of half of them on
- * a fist. The swing rolls the whole sword about that origin, so the tip traces a circle of radius
- * `SWORD_REACH`; 48 is the longest blade whose tip stays on the card across the whole arc, and
- * `enemies.test.mjs` pins it — a pose that clips is invisible as a bug and very visible as a sword
- * with no point.
+ * The origin is the pommel. It sits a little below the card so the fist is out of frame, but only a
+ * little: pushing it to row 68 of a 64-row sprite spent every row on steel and took the crossguard
+ * and grip with it, and what reached the screen was a blade sliding in from the corner with nothing
+ * holding it. A sword reads as a sword because it has a guard. The swing rolls the whole thing about
+ * this origin, so the tip traces a circle of radius `SWORD_REACH`, and 44 is the longest blade whose
+ * point stays on the card across the whole arc — `enemies.test.mjs` pins it, because a pose that
+ * clips is invisible as a bug and very visible as a sword with no point.
  */
-const SWORD_ORIGIN_ROW = 68;
-const SWORD_REACH = 48;
+const SWORD_ORIGIN_ROW = 61;
+const SWORD_REACH = 44;
 
 /** @type {import('./models.js').Material[]} */
 const SWORD_MATS = [
-  // 0 blade: bright, hard specular — it has to out-shine every wall in the frame. The high ambient
-  // is deliberate and not physical: a blade lit only by a guttering torch is correct and unreadable.
-  { ramp: RAMPS.steel, albedo: 0.92, spec: 1.3, shine: 30, ambient: 0.62 },
+  // 0 blade: bright, with a HARD NARROW specular. 0.92/1.3/0.62 parked the whole flat at the top of
+  // the steel ramp and produced a paper-white shape with no form at all — the correction for a blade
+  // that was too dark overshot into a blade that was not a solid. The ramp has seven steps; the
+  // point of the material is to use several of them, with the glint confined to the edge.
+  { ramp: RAMPS.steel, albedo: 0.66, spec: 1.5, shine: 52, ambient: 0.4 },
   // 1 fuller (the groove down the blade): the same metal, a step darker.
   { ramp: RAMPS.steel, albedo: 0.42, spec: 0.5, shine: 26, ambient: 0.3 },
   // 2 guard and pommel: brass.
@@ -773,32 +777,41 @@ function paintSword(i, stipple) {
  * @returns {void}
  */
 function trailArc(buf, stipple, frame) {
-  // The arc is centred on the grip and sweeps back the way the blade came, between the radii the
-  // blade itself occupies — so it reads as the path of *this* blade rather than as a cloud.
+  // A SOLID tapering band, not a scatter. The first pass gated each texel on a hash and then
+  // `renderWeapon` dropped every other screen pixel again for stippled texels — random scatter times
+  // a 50 % screen stipple is white noise, and it read as dead pixels rather than as a swing. The
+  // screen-space stipple alone is the translucency; this only has to describe the path.
   const pose = swordPose(frame);
   const cx = SIZE / 2 + pose.dx;
   const cy = SWORD_ORIGIN_ROW - pose.dy;
-  // Screen angle of the blade now, and where it came from (the previous pose).
   const here = pose.roll;
   const from = swordPose(frame - 1).roll;
-  const steps = 22;
+  const steps = 26;
+  // Only the OUTER part of the blade leaves a smear, and only a couple of texels of it. Sweeping the
+  // whole length across the whole arc fills a solid sector — which is what the first solid version
+  // drew: a white wedge over a quarter of the screen that read as fog rather than as a blade. What a
+  // fast blade actually leaves is a thin crescent trailing its tip.
+  const inner = SWORD_REACH * 0.62;
   for (let k = 0; k <= steps; k++) {
-    const a = from + ((here - from) * k) / steps;
-    // Newest part of the trail is the densest: the smear fades back toward where the blade was.
-    const fade = 0.25 + 0.75 * (k / steps);
-    for (let r = 20; r < SWORD_REACH; r++) {
-      const x = Math.round(cx - Math.sin(a) * r);
-      const y = Math.round(cy - Math.cos(a) * r);
-      if (x < 0 || y < 0 || x >= SIZE || y >= SIZE) continue;
-      const i = (y << 6) | x;
-      if (buf[i] !== 0) continue;
-      // Thinner toward the grip, where a real smear has barely moved.
-      const along = (r - 20) / (SWORD_REACH - 20);
-      // Denser than the first pass (0.85): the smear is half-stippled on screen, so a texel density
-      // that looks right on the card comes out at half strength in the frame.
-      if (h01(x, y, 0x7a31) > fade * along * 1.35) continue;
-      buf[i] = r > SWORD_REACH - 8 ? C.steelGlint : C.steelPale;
-      stipple[i] = 1;
+    const u = k / steps;
+    const a = from + (here - from) * u;
+    const sn = Math.sin(a);
+    const cs = Math.cos(a);
+    // Brightest at the leading edge, dissolving back toward where the blade came from.
+    const lead = u > 0.82;
+    for (let r = inner; r < SWORD_REACH; r += 1) {
+      const along = (r - inner) / (SWORD_REACH - inner);
+      // One texel through most of it, two at the very tip.
+      const thick = along > 0.72 ? 1 : 0;
+      for (let w = -thick; w <= thick; w++) {
+        const x = Math.round(cx - sn * r + cs * w);
+        const y = Math.round(cy - cs * r - sn * w);
+        if (x < 0 || y < 0 || x >= SIZE || y >= SIZE) continue;
+        const i = (y << 6) | x;
+        if (buf[i] !== 0) continue;
+        buf[i] = lead ? C.steelPale : C.ironBase;
+        stipple[i] = 1;
+      }
     }
   }
 }
@@ -815,41 +828,89 @@ function trailArc(buf, stipple, frame) {
  * @returns {CombatTextures}
  */
 export function createCombatTextures(seed = 0xa11a2e) {
-  const usedSeed = Number.isFinite(seed) ? Number(seed) : 0xa11a2e;
-  const root = createRng(usedSeed);
-  const s = (/** @type {string} */ name) => root.fork(name).u32();
-
-  return {
-    seed: usedSeed,
-    crawler: paintKind('crawler', s('crawler')),
-    wraith: paintKind('wraith', s('wraith')),
-    sword: Array.from({ length: SWORD_FRAMES }, (_, i) => finishStippled((st) => paintSword(i, st), false)),
-  };
+  const job = startCombatTextures(seed);
+  while (!job.done) job.step(Infinity);
+  return job.set;
 }
 
 /**
- * Every frame of one creature, in `enemyFrameIndex` order.
- * @param {'crawler'|'wraith'} kind
- * @param {number} seed
- * @returns {Texture[]}
+ * Begin painting the set, a few frames at a time.
+ *
+ * The whole set is ~130 ms of rasterising, and painting it in one go inside a simulation step froze
+ * the main thread for 233 ms and lost eight steps the first time a player chose New Descent — against
+ * this project's own rule that nothing discards a step in unthrottled play. So it is a **budgeted
+ * job**, like the fog-of-war reveal and the map's rolling sweep: `main.js` spends a few frames of it
+ * per step on the loading screen, which has an 800 ms floor to hide it behind, and the set is ready
+ * before the first frame of play.
+ *
+ * `set` is filled in progressively and is safe to install at any point — a frame that has not been
+ * painted yet is simply absent, and the renderer falls back to frame 0 — but `done` is what says
+ * every pose exists.
+ * @param {number} [seed]
+ * @returns {{set: CombatTextures, done: boolean, step: (budget: number) => boolean, total: number, painted: number}}
  */
-function paintKind(kind, seed) {
-  /** @type {Texture[]} */
-  const frames = new Array(ENEMY_FRAME_COUNT);
-  /** One frame, with the ground shadow's stippled penumbra collected into its mask. */
-  const paint = (/** @type {number} */ yaw, /** @type {number} */ gait, /** @type {number} */ action, /** @type {number} */ tilt) =>
-    finishStippled((st) => paintCreature(kind, yaw, gait, action, seed, tilt, st), false);
+export function startCombatTextures(seed = 0xa11a2e) {
+  const usedSeed = Number.isFinite(seed) ? Number(seed) : 0xa11a2e;
+  const root = createRng(usedSeed);
+  const fork = (/** @type {string} */ name) => root.fork(name).u32();
+  const crawlerSeed = fork('crawler');
+  const wraithSeed = fork('wraith');
 
-  for (let v = 0; v < ENEMY_VIEWS; v++) {
-    // View 0 is the creature facing the camera; the yaw runs the full turn from there.
-    const yaw = (v / ENEMY_VIEWS) * Math.PI * 2;
-    for (let g = 0; g < ENEMY_FRAMES; g++) frames[enemyFrameIndex(v, -1, g)] = paint(yaw, g / ENEMY_FRAMES, 0, 0);
+  /** @type {CombatTextures} */
+  const set = { seed: usedSeed, crawler: new Array(ENEMY_FRAME_COUNT), wraith: new Array(ENEMY_FRAME_COUNT), sword: new Array(SWORD_FRAMES) };
+  // One flat list of thunks, so the budget is simply "how many of these to run".
+  /** @type {Array<() => void>} */
+  const work = [];
+  for (const [kind, kseed] of /** @type {const} */ ([['crawler', crawlerSeed], ['wraith', wraithSeed]])) {
+    for (let v = 0; v < ENEMY_VIEWS; v++) {
+      const yaw = (v / ENEMY_VIEWS) * Math.PI * 2;
+      for (let g = 0; g < ENEMY_FRAMES; g++) {
+        const idx = enemyFrameIndex(v, -1, g);
+        const gait = g / ENEMY_FRAMES;
+        work.push(() => {
+          set[kind][idx] = finishStippled((st) => paintCreature(kind, yaw, gait, 0, kseed, 0, st), false);
+        });
+      }
+    }
+    /** @type {Array<[number, number, number, number, number]>} */
+    const poses = [
+      [ENEMY_POSE.WIND, 0, 0, 0.55, 0],
+      [ENEMY_POSE.STRIKE, 0, 0.5, 1, 0],
+      [ENEMY_POSE.STAGGER, 0.35, 0.25, 0.2, -0.12],
+      [ENEMY_POSE.DIE_A, 0.7, 0.5, 0.1, 0.45],
+      [ENEMY_POSE.DIE_B, 1.1, 0.75, 0, 0.95],
+    ];
+    for (const [pose, yaw, gait, action, tilt] of poses) {
+      const idx = enemyFrameIndex(0, pose);
+      work.push(() => {
+        set[kind][idx] = finishStippled((st) => paintCreature(kind, yaw, gait, action, kseed, tilt, st), false);
+      });
+    }
   }
-  // Poses, front-on (see the file header).
-  frames[enemyFrameIndex(0, ENEMY_POSE.WIND)] = paint(0, 0, 0.55, 0);
-  frames[enemyFrameIndex(0, ENEMY_POSE.STRIKE)] = paint(0, 0.5, 1, 0);
-  frames[enemyFrameIndex(0, ENEMY_POSE.STAGGER)] = paint(0.35, 0.25, 0.2, -0.12);
-  frames[enemyFrameIndex(0, ENEMY_POSE.DIE_A)] = paint(0.7, 0.5, 0.1, 0.45);
-  frames[enemyFrameIndex(0, ENEMY_POSE.DIE_B)] = paint(1.1, 0.75, 0, 0.95);
-  return frames;
+  for (let i = 0; i < SWORD_FRAMES; i++) {
+    work.push(() => {
+      set.sword[i] = finishStippled((st) => paintSword(i, st), false);
+    });
+  }
+
+  let cursor = 0;
+  const job = {
+    set,
+    total: work.length,
+    painted: 0,
+    done: false,
+    /**
+     * Paint up to `budget` more frames.
+     * @param {number} budget
+     * @returns {boolean} true once every frame exists
+     */
+    step(budget) {
+      const n = budget > 0 ? budget : 1;
+      for (let k = 0; k < n && cursor < work.length; k++) work[cursor++]();
+      job.painted = cursor;
+      job.done = cursor >= work.length;
+      return job.done;
+    },
+  };
+  return job;
 }

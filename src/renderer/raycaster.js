@@ -2634,7 +2634,11 @@ export function createRaycaster(canvas, options) {
       }
     }
 
-    gatherEnemies(view, time);
+    // Gated HERE rather than inside `gatherEnemies`, and for the same reason `sim.js` gates
+    // `stepCombat`: `time` is a non-integer, so passing it to a function too big to inline boxes it
+    // into a fresh heap number on every frame — in a mode that has no enemies in it. Classic
+    // Descent must not so much as make the call.
+    if (combat !== null && idxEnemies.length > 0) gatherEnemies(view, time);
 
     const exit = view.exit;
     if (exit) {
@@ -3165,7 +3169,7 @@ export function createRaycaster(canvas, options) {
     partCam.invDet = 1 / (planeX * dirY - dirX * planeY);
     partCam.horizon = horizon;
     const partsDrawn = particles.draw(buf, width, height, zbuf, partCam);
-    renderWeapon(view);
+    if (combat !== null) renderWeapon(view);
 
     const flash = view.flash;
     if (flash && flash.a > 0.004) {

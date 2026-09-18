@@ -97,12 +97,17 @@ const AUTO_OFF_OPACITY = '0.7';
  * @param {HTMLElement|null|undefined} root  container to append into; `#touch` in `index.html`
  * @param {Object} [opts]
  * @param {(action: InputAction) => void} [opts.onAction]  called on press with `'pause'`/`'map'`/`'chalk'`
+ * @param {(action: InputAction, held: boolean) => void} [opts.onHold]  called on press AND release,
+ *   so a consumer can treat a button as held rather than tapped (the sword, §4.11)
  * @param {Document} [opts.document]  injectable document (Node tests pass a fake)
  * @returns {TouchOverlay}
  */
 export function createTouchOverlay(root, opts) {
   const options = opts || {};
   const onAction = typeof options.onAction === 'function' ? options.onAction : null;
+  // New Descent's ATTACK button is a HOLD, not a tap (§4.11): `onHold(action, down)` reports the
+  // press and the release, so a thumb kept on it keeps swinging.
+  const onHold = typeof options.onHold === 'function' ? options.onHold : null;
   /** @type {any} */
   const doc =
     options.document ||
@@ -223,10 +228,12 @@ export function createTouchOverlay(root, opts) {
       btn.style.transform = 'translateY(2px)';
       btn.style.boxShadow = 'inset 0 0 0 2px rgba(0,0,0,0.55)';
       if (onAction) onAction(action);
+      if (onHold) onHold(action, true);
     };
     const release = () => {
       if (!held) return;
       held = false;
+      if (onHold) onHold(action, false);
       btn.style.background = INK;
       btn.style.color = GOLD;
       btn.style.transform = '';

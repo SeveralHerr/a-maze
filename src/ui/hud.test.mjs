@@ -18,7 +18,7 @@ import {
   mapPointer,
   withAlpha,
 } from './hud.js';
-import { clearFontCache } from './font.js';
+import { clearFontCache, setLayoutProbe } from './font.js';
 import { countExplored } from './map.js';
 import { collectLayout, installFakeDocument } from './layout-audit.test-util.mjs';
 
@@ -909,4 +909,119 @@ test('the AUTO button yields to a key hint while the pointer is locked (§4.10)'
   } finally {
     restore();
   }
+});
+
+
+// ─── New Descent (ARCHITECTURE.md §4.11) ─────────────────────────────────────────────────────
+//
+// The HUD's combat layer had no test, and the gap let `healthText.get is not a function` reach a
+// live build — every one of these drawing tests passed, because none of them entered the mode.
+
+/**
+ * `playingState` in New Descent, with health and a live enemy.
+ * @param {object} [over] merged into `run`
+ * @returns {any}
+ */
+function combatState(over) {
+  const st = playingState(Object.assign({ hp: 62, hpMax: 100, kills: 3, iframes: 0 }, over));
+  st.mode = 'combat';
+  st.attack = { st: 0, t: 0, hits: 0, buffer: 0 };
+  st.enemies = [];
+  st.derived.threat = 0.4;
+  return st;
+}
+
+test('New Descent: the HUD renders without throwing, at every viewport and every health', () => {
+  for (const [w, h, dpr] of [[1280, 720, 1], [390, 844, 3], [1920, 1080, 2], [640, 480, 1]]) {
+    const hud = createHud(drawableCanvas(w, h), { map: 'corner' });
+    hud.resize(w, h, dpr);
+    for (const hp of [100, 62, 27, 1, 0]) {
+      const st = combatState({ hp });
+      st.run.mapFound = true;
+      // Several frames, because the bar EASES toward the real value: a throw on the second frame
+      // is exactly the kind of thing one render would miss.
+      for (let i = 0; i < 6; i++) {
+        st.time += 1 / 60;
+        hud.render(st, null, 0);
+      }
+    }
+    hud.dispose();
+  }
+});
+
+test('New Descent: the health readout carries a label and a number, not just a bar', () => {
+  const hud = createHud(drawableCanvas(1280, 720), { map: 'off' });
+  hud.resize(1280, 720, 1);
+  const st = combatState({ hp: 62, hpMax: 100 });
+  const boxes = [];
+  setLayoutProbe((kind, x, y, wd, ht, unit, label) => boxes.push({ kind, x, y, w: wd, h: ht, unit, label }));
+  try {
+    hud.render(st, null, 0);
+    hud.render(st, null, 0);
+  } finally {
+    setLayoutProbe(null);
+  }
+  const texts = boxes.filter((b) => b.kind === 'text').map((b) => b.label);
+  assert.ok(texts.includes('LIFE'), `the bar is labelled (${texts.join('|')})`);
+  assert.ok(texts.some((t) => /\d+\/\d+/.test(String(t))), 'and carries the numbers');
+  hud.dispose();
+});
+
+test('New Descent: the health bar never overlaps the depth plaque, at any viewport', () => {
+  // It did, on a phone: both wanted the column directly under the fuel gauge and neither knew about
+  // the other, so the mode's primary mobile layout drew one straight through the other.
+  for (const [w, h, dpr] of [[1280, 720, 1], [390, 844, 3], [414, 896, 2], [1024, 640, 1]]) {
+    const hud = createHud(drawableCanvas(w, h), { map: 'off' });
+    hud.resize(w, h, dpr);
+    const st = combatState();
+    const boxes = [];
+    setLayoutProbe((kind, x, y, wd, ht, unit, label) => boxes.push({ kind, x, y, w: wd, h: ht, unit, label }));
+    try {
+      hud.render(st, null, 0);
+      hud.render(st, null, 0);
+    } finally {
+      setLayoutProbe(null);
+    }
+    const life = boxes.find((b) => b.kind === 'text' && b.label === 'LIFE');
+    const depth = boxes.find((b) => b.kind === 'text' && /^DEPTH /.test(String(b.label)));
+    assert.ok(life !== undefined, `${w}x${h}: the health readout is drawn`);
+    if (depth === undefined) continue;
+    const apart = life.y + life.h <= depth.y || depth.y + depth.h <= life.y;
+    assert.ok(apart, `${w}x${h}: LIFE (${life.y}..${life.y + life.h}) overlaps DEPTH (${depth.y}..${depth.y + depth.h})`);
+  }
+});
+
+test('New Descent: the ATTACK plaque is on screen and hit-testable; Classic never draws it', () => {
+  const hud = createHud(drawableCanvas(1280, 720), { map: 'off' });
+  hud.resize(1280, 720, 1);
+  const st = combatState();
+  hud.render(st, null, 0);
+  const boxes = [];
+  setLayoutProbe((kind, x, y, wd, ht, unit, label) => boxes.push({ kind, label }));
+  try {
+    hud.render(st, null, 0);
+  } finally {
+    setLayoutProbe(null);
+  }
+  assert.ok(boxes.some((b) => b.label === 'ATTACK'), 'the plaque is drawn in New Descent');
+  // Suppressed on touch, where the touch bar owns it.
+  hud.setAttackButton(false);
+  hud.render(st, null, 0);
+  assert.equal(hud.hitAttack(640, 700), false, 'a suppressed plaque cannot be hit');
+  hud.setAttackButton(true);
+
+  // Classic Descent draws neither the plaque nor the health bar.
+  const classic = playingState();
+  classic.mode = 'classic';
+  const after = [];
+  setLayoutProbe((kind, x, y, wd, ht, unit, label) => after.push(String(label)));
+  try {
+    hud.render(classic, null, 0);
+    hud.render(classic, null, 0);
+  } finally {
+    setLayoutProbe(null);
+  }
+  assert.equal(after.includes('ATTACK'), false, 'no attack plaque in Classic Descent');
+  assert.equal(after.includes('LIFE'), false, 'and no health bar');
+  hud.dispose();
 });
