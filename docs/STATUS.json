@@ -1,6 +1,6 @@
 {
- "updated": "2026-09-17T20:59:50.170Z",
- "iteration": 24,
+ "updated": "2026-09-18T00:04:46.805Z",
+ "iteration": 25,
  "passThreshold": 8.5,
  "wave": "gauntlet",
  "waves": {
@@ -538,11 +538,11 @@
   },
   "gauntlet": {
    "status": "failing",
-   "rounds": 2
+   "rounds": 1
   },
   "stress": {
    "status": "done",
-   "summary": "FINAL STRESS GATE PASS — 18/18 checks (logs/stress-gate.json). tools/stress.mjs 6 extreme cases 0 failures, peak RSS 68.8 MB; 2000x2000 with campaign shortcut density 7.05 us/cell (the 91 s / no-shortcut-coverage blocker is stale). 45-case extreme sweep incl. buildLevel 4096x4096 (22.2 s, 1069 MB, clean) and clean RangeError on every over-limit input; no recursion in src/maze|core|state. Two headless-Chrome runs: 60 s cap-level soak 295.3/306.1 fps, frame p99 5.5/5.9 ms, 0 frames over 33.4 ms, heap +0.25/+0.21 MB after forced GC, listeners 24->24 and 13->13 over 5 full run cycles, worker builds max rAF gap 3.1/3.7 ms against a 172 ms synchronous control, 0 console/page/request/in-game errors, npm test 44/44. Throttled 4x re-measured on an idle run: median 48.2 fps, render avg 12.8-16.7 ms — still under verify.mjs's 50 fps / 12 ms gate, reported as an open renderer finding, not a stress failure."
+   "summary": "FINAL STRESS GATE PASS - 21/21 checks (logs/stress-gate.json). tools/stress.mjs full green (2000x2000 braid 0.6 + 1M shortcuts in 32.0 s, 8.00 us/cell, peak RSS 69 MB; leak loops +0.1 MB). 25/25 extreme cases incl. buildLevel 4096x4096 (3.6 s, 264 MB) and a clean RangeError on every over-limit input; no recursion in src/maze|core|state. Headless Chrome: worker builds never block a frame (max rAF gap 3.1 ms), 60 s cap soak 313.2 fps / p99 9.4 ms / 0 dropped / heap +0.55 MB, listeners flat over 5 run cycles, zero console/page/request errors. Added a New Descent cap soak (311.9 fps, p99 6.9 ms, heap +0.13 MB, up to 40 live enemies, autopilot replanned 0 times). 4x throttle at the cap is the soft spot: 50.0 fps, p99 50.1 ms, 38 dropped frames."
   },
   "5-massive-mazes": {
    "status": "done",
@@ -659,53 +659,60 @@
  },
  "modules": {
   "maze": {
-   "score": 8.2,
-   "pass": false,
-   "lastScoredRound": 2,
-   "errors": 0,
-   "note": "1 high issue(s); 8.2 < 8.5"
-  },
-  "core": {
    "score": 8.7,
    "pass": true,
    "lastScoredRound": 1,
    "errors": 0,
-   "note": "Gauntlet pass; no blocker/high issues."
+   "note": "Gauntlet pass; no blocker/high issues.",
+   "verdict": "Solvability independently re-proven over 6414 mazes; three medium contract/guarantee findings."
+  },
+  "core": {
+   "score": 7.5,
+   "pass": false,
+   "lastScoredRound": 1,
+   "errors": 0,
+   "note": "3 blocker/high issue(s); 7.5 < 8.5",
+   "verdict": "Strong shell; 233 ms stall starting New Descent and verify.mjs never enters the new mode."
   },
   "audio": {
-   "score": 8.6,
-   "pass": true,
+   "score": 5.5,
+   "pass": false,
    "lastScoredRound": 1,
    "errors": 0,
-   "note": "Gauntlet pass; no blocker/high issues."
+   "note": "3 blocker/high issue(s); 5.5 < 8.5",
+   "verdict": "Classic audio best-in-repo; swing/enemyHit/playerHit are unhandled and derived.threat is never read."
   },
   "input": {
-   "score": 8.6,
-   "pass": true,
+   "score": 7,
+   "pass": false,
    "lastScoredRound": 1,
    "errors": 0,
-   "note": "Gauntlet pass; no blocker/high issues."
+   "note": "3 blocker/high issue(s); 7 < 8.5",
+   "verdict": "Locomotion inputs excellent; attack is edge-only everywhere, click needs pointer lock, ATTACK button at top of phone screen."
   },
   "state": {
-   "score": 8.4,
+   "score": 6.5,
    "pass": false,
-   "lastScoredRound": 2,
+   "lastScoredRound": 1,
    "errors": 0,
-   "note": "1 high issue(s); 8.4 < 8.5"
+   "note": "3 blocker/high issue(s); 6.5 < 8.5",
+   "verdict": "Classic sim excellent; combat is perma-stunlockable, enemies slower than the player, separate() pushes bodies into walls."
   },
   "renderer": {
-   "score": 7.8,
+   "score": 6.5,
    "pass": false,
-   "lastScoredRound": 2,
+   "lastScoredRound": 1,
    "errors": 0,
-   "note": "1 high issue(s); 7.8 < 8.5"
+   "note": "6 blocker/high issue(s); 6.5 < 8.5",
+   "verdict": "Classic renderer excellent; New Descent art (sword, crawler legs, stipple shadows) below bar and untested."
   },
   "ui": {
-   "score": 8.2,
+   "score": 7,
    "pass": false,
-   "lastScoredRound": 2,
+   "lastScoredRound": 1,
    "errors": 0,
-   "note": "1 high issue(s); 8.2 < 8.5"
+   "note": "6 blocker/high issue(s); 7 < 8.5",
+   "verdict": "Classic UI premium; New Descent HUD unfinished - health bar overprints depth plaque on phone, no combat tests."
   }
  },
  "metrics": {
@@ -719,26 +726,40 @@
   },
   "fpsUnlimited": 611.1,
   "renderMsAvgFull": 1.239,
-  "renderMsAvgWorld": 2.972,
-  "renderMsP99World": 1.7,
-  "stepMsAvg": 0.075,
-  "heapGrowthMB20s": 0.05,
+  "renderMsAvgWorld": 1.166,
+  "renderMsP99World": 1.9,
+  "stepMsAvg": 0.1,
+  "heapGrowthMB20s": 0.06,
   "capLevel": {
+   "seconds": 60.02,
+   "frames": 18270,
+   "fuelRises": 11,
+   "rafFps": 304.4,
+   "loopFps": 286.5,
+   "stepMsAvg": 0.084,
+   "frameMsP99": 5.3,
+   "renderMsAvg": 2.84,
+   "worldMsAvg": 2.227,
+   "worldMsP99": 4.4,
+   "droppedFrames": 0,
+   "skippedSteps": 34,
+   "phase": "playing",
    "level": 15,
-   "cells": "128x128",
-   "tiles": "257x257",
-   "items": 819,
-   "torches": 1290,
-   "exploredBytes": 66049,
-   "buildRafGapMaxMs": 19.3,
-   "soakSeconds": 60.01,
-   "soakFps": 623.4,
-   "soakStepMsAvg": 0.1091,
-   "soakRenderMsAvg": 1.2,
-   "soakWorldMsP99": 1.9,
-   "soakHeapGrowthMB": 0.21,
-   "soakRefuels": 7,
-   "distance": 929
+   "items": 756,
+   "itemsTaken": 12,
+   "fuel": 144.9,
+   "fuelMax": 150,
+   "levelRefuels": 11,
+   "refuels": 31,
+   "distance": 1013,
+   "mapped": 433,
+   "refuelsDuringSoak": 11,
+   "walkedDuringSoak": 152,
+   "heap": {
+    "beforeMB": 6.24,
+    "afterMB": 6.47,
+    "growthMB": 0.23
+   }
   },
   "refuelsObserved": 36,
   "fuelSecondsRecovered": 348.19,
@@ -748,26 +769,51 @@
   "mazesValidated": 117306,
   "campaignLevelsValidated": 750,
   "mazeFailures": 0,
-  "fps": 295.3,
-  "loadMs": 562,
-  "renderMsMaxWorld": 4.3,
+  "fps": 586.1,
+  "loadMs": 441,
+  "renderMsMaxWorld": 21.3,
   "droppedFrames": 0,
   "level1": {
-   "seconds": 132.588,
-   "fuelLeft": 103.77,
-   "fuelMax": 110,
-   "score": 1630
+   "done": true,
+   "phase": "levelComplete",
+   "level": 1,
+   "gems": 1,
+   "gemsTotal": 4,
+   "score": 1440,
+   "fuel": 84.57,
+   "fuelMax": 95,
+   "exitDist": 0.77,
+   "x": 10.73,
+   "y": 1.5,
+   "seconds": 41.94
   },
   "level2": {
-   "seconds": 119.089,
-   "fuelLeft": 101.31,
+   "done": true,
+   "phase": "levelComplete",
+   "level": 2,
+   "gems": 1,
+   "gemsTotal": 11,
+   "score": 4360,
+   "fuel": 86.55,
    "fuelMax": 113,
-   "score": 4850
+   "exitDist": 0.79,
+   "x": 45.28,
+   "y": 42.75,
+   "seconds": 233.899
   },
   "lowFuelEvents": 0,
   "mobile": {
-   "fps": 638,
-   "renderMsAvg": 1.02,
+   "phase": "playing",
+   "fps": 364,
+   "renderMsAvg": 1.98,
+   "viewBox": {
+    "w": 390,
+    "h": 293
+   },
+   "internal": {
+    "w": 320,
+    "h": 240
+   },
    "horizontalOverflow": false,
    "errors": 0
   },
@@ -776,62 +822,206 @@
   "verifyPass": false,
   "stateTests": 110,
   "verifyTag": "gauntlet",
-  "checkedAt": "2026-09-17T20:59:50.170Z",
+  "checkedAt": "2026-09-18T00:04:46.804Z",
   "validate": "784 mazes, 0 failures (--quick)",
-  "stress": "pass (final gate, 18/18)",
-  "fpsUncapped": 306.1,
+  "stress": "pass (final gate, 21/21)",
+  "fpsUncapped": 552.6,
   "frameMsP99": 5.5,
-  "renderMsAvg": 2.4,
+  "renderMsAvg": 1.401,
   "renderMsAvgUncapped": 1.357,
-  "heapGrowthMB": 0.25,
-  "largestGrid": "4096x4096 cells (buildLevel 22.2 s, 1069 MB peak RSS, clean completion); gameplay cap 128x128 cells / 257x257 tiles",
+  "heapGrowthMB": 0.06,
+  "largestGrid": "4096x4096 cells (buildLevel 3.6 s, 264 MB peak RSS, clean completion); gameplay cap 128x128 cells / 257x257 tiles",
   "throttled": {
    "rate": 4,
-   "fps": 48.2,
-   "fpsSamples": [
-    39.9,
-    51.3,
-    48.2
-   ],
-   "renderMsAvg": "12.8-16.7",
-   "note": "median of 3x10 s on the cap level, dedicated idle run; verify gate is 50 fps / 12 ms"
+   "seconds": 10.01,
+   "frames": 501,
+   "rafFps": 50,
+   "loopFps": 49.7,
+   "stepMsAvg": 0.4876,
+   "frameMsP99": 47.9,
+   "renderMsAvg": 15.592,
+   "worldMsAvg": 12.796,
+   "worldMsP99": 23.9,
+   "gapMaxMs": 42,
+   "gapsOver33Ms": 13,
+   "droppedFrames": 40,
+   "skippedSteps": 0,
+   "phase": "playing",
+   "level": 15,
+   "baseline": {
+    "seconds": 3,
+    "frames": 808,
+    "rafFps": 269.3,
+    "loopFps": 264.7,
+    "stepMsAvg": 0.1444,
+    "frameMsP99": 5.9,
+    "renderMsAvg": 3.074,
+    "worldMsAvg": 2.637,
+    "worldMsP99": 4.3,
+    "gapMaxMs": 7,
+    "gapsOver33Ms": 0,
+    "droppedFrames": 0,
+    "skippedSteps": 0,
+    "phase": "playing",
+    "level": 15
+   }
   },
-  "errors": 0
+  "errors": 0,
+  "failReasons": [
+   "cap-level soak discarded 34 sim steps (> 5: the sim is losing ground)",
+   "throttled (4×) fps 49.7 < 50 (unthrottled control: render 3.074ms, 264.7fps, gap max 7ms)",
+   "throttled (4×) render avg 15.592ms > 12ms (unthrottled control: render 3.074ms, 264.7fps, gap max 7ms)"
+  ],
+  "fpsVsync": {
+   "fps": 120,
+   "frameMsP99": 8.8,
+   "note": "compositor frame limiter enabled (realistic display cap)"
+  }
  },
  "blocking": [
   {
    "area": "gauntlet",
    "module": "renderer",
+   "severity": "blocker",
+   "issue": "[blocker] src/renderer/enemies.js: the sword's motion smear renders as scattered isolated white texels (trailArc h01 gate + renderWeapon half-stipple) and reads as a rendering fault; replace with a solid tapering crescent band."
+  },
+  {
+   "area": "gauntlet",
+   "module": "renderer",
    "severity": "high",
-   "issue": "src/renderer/textures.js: walls read as a grid of dark framed panels, not masonry — paintBlock bevels row 0 and column 0 at +0.28*bevel (40-76% brighter than the face) then shadows two rows/cols on top of MORTAR 3, so only ~37% of a block cell is the block; COURSES(4) x BLOCK_W_MIN 20 puts 12 blocks on a 1x1 face against the reference's ~4-6. Fix: drop the column bevel, MORTAR 3->2, COURSES to 3 (0,21,43,64), BLOCK_W_MIN 20->28 / SPREAD 5->9."
+   "issue": "[high] src/renderer/textures.js: paintBlock's shadow skirt (lines 383-384) plus MORTAR 3 makes ~31% of every block cell joint, so walls read as framed panels; drop the vertical skirt, MORTAR 3->2."
+  },
+  {
+   "area": "gauntlet",
+   "module": "renderer",
+   "severity": "high",
+   "issue": "[high] src/renderer/enemies.js: CRAWLER_MATS[1] is the darkest material in the set, so the six legs collapse into the body shadow; raise albedo to ~0.46 and let the outline separate limbs."
+  },
+  {
+   "area": "gauntlet",
+   "module": "renderer",
+   "severity": "high",
+   "issue": "[high] src/renderer/enemies.js: SWORD_ORIGIN_ROW 68 on a 64-row card pushes hilt, guard and hand off screen and SWORD_MATS[0] ambient 0.62 makes the blade paper-white; move to 58, add a gauntleted fist, drop ambient to 0.30."
+  },
+  {
+   "area": "gauntlet",
+   "module": "renderer",
+   "severity": "high",
+   "issue": "[high] src/renderer/raycaster.js: gatherEnemies, renderWeapon, setCombatTextures and the per-frame enemy index (272 new lines) have zero test coverage."
+  },
+  {
+   "area": "gauntlet",
+   "module": "renderer",
+   "severity": "high",
+   "issue": "[high] logs/gauntlet.json: throttled (4x) render avg 15.592 ms > 12 ms and loop fps 49.7 < 50 - a standing mid-tier overrun (the previous run was worse), owned by the renderer."
+  },
+  {
+   "area": "gauntlet",
+   "module": "ui",
+   "severity": "blocker",
+   "issue": "[blocker] src/ui/hud.js:1824: in New Descent on a 390x844 phone the health bar overprints the depth plaque by 34 units; publish healthPanelH and offset drawDepthPanel, pin with a combat state in geometry.test.mjs."
   },
   {
    "area": "gauntlet",
    "module": "ui",
    "severity": "high",
-   "issue": "src/ui/menus.js:3714,3732,3820-3822: level-complete TOTAL is not the sum of the rows above it from depth 2 on — targets[3] = run.score under a summation rule (Depth 2 shows 0 + 2,260 + 1,000 = 4,710). Either relabel to RUN TOTAL and drop the rule, or sum the three rows and add a separate RUN line; gate it in menus.test.mjs."
+   "issue": "[high] src/ui/hud.js:1806: the health bar - the mode's headline stat - has no label, icon or number and reads as a broken loading bar."
+  },
+  {
+   "area": "gauntlet",
+   "module": "ui",
+   "severity": "high",
+   "issue": "[high] src/ui/hud.js:586: the attack control is undiscoverable: no key hint, and the touch Controls table still advertises a 0x0 Auto button while never mentioning ATTACK."
+  },
+  {
+   "area": "gauntlet",
+   "module": "ui",
+   "severity": "high",
+   "issue": "[high] src/ui/menus.js:3169: the Controls screen lists 'Auto Explore  O' inside New Descent, contradicting S4.11 and the pause screen."
+  },
+  {
+   "area": "gauntlet",
+   "module": "ui",
+   "severity": "high",
+   "issue": "[high] src/ui/map.js: the corner map flushes an undersized maze into the panel corner, so depth 1 renders ~95% empty; centre the window when span >= mw."
+  },
+  {
+   "area": "gauntlet",
+   "module": "ui",
+   "severity": "high",
+   "issue": "[high] src/ui/hud.test.mjs: no test file in src/ui contains 'combat' - hitAttack, setAttackButton, drawHealthBar, drawAttackButton and the 'tr' corner are all unproven."
+  },
+  {
+   "area": "gauntlet",
+   "module": "state",
+   "severity": "blocker",
+   "issue": "[blocker] src/state/combat.js: every enemy is perma-stunlockable - damageEnemy staggers on every non-killing hit and the 0.44 s swing cycle beats both wind-ups, so a rhythm swinger takes zero damage (134 swings, 0 hits). Add poise / super-armour."
   },
   {
    "area": "gauntlet",
    "module": "state",
    "severity": "high",
-   "issue": "ARCHITECTURE.md S1:76-77 and S4.2:384 state FUEL.GAP_SAFETY 0.7 -> GAP_SAFETY_END 0.8 (30%->20% headroom) while balance.js:347/355 has 0.62/0.62, making gapSafety() a lerp between identical numbers. Binding-contract drift: reconcile doc and code in one commit and assert the endpoints in balance.test.mjs."
+   "issue": "[high] src/state/balance.js: both enemies are slower than PLAYER.WALK_SPEED (2.55 and 1.32 vs 3.2) and do not pathfind, so combat is optional; give the crawler a lunge or raise its speed."
   },
   {
    "area": "gauntlet",
-   "module": "maze",
+   "module": "state",
    "severity": "high",
-   "issue": "src/maze/populate.js:333-342: resolveGap floors the refuel gap at 1 but placeRefuelChain cannot resolve below 4 (nearestPathFrom snaps within OIL_BRANCH_RADIUS 3), so a state-side retune ships a level whose refuel guarantee is silently broken ({fuelSeconds:150,drain:10} -> walkRefuelChain ok:false; {oilRefuelSeconds:0.5} -> minFuel -7505 s). Floor the gap at 2*OIL_BRANCH_RADIUS-2 and surface chainOk so buildLevel refuses the level."
+   "issue": "[high] src/state/combat.js: separate() nudges bodies outside moveCircleIO, putting enemy centres inside walls 8.7% of samples at 8 awake and 21.5% at 12; push the nudge through the solver."
   },
   {
    "area": "gauntlet",
-   "module": "renderer",
-   "severity": "medium",
-   "issue": "Throttled 4x still misses tools/verify.mjs (median 48.2 fps vs 50, render avg 12.8-16.7 ms vs 12). Improved from 39.8 fps / 19.55 ms but open; renderer has one quality knob (INTERNAL_H 240, a module constant) so there is no resolution fallback — needs an ARCHITECTURE.md S4.5 change to parameterise internalH."
+   "module": "input",
+   "severity": "high",
+   "issue": "[high] src/input/input.js:636-641: a mouse click only swings while the pointer is locked, so the mode's primary verb is silently dead in an itch.io iframe and for ~1 s after every Esc."
   },
   {
-   "area": "verify",
-   "issue": "tools/verify.mjs throttled (4x) gate still fails: fps 48.2 < 50, render avg 12.8-16.7 ms > 12 ms. Unthrottled control 273-329 fps. Not a stress-gate failure (stress gate PASSES 18/18)."
+   "area": "gauntlet",
+   "module": "input",
+   "severity": "high",
+   "issue": "[high] src/input/input.js:497 + bindings.js:44-57: attack is edge-only, so holding F, pad RT or the touch ATTACK button yields one swing and presses inside the 0.44 s recovery are dropped."
+  },
+  {
+   "area": "gauntlet",
+   "module": "input",
+   "severity": "high",
+   "issue": "[high] src/input/touch-overlay.js:283-294: on a 390x844 phone ATTACK sits in the top-right bar, ~600 px above the resting thumb and 10 px from PAUSE, while the bottom half of the screen is empty."
+  },
+  {
+   "area": "gauntlet",
+   "module": "audio",
+   "severity": "blocker",
+   "issue": "[blocker] src/ui/audio.js: handle() has no case for 'swing', 'enemyHit' or 'playerHit' - the sword, both enemies, kills and taking damage are completely silent, against ARCHITECTURE.md:1453."
+  },
+  {
+   "area": "gauntlet",
+   "module": "audio",
+   "severity": "high",
+   "issue": "[high] src/ui/audio.js: derived.threat is computed for this module and never read, so a wraith at arm's length sounds like an empty corridor."
+  },
+  {
+   "area": "gauntlet",
+   "module": "audio",
+   "severity": "high",
+   "issue": "[high] src/ui/audio.test.mjs:1272: the 'every GameEvent type is audible' guard asserts its own hardcoded 10-element list against 10 and can never fail; GameEvent now has 16 members."
+  },
+  {
+   "area": "gauntlet",
+   "module": "core",
+   "severity": "high",
+   "issue": "[high] src/main.js: starting New Descent blocks the main thread for 233 ms and discards 8 sim steps - createCombatTextures is painted synchronously inside a store subscriber inside step()."
+  },
+  {
+   "area": "gauntlet",
+   "module": "core",
+   "severity": "high",
+   "issue": "[high] tools/verify.mjs: all three newGame dispatches omit mode, so every fps, render, heap, screenshot and mobile assertion covers Classic Descent only."
+  },
+  {
+   "area": "gauntlet",
+   "module": "core",
+   "severity": "high",
+   "issue": "[high] tools/verify.mjs: the gauntlet gate is red (pass:false - throttled fps 49.7, render 15.592 ms, cap soak discarded 34 steps) and the process still exits 0."
   }
  ],
  "history": [
@@ -1084,6 +1274,21 @@
     "core": 8.7
    },
    "stressPass": true
+  },
+  {
+   "iteration": 25,
+   "updated": "2026-09-18T00:04:46.805Z",
+   "wave": "gauntlet",
+   "scores": {
+    "renderer": 6.5,
+    "ui": 7,
+    "state": 6.5,
+    "maze": 8.7,
+    "input": 7,
+    "audio": 5.5,
+    "core": 7.5
+   },
+   "stressPass": true
   }
  ],
  "openIssues": [
@@ -1108,49 +1313,8 @@
   "A save is tied to the generator: after a deploy that changes maze generation, a mid-level save starts its level fresh (totals kept). A checkpoint save is unaffected."
  ],
  "stressGate": {
-  "at": "2026-09-17T20:56:51.432Z",
   "pass": true,
-  "source": "logs/stress-gate.json",
-  "checks": "18/18 passed",
-  "node": {
-   "stressMjs": "ok, peak RSS 68.8 MB; 2000x2000 with campaign shortcuts 28.2 s = 7.05 us/cell (O(n) holds)",
-   "extremeLimits": "45 cases: 4096x1, 1x4096, 2x4096, 2048x2048, 3000x3000, braid 1.0 at 1000x1000, buildLevel 4096x4096 (22.2 s, 1069 MB RSS). Every over-limit/NaN/Infinity/null input threw a clean RangeError; validateMaze never throws on malformed input.",
-   "recursion": "257 function bodies scanned in src/maze, src/core, src/state - zero self-calls (rng fromSeedWords is a fork factory, allowlisted with reason)"
-  },
-  "browser": {
-   "workerNeverBlocksFrames": "forced 40x40 / 128x128 / 200x200 builds through createMazeClient(mode:always): max rAF gap 3.1-3.7 ms; cap-level install 10.2-35.3 ms (gate 50). Synchronous 200x200 control stalled 163-172 ms, so the sampler is proven able to see blocking.",
-   "soak60s": "fps 295.3/306.1, frame p99 5.5/5.9 ms, 0 frames over 33.4 ms, 0 steps discarded",
-   "heapGrowthMB": [
-    0.29,
-    0.21
-   ],
-   "listeners": "window 24->24, document 13->13 across 5 newGame->gameOver->toTitle cycles (CDP DOMDebugger.getEventListeners)",
-   "consoleErrors": 0
-  },
-  "throttled4x": {
-   "fpsMin": 39.9,
-   "fpsMedian": 48.2,
-   "fpsMax": 51.3,
-   "renderMsAvg": [
-    13.438,
-    12.828,
-    16.691
-   ],
-   "note": "Reported, not gated - the PASS criteria gate fps unthrottled. Still under verify.mjs THROTTLED_MIN_FPS 50 / THROTTLED_MAX_RENDER_MS_AVG 12, so the renderer throttled item stays open (was 39.8 fps / 19.55 ms, now 40-51 fps / 12.8-16.7 ms)."
-  },
-  "openFindings": [
-   {
-    "severity": "medium",
-    "module": "renderer",
-    "finding": "With CPU throttled 4x on the 128x128 cap level the loop holds 40-51 fps (median 48) at 12.8-16.7 ms render avg — under tools/verify.mjs THROTTLED_MIN_FPS 50 and THROTTLED_MAX_RENDER_MS_AVG 12. Improved from the recorded 39.8 fps / 19.55 ms but still short. Not a stress-gate failure (the PASS criteria gate fps unthrottled), and no defect: the frame budget degrades linearly, 0 sim steps are discarded and nothing errors.",
-    "evidence": "logs/_gate-throttle.json"
-   },
-   {
-    "severity": "low",
-    "module": "maze",
-    "finding": "src/maze/constants.js MAX_CELLS_PER_SIDE docstring states ~12 s generate, ~12 s validate and ~490 MiB RSS for a 4096x4096 maze. Measured here: buildLevel(4096x4096) 22.2 s and 1069 MB peak RSS. The cap still holds (clean completion, no OOM, no stack overflow) but the quoted memory figure is ~2x optimistic.",
-    "evidence": "logs/_gate-extreme-heavy.log"
-   }
-  ]
+  "checks": "21/21",
+  "summary": "FINAL STRESS GATE PASS - 21/21 checks (logs/stress-gate.json). tools/stress.mjs full green (2000x2000 braid 0.6 + 1M shortcuts in 32.0 s, 8.00 us/cell, peak RSS 69 MB; leak loops +0.1 MB). 25/25 extreme cases incl. buildLevel 4096x4096 (3.6 s, 264 MB) and a clean RangeError on every over-limit input; no recursion in src/maze|core|state. Headless Chrome: worker builds never block a frame (max rAF gap 3.1 ms), 60 s cap soak 313.2 fps / p99 9.4 ms / 0 dropped / heap +0.55 MB, listeners flat over 5 run cycles, zero console/page/request errors. Added a New Descent cap soak (311.9 fps, p99 6.9 ms, heap +0.13 MB, up to 40 live enemies, autopilot replanned 0 times). 4x throttle at the cap is the soft spot: 50.0 fps, p99 50.1 ms, 38 dropped frames."
  }
 }
