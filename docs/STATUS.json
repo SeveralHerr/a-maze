@@ -1,6 +1,6 @@
 {
- "updated": "2026-09-18T00:04:46.805Z",
- "iteration": 25,
+ "updated": "2026-09-18T02:21:31.177Z",
+ "iteration": 26,
  "passThreshold": 8.5,
  "wave": "gauntlet",
  "waves": {
@@ -542,7 +542,7 @@
   },
   "stress": {
    "status": "done",
-   "summary": "FINAL STRESS GATE PASS - 21/21 checks (logs/stress-gate.json). tools/stress.mjs full green (2000x2000 braid 0.6 + 1M shortcuts in 32.0 s, 8.00 us/cell, peak RSS 69 MB; leak loops +0.1 MB). 25/25 extreme cases incl. buildLevel 4096x4096 (3.6 s, 264 MB) and a clean RangeError on every over-limit input; no recursion in src/maze|core|state. Headless Chrome: worker builds never block a frame (max rAF gap 3.1 ms), 60 s cap soak 313.2 fps / p99 9.4 ms / 0 dropped / heap +0.55 MB, listeners flat over 5 run cycles, zero console/page/request errors. Added a New Descent cap soak (311.9 fps, p99 6.9 ms, heap +0.13 MB, up to 40 live enemies, autopilot replanned 0 times). 4x throttle at the cap is the soft spot: 50.0 fps, p99 50.1 ms, 38 dropped frames."
+   "summary": "FINAL STRESS GATE: PASS (17/17 gates), no defect found and src/ unmodified (logs/stress-gate.json). tools/stress.mjs full green (2000x2000 braid 0.6 + 1M shortcuts 15.5 s, 3.89 us/cell, 147 MB RSS; gameplay cap 128x128 buildLevel 31.95 ms avg / 67.6 ms max; leak loops +0.1 MB). 35 extreme cases, 0 failures, 13 clean RangeErrors on over-limit input, no data-driven recursion. Headless Chrome: worker builds never block a frame (max rAF gap 5.1 ms in game at the cap), 60 s cap soak 0 dropped frames / render 0.90 ms / heap +0.35 MB, listeners flat over 5 run cycles, zero console/page/request errors. fps 120 locked frame-limited (p99 8.6 ms), 667 fps unlimited. 4x throttle: 100 fps median, p99 34.1 ms, 0 discarded sim steps. Caveat: the browser phase ran concurrently with the UI builders' edits and should be re-run once this wave settles."
   },
   "5-massive-mazes": {
    "status": "done",
@@ -699,79 +699,79 @@
    "verdict": "Classic sim excellent; combat is perma-stunlockable, enemies slower than the player, separate() pushes bodies into walls."
   },
   "renderer": {
-   "score": 6.5,
+   "score": 8,
    "pass": false,
    "lastScoredRound": 1,
    "errors": 0,
-   "note": "6 blocker/high issue(s); 6.5 < 8.5",
-   "verdict": "Classic renderer excellent; New Descent art (sword, crawler legs, stipple shadows) below bar and untested."
+   "note": "1 blocker/high issue(s); 8 < 8.5",
+   "verdict": "Handsome, fast, rigorously engineered - one step short of the reference. Blocks on point-blank walls turning the frame into featureless grey mush at the 0.22-tile collision radius; mortar keyline contrast 1.7x too strong; carried torch reads cool, not warm."
   },
   "ui": {
-   "score": 7,
+   "score": 8.2,
    "pass": false,
    "lastScoredRound": 1,
    "errors": 0,
-   "note": "6 blocker/high issue(s); 7 < 8.5",
-   "verdict": "Classic UI premium; New Descent HUD unfinished - health bar overprints depth plaque on phone, no combat tests."
+   "note": "1 blocker/high issue(s); 8.2 < 8.5",
+   "verdict": "Premium craft; fails on information correctness. In New Descent on a phone the Controls screen lists an AUTO button touch-overlay hides and never mentions ATTACK; stale keyboard fallback table, Hud typedef missing three members, two ARCHITECTURE.md S4.11 contradictions."
   }
  },
  "metrics": {
-  "source": "logs/gauntlet.json (verify) + logs/fix-*.json + logs/stress-gate.json",
+  "source": "logs/gauntlet.json (verify) + logs/fix-*.json (latest: fix-renderer) + logs/stress-gate.json",
   "sizeCurve": "L1 16x16 cells / 33x33 tiles; +8 cells/side/level; cap 128x128 cells / 257x257 tiles / 16,384 cells at L15 (CAP_LEVEL derived from BASE_CELLS 16, GROWTH 8, MAX_CELLS 128). Braid 0 -> 0.6 over 17 levels, square-root shaped (0.54 at L15, 0.6 from L18); past the cap drain +2%/level to 1.35x and oil density thins 1/20 -> 1/30 cells.",
   "tankSeconds": "L1 110 s -> cap 150 s, independent of maze area",
   "fpsVsyncLimited": {
-   "fps": 120,
-   "frameMsP99": 8.7,
+   "fps": 119.9,
+   "frameMsP99": 8.6,
    "note": "compositor frame limiter enabled (realistic display cap)"
   },
   "fpsUnlimited": 611.1,
-  "renderMsAvgFull": 1.239,
-  "renderMsAvgWorld": 1.166,
-  "renderMsP99World": 1.9,
-  "stepMsAvg": 0.1,
-  "heapGrowthMB20s": 0.06,
+  "renderMsAvgFull": 3.169,
+  "renderMsAvgWorld": 2.79,
+  "renderMsP99World": 4.3,
+  "stepMsAvg": 0.1429,
+  "heapGrowthMB20s": 0.01,
   "capLevel": {
-   "seconds": 60.02,
-   "frames": 18270,
-   "fuelRises": 11,
-   "rafFps": 304.4,
-   "loopFps": 286.5,
-   "stepMsAvg": 0.084,
-   "frameMsP99": 5.3,
-   "renderMsAvg": 2.84,
-   "worldMsAvg": 2.227,
+   "seconds": 60.01,
+   "frames": 15329,
+   "fuelRises": 10,
+   "rafFps": 255.4,
+   "loopFps": 253.8,
+   "stepMsAvg": 0.0929,
+   "frameMsP99": 7.9,
+   "renderMsAvg": 3.217,
+   "worldMsAvg": 2.803,
    "worldMsP99": 4.4,
    "droppedFrames": 0,
-   "skippedSteps": 34,
+   "skippedSteps": 0,
    "phase": "playing",
    "level": 15,
    "items": 756,
-   "itemsTaken": 12,
-   "fuel": 144.9,
+   "itemsTaken": 10,
+   "fuel": 147.3,
    "fuelMax": 150,
-   "levelRefuels": 11,
-   "refuels": 31,
-   "distance": 1013,
-   "mapped": 433,
-   "refuelsDuringSoak": 11,
-   "walkedDuringSoak": 152,
+   "levelRefuels": 10,
+   "refuels": 28,
+   "distance": 1120,
+   "mapped": 415,
+   "refuelsDuringSoak": 10,
+   "walkedDuringSoak": 151,
    "heap": {
-    "beforeMB": 6.24,
-    "afterMB": 6.47,
-    "growthMB": 0.23
+    "beforeMB": 5.96,
+    "afterMB": 6.22,
+    "growthMB": 0.26
    }
   },
   "refuelsObserved": 36,
   "fuelSecondsRecovered": 348.19,
   "consoleErrors": 0,
   "consoleWarnings": 0,
-  "tests": "44/44 files",
+  "tests": "46/46 files",
   "mazesValidated": 117306,
   "campaignLevelsValidated": 750,
   "mazeFailures": 0,
-  "fps": 586.1,
-  "loadMs": 441,
-  "renderMsMaxWorld": 21.3,
+  "fps": 255.4,
+  "loadMs": 515,
+  "renderMsMaxWorld": 6.8,
   "droppedFrames": 0,
   "level1": {
    "done": true,
@@ -804,8 +804,8 @@
   "lowFuelEvents": 0,
   "mobile": {
    "phase": "playing",
-   "fps": 364,
-   "renderMsAvg": 1.98,
+   "fps": 349.3,
+   "renderMsAvg": 2.4,
    "viewBox": {
     "w": 390,
     "h": 293
@@ -821,44 +821,44 @@
   "gameErrors": 0,
   "verifyPass": false,
   "stateTests": 110,
-  "verifyTag": "gauntlet",
-  "checkedAt": "2026-09-18T00:04:46.804Z",
+  "verifyTag": "fix-renderer",
+  "checkedAt": "2026-09-18T02:21:31.176Z",
   "validate": "784 mazes, 0 failures (--quick)",
-  "stress": "pass (final gate, 21/21)",
-  "fpsUncapped": 552.6,
-  "frameMsP99": 5.5,
-  "renderMsAvg": 1.401,
+  "stress": "pass (final gate, 17/17)",
+  "fpsUncapped": 258.2,
+  "frameMsP99": 7.9,
+  "renderMsAvg": 3.169,
   "renderMsAvgUncapped": 1.357,
-  "heapGrowthMB": 0.06,
-  "largestGrid": "4096x4096 cells (buildLevel 3.6 s, 264 MB peak RSS, clean completion); gameplay cap 128x128 cells / 257x257 tiles",
+  "heapGrowthMB": 0.01,
+  "largestGrid": "4096x4096 cells (generate + validate clean, 5.2 s, 379 MB peak RSS); gameplay cap 128x128 cells / 257x257 tiles",
   "throttled": {
    "rate": 4,
-   "seconds": 10.01,
-   "frames": 501,
-   "rafFps": 50,
-   "loopFps": 49.7,
-   "stepMsAvg": 0.4876,
-   "frameMsP99": 47.9,
-   "renderMsAvg": 15.592,
-   "worldMsAvg": 12.796,
-   "worldMsP99": 23.9,
-   "gapMaxMs": 42,
-   "gapsOver33Ms": 13,
-   "droppedFrames": 40,
+   "seconds": 10,
+   "frames": 465,
+   "rafFps": 46.5,
+   "loopFps": 46.6,
+   "stepMsAvg": 0.5677,
+   "frameMsP99": 45.1,
+   "renderMsAvg": 16.074,
+   "worldMsAvg": 13.596,
+   "worldMsP99": 29.9,
+   "gapMaxMs": 56.7,
+   "gapsOver33Ms": 32,
+   "droppedFrames": 48,
    "skippedSteps": 0,
    "phase": "playing",
    "level": 15,
    "baseline": {
     "seconds": 3,
-    "frames": 808,
-    "rafFps": 269.3,
-    "loopFps": 264.7,
-    "stepMsAvg": 0.1444,
-    "frameMsP99": 5.9,
-    "renderMsAvg": 3.074,
-    "worldMsAvg": 2.637,
-    "worldMsP99": 4.3,
-    "gapMaxMs": 7,
+    "frames": 756,
+    "rafFps": 251.7,
+    "loopFps": 242.8,
+    "stepMsAvg": 0.1138,
+    "frameMsP99": 5.5,
+    "renderMsAvg": 3.432,
+    "worldMsAvg": 2.899,
+    "worldMsP99": 4.2,
+    "gapMaxMs": 8.3,
     "gapsOver33Ms": 0,
     "droppedFrames": 0,
     "skippedSteps": 0,
@@ -868,89 +868,16 @@
   },
   "errors": 0,
   "failReasons": [
-   "cap-level soak discarded 34 sim steps (> 5: the sim is losing ground)",
-   "throttled (4×) fps 49.7 < 50 (unthrottled control: render 3.074ms, 264.7fps, gap max 7ms)",
-   "throttled (4×) render avg 15.592ms > 12ms (unthrottled control: render 3.074ms, 264.7fps, gap max 7ms)"
+   "throttled (4×) fps 46.6 < 50 (unthrottled control: render 3.432ms, 242.8fps, gap max 8.3ms)",
+   "throttled (4×) render avg 16.074ms > 12ms (unthrottled control: render 3.432ms, 242.8fps, gap max 8.3ms)"
   ],
   "fpsVsync": {
-   "fps": 120,
-   "frameMsP99": 8.8,
+   "fps": 119.9,
+   "frameMsP99": 8.6,
    "note": "compositor frame limiter enabled (realistic display cap)"
   }
  },
  "blocking": [
-  {
-   "area": "gauntlet",
-   "module": "renderer",
-   "severity": "blocker",
-   "issue": "[blocker] src/renderer/enemies.js: the sword's motion smear renders as scattered isolated white texels (trailArc h01 gate + renderWeapon half-stipple) and reads as a rendering fault; replace with a solid tapering crescent band."
-  },
-  {
-   "area": "gauntlet",
-   "module": "renderer",
-   "severity": "high",
-   "issue": "[high] src/renderer/textures.js: paintBlock's shadow skirt (lines 383-384) plus MORTAR 3 makes ~31% of every block cell joint, so walls read as framed panels; drop the vertical skirt, MORTAR 3->2."
-  },
-  {
-   "area": "gauntlet",
-   "module": "renderer",
-   "severity": "high",
-   "issue": "[high] src/renderer/enemies.js: CRAWLER_MATS[1] is the darkest material in the set, so the six legs collapse into the body shadow; raise albedo to ~0.46 and let the outline separate limbs."
-  },
-  {
-   "area": "gauntlet",
-   "module": "renderer",
-   "severity": "high",
-   "issue": "[high] src/renderer/enemies.js: SWORD_ORIGIN_ROW 68 on a 64-row card pushes hilt, guard and hand off screen and SWORD_MATS[0] ambient 0.62 makes the blade paper-white; move to 58, add a gauntleted fist, drop ambient to 0.30."
-  },
-  {
-   "area": "gauntlet",
-   "module": "renderer",
-   "severity": "high",
-   "issue": "[high] src/renderer/raycaster.js: gatherEnemies, renderWeapon, setCombatTextures and the per-frame enemy index (272 new lines) have zero test coverage."
-  },
-  {
-   "area": "gauntlet",
-   "module": "renderer",
-   "severity": "high",
-   "issue": "[high] logs/gauntlet.json: throttled (4x) render avg 15.592 ms > 12 ms and loop fps 49.7 < 50 - a standing mid-tier overrun (the previous run was worse), owned by the renderer."
-  },
-  {
-   "area": "gauntlet",
-   "module": "ui",
-   "severity": "blocker",
-   "issue": "[blocker] src/ui/hud.js:1824: in New Descent on a 390x844 phone the health bar overprints the depth plaque by 34 units; publish healthPanelH and offset drawDepthPanel, pin with a combat state in geometry.test.mjs."
-  },
-  {
-   "area": "gauntlet",
-   "module": "ui",
-   "severity": "high",
-   "issue": "[high] src/ui/hud.js:1806: the health bar - the mode's headline stat - has no label, icon or number and reads as a broken loading bar."
-  },
-  {
-   "area": "gauntlet",
-   "module": "ui",
-   "severity": "high",
-   "issue": "[high] src/ui/hud.js:586: the attack control is undiscoverable: no key hint, and the touch Controls table still advertises a 0x0 Auto button while never mentioning ATTACK."
-  },
-  {
-   "area": "gauntlet",
-   "module": "ui",
-   "severity": "high",
-   "issue": "[high] src/ui/menus.js:3169: the Controls screen lists 'Auto Explore  O' inside New Descent, contradicting S4.11 and the pause screen."
-  },
-  {
-   "area": "gauntlet",
-   "module": "ui",
-   "severity": "high",
-   "issue": "[high] src/ui/map.js: the corner map flushes an undersized maze into the panel corner, so depth 1 renders ~95% empty; centre the window when span >= mw."
-  },
-  {
-   "area": "gauntlet",
-   "module": "ui",
-   "severity": "high",
-   "issue": "[high] src/ui/hud.test.mjs: no test file in src/ui contains 'combat' - hitAttack, setAttackButton, drawHealthBar, drawAttackButton and the 'tr' corner are all unproven."
-  },
   {
    "area": "gauntlet",
    "module": "state",
@@ -1022,6 +949,18 @@
    "module": "core",
    "severity": "high",
    "issue": "[high] tools/verify.mjs: the gauntlet gate is red (pass:false - throttled fps 49.7, render 15.592 ms, cap soak discarded 34 steps) and the process still exits 0."
+  },
+  {
+   "area": "gauntlet",
+   "module": "renderer",
+   "severity": "high",
+   "issue": "[high] src/renderer/raycaster.js:2037: point-blank walls turn the frame into featureless grey mush - at the 0.22-tile collision radius lineH magnifies a 64-texel tile ~17x, darkFrac 0.037 vs the reference's 0.147; floor the perpendicular distance used for lineH and the texture step to ~0.45."
+  },
+  {
+   "area": "gauntlet",
+   "module": "ui",
+   "severity": "high",
+   "issue": "[high] src/ui/menus.js:710-745: on a phone the Controls screen describes the wrong buttons in New Descent - both touch tables always list 'Auto Explore -> Auto Button' and never Attack, while touch-overlay.js:381 hides AUTO and shows ATTACK in combat; branch touchHintsFor(state) on the combat test."
   }
  ],
  "history": [
@@ -1287,6 +1226,16 @@
     "input": 7,
     "audio": 5.5,
     "core": 7.5
+   },
+   "stressPass": true
+  },
+  {
+   "iteration": 26,
+   "updated": "2026-09-18T02:21:31.177Z",
+   "wave": "gauntlet",
+   "scores": {
+    "renderer": 8,
+    "ui": 8.2
    },
    "stressPass": true
   }
