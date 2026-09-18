@@ -138,6 +138,8 @@ export const AUDIO = Object.freeze({
    */
   DRONE_GAIN: 0.11,
   THREAT_SWELL: 1.4,
+  /** Minimum seconds between two creatures' wake cues, so a pack is a sound and not a click. */
+  WAKE_GAP: 0.18,
   /** Look-ahead window for the generative scheduler, seconds. */
   LOOKAHEAD: 0.3,
   /** Master compressor. Transparent until cues stack up. */
@@ -403,6 +405,8 @@ export function createAudio(options) {
   let comboCount = 0;
   let comboUntil = 0; //  ctx time at which the gem combo lapses
   let lastStepAt = -1; //  rate limit so a stuck footstep event storm cannot machine-gun
+  /** Audio-clock time of the last wake cue, for the pack rate limit (see `playWake`). */
+  let lastWakeAt = -1e9;
   let lastMapAt = -Infinity; //  rate limit for the map-scroll cue (see `playMap`)
   let lastUpdateT = -1; // ctx time of the previous update(), -1 = never
   let lastUiSoundAt = -1; // ctx time of the last UI blip, whatever path played it
@@ -1696,17 +1700,47 @@ export function createAudio(options) {
    */
   function playWake(kind, pan = 0) {
     const t = now();
+    // Six creatures noticing the player in the same second played six identical cues on top of each
+    // other, which is a click rather than six things. Rate-limited, and every one is pitched a
+    // little differently, so a pack sounds like a pack.
+    if (t - lastWakeAt < AUDIO.WAKE_GAP) return;
+    lastWakeAt = t;
+    const bend = rng.range(0.86, 1.18);
     if (kind === 'wraith') {
       // A rising, breathy band of noise — air moving where there is no mouth.
-      sfxNoise('bandpass', 420, 1450, 1.6, t, 0.16, 0.62, 0.15, PRI.CUE, 0.34, pan);
-      sfx('sine', degreeHz(1), degreeHz(6), t + 0.04, 0.12, 0.5, 0.055, PRI.CUE, 0.4, 0, 0, pan);
+      sfxNoise('bandpass', 420 * bend, 1450 * bend, 1.6, t, 0.16, 0.62, 0.15, PRI.CUE, 0.34, pan);
+      sfx('sine', degreeHz(1) * bend, degreeHz(6) * bend, t + 0.04, 0.12, 0.5, 0.055, PRI.CUE, 0.4, 0, 0, pan);
     } else {
       // Six fast dry ticks: legs finding purchase on stone.
       for (let i = 0; i < 6; i++) {
-        const f = 1900 * rng.range(0.85, 1.2);
+        const f = 1900 * bend * rng.range(0.85, 1.2);
         sfxNoise('bandpass', f, f * 0.7, 3.4, t + i * 0.035 + rng.range(0, 0.012), 0.001, 0.035, 0.12, PRI.CUE, 0.12, pan);
       }
       sfxNoise('lowpass', 300, 200, 0.9, t, 0.01, 0.2, 0.07, PRI.CUE, 0.2, pan);
+    }
+  }
+
+  /**
+   * A creature winding up to strike — the telegraph, in sound.
+   *
+   * Short, rising and unmistakably ABOUT to happen, so it can be answered by stepping back rather
+   * than only by seeing it. Pitched apart from every other combat voice: a crawler's is a fast dry
+   * tick-tick-tick that accelerates, a wraith's a single cold tone bending upward over its longer
+   * wind-up. Both are panned, because the one behind you is the one that matters.
+   * @param {'crawler'|'wraith'} kind
+   * @param {number} [pan]
+   */
+  function playWind(kind, pan = 0) {
+    const t = now();
+    if (kind === 'wraith') {
+      sfx('triangle', degreeHz(2), degreeHz(8), t, 0.03, 0.5, 0.075, PRI.CUE, 0.22, 0, 0, pan);
+      sfxNoise('highpass', 2600, 4200, 0.8, t + 0.12, 0.1, 0.34, 0.05, PRI.CUE, 0.18, pan);
+    } else {
+      for (let i = 0; i < 4; i++) {
+        // Accelerating: the gaps shorten, which is what "about to" sounds like.
+        const at = t + i * (0.075 - i * 0.012);
+        sfxNoise('bandpass', 2400 + i * 260, 1500, 3.6, at, 0.001, 0.03, 0.1, PRI.CUE, 0.06, pan);
+      }
     }
   }
 
@@ -2259,6 +2293,11 @@ export function createAudio(options) {
           case 'enemyWake':
             if (!muted) {
               playWake(e.kind === 'wraith' ? 'wraith' : 'crawler', pickupPan(e.x, e.y, state));
+            }
+            break;
+          case 'enemyWind':
+            if (!muted) {
+              playWind(e.kind === 'wraith' ? 'wraith' : 'crawler', pickupPan(e.x, e.y, state));
             }
             break;
           case 'unlock':

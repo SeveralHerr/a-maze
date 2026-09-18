@@ -825,6 +825,12 @@ function boot() {
           // And a wound vignette that outlasts the flash — the screen edges stay red for about a
           // second, so being hurt is a state the player can see they are in and not only an instant.
           hurtPulse = 1;
+          // Which way it came from, relative to where the player is looking — the HUD draws a wedge
+          // on that edge of the world band. `atan2` in the world's convention, minus the facing.
+          // World angles are `atan2(dy, dx)` with y growing DOWN (§4.2), and the player's right is
+          // +90 degrees in that convention — so subtracting their facing gives exactly what the HUD
+          // wants: 0 dead ahead, positive to the right.
+          hud.hurtFrom(Math.atan2(ev.y - state.player.y, ev.x - state.player.x) - state.player.angle);
           break;
         case 'ember':
           hud.notice(NOTICE_EMBER);

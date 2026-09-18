@@ -278,6 +278,12 @@ const CRAWLER_MATS = [
   { ramp: RAMPS.chitin, albedo: 0.46, spec: 0.25, shine: 18, ambient: 0.26 },
   // 2 mandibles: bone-pale against the shell, which is what makes the front end read as a head.
   { ramp: RAMPS.map, albedo: 0.92, spec: 0.5, shine: 20, ambient: 0.38 },
+  // 3 abdomen and 4 head: the SAME shell, deliberately a couple of ramp steps apart from the thorax
+  // and from each other. Three domes of one material merged into a single brown mass at the range
+  // the creature fills the view — a specular ridge separates a segment from the air around it, not
+  // from the segment behind it. Different albedos are what make it read as segmented.
+  { ramp: RAMPS.chitin, albedo: 0.42, spec: 0.9, shine: 34, ambient: 0.16 },
+  { ramp: RAMPS.chitin, albedo: 0.78, spec: 1.4, shine: 48, ambient: 0.26 },
 ];
 
 /**
@@ -295,9 +301,9 @@ function crawlerMesh(gait, rear) {
   const m = createMesh();
   const lift = rear * 5;
   // Abdomen, thorax, head — decreasing domes along +z (forward).
-  lathe(m, [[0, 1], [7, 1.5], [9.6, 3.5], [10.2, 7], [8.6, 10], [5, 12], [0, 12.6]], 0, { segs: 16, cz: -8.5 });
+  lathe(m, [[0, 1], [7, 1.5], [9.6, 3.5], [10.2, 7], [8.6, 10], [5, 12], [0, 12.6]], 3, { segs: 16, cz: -8.5 });
   lathe(m, [[0, 1.5], [6.5, 2], [8.4, 4.5], [8.6, 8], [6.8, 10.6], [3.6, 12], [0, 12.4]], 0, { segs: 16, cz: 0.5 });
-  lathe(m, [[0, 2 + lift], [4.6, 2.6 + lift], [5.8, 5 + lift], [5.4, 7.8 + lift], [3.4, 9.4 + lift], [0, 10 + lift]], 0, {
+  lathe(m, [[0, 2 + lift], [4.6, 2.6 + lift], [5.8, 5 + lift], [5.4, 7.8 + lift], [3.4, 9.4 + lift], [0, 10 + lift]], 4, {
     segs: 14,
     cz: 9,
   });
@@ -543,6 +549,34 @@ function paintEyes(buf, cx, cy, spread, bright, halo, facing) {
 const EYE_BLOOM = Object.freeze([[-1, 0], [1, 0], [0, -1], [0, 1]]);
 
 /**
+ * Trace a bright rim along the lit edges of a silhouette.
+ *
+ * A texel is on the rim when it is painted and its neighbour toward the light is not. One texel
+ * wide: at 240p that is all there is room for, and more reads as an outline rather than as light.
+ * @param {Uint8Array} buf
+ * @param {number} index palette index of the rim
+ * @returns {void}
+ */
+function rimLight(buf, index) {
+  // Walked back to front so a texel promoted to the rim cannot itself seed the next one.
+  for (let y = SIZE - 1; y >= 1; y--) {
+    for (let x = SIZE - 1; x >= 1; x--) {
+      const i = (y << 6) | x;
+      const here = buf[i];
+      // Empty, or the creature's own cast shadow — a shadow does not have a lit edge, and rimming
+      // it promoted shadow texels into body ones, which pushed the silhouette out to the card edge.
+      if (here === 0 || here === SHADOW_INDEX) continue;
+      const left = buf[i - 1];
+      const up = buf[i - SIZE];
+      const solid = (/** @type {number} */ v) => v !== 0 && v !== SHADOW_INDEX;
+      // Lit from up and to the left, matching every other model in the game.
+      if (solid(left) && solid(up)) continue;
+      buf[i] = index;
+    }
+  }
+}
+
+/**
  * Sink a dark ellipse into the hood, so the cowl reads as an opening rather than as a dark hat.
  *
  * Painted over the creature only — never into the transparency key — so the hole stays inside the
@@ -662,7 +696,7 @@ function paintCreature(kind, yaw, gait, action, seed, tilt, stipple) {
       Math.round((l.sx + r.sx) * 0.5),
       Math.round((l.sy + r.sy) * 0.5),
       Math.abs(r.sx - l.sx),
-      C.fireCore,
+      C.eyeEmber,
       C.fireEmber,
       facing,
     );
@@ -680,7 +714,12 @@ function paintCreature(kind, yaw, gait, action, seed, tilt, stipple) {
     // before the eyes go in. Without it the hood was a flat dark lump with two lights stuck on the
     // front, and the whole point of this creature is that you cannot see what is inside it.
     if (facing > 0.12) voidCowl(buf, ex, ey, 6.2 * k * facing, 4.6 * k);
-    paintEyes(buf, Math.round(ex), Math.round(ey), Math.abs(r.sx - l.sx), C.arcPale, C.arcCyan, facing);
+    paintEyes(buf, Math.round(ex), Math.round(ey), Math.abs(r.sx - l.sx), C.eyeCold, C.arcCyan, facing);
+    // A rim light down the wraith's lit edges. It is separated from the world by colour TEMPERATURE
+    // alone, which works on the warm Keep and disappears on the cold Cistern and Glacier, where the
+    // dungeon is the same blue-grey it is. A bright edge is a separation that does not depend on
+    // what the creature happens to be standing in front of.
+    rimLight(buf, C.shroudPale);
   }
   return buf;
 }
@@ -715,6 +754,12 @@ const SWORD_MATS = [
   { ramp: RAMPS.gold, albedo: 0.78, spec: 0.7, shine: 20, ambient: 0.34 },
   // 3 grip: bound leather.
   { ramp: RAMPS.wood, albedo: 0.5, spec: 0.1, ambient: 0.3 },
+  // 4 gauntlet: cool and matte, so the hand sits UNDER the blade in value and never competes with
+  // it — but not DARK. At 0.62 with a low ambient it crushed into one silhouette and read as a grey
+  // lump; a hand has to have a lit side to be a hand.
+  { ramp: RAMPS.gauntlet, albedo: 0.86, spec: 0.5, shine: 22, ambient: 0.34 },
+  // 5 knuckles and thumb: a step brighter again, because they are the shapes doing the reading.
+  { ramp: RAMPS.gauntlet, albedo: 1.05, spec: 0.7, shine: 26, ambient: 0.4 },
 ];
 
 /**
@@ -770,6 +815,30 @@ function swordMesh() {
   // ── Grip and pommel ──
   lathe(m, [[2.3, -0.4], [2.7, 1.6], [2.4, 4.4], [2.6, 7], [2.4, 9]], 3, { segs: 10, capBottom: true });
   lathe(m, [[0, -4.6], [2.9, -3.4], [3.8, -0.9], [2.8, 1.1], [0, 2]], 2, { segs: 12 });
+
+  // ── The hand ──
+  // A gauntleted fist round the grip, knuckle ridges across its back, a thumb laid along the near
+  // side, and a stub of forearm running out of it. Without this the sword is a blade floating in
+  // the corner of the screen: the single thing that most made it read as a sprite rather than as
+  // something the player is holding.
+  //
+  // It is part of the same mesh, so it rolls WITH the sword — correct for a fist on a grip. The
+  // forearm is deliberately a stub: a full arm rotating through 90 degrees of swing would point
+  // somewhere no arm goes, and at this size a wrist leaving the card reads fine.
+  // Short and broad — a fist, not a sleeve. The first pass was a long smooth cylinder running off
+  // the bottom of the card, which read as a grey tube with a sword coming out of it.
+  lathe(m, [[3.8, 0.8], [5.4, 2.6], [5.6, 5.6], [4.8, 8.4], [3.2, 9.4]], 4, { segs: 12, capBottom: true });
+  // Knuckle ridges across the FRONT of the fist (+z, toward the eye). On the back they were facing
+  // away at every yaw the swing actually uses, so the fist had no features at all.
+  for (let k = 0; k < 4; k++) {
+    const y = 2.6 + k * 1.8;
+    limb(m, [[-3.9, y, 3.4], [3.9, y, 3.4]], 1.15, 5);
+  }
+  // The thumb, laid across the grip on the near side: the detail that says "fist" rather than "tube".
+  limb(m, [[-3.4, 8.6, 2.6], [-0.6, 6.0, 4.2], [1.6, 3.4, 4.0]], 1.7, 5);
+  // A stub of wrist, and no more: an arm long enough to see is an arm long enough to point somewhere
+  // no arm goes once the sword has rolled ninety degrees.
+  lathe(m, [[4.4, -3.4], [4.9, -1.6], [4.2, 0.6]], 4, { segs: 10 });
   return m;
 }
 
@@ -824,20 +893,14 @@ function swordPose(i) {
 }
 
 /**
- * Sword poses that carry a motion smear: the frames of the cut where the blade is genuinely moving
- * faster than the eye can resolve. Exported so `enemies.test.mjs` asserts against the same list the
- * painter reads, rather than against frame numbers that go stale the moment the arc is re-timed.
+ * Sword poses the cut passes through — the frames where the blade is genuinely moving faster than
+ * the eye can resolve, and therefore the ones the renderer strokes a motion smear between.
+ *
+ * The smear itself is no longer baked into these sprites (see {@link SWORD_TIPS}); this is the
+ * slice of the swing it is drawn across.
  * @type {ReadonlyArray<number>}
  */
 export const SWORD_SMEAR_FRAMES = Object.freeze([5, 6, 7, 8]);
-
-/**
- * @param {number} i
- * @returns {boolean}
- */
-function swordSmears(i) {
-  return SWORD_SMEAR_FRAMES.indexOf(i) >= 0;
-}
 
 /**
  * Paint one sword pose.
@@ -865,9 +928,6 @@ function paintSword(i, stipple) {
     (ramp, t, x, y) => (ramp === RAMPS.steel ? rampPickFlat(ramp, t) : rampPickChunky(ramp, t, x, y)),
     buf,
   );
-  // A stippled arc trailing the fast frames: half-shaded, like the flame's halo, so it reads as
-  // speed rather than as a second blade.
-  if (swordSmears(i)) trailArc(buf, stipple, i);
   return buf;
 }
 
@@ -878,43 +938,26 @@ function paintSword(i, stipple) {
  * @param {number} frame
  * @returns {void}
  */
-function trailArc(buf, stipple, frame) {
-  // A smear that HUGS the blade and tapers to nothing behind it.
-  //
-  // Two earlier versions failed in opposite directions, and both failed the same way on screen —
-  // by reading as an object rather than as motion. A per-texel hash under the renderer's half-
-  // stipple was white noise; a solid band swept over the whole gap between two poses was a slab
-  // that detached from the sword and floated beside it. What works is a wedge: deep where it meets
-  // the blade, shallower every step back, gone before it has travelled far enough to look separate.
-  const pose = swordPose(frame);
-  const prev = swordPose(frame - 1);
-  const cx = SIZE / 2 + pose.dx;
-  const cy = SWORD_ORIGIN_ROW - pose.dy;
-  // Hard cap on the span. Past about a sixth of a turn the tail is far enough from the blade that
-  // no amount of fading stops it reading as a second object.
-  let from = prev.roll;
-  const maxSpan = 0.3;
-  if (Math.abs(pose.roll - from) > maxSpan) from = pose.roll - Math.sign(pose.roll - from) * maxSpan;
-  const steps = 16;
-  for (let k = 0; k < steps; k++) {
-    // u = 0 at the blade, 1 at the far end of the tail.
-    const u = k / (steps - 1);
-    const a = pose.roll + (from - pose.roll) * u;
-    const sn = Math.sin(a);
-    const cs = Math.cos(a);
-    // Deep against the blade, tapering to a single texel at the tail.
-    const depth = 16 * (1 - u) * (1 - u) + 1.5;
-    for (let r = SWORD_REACH - depth; r < SWORD_REACH + 1; r += 1) {
-      const x = Math.round(cx - sn * r);
-      const y = Math.round(cy - cs * r);
-      if (x < 1 || y < 1 || x >= SIZE - 1 || y >= SIZE - 1) continue;
-      const i = (y << 6) | x;
-      if (buf[i] !== 0) continue;
-      buf[i] = u < 0.35 ? C.steelGlint : u < 0.7 ? C.steelPale : C.ironLight;
-      stipple[i] = 1;
-    }
-  }
-}
+/**
+ * Where the blade's TIP sits on each pose's card, in texels.
+ *
+ * Published so the renderer can draw the motion smear in **screen space**, by stroking between the
+ * tips of the poses the swing has just passed through, instead of every sprite carrying a baked
+ * one. Three baked versions failed the same way — as an object rather than as motion: a per-texel
+ * hash under the renderer's half-stipple was white noise, a solid swept band was a slab that
+ * detached from the sword, and a tapered wedge was a smudge stuck near the point. A smear is the
+ * path the tip actually took, and only the renderer knows how far along that path this frame is.
+ * @type {ReadonlyArray<{x:number, y:number}>}
+ */
+export const SWORD_TIPS = Object.freeze(
+  Array.from({ length: SWORD_FRAMES }, (_, i) => {
+    const pose = swordPose(i);
+    return Object.freeze({
+      x: SIZE / 2 + pose.dx - Math.sin(pose.roll) * SWORD_REACH,
+      y: SWORD_ORIGIN_ROW - pose.dy - Math.cos(pose.roll) * SWORD_REACH,
+    });
+  }),
+);
 
 // ─── Public surface ──────────────────────────────────────────────────────────────────────────
 

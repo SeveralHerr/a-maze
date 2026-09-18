@@ -205,6 +205,18 @@ const SHARED_ENTRIES = /** @type {ReadonlyArray<readonly [string, number, boolea
   // frame or it reads as a grey stick held in front of the camera.
   ['steelPale', 0xcdd6e0],
   ['steelGlint', 0xf2f6fb],
+  // Eyes, and the ONLY two glow colours outside a tileset block. `PALETTE_GLOW` stops the colormap
+  // shading them below `GLOW_MIN_LIGHT`, so a creature's eyes stay lit at the edge of the torch
+  // while the body around them goes to fog — which is what lets a thing resolve out of the dark
+  // eyes-first instead of arriving fully painted (§4.11). They are their own entries rather than
+  // `fireCore`/`arcPale` because marking those would make every flame and every gem self-lit too.
+  ['eyeEmber', 0xffb648, true],
+  ['eyeCold', 0x9beaf6, true],
+  // The gauntlet holding the sword: dark leather over steel, so the hand reads against the blade.
+  ['gauntShadow', 0x15171d],
+  ['gauntDark', 0x2a2f3a],
+  ['gauntMid', 0x454c5a],
+  ['gauntLight', 0x6b7486],
 ]);
 
 /**
@@ -337,6 +349,7 @@ export const RAMPS = Object.freeze({
   chitin: ramp('chitinShadow', 'chitinDark', 'chitinMid', 'chitinLight', 'chitinPale'),
   shroud: ramp('shroudShadow', 'shroudDark', 'shroudMid', 'shroudLight', 'shroudPale'),
   steel: ramp('ironShadow', 'ironDark', 'ironBase', 'ironLight', 'ironHilite', 'steelPale', 'steelGlint'),
+  gauntlet: ramp('gauntShadow', 'gauntDark', 'gauntMid', 'gauntLight'),
 });
 
 /** Every packed colour, for O(1) "is this on-palette?" checks in tests. */

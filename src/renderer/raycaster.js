@@ -75,7 +75,7 @@ import {
 } from './textures.js';
 import { createParticles, PARTICLE, PARTICLE_COLORS } from './particles.js';
 import { createSpriteIndex } from './sprite-index.js';
-import { ENEMY_ART, ENEMY_FRAMES, ENEMY_POSE, enemyFrameIndex } from './enemies.js';
+import { ENEMY_ART, ENEMY_FRAMES, ENEMY_POSE, SWORD_TIPS, enemyFrameIndex } from './enemies.js';
 
 // ─── Tunables ──────────────────────────────────────────────────────────────────────────────────
 
@@ -624,6 +624,14 @@ const EMPTY_ENEMIES = /** @type {any[]} */ ([]);
  */
 const ENEMY_VIEWS_LOCAL = 6;
 
+/**
+ * Tiles past which a creature's body starts sinking toward the fog, and how much of its shade it
+ * loses by the cull distance. Its EYES are exempt — they are painted in `PALETTE_GLOW` colours — so
+ * a thing coming down a corridor is two lights first and a shape second (§4.11).
+ */
+const ENEMY_FADE_FROM = 6;
+const ENEMY_FADE_DEPTH = 0.62;
+
 /** Seconds a corpse stays on the cobbles before it stops being drawn. Mirrors `COMBAT.CORPSE_SECONDS`. */
 const CORPSE_FADE = 1.1;
 
@@ -654,6 +662,10 @@ const WEAPON_LIFT = 0.13;
 
 /** Fraction of a card-width the strike carries the weapon ACROSS the screen (see `sweep`). */
 const WEAPON_SWEEP = 0.3;
+
+/** How many poses back the motion smear reaches, and how many dabs it is stroked with. */
+const SMEAR_POSES = 3;
+const SMEAR_STEPS = 14;
 
 /**
  * How lit the sword stays on an empty torch.
@@ -2751,6 +2763,17 @@ export function createRaycaster(canvas, options) {
         // A creature that has just been hit flashes: the shade is pinned bright for a fraction of a
         // second. It is the only feedback that a swing connected when the thing is at the edge of
         // the torch pool, and at 240p it has to be a value change, not a colour change.
+        // A creature RESOLVES out of the dark rather than arriving fully painted: past
+        // `ENEMY_FADE_FROM` tiles its body is pushed down toward the fog, so what reaches the eye
+        // first is the pair of eyes (painted in the two glow colours, which the colormap refuses to
+        // shade below `GLOW_MIN_LIGHT`), then a silhouette, then the thing itself. Being able to
+        // see exactly what is coming from twenty tiles away is most of what stopped this being
+        // frightening.
+        if (d > ENEMY_FADE_FROM) {
+          let f = (d - ENEMY_FADE_FROM) / (SPRITE_FAR - ENEMY_FADE_FROM);
+          if (f > 1) f = 1;
+          lvl = (lvl * (1 - f * ENEMY_FADE_DEPTH)) | 0;
+        }
         const hurt = e.hurt > 0 ? e.hurt : 0;
         if (hurt > 0) {
           const lit = (LEVEL_MAX * (0.55 + 0.45 * hurt)) * FX_ONE;
@@ -2966,6 +2989,11 @@ export function createRaycaster(canvas, options) {
     else if (level > LEVEL_MAX) level = LEVEL_MAX;
     const base = level << 8;
 
+    // The motion smear, stroked BEFORE the blade so the blade always sits on top of its own trail.
+    if (weapon.st === 2 || (weapon.st === 3 && weapon.phase < 0.35)) {
+      drawSwordSmear(left, top, scale, fi, weapon.phase, base);
+    }
+
     const x0 = left < 0 ? 0 : left;
     const x1 = left + size > width ? width : left + size;
     const y0 = top < 0 ? 0 : top;
@@ -2989,6 +3017,62 @@ export function createRaycaster(canvas, options) {
       }
     }
     return 1;
+  }
+
+  /**
+   * Stroke the blade's motion smear across the frames the cut has just passed through.
+   *
+   * Screen space, not baked into the sprites. Three baked attempts all read as an *object* rather
+   * than as motion — noise, then a detached slab, then a smudge welded to the point — because a
+   * sprite can only ever carry one frozen smear whatever the swing is actually doing. Here the
+   * renderer knows how far through the cut this frame is, so it strokes the real path the tip took
+   * to get here: a line from a few poses back to exactly where the point is now, fading and
+   * thinning along its length. Allocation-free; the tip path is a frozen table (`SWORD_TIPS`).
+   * @param {number} left card's left edge in framebuffer pixels
+   * @param {number} top card's top edge
+   * @param {number} scale framebuffer pixels per card texel
+   * @param {number} frame the pose being drawn
+   * @param {number} phase 0..1 through that phase of the swing
+   * @param {number} base colormap row (`level << 8`) the weapon is lit at
+   * @returns {void}
+   */
+  function drawSwordSmear(left, top, scale, frame, phase, base) {
+    // Where the point is now, and where it was `SMEAR_POSES` poses ago. `phase` slides the leading
+    // end between two table entries so the smear grows and shrinks with the swing rather than
+    // stepping once per frame.
+    const tip = SWORD_TIPS[frame < SWORD_TIPS.length ? frame : SWORD_TIPS.length - 1];
+    const nextIdx = frame + 1 < SWORD_TIPS.length ? frame + 1 : frame;
+    const next = SWORD_TIPS[nextIdx];
+    const p = phase > 1 ? 1 : phase < 0 ? 0 : phase;
+    const headX = tip.x + (next.x - tip.x) * p;
+    const headY = tip.y + (next.y - tip.y) * p;
+    const backIdx = frame - SMEAR_POSES > 0 ? frame - SMEAR_POSES : 0;
+    const back = SWORD_TIPS[backIdx];
+
+    for (let k = 0; k <= SMEAR_STEPS; k++) {
+      const u = k / SMEAR_STEPS;
+      // u = 0 at the tail, 1 at the point.
+      const cardX = back.x + (headX - back.x) * u;
+      const cardY = back.y + (headY - back.y) * u;
+      const px = left + cardX * scale;
+      const py = top + cardY * scale;
+      // Thick and bright at the point, thinning to nothing at the tail — a streak, not a band.
+      const half = (0.5 + u * u * 2.6) * scale;
+      const idx = u > 0.82 ? C.steelGlint : u > 0.5 ? C.steelPale : C.ironLight;
+      const colour = colormap[base | idx];
+      const ax = (px - half) | 0;
+      const bx = (px + half) | 0;
+      const ay = (py - half) | 0;
+      const by = (py + half) | 0;
+      for (let y = ay < 0 ? 0 : ay; y <= by && y < height; y++) {
+        const row = y * width;
+        for (let x = ax < 0 ? 0 : ax; x <= bx && x < width; x++) {
+          // Half-stippled, like the flame halo and the Oil Sense ghost: a smear is translucent.
+          if (((x + y) & 1) === 0) continue;
+          buf[row + x] = colour;
+        }
+      }
+    }
   }
 
   // ── Flash ───────────────────────────────────────────────────────────────────────────────────

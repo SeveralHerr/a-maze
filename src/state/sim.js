@@ -72,6 +72,7 @@ import { createRng } from '../core/rng.js';
 import {
   combatDt,
   installPrimitives,
+  stepWeapon,
   isPlayerDead,
   healOnOil,
   startAttack,
@@ -1289,6 +1290,13 @@ export function stepPlayingBody(state, input) {
     if (run.iframes > 0) {
       run.iframes -= dt;
       if (run.iframes < 0) run.iframes = 0;
+    }
+    // The SWORD keeps moving. Freezing the weapon along with the world made a landed blow read as
+    // the game hitching; letting the cut follow through while everything it is cutting holds still
+    // is what turns the same three frames into weight.
+    if (state.mode === 'combat') {
+      combatDt[0] = dt;
+      stepWeapon(state);
     }
     updateDerived(state);
     return;

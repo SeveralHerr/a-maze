@@ -472,6 +472,21 @@ function damagePlayer(state, e) {
  * @param {SimState} state must be in `playing` with `levelData` installed, and in `'combat'`
  * @returns {void}
  */
+/**
+ * Advance the player's sword ONLY — the weapon's own animation, with the world held still.
+ *
+ * Called from `sim.js` during hitstop. The world stopping on a landed blow is the point; the sword
+ * stopping mid-cut is not, and freezing both made the impact read as the game hitching rather than
+ * as the blade meeting something. Letting the swing run through the freeze while everything else
+ * holds is the standard trick, and it roughly doubles what the hitstop buys.
+ * @param {SimState} state
+ * @returns {void}
+ */
+export function stepWeapon(state) {
+  if (state.mode !== 'combat') return;
+  stepSword(state, combatDt[0], state.sim.attackHeld === true);
+}
+
 export function stepCombat(state) {
   const dt = combatDt[0];
   const run = state.run;
@@ -621,6 +636,7 @@ function stepEnemy(state, e, dt, dx, dy, d2, sees) {
       if (sees && d2 <= back * back) {
         e.st = /** @type {EnemyState} */ (ST_WIND);
         e.cool = stats.windUp + stats.strike + stats.recover;
+        state.events.push({ type: 'enemyWind', kind: e.kind, x: e.x, y: e.y });
       } else {
         e.st = /** @type {EnemyState} */ (ST_CHASE);
       }
@@ -638,6 +654,9 @@ function stepEnemy(state, e, dt, dx, dy, d2, sees) {
     e.st = /** @type {EnemyState} */ (ST_WIND);
     e.t = 0;
     e.cool = stats.windUp + stats.strike + stats.recover;
+    // The telegraph was visual only, so a creature rearing up BEHIND the player announced nothing
+    // at all until it connected. Voiced, and panned, the fight becomes playable by ear.
+    state.events.push({ type: 'enemyWind', kind: e.kind, x: e.x, y: e.y });
     return;
   }
   // Toward the player when they can be seen, otherwise toward where they last were.

@@ -600,6 +600,10 @@ const HEALTH_FLASH_S = 0.28;
 /** Fraction of health below which the readout turns to the alarm colour and the panel pulses. */
 const HEALTH_LOW = 0.28;
 
+/** Seconds the directional damage wedge stays up, and its half-width in radians (~40 degrees). */
+const HURT_ARC_S = 1.1;
+const HURT_ARC_RAD = 0.7;
+
 /** The health readout's label — the same shape as the fuel gauge's `OIL`. */
 const LIFE_LABEL = 'LIFE';
 
@@ -817,6 +821,16 @@ export function createHud(overlayCanvas, options) {
   let shownHp = -1;
   /** `anim.clock` of the last time health actually fell — drives the bar's alarm flash. */
   let hurtAt = -1e9;
+  /**
+   * Bearing to whatever last hit the player, in radians relative to their facing, and the clock it
+   * arrived at. 0 is dead ahead, positive to the right.
+   *
+   * Being hit from behind looked exactly like being hit from the front — one uniform red vignette —
+   * in a mode whose entire threat is things arriving out of the dark, where the cue that matters
+   * most is WHICH WAY. Set by `hurtFrom`, which main.js calls from the `playerHit` event.
+   */
+  let hurtBearing = 0;
+  let hurtBearingAt = -1e9;
   /** Whether the AUTO button may be drawn at all (`setAutoButton`; main.js turns it off on touch). */
   let autoButtonEnabled = true;
   /** `anim.clock` when the Auto Explore key hint appeared; −1 while it is not showing. */
@@ -1171,6 +1185,7 @@ export function createHud(overlayCanvas, options) {
     // New Descent (§4.11). Both return immediately in Classic Descent, so the classic HUD draws
     // exactly the calls it always drew.
     drawHealthBar(ctx, state, m, reduced);
+    drawHurtArc(ctx, state, m, reduced);
     drawAttackButton(ctx, state, m, reduced);
     drawAutoButton(ctx, state, m, reduced);
     drawLodestone(ctx, state, m, reduced);
@@ -1963,6 +1978,49 @@ export function createHud(overlayCanvas, options) {
   }
 
   /**
+   * Draw the directional damage arc: a red wedge on the edge of the world band, in the direction
+   * the blow came from, fading over `HURT_ARC_S`.
+   *
+   * Placed on the RIM rather than over the world, because it is peripheral information — the player
+   * is looking at whatever is in front of them, and this has to be readable without being looked at.
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {GameState} state
+   * @param {SurfaceMetrics} m
+   * @param {boolean} reduced
+   * @returns {void}
+   */
+  function drawHurtArc(ctx, state, m, reduced) {
+    if (!isCombat(state)) return;
+    const age = anim.clock - hurtBearingAt;
+    if (age < 0 || age >= HURT_ARC_S) return;
+    const fade = 1 - age / HURT_ARC_S;
+    const u = m.u;
+    // Centre of the world band, and the radius the wedge is drawn at.
+    const cx = m.viewX + m.viewW / 2;
+    const cy = m.viewY + m.viewH / 2;
+    const rx = m.viewW * 0.5;
+    const ry = m.viewH * 0.5;
+    const before = ctx.globalAlpha;
+    ctx.globalAlpha = before * fade * (reduced ? 0.7 : 0.55 + 0.45 * fade);
+    ctx.fillStyle = COLOR.alarm;
+    // Screen convention: forward is UP, so a bearing of 0 puts the wedge at the top of the band.
+    const half = HURT_ARC_RAD;
+    const steps = 14;
+    const thick = 3 * u;
+    for (let k = 0; k <= steps; k++) {
+      const a = hurtBearing - half + (2 * half * k) / steps;
+      // Taper to nothing at the ends, so the wedge reads as a direction and not as a bar.
+      const t = 1 - Math.abs(k / steps - 0.5) * 2;
+      const len = thick * (0.25 + 0.75 * t);
+      if (len < 1) continue;
+      const sx = cx + Math.sin(a) * rx;
+      const sy = cy - Math.cos(a) * ry;
+      ctx.fillRect(Math.round(sx - len * 0.5), Math.round(sy - len * 0.5), Math.ceil(len), Math.ceil(len));
+    }
+    ctx.globalAlpha = before;
+  }
+
+  /**
    * Is the mouse pointer captured by the page right now?
    *
    * Read straight off the document rather than passed in: the HUD needs it once a frame to decide
@@ -2160,6 +2218,15 @@ export function createHud(overlayCanvas, options) {
     hitAttack,
     setAttackButton(on) {
       attackButtonEnabled = on === true;
+    },
+    /**
+     * Note which way a blow came from, for the directional damage wedge (§4.11).
+     * @param {number} bearing radians relative to the player's facing; 0 ahead, positive right
+     */
+    hurtFrom(bearing) {
+      if (!Number.isFinite(bearing)) return;
+      hurtBearing = bearing;
+      hurtBearingAt = anim.clock;
     },
     dispose,
   };

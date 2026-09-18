@@ -1220,6 +1220,90 @@ try {
     };
   });
   await page.evaluate(() => window.__ap.stop());
+
+  // ── New Descent (ARCHITECTURE.md §4.11) ──
+  // Runs in EVERY invocation, not behind `--mode combat`. The flag existed and nobody typed it, so
+  // roughly 270 lines of enemy and weapon rendering shipped without the gate ever entering the mode
+  // they were written for — and the first run that did immediately found a crash throwing 97 286
+  // times a session. A gate that has to be remembered is not a gate.
+  //
+  // Deliberately short (~15 s): it is a smoke test for the mode's own surfaces — creatures spawn,
+  // the art paints without stalling the loop, a swing lands, a blow is taken, the console stays
+  // silent — not a second full descent.
+  await page.setViewport({ width: 1280, height: 720, deviceScaleFactor: 1 });
+  await page.goto(`${URL}/?headless=1&seed=${SEED}`, { waitUntil: 'load', timeout: 30000 });
+  await waitForState(page, () => window.__game && window.__game.ready === true, 20000, 'combat ready');
+  await waitForState(page, () => window.__game.state().levelData !== null, 20000, 'combat demo level');
+  await page.evaluate((seed) => window.__game.dispatch({ type: 'newGame', seed, mode: 'combat' }), SEED);
+  await waitForState(page, () => window.__game.state().phase === 'playing', 20000, 'combat playing');
+  // The art is painted across the loading screen in a budget (§4.11). If that ever goes back to one
+  // synchronous paint it shows up here as discarded steps, which is exactly what it did before.
+  const combatEntry = await page.evaluate(() => ({
+    skipped: window.__game.stats().skippedSteps,
+    enemies: window.__game.state().enemies.length,
+  }));
+  await sleep(600);
+  await page.evaluate(() => {
+    // Stand in front of a creature and hold the button: the whole combat loop in one gesture.
+    const g = window.__game;
+    const st = g.state();
+    st.run.mapFound = true;
+    const foes = st.enemies.filter((e) => e.st !== 6);
+    if (foes.length === 0) return;
+    const e = foes[0];
+    const p = st.player;
+    // Placed in front of it and LEFT ASLEEP: the creature has to notice the player on its own, so
+    // the wake path is exercised rather than stubbed. Force-waking it here made the gate assert
+    // that a wake event fires while guaranteeing one never could.
+    p.x = e.x - 2.2;
+    p.y = e.y;
+    p.px = p.x;
+    p.py = p.y;
+    p.angle = 0;
+    p.pangle = 0;
+  });
+  /** @type {any} */
+  const combatSeen = { swings: 0, enemyHits: 0, playerHits: 0, kills: 0, wakes: 0, winds: 0 };
+  await page.evaluate((seen) => {
+    window.__combat = { ...seen };
+    window.__combatOff = window.__game.subscribe((s) => {
+      for (const ev of s.events) {
+        if (ev.type === 'swing') window.__combat.swings++;
+        else if (ev.type === 'enemyHit') {
+          window.__combat.enemyHits++;
+          if (ev.killed) window.__combat.kills++;
+        } else if (ev.type === 'playerHit') window.__combat.playerHits++;
+        else if (ev.type === 'enemyWake') window.__combat.wakes++;
+        else if (ev.type === 'enemyWind') window.__combat.winds++;
+      }
+    });
+  }, combatSeen);
+  // Hold the attack button for ten seconds of real fighting.
+  for (let i = 0; i < 40; i++) {
+    await page.evaluate(() => window.__game.input.inject({ pressed: ['attack'], moveY: 0.25 }));
+    await sleep(250);
+  }
+  await page.evaluate(() => window.__game.input.clear());
+  await clearView(page, 4000);
+  await shot(page, 'combat-fight');
+  report.combat = await page.evaluate((entry) => {
+    const g = window.__game;
+    const st = g.state();
+    if (window.__combatOff) window.__combatOff();
+    return {
+      ...window.__combat,
+      enemiesAtStart: entry.enemies,
+      skippedOnEntry: entry.skipped,
+      skipped: g.stats().skippedSteps,
+      phase: st.phase,
+      hp: Math.round(st.run.hp),
+      hpMax: st.run.hpMax,
+      kills: st.run.kills,
+      renderMsAvg: +g.renderStats().msAvg.toFixed(2),
+      fps: +g.stats().fps.toFixed(1),
+      errors: g.errors.length,
+    };
+  }, combatEntry);
 } catch (e) {
   report.errors.push(`verify.mjs: ${(e && e.stack) || e}`);
 } finally {
@@ -1382,6 +1466,28 @@ if (report.options && report.options.cycle) {
 if (!report.loading || report.loading.phase !== 'loading') {
   fail(`the loading screen was already gone 380ms after nextLevel (${report.loading ? report.loading.phase : 'no data'})`);
 }
+// New Descent (§4.11). Every one of these was a real defect at some point in this wave.
+if (!report.combat) {
+  fail('the New Descent phase never ran, so the combat mode is ungated');
+} else {
+  const c = report.combat;
+  if (c.enemiesAtStart <= 0) fail('New Descent spawned no creatures on level 1');
+  if (c.errors > 0) fail(`New Descent recorded ${c.errors} guarded runtime errors`);
+  // Painting the art used to freeze the thread for 233 ms and lose eight steps on the way in.
+  if (c.skippedOnEntry > MAX_STALL_SKIPPED_STEPS) {
+    fail(`entering New Descent discarded ${c.skippedOnEntry} sim steps (the art paint is blocking again)`);
+  }
+  if (c.skipped - c.skippedOnEntry > MAX_STALL_SKIPPED_STEPS) {
+    fail(`New Descent discarded ${c.skipped - c.skippedOnEntry} sim steps while fighting`);
+  }
+  // A held button has to keep swinging (it used to give exactly one swing), the swings have to
+  // connect, and the creature has to be able to answer — a fight the player cannot lose is not one.
+  if (c.swings < 5) fail(`holding the attack button produced only ${c.swings} swings in 10 s`);
+  if (c.enemyHits < 1) fail('ten seconds of swinging at a creature never connected');
+  if (c.wakes < 1) fail('no creature ever noticed the player');
+  if (c.playerHits < 1 && c.kills < 1) fail('nothing happened in the fight: no blow landed either way');
+}
+
 if (report.mobile) {
   if (report.mobile.phase !== 'playing') fail('mobile run never reached playing');
   if (report.mobile.horizontalOverflow) fail('mobile layout overflows horizontally');
@@ -1428,6 +1534,14 @@ console.log(
         (thr.baseline ? ` · control at 1×: render ${thr.baseline.renderMsAvg}ms, ${thr.baseline.loopFps}fps` : '')
       : 'not sampled'),
 );
+if (report.combat) {
+  const c = report.combat;
+  console.log(
+    `[verify] combat: ${c.enemiesAtStart} creatures · ${c.swings} swings, ${c.enemyHits} connected, ` +
+      `${c.kills} killed · ${c.playerHits} taken (hp ${c.hp}/${c.hpMax}) · ${c.wakes} woke, ${c.winds} telegraphed · ` +
+      `render ${c.renderMsAvg}ms · ${c.skipped - c.skippedOnEntry} steps discarded · errors ${c.errors}`,
+  );
+}
 if (!report.pass) for (const r of report.failReasons) console.log(`[verify]   ✗ ${r}`);
 console.log(`[verify] ${report.screenshots.length} screenshots · wrote ${path.relative(ROOT, outFile)}`);
 process.exit(report.pass ? 0 : 1);

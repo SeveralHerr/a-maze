@@ -22,6 +22,7 @@ import {
   SHADOW_INDEX,
   SWORD_FRAMES,
   SWORD_SMEAR_FRAMES,
+  SWORD_TIPS,
   createCombatTextures,
   enemyFrameIndex,
 } from './enemies.js';
@@ -208,15 +209,18 @@ test('the sword reads as a sword: mostly blade, and it moves through the swing',
   const rest = bbox(SET.sword[0]);
   assert.ok(rest !== null);
   assert.ok(rest.h > rest.w, `the rest pose is longer than it is wide (${rest.w}×${rest.h})`);
-  // The cut's fast frames carry a motion smear; nothing else does. Checked against the painter's
-  // own list, so re-timing the arc cannot leave this asserting stale frame numbers.
+  // NO sprite carries a baked motion smear any more — it is stroked in screen space between the
+  // tips of the poses the cut passes through (`SWORD_TIPS`, and `raycaster.test.mjs` covers the
+  // drawing). Three baked versions read as an object rather than as motion; this asserts the
+  // fourth attempt did not quietly come back.
   const stippled = SET.sword.map((t) => (t.stipple === null ? 0 : t.stipple.reduce((a, b) => a + b, 0)));
-  const smeared = stippled.map((n, i) => (n > 0 ? i : -1)).filter((i) => i >= 0);
-  for (const i of smeared) {
-    assert.ok(SWORD_SMEAR_FRAMES.includes(i), `frame ${i} smears but is not a cut frame`);
+  assert.deepEqual(stippled, stippled.map(() => 0), `no pose bakes a smear (${stippled.join(',')})`);
+  // The tip path the renderer strokes has to be a real path: the cut's frames must actually move.
+  for (const i of SWORD_SMEAR_FRAMES) {
+    const a = SWORD_TIPS[i - 1];
+    const b = SWORD_TIPS[i];
+    assert.ok(Math.hypot(b.x - a.x, b.y - a.y) > 4, `the tip travels between poses ${i - 1} and ${i}`);
   }
-  assert.ok(smeared.length >= 3, `the cut smears (${stippled.join(',')})`);
-  assert.equal(stippled[0], 0, 'the rest pose does not');
   // And every pose is a different picture — eight frames of the same sword is not an animation.
   for (let i = 1; i < SWORD_FRAMES; i++) {
     const a = SET.sword[0].indices;
