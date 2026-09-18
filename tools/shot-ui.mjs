@@ -156,7 +156,15 @@ async function boot(page, viewport, mode) {
   await sleep(700);
 }
 
-/** Give the run the things whose *presence* is what crowds the layout: the map, chalk, some score. */
+/**
+ * Give the run the things whose *presence* is what crowds the layout: the map, chalk, some score.
+ *
+ * Then walk. Two reasons, both learned from the first set of shots: granting the map raises the
+ * "Map Found" banner, which is a full-width plaque across the middle of the world and covers the
+ * thing under review for about two seconds; and a player standing on their spawn tile has an empty
+ * corner map, which is exactly the widget being checked for collisions. Walking a few seconds costs
+ * nothing and makes every shot a picture of the game rather than of its first frame.
+ */
 async function enrich(page) {
   await page.evaluate(() => {
     const s = window.__game.state();
@@ -166,7 +174,15 @@ async function enrich(page) {
     if (s.perks) s.perks.chalk = 2;
     if (s.settings) s.settings.mapMode = 'corner';
   });
-  await sleep(400);
+  if (!has('still')) {
+    await page.evaluate(() => window.__game.input.inject({ moveY: 1 }));
+    await sleep(3200);
+    await page.evaluate(() => window.__game.input.inject({ turn: 0.6 }));
+    await sleep(700);
+    await page.evaluate(() => window.__game.input.clear());
+  }
+  // Outlast the banner whether or not we walked: it is timed, not distance-based.
+  await sleep(2600);
 }
 
 let page;
