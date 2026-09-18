@@ -750,8 +750,11 @@ const SWORD_MATS = [
   // 1 fuller (the groove down the blade): the same metal, several steps darker, because a groove is
   // in shadow from almost every direction.
   { ramp: RAMPS.steel, albedo: 0.3, spec: 0.35, shine: 26, ambient: 0.12 },
-  // 2 guard and pommel: brass.
-  { ramp: RAMPS.gold, albedo: 0.78, spec: 0.7, shine: 20, ambient: 0.34 },
+  // 2 guard and pommel: AGED bronze, not gold. At 0.78/0.34 the brass sat several stops above the
+  // steel and the eye went to the guard every time — on the sprite sheet it was the brightest,
+  // most saturated thing in the frame, which is the wrong place for the brightest thing on a sword.
+  // Dropped until it reads as a warm accent at the blade's root instead of as the subject.
+  { ramp: RAMPS.gold, albedo: 0.26, spec: 0.14, shine: 30, ambient: 0.08 },
   // 3 grip: bound leather.
   { ramp: RAMPS.wood, albedo: 0.5, spec: 0.1, ambient: 0.3 },
   // 4 gauntlet: cool and matte, so the hand sits UNDER the blade in value and never competes with
@@ -760,6 +763,12 @@ const SWORD_MATS = [
   { ramp: RAMPS.gauntlet, albedo: 0.86, spec: 0.5, shine: 22, ambient: 0.34 },
   // 5 knuckles and thumb: a step brighter again, because they are the shapes doing the reading.
   { ramp: RAMPS.gauntlet, albedo: 1.05, spec: 0.7, shine: 26, ambient: 0.4 },
+  // 6 cutting edge and 7 spine: the two ends of the blade's value range, pinned rather than lit.
+  // The high ambient on the edge and the low one on the spine are the point — they hold the band
+  // apart from the flat at every angle the swing passes through, including the ones where the lamp
+  // is behind the blade.
+  { ramp: RAMPS.steel, albedo: 1.3, spec: 1.8, shine: 60, ambient: 0.62 },
+  { ramp: RAMPS.steel, albedo: 0.34, spec: 0.2, shine: 30, ambient: 0.1 },
 ];
 
 /**
@@ -783,13 +792,17 @@ function swordMesh() {
   const blade = createMesh();
   lathe(
     blade,
+    // The PROFILE is a sword's, not a dagger's: near-parallel edges for two thirds of the length,
+    // then the taper. The first lens blade was 9.4 across over 43 long — 4.6:1, which is a gladius,
+    // and on the sheet it read as a fat triangular spearhead. An arming sword is nearer 7:1, so the
+    // edges come in to 3.4 and hold there until y=38 before the point starts.
     [
-      [3.0, 11],
-      [4.6, 15],
-      [4.7, 24],
-      [4.4, 34],
-      [3.8, 42],
-      [2.6, 48],
+      [2.4, 11],
+      [3.3, 14],
+      [3.4, 22],
+      [3.4, 32],
+      [3.2, 38],
+      [2.5, 45],
       [1.2, SWORD_REACH - 2],
       [0.15, SWORD_REACH],
     ],
@@ -802,15 +815,38 @@ function swordMesh() {
   m.n.push(...blade.n);
   m.t.push(...blade.t);
 
-  // A fuller: a narrow groove running most of the blade's length, set just proud of the flat so it
-  // catches its own tone. It is what stops the two big faces reading as one slab.
-  box(m, -0.8, 18, 1.02, 0.8, SWORD_REACH - 12, 1.25, 1);
+  // ── The three bands ──
+  // A blade this size is SEVEN TEXELS across. The lens section was supposed to let the light draw a
+  // bright cutting edge, a mid flat and a dark spine; at seven texels it does not — each of the four
+  // faces lands on one or two texels, the colormap rounds them to the same ramp step, and the whole
+  // blade comes out one flat grey. Diagnosed by magnifying the sheet to the texel, which is the only
+  // way to see it: at sprite-sheet scale the lens version looks like it is working.
+  //
+  // So the bands are geometry now. Three strips laid along the front of the lens, each with its own
+  // material, tapering with it: a bright edge down the left, the dark fuller down the middle, and a
+  // shadowed spine on the right. Explicit value structure is what pixel-art blades have always done,
+  // and it is robust to the light direction — which matters, because the sword rolls through ninety
+  // degrees and a lit edge that depends on the lamp angle would wash out halfway through the swing.
+  for (let k = 0; k < 4; k++) {
+    const y0 = 13 + k * 9.5;
+    const y1 = y0 + 9.5;
+    // Follows the lathe's own taper, so the strips stay on the blade rather than hanging off it.
+    const w = 3.3 - k * 0.42;
+    box(m, -w, y0, 0.55, -w + 1.15, y1, 1.02, 6);
+    box(m, -0.5, y0, 0.7, 0.5, y1, 1.12, 1);
+    box(m, w - 1.5, y0, 0.5, w, y1, 0.95, 7);
+  }
 
   // ── Crossguard ──
   // Swept forward at the tips, which is what makes it read as a guard rather than as a crossbar.
-  box(m, -8.5, 8.4, -1.7, 8.5, 11.6, 1.7, 2);
-  box(m, -10.4, 9.2, -1.4, -7.8, 14.2, 1.4, 2);
-  box(m, 7.8, 9.2, -1.4, 10.4, 14.2, 1.4, 2);
+  //
+  // Sized and placed against the blade rather than by eye. It used to span 20.8 units across a
+  // 9.4-unit blade and sit at y 8.4-14.2 — wrapping OVER the blade's base at y=11 — so on the sheet
+  // the sword read as a fat gold banana with a grey shard behind it. A guard belongs BELOW the
+  // blade and a little wider than it: 15.6 across, topping out at 10.6 where the blade begins.
+  box(m, -5.2, 8.0, -1.5, 5.2, 10.4, 1.5, 2);
+  box(m, -6.4, 8.5, -1.2, -4.7, 11.9, 1.2, 2);
+  box(m, 4.7, 8.5, -1.2, 6.4, 11.9, 1.2, 2);
 
   // ── Grip and pommel ──
   lathe(m, [[2.3, -0.4], [2.7, 1.6], [2.4, 4.4], [2.6, 7], [2.4, 9]], 3, { segs: 10, capBottom: true });
@@ -827,15 +863,26 @@ function swordMesh() {
   // somewhere no arm goes, and at this size a wrist leaving the card reads fine.
   // Short and broad — a fist, not a sleeve. The first pass was a long smooth cylinder running off
   // the bottom of the card, which read as a grey tube with a sword coming out of it.
-  lathe(m, [[3.8, 0.8], [5.4, 2.6], [5.6, 5.6], [4.8, 8.4], [3.2, 9.4]], 4, { segs: 12, capBottom: true });
-  // Knuckle ridges across the FRONT of the fist (+z, toward the eye). On the back they were facing
-  // away at every yaw the swing actually uses, so the fist had no features at all.
+  // Squashed in z, for the same reason the blade is: a lathe is a solid of revolution, so an
+  // unsquashed one is a BALL, and a ball has no front for knuckles to sit on. Flattening it gives
+  // the fist a back, a front and two sides — and puts its front surface at a known depth.
+  const fist = createMesh();
+  lathe(fist, [[3.8, 0.8], [5.4, 2.6], [5.6, 5.6], [4.8, 8.4], [3.2, 9.4]], 4, { segs: 12, capBottom: true });
+  scaleMeshXYZ(fist, 1, 1, 0.72);
+  m.p.push(...fist.p);
+  m.n.push(...fist.n);
+  m.t.push(...fist.t);
+  // Knuckle ridges across the FRONT of the fist (+z, toward the eye). They were at z=3.4 on a fist
+  // whose surface reached z=5.6, so every ridge was BURIED inside the body it was meant to sit on
+  // and the hand rendered as a featureless grey lump. The fist's front is now at z≈4.0, so they go
+  // just proud of it.
   for (let k = 0; k < 4; k++) {
-    const y = 2.6 + k * 1.8;
-    limb(m, [[-3.9, y, 3.4], [3.9, y, 3.4]], 1.15, 5);
+    const y = 2.7 + k * 1.75;
+    const half = 3.5 - k * 0.35;
+    limb(m, [[-half, y, 4.1], [half, y, 4.1]], 1.0, 5);
   }
   // The thumb, laid across the grip on the near side: the detail that says "fist" rather than "tube".
-  limb(m, [[-3.4, 8.6, 2.6], [-0.6, 6.0, 4.2], [1.6, 3.4, 4.0]], 1.7, 5);
+  limb(m, [[-3.6, 8.4, 3.0], [-0.8, 5.8, 4.6], [1.5, 3.2, 4.4]], 1.55, 5);
   // A stub of wrist, and no more: an arm long enough to see is an arm long enough to point somewhere
   // no arm goes once the sword has rolled ninety degrees.
   lathe(m, [[4.4, -3.4], [4.9, -1.6], [4.2, 0.6]], 4, { segs: 10 });
