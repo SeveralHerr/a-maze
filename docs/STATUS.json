@@ -1,5 +1,5 @@
 {
-  "updated": "2026-09-18T02:31:08.996Z",
+  "updated": "2026-09-18T02:49:32.895Z",
   "iteration": 27,
   "passThreshold": 8.5,
   "wave": "new-descent",
@@ -1212,7 +1212,8 @@
     "Renderer, from the second gauntlet: at the 0.22-tile collision radius a wall magnifies ~17x and the frame becomes one flat grey block face (darkFrac 0.037 vs the reference 0.147). Floor the perpendicular distance used for lineH and the texture step while keeping the true distance for the z-buffer and shading. Pre-dates New Descent but combat makes it constant, because the player is pressed into walls.",
     "Renderer, from the second gauntlet: the masonry keyline is 1.7x too strong (face-to-highlight 2.36:1 against the reference 1.40:1), so walls read as framed grey panels. MORTAR 3->2 and softer bevel steps in textures.js paintBlock.",
     "Renderer, from the second gauntlet: the carried torch reads cool (near wall r-b -10 with no sconce in frame), so all the amber in the game belongs to sconces. PLAYER_WARM 0.35 -> ~0.50 and a 1.5 power instead of squaring; the test pins only the relative delta and never the absolute sign, which is how it drifted.",
-    "UI, from the second gauntlet: the boon deep link screenshots the wrong screen under reduced motion; the level-complete plaque is half-empty for ~1.8 s; the phone corner map sits under the look thumb."
+    "UI, from the second gauntlet: the boon deep link screenshots the wrong screen under reduced motion; the level-complete plaque is half-empty for ~1.8 s; the phone corner map sits under the look thumb.",
+    "HUD: a fuel pop and a score pop that land in the same frame draw over one another and neither is legible. Seen in logs/descent/sw-crawler.png, where \"+1:53\" and \"50\" overlap."
   ],
   "stressGate": {
     "pass": true,
