@@ -563,6 +563,8 @@ export function cornerWindow(px, py, span, mw, mh, out, pad) {
  * @property {(ctx:CanvasRenderingContext2D, m:any, state:GameState, clock:number, reduced:boolean, gaugeRight?:number, gaugeBottom?:number) => void}
  *   drawFull  draw the full-screen labyrinth map, laying its text out clear of the fuel gauge box
  *   the HUD keeps on screen over it (right and bottom edges, UI pixels)
+ * @property {() => Float64Array} cornerRect  the corner window's `[x,y,w,h]` in UI pixels from the
+ *   last frame, `w === 0` when it drew nothing. Live and reused — never retain it (§4.12)
  * @property {() => number} exploredCount  explored tiles, maintained incrementally
  * @property {() => MapStats} stats  live, reused object — never retain a copy
  * @property {() => void} invalidate  make the next `update` one exact full rescan (O(tiles), once)
@@ -640,6 +642,13 @@ export function createMapView(options) {
   const dirty = new Int32Array(4);
   /** Scratch for {@link cornerWindow}. */
   const win = new Int32Array(2);
+  /**
+   * The corner window's box from the last frame that drew one, `[x, y, w, h]` in UI pixels;
+   * `w === 0` means it was not drawn. Reported through `cornerRect()` so a tool can check
+   * arithmetically that no touch button lands on top of it (§4.12) — a 40 px collision on a phone
+   * is invisible in a screenshot nobody looks at twice, and it shipped once already.
+   */
+  const lastCorner = new Float64Array(4);
 
   /** Frame counter for the sampled cost timings; see `update`. */
   let timingTick = 0;
@@ -1005,6 +1014,7 @@ export function createMapView(options) {
    * @returns {number} the box height in UI pixels, 0 when nothing was drawn
    */
   function drawCorner(ctx, m, state, clock, reduced, corner, topGap) {
+    lastCorner[2] = 0;
     if (tileCanvas === null || levelRef === null || levelRef !== state.levelData) return 0;
     const t0 = timing ? now() : 0;
     const u = m.u;
@@ -1069,6 +1079,10 @@ export function createMapView(options) {
       zoom * 3,
       !reduced && clock % 1.1 >= 0.82,
     );
+    lastCorner[0] = bx;
+    lastCorner[1] = by;
+    lastCorner[2] = box;
+    lastCorner[3] = box;
     if (timing) stats.drawMs = now() - t0;
     return box;
   }
@@ -1831,6 +1845,7 @@ export function createMapView(options) {
   return {
     update,
     drawCorner,
+    cornerRect: () => lastCorner,
     drawFull,
     exploredCount: () => explored,
     stats: () => stats,

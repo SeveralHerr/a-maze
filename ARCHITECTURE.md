@@ -149,7 +149,7 @@ by `main.js`):
 | `#view`    | `src/renderer/raycaster.js` | 240-row framebuffer, upscaled with `image-rendering: pixelated` |
 | `#post`    | `src/renderer/post.js`      | scanlines, vignette, low-fuel pulse, flash, iris — sized to `#view` |
 | `#overlay` | `src/ui/hud.js` + `menus.js`| one shared `Surface`; also the input target (pointer lock, touch) |
-| `#touch`   | `src/input/touch-overlay.js`| virtual stick + MAP/PAUSE, only on a touch device; `pointer-events: none` |
+| `#touch`   | `src/input/touch-overlay.js`| virtual stick + the bottom-right thumb deck (§4.12), only on a touch device; `pointer-events: none` |
 
 Above all four, `#splash` (`src/splash.js`, integrator) is the Jamcraft studio logo intro: static
 markup in `index.html`, loaded as its own module script so a `main.js` failure cannot strand it,
@@ -230,6 +230,7 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
 /**
  * @typedef {'title'|'loading'|'playing'|'paused'|'levelComplete'|'gameOver'} Phase
  * @typedef {'classic'|'combat'} Mode                 which game mode this run is (§4.11)
+ * @typedef {'torch'|'slain'} EndCause                how a run ended (§4.11) — a dead torch, or killed
  * @typedef {{best:BestScore, progress:Progress}} Profile   one mode's saved record and purse (§4.11)
  * @typedef {'off'|'corner'|'full'} MapMode           the three-state map (§4.6)
  * @typedef {Object} Settings
@@ -280,6 +281,9 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
  * @property {ChalkMark[]} marks       chalk marks on THIS level `{x, y, face, seed}` (wall tile + face)
  *   `run` also gains `chalk` (charges left this level), `reserve` (siphon seconds) and `emberUsed`;
  *   `derived` gains `scrollSense` (0..1, proximity of the unfound map scroll).
+ *   `run.endCause` is an `EndCause` — `'torch'` (the default, and what a fresh run carries) or
+ *   `'slain'`, written by `endRun` and read by the game-over screen so it can say what killed you.
+ *   A run that is still going carries the field but nothing reads it before `gameOver`.
  * @property {GameEvent[]} events     events emitted by the action just dispatched. Cleared at the
  *   top of EVERY dispatch, not only on `tick`, so a subscriber sees each event exactly once and a
  *   UI-driven `phase` event cannot be clobbered by the following tick. The array identity is
@@ -293,7 +297,7 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
 /**
  * @typedef {{type:'footstep', foot:0|1} | {type:'bump', strength:number} | {type:'pickup', kind:ItemKind, x:number, y:number, value:number}
  *   | {type:'levelStart', level:number} | {type:'levelComplete', level:number, bonus:number}
- *   | {type:'lowFuel'} | {type:'gameOver', score:number, newBest:boolean} | {type:'phase', from:Phase, to:Phase}
+ *   | {type:'lowFuel'} | {type:'gameOver', score:number, newBest:boolean, cause:EndCause} | {type:'phase', from:Phase, to:Phase}
  *   | {type:'uiMove'} | {type:'uiConfirm'}
  *   | {type:'chalk', ok:boolean, x:number, y:number} | {type:'ember', seconds:number}
  *   | {type:'unlock', id:string, rank:number, boon:boolean}
@@ -497,10 +501,25 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
   screen lands, add `keyBindings: BindingOverrides` to §3 `Settings` (sanitised in `balance.js`), and
   main.js calls `input.setBindings(createBindings(settings.keyBindings))` and hands
   `describeControls(thoseTables)` to the menus.
-- `touch-overlay.js` — `createTouchOverlay(root, {onAction?, document?}) → { update(state), setStick(...), destroy(), element }`
-  draws the stick and pause/map buttons as DOM/CSS elements. `input.js` owns it and creates it
-  lazily on the first real touch; `{touchOverlay:false}` opts out. The button bar carries the class
-  `amaze-touch-bar` so `styles.css` (integrator) can keep it clear of the HUD's top-right panel.
+- `touch-overlay.js` — `createTouchOverlay(root, {onAction?, onHold?, document?}) → { update(state), setStick(...), destroy(), element }`
+  draws the stick and the on-screen buttons as DOM/CSS elements. `input.js` owns it and creates it
+  lazily on the first real touch; `{touchOverlay:false}` opts out.
+
+  **The thumb deck (§4.12).** Every button is anchored to the **bottom right**, never the top: the
+  top belongs to the HUD's panels and to the corner map, and a control a thumb cannot reach without
+  regripping the phone is not a control. Two right-aligned rows:
+
+  | row | contents | size |
+  |-----|----------|------|
+  | primary (bottom) | **ATTACK** in `'combat'`, **AUTO** in `'classic'` — the mode's one constantly-pressed button | `PRIMARY_W × PRIMARY_H` (112×92 CSS px) |
+  | system (above it) | **CHALK** (only with the unlock) · **MAP** · **PAUSE** | `SYS_MIN_W × SYS_MIN_H` (58×44) |
+
+  Both rows are **right-aligned**, so a button appearing on the left of a row (CHALK) never moves
+  one already there — the same rule the old top bar had, and the reason a second tap still lands.
+  The system row is held clear of the left `STICK_ZONE_FRACTION` of the screen in portrait *and*
+  landscape, so a thumb planted to walk can never hit PAUSE. The bar carries the class
+  `amaze-touch-deck` as the only hook `styles.css` (integrator) has; nothing in the module depends
+  on it.
 - `fullscreen.js` — `createFullscreen({root?, env?}) → { request():boolean, exit(), readonly active:boolean, readonly supported:boolean, onChange(fn) → unsubscribe, destroy() }`
   plus the pure `shouldAutoFullscreen({param, headless, embedded, setting}) → boolean`.
   `root` defaults to `document.documentElement`. `request()` **never throws** and swallows the
@@ -1028,10 +1047,14 @@ leaves fullscreen without delivering the key, exactly like pointer lock). Turnin
 setting off exits fullscreen. `shutdown()` destroys the controller.
 
 `?headless=1` (or `?debug=1`) exposes
-`window.__game = { ready, state(), dispatch(action), subscribe(fn), stepOnce(n), stats(), renderStats(), audioStats(), screen(), mapMode(), autopilot(), savedRun(), errors, input:{inject(partialFrame), clear()} }`
+`window.__game = { ready, state(), dispatch(action), subscribe(fn), stepOnce(n), stats(), renderStats(), audioStats(), screen(), mapMode(), hudRects(), autopilot(), savedRun(), errors, input:{inject(partialFrame), clear()} }`
 (`screen()` is `menus.screen()` and `mapMode()` is `hud.mapMode(settings)`: a tool driving the menus
 through the real input path has no other way to tell whether a keypress landed, and "the options
-screen opened" is the kind of thing a gate should assert rather than assume)
+screen opened" is the kind of thing a gate should assert rather than assume. `hudRects()` is
+`hud.rects()` — the client-space rectangle of each HUD widget that a touch control could collide
+with, `{cornerMap, attack}`, empty when the widget was not drawn. It exists for `tools/shot-ui.mjs`,
+which checks arithmetically that no on-screen button overlaps the corner map: a collision on a phone
+is 40 px of a screenshot nobody looks at twice, and it shipped once already)
 for tools. `inject` merges into the real device frame: axes persist until changed, `lookDX` and
 `pressed` are consumed by the next step exactly like a real device's edges. `?seed=N` pins the run
 seed. `?debug=1` additionally turns on the logger and the HUD's FPS readout. `?fatal=1` throws
@@ -1470,7 +1493,8 @@ tiles/second along the blow for `KNOCKBACK_TIME`, and the player's camera takes
   screen swaps its AUTO row for an **Attack** one, because `touch-overlay.js` swaps the buttons.
 - **The corner map moves to the top right in `'combat'`** — tucked under the score panel — because
   the bottom right now belongs to the attack button. In `'classic'` it stays exactly where it was
-  (bottom right). `map.js` `drawCorner` gains a `corner` argument (`'br'` default, `'tr'`), and
+  (bottom right) **on a mouse**; §4.12 moves it top right in both modes on a touch device, where the
+  bottom belongs to the thumb deck. `map.js` `drawCorner` gains a `corner` argument (`'br'` default, `'tr'`), and
   `MAP.CORNER_TOP_GAP` is the clearance it leaves for the score plaque.
 - `menus.js` — the title is **New Descent · Classic Descent**, then *Continue* when a run is saved,
   then Options · Controls · Credits. **Nothing sits above the two mode rows**, and the Shrine row is
@@ -1478,8 +1502,9 @@ tiles/second along the blow for `KNOCKBACK_TIME`, and the player's camera takes
   raises the existing *Start Over?* confirm. The pause screen drops its *Auto Explore* row in
   `'combat'`, and the Options screen's Auto Explore toggle is disabled there.
 - `audio.js` — voices `swing`, `enemyHit`, `playerHit` and a kill; `derived.threat` rides the drone.
-- `touch-overlay.js` — an **ATTACK** button, rightmost and larger than the rest, shown only while
-  `state.mode === 'combat'`; the AUTO button is hidden there.
+- `touch-overlay.js` — an **ATTACK** button, shown only while `state.mode === 'combat'`; the AUTO
+  button is hidden there. Superseded by §4.12: the two share the one big bottom-right slot, because
+  they are never both on screen and it is the slot a thumb actually rests on.
 
 #### Saved runs
 
@@ -1496,9 +1521,45 @@ the `auto` action is swallowed, `shouldLockPointer()` no longer consults the set
 buttons and the pause row are hidden. The setting itself is left alone — a player who turns it on in
 Classic still has it on in Classic.
 
+### 4.12 The thumb deck and how a run ends _(mobile wave — cross-module seam)_
+
+Two problems, one cause: **everything wanted the top right.** The score plaque is there, the corner
+map moved there in `'combat'` (§4.11), and the touch button bar was there too — pushed down by a
+`15vh` margin and a 64 px inline drop that were tuned against a HUD that has grown twice since. On a
+390×844 phone the bar sat squarely on top of the corner map the moment the map scroll was found, and
+ATTACK — the button pressed more than every other control combined — was at the far top right, the
+one place a thumb cannot reach without regripping.
+
+**The rule: the top is instruments, the bottom is controls.**
+
+- **`touch-overlay.js` anchors every button bottom-right**, in the two right-aligned rows tabled in
+  §4.3. Nothing is top-anchored any more, `BAR_DROP_PX` is gone, and `styles.css` no longer needs a
+  `margin-top` to push the bar clear of a panel — the class (`amaze-touch-deck`) survives only as a
+  hook, now used to hold the deck above the home indicator.
+- **The primary button is the mode's:** ATTACK in `'combat'`, AUTO in `'classic'`. They are never
+  both present, so they share the one big bottom-right slot instead of competing for the row. This
+  replaces §4.11's "AUTO is hidden and ATTACK is rightmost and larger".
+- **The system row is held out of the stick zone.** `input.js` reserves the left
+  `STICK_ZONE_FRACTION` (0.4) of the width for the virtual stick at *any* height, so a right-aligned
+  row of three 58 px buttons clears it on a 390 px-wide portrait phone with room to spare. This is
+  asserted, not assumed: `touch-overlay.test.mjs` computes the row's left edge and compares it to the
+  zone at both orientations.
+- **On touch the corner map is always top right**, in `'classic'` as well as `'combat'`:
+  `hud.setTouchLayout(on)` (main.js passes `input.isTouch`, exactly as it already does for
+  `setAttackButton`). Classic's bottom-right corner map would otherwise sit underneath the new deck.
+  On a mouse both modes are unchanged, down to the pixel.
+
+**How a run ended.** `run.endCause` is an `EndCause` (§3): `'torch'` or `'slain'`. `endRun(state,
+cause)` writes it and puts it on the `gameOver` event; `newGame` and `continueRun` reset it to
+`'torch'`. It exists because `run.hp` reaching 0 and `run.fuel` reaching 0 deliberately end a run
+through **one** code path (§4.11), which is right for the score, the record and the save — and wrong
+for the sentence on the screen. A player killed by a crawler was told *"Your torch has gone out"*,
+which is not a death message, it is the wrong death message. `menus.js` picks its heading off the
+field: `HEADING_OUT` for `'torch'`, `HEADING_SLAIN` for `'slain'`.
+
 ## 5. Quality gates (automated)
-- `npm test` — every `src/*/*.test.mjs` (node:test) in its own process (**808 tests in 44 files** —
-  core 86, input 101, maze 94, renderer 111, state 183, ui 233).
+- `npm test` — every `src/*/*.test.mjs` (node:test) in its own process (**864 tests in 46 files** —
+  core 86, input 105, maze 94, renderer 129, state 210, ui 240).
   Two of those files, `src/state/perf.test.mjs` and `src/state/feasibility.test.mjs`, import
   `src/maze` as a **test-only** dependency: the §2 runtime rule is unchanged (`src/state` still
   imports only `src/maze/constants.js` at runtime), but a feasibility proof over fake mazes would

@@ -333,6 +333,50 @@ test('enemies: running out of health ends the run exactly as a dead torch does',
   assert.equal(s.run.hp, 0);
 });
 
+test('enemies: a killing blow ends the run as SLAIN, not as a dead torch (§4.12)', () => {
+  // The score, the record and the saved run all go through one `endRun` whatever killed you, and
+  // that is right. The *sentence on the screen* is the one thing that must not: a player killed by
+  // a crawler with two thirds of a tank left was told "Your torch has gone out".
+  const s = run('combat', 1);
+  assert.equal(s.run.endCause, 'torch', 'a run in progress carries the honest default');
+  s.run.hp = 1;
+  const e = faceFirstEnemy(s, 0.8);
+  e.awake = true;
+  let guard = 0;
+  while (s.phase === 'playing' && guard++ < 1800) tick(s, 1);
+  assert.equal(s.phase, 'gameOver');
+  assert.equal(s.run.endCause, 'slain');
+  assert.ok(s.run.fuel > 0, 'the torch was still burning — which is the whole point');
+  const over = s.events.filter((/** @type {any} */ ev) => ev.type === 'gameOver');
+  assert.equal(over.length, 1);
+  assert.equal(over[0].cause, 'slain', 'the event carries it too, for audio and tools');
+});
+
+test('the torch running out still ends the run as TORCH, in either mode (§4.12)', () => {
+  for (const mode of /** @type {const} */ (['classic', 'combat'])) {
+    const s = run(mode, 1);
+    s.run.emberUsed = true; // Ember Reserve would otherwise rekindle it once (§4.9)
+    s.run.fuel = 0.0001;
+    let guard = 0;
+    while (s.phase === 'playing' && guard++ < 600) tick(s, 1);
+    assert.equal(s.phase, 'gameOver', mode);
+    assert.equal(s.run.endCause, 'torch', mode);
+    const over = s.events.filter((/** @type {any} */ ev) => ev.type === 'gameOver');
+    assert.equal(over[0].cause, 'torch', mode);
+  }
+});
+
+test('a new run clears how the last one ended (§4.12)', () => {
+  // `endCause` outliving its run would put "You were slain" on the next torch death, which is the
+  // same class of bug this field exists to fix.
+  const s = run('combat', 1);
+  s.run.hp = 0;
+  tick(s, 2);
+  assert.equal(s.run.endCause, 'slain');
+  reducer(s, { type: 'newGame', seed: 99, mode: 'classic' });
+  assert.equal(s.run.endCause, 'torch');
+});
+
 test('enemies: they never leave the floor, however long they hunt', () => {
   const s = run('combat', 4, 77);
   const maze = s.levelData.maze;

@@ -1204,16 +1204,27 @@ function openBoonOffer(state) {
 
 /**
  * End the run: record the best score and move to `gameOver`.
+ *
+ * A dead torch and a dead player deliberately share this one path (§4.11), so the score, the record
+ * and the saved run cannot behave differently depending on what killed you. `cause` is the one thing
+ * that must differ: it is the sentence the end screen puts on the run, and the screen told a player
+ * killed by a crawler that their torch had gone out.
+ *
  * @param {SimState} state
+ * @param {import('../core/types.js').EndCause} [cause] `'torch'` (default) or `'slain'`
  * @returns {void}
  */
-export function endRun(state) {
+export function endRun(state, cause) {
   const newBest = recordBest(state);
   const p = state.player;
   p.vx = 0;
   p.vy = 0;
+  // Anything that is not an explicit `'slain'` is the torch: an older caller, a tool, or the fuel
+  // path itself. The torch is the game's clock, so it is also the right default.
+  const end = cause === 'slain' ? 'slain' : 'torch';
+  state.run.endCause = end;
   setPhase(state, 'gameOver');
-  state.events.push({ type: 'gameOver', score: state.run.score, newBest });
+  state.events.push({ type: 'gameOver', score: state.run.score, newBest, cause: end });
 }
 
 // ─── The playing step ────────────────────────────────────────────────────────────────────────
@@ -1499,7 +1510,7 @@ export function stepPlayingBody(state, input) {
   // Health runs out the same way the torch does — through `endRun`, so one code path ends a run and
   // the score summary, the record and the saved run all behave identically however it ended.
   if (isPlayerDead(state)) {
-    endRun(state);
+    endRun(state, 'slain');
     updateDerived(state);
     return;
   }

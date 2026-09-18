@@ -201,6 +201,9 @@ test('createInitialState: a clean, valid, contract-shaped state', () => {
     hpMax: 0,
     kills: 0,
     iframes: 0,
+    // How the run ended (§4.12). A run that has not ended still carries the field, and carries the
+    // torch — which is what it is heading for.
+    endCause: 'torch',
   });
   assert.equal(s.mode, 'classic', 'a fresh state is Classic Descent until a title row says otherwise');
   assert.deepEqual(s.enemies, []);

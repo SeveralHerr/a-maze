@@ -163,6 +163,8 @@
  */
 
 /** @typedef {'title'|'loading'|'playing'|'paused'|'levelComplete'|'gameOver'} Phase */
+/** How a run ended (Â§4.12): the torch burned out, or something killed you. */
+/** @typedef {'torch'|'slain'} EndCause */
 
 /**
  * Which game the run is (ARCHITECTURE.md §4.11). `'classic'` is Classic Descent — everything
@@ -255,7 +257,9 @@
  * seconds stored, `emberUsed` = this level's ember has rekindled the torch (§4.9).
  * `hp`/`hpMax` are the player's health in New Descent (§4.11) and are 0 in Classic Descent;
  * `kills` counts enemies felled this run; `iframes` is the invulnerability left after a hit.
- * @typedef {{score:number, gems:number, gemsTotal:number, fuel:number, fuelMax:number, levelTime:number, totalTime:number, levelScore:number, bestCombo:number, refuels:number, distance:number, mapFound:boolean, chalk:number, reserve:number, emberUsed:boolean, hp:number, hpMax:number, kills:number, iframes:number}} RunStats
+ * `endCause` is how the run ended (§4.12) — `'torch'` until `endRun` says otherwise, so a run in
+ * progress and a run ended by a dead torch read identically, which is the honest default.
+ * @typedef {{score:number, gems:number, gemsTotal:number, fuel:number, fuelMax:number, levelTime:number, totalTime:number, levelScore:number, bestCombo:number, refuels:number, distance:number, mapFound:boolean, chalk:number, reserve:number, emberUsed:boolean, hp:number, hpMax:number, kills:number, iframes:number, endCause:EndCause}} RunStats
  */
 
 /**
@@ -301,7 +305,7 @@
  * Discrete things that happened during a step; consumed by audio/particles/post effects.
  * @typedef {{type:'footstep', foot:0|1} | {type:'bump', strength:number} | {type:'pickup', kind:ItemKind, x:number, y:number, value:number}
  *   | {type:'levelStart', level:number} | {type:'levelComplete', level:number, bonus:number}
- *   | {type:'lowFuel'} | {type:'gameOver', score:number, newBest:boolean} | {type:'phase', from:Phase, to:Phase}
+ *   | {type:'lowFuel'} | {type:'gameOver', score:number, newBest:boolean, cause:EndCause} | {type:'phase', from:Phase, to:Phase}
  *   | {type:'uiMove'} | {type:'uiConfirm'}
  *   | {type:'chalk', ok:boolean, x:number, y:number} | {type:'ember', seconds:number}
  *   | {type:'unlock', id:string, rank:number, boon:boolean}

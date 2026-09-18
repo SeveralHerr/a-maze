@@ -678,7 +678,14 @@ function intWidth(n, size) {
  * @property {(clientX:number, clientY:number) => boolean} hitAttack  true when a pointer at these
  *   client coordinates is over the ATTACK plaque drawn last frame (New Descent, §4.11)
  * @property {(on:boolean) => void} setAttackButton  allow or suppress the ATTACK plaque (main.js
- *   turns it off on touch, where the touch bar owns it)
+ *   turns it off on touch, where the thumb deck owns it)
+ * @property {(on:boolean) => void} setTouchLayout  tell the HUD the on-screen thumb deck is live
+ *   (§4.12). main.js passes `input.isTouch`, exactly as it does for `setAttackButton`. It moves the
+ *   corner map to the top right in BOTH modes, because the bottom right belongs to the deck.
+ * @property {() => {cornerMap:{x:number,y:number,w:number,h:number}|null, attack:{x:number,y:number,w:number,h:number}|null}} rects
+ *   Where the HUD widgets a touch control could collide with were drawn last frame, in CLIENT
+ *   coordinates (so they compare directly against `getBoundingClientRect()`), or null each when the
+ *   widget was not drawn. For `tools/shot-ui.mjs`, which gates that nothing overlaps (§4.12).
  * @property {(bearing:number) => void} hurtFrom  note the direction a blow came from, in radians
  *   relative to the player's facing, for the directional damage wedge (§4.11)
  * @property {(clientX:number, clientY:number) => boolean} hitAuto  true when a pointer at these
@@ -817,8 +824,14 @@ export function createHud(overlayCanvas, options) {
   const attackRect = new Float64Array(4);
   /** Pointer mapping scratch for `hitAttack`. */
   const attackPtr = new Float64Array(2);
-  /** Whether the ATTACK button may be drawn (main.js suppresses it on touch, where the bar owns it). */
+  /** Whether the ATTACK button may be drawn (main.js suppresses it on touch, where the deck owns it). */
   let attackButtonEnabled = true;
+  /**
+   * Whether the on-screen thumb deck is live (§4.12). It moves the corner map to the TOP right in
+   * both modes, because on a touch device the bottom right is the deck's and a map under a button
+   * is not a map. On a mouse this is false and both modes lay out exactly as they always did.
+   */
+  let touchLayout = false;
   /** This frame's clamped delta, written by `advance` and read by the draw pass. */
   let lastDt = 0;
   /** Text size of the health readout, set by `layoutTopRow`. */
@@ -1198,7 +1211,10 @@ export function createHud(overlayCanvas, options) {
     // The corner map moves to the TOP right in New Descent, because the bottom right is where the
     // attack button lives (§4.11). In Classic Descent it stays exactly where it was.
     if (mode === 'corner') {
-      mapView.drawCorner(ctx, m, state, anim.clock, reduced, isCombat(state) ? 'tr' : 'br', 3 * m.u + fuelPanelH);
+      // Top right in New Descent (§4.11), and top right in EITHER mode once the thumb deck is on
+      // screen (§4.12) — Classic's bottom-right window would otherwise sit under MAP and PAUSE.
+      const corner = isCombat(state) || touchLayout ? 'tr' : 'br';
+      mapView.drawCorner(ctx, m, state, anim.clock, reduced, corner, 3 * m.u + fuelPanelH);
     }
     drawPops(ctx, m, reduced);
     drawBanner(ctx, m, reduced);
@@ -1878,19 +1894,30 @@ export function createHud(overlayCanvas, options) {
     // loading bar rather than as the thing standing between the player and a lost run.
     const low = frac <= HEALTH_LOW;
     const label = LIFE_LABEL;
-    const value = healthText(Math.round(shownHp), run.hpMax);
     const labelW = measureAt(label, 'hud', healthSize);
-    const valueW = measureAt(value, 'hud', healthSize);
     const textH = heightAt('hud', healthSize);
+    // The bar has to fit BETWEEN the label and the number, and on a portrait phone `LIFE 100/100`
+    // already fills the panel — the old `Math.max(4 * u, …)` floor then drew an 8 px stub straight
+    // through the first digit. Measure the room honestly, and when there is not enough, spend the
+    // number rather than the bar: `100/100` and `100` say the same thing when the maximum is on the
+    // bar right beside it, and the bar is the readout a glance mid-fight actually uses.
+    const room = (/** @type {string} */ v) => w - insetX * 2 - labelW - measureAt(v, 'hud', healthSize) - 4 * u;
+    const MIN_BAR = 8 * u;
+    let value = healthText(Math.round(shownHp), run.hpMax);
+    if (room(value) < MIN_BAR) value = String(Math.round(shownHp));
+    const valueW = measureAt(value, 'hud', healthSize);
     const barX = x + insetX + labelW + 2 * u;
-    const barW = Math.max(4 * u, w - insetX * 2 - labelW - valueW - 4 * u);
+    // Still clamped to a minimum, but the clamp can no longer overrun the number: whatever room is
+    // left after the compact value is what the bar gets, and a panel too narrow for both loses the
+    // bar instead of drawing it on top of the digits.
+    const barW = Math.min(Math.max(MIN_BAR, room(value)), w - insetX * 2 - labelW - valueW - 4 * u);
     const barH = HEALTH_BAR_UNITS * u;
     const midY = y + ((h - barH) >> 1);
     const textY = y + ((h - textH) >> 1);
 
     drawAt(ctx, label, x + insetX, textY, 'hud', healthSize, low ? 'hudAlarm' : 'hudDim');
-    drawWell(ctx, barX, midY, barW, barH, u, COLOR.void, low ? COLOR.fireDeep : COLOR.ironDark);
-    const fill = Math.round(barW * frac);
+    if (barW >= MIN_BAR) drawWell(ctx, barX, midY, barW, barH, u, COLOR.void, low ? COLOR.fireDeep : COLOR.ironDark);
+    const fill = barW >= MIN_BAR ? Math.round(barW * frac) : 0;
     if (fill > 0) {
       // Three bands, so the bar reads at a glance even before the number is looked at.
       ctx.fillStyle = frac > 0.55 ? COLOR.alarm : frac > HEALTH_LOW ? COLOR.fireEmber : COLOR.fireDeep;
@@ -1981,6 +2008,41 @@ export function createHud(overlayCanvas, options) {
     const x = attackPtr[0];
     const y = attackPtr[1];
     return x >= attackRect[0] && x < attackRect[0] + attackRect[2] && y >= attackRect[1] && y < attackRect[1] + attackRect[3];
+  }
+
+  /**
+   * One UI-pixel rectangle mapped into client coordinates, or null when it was not drawn.
+   *
+   * The inverse of `mapPointer`, and deliberately written out rather than folded into `Surface`:
+   * the game itself only ever needs client → UI (it is answering "what did the player touch"), and
+   * a seam that exists for one review tool should not grow the contract every consumer reads.
+   * @param {Float64Array} r `[x, y, w, h]` in UI pixels; `w === 0` means not drawn
+   * @returns {{x:number,y:number,w:number,h:number}|null}
+   */
+  function toClientRect(r) {
+    if (!(r[2] > 0)) return null;
+    const canvas = surface.canvas;
+    if (canvas === null || typeof canvas.getBoundingClientRect !== 'function') return null;
+    const box = canvas.getBoundingClientRect();
+    const m = surface.metrics;
+    if (!(box.width > 0) || !(box.height > 0) || !(m.devW > 0) || !(m.devH > 0)) return null;
+    const sx = box.width / m.devW;
+    const sy = box.height / m.devH;
+    return {
+      x: box.left + (m.originX + r[0] * m.px) * sx,
+      y: box.top + (m.originY + r[1] * m.px) * sy,
+      w: r[2] * m.px * sx,
+      h: r[3] * m.px * sy,
+    };
+  }
+
+  /**
+   * Where the HUD widgets a touch control could land on top of were drawn last frame, in client
+   * coordinates (§4.12). See the `rects` entry on {@link Hud}.
+   * @returns {{cornerMap:{x:number,y:number,w:number,h:number}|null, attack:{x:number,y:number,w:number,h:number}|null}}
+   */
+  function rects() {
+    return { cornerMap: toClientRect(mapView.cornerRect()), attack: toClientRect(attackRect) };
   }
 
   /**
@@ -2225,6 +2287,10 @@ export function createHud(overlayCanvas, options) {
     setAttackButton(on) {
       attackButtonEnabled = on === true;
     },
+    setTouchLayout(on) {
+      touchLayout = on === true;
+    },
+    rects,
     /**
      * Note which way a blow came from, for the directional damage wedge (§4.11).
      * @param {number} bearing radians relative to the player's facing; 0 ahead, positive right

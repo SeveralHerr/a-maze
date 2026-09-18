@@ -1514,9 +1514,12 @@ function boot() {
     syncTileset(state.phase === 'title' ? 1 : state.level);
     raycaster.render(renderView);
 
-    // Touch devices get these in the touch bar; the HUD's plaques are for a mouse (§4.10, §4.11).
+    // Touch devices get these in the thumb deck; the HUD's plaques are for a mouse (§4.10, §4.11).
     hud.setAutoButton(!input.isTouch);
     hud.setAttackButton(!input.isTouch);
+    // …and the deck owns the bottom right of the screen while it is up, so the corner map takes the
+    // top right in both modes rather than only in New Descent (§4.12).
+    hud.setTouchLayout(input.isTouch);
     hud.render(state, loop.stats(), alpha);
     menus.render(state);
 
@@ -1581,6 +1584,10 @@ function boot() {
       // of thing a gate should assert rather than assume.
       screen: () => menus.screen(),
       mapMode: () => hud.mapMode(store.getState().settings),
+      // Where the HUD's collidable widgets landed, in client coordinates (§4.12). `tools/shot-ui.mjs`
+      // compares them against every touch button's `getBoundingClientRect()`, because "does a button
+      // cover the map" is arithmetic and a screenshot review answers it only by luck.
+      hudRects: () => hud.rects(),
       // Auto Explore's current goal and plan count, and the saved run the title offers (§4.10).
       autopilot: () => autopilot.info(),
       savedRun: () => savedSummary,

@@ -11,9 +11,12 @@ tool dependency). `index.html` loads `src/main.js`. Deployed to itch.io
 ## Commands
 ```sh
 npm run serve                     # static dev server http://localhost:5173 — keep it running
-npm test                          # every src/*/*.test.mjs in its own Node process (808 tests in 44 files)
+npm test                          # every src/*/*.test.mjs in its own Node process (864 tests in 46 files)
 node tools/validate-mazes.mjs     # 81k mazes + the 750-level campaign incl. the refuel chain; --quick
 node tools/stress.mjs             # extreme grid sizes + the gameplay maximum + leak loops; --quick
+node tools/shot-ui.mjs --tag x     # phone/landscape/desktop UI shots → logs/ui-x/ + an OVERLAP report
+                                  #   --desktop adds the 1280x720 set; --only play,slain,… narrows it
+                                  #   needs `npm run serve` running and Chrome (CHROME_PATH)
 node tools/verify.mjs --tag x     # headless Chrome autopilot run → logs/x.json + logs/shot-x-*.png
                                   #   descends to the size cap and drives it for 60s (~8 min total)
                                   #   needs `npm run serve` running and Chrome (CHROME_PATH)
@@ -101,6 +104,29 @@ you think. Three ways this has actually gone wrong here:
   an older tag to illustrate a newer claim.
 - **Look at the artefact at the scale its defects live at.** Sprite art reviewed at sheet scale
   is not reviewed; see the `pixel-art-texel-review` skill.
+- **A PASSING gate is guilty too.** `tools/shot-ui.mjs`'s first run reported "0 overlapping
+  control pair(s)" for a screen whose buttons were sitting squarely on the minimap: it read
+  `r.width` on a rect that reports `w`. A green result from a gate you have never seen go red is
+  not evidence. Before trusting a new check, make it fail on purpose — run it against the commit
+  the bug is still in.
+
+## Layout is arithmetic, not photography
+A screenshot answers "does this look wrong" only if the defect happens to be where you looked.
+"Does this button cover that panel" is a subtraction, so do the subtraction: have the UI report
+its rectangles (`hud.rects()` → `window.__game.hudRects()`), compare them in the tool, and fail
+the run on an intersection. The same applies to clearances a thumb depends on —
+`touch-overlay.test.mjs` computes the control row's left edge against `STICK_ZONE_FRACTION` at
+four real viewport widths, and caught a 320 px phone that no screenshot in the set covered.
+Corollary: any size a layout promise rests on must be **fixed**, not `min-`. A `min-width` hands
+the promise to whatever font the device substituted.
+
+## Look at the screen you changed, in the states you changed it for
+Three of this wave's defects — labels riding the top border of every button that can be hidden,
+an 8 px health-bar stub drawn through the first digit of `100/100`, an ATTACK button with no
+swing feedback — were invisible to 864 passing tests and visible in the first screenshot. Budget
+a look at the real thing, at the real viewport, in each state the change touches (both
+orientations, both modes, mid-run *and* end-of-run), and write the test once the screenshot has
+told you what to assert.
 
 ## Single Loop Learning
 Learn from the tasks you complete:

@@ -188,6 +188,10 @@ export function createInitialState(settings, best, progress, profiles) {
       chalk: 0,
       reserve: 0,
       emberUsed: false,
+      // How the run ended (Â§4.12). Every run carries it; only the game-over screen reads it, and
+      // only after `endRun` has had its say. `'torch'` is the honest default: it is what a run that
+      // is still going is heading for.
+      endCause: 'torch',
     },
     best: sanitizedBest,
     settings: sanitizeSettings(settings),
@@ -473,6 +477,7 @@ function resetRun(state) {
   run.chalk = 0;
   run.reserve = 0;
   run.emberUsed = false;
+  run.endCause = 'torch';
   // New Descent (§4.11): full health, no kills, no enemies until a level is installed. Health is a
   // RUN resource, not a per-level one — that is what makes a descent a descent.
   resetRunCombat(state);

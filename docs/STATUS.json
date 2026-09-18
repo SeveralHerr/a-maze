@@ -1,8 +1,8 @@
 {
-  "updated": "2026-09-18T02:49:32.895Z",
-  "iteration": 27,
+  "updated": "2026-09-18T04:10:53.819Z",
+  "iteration": 28,
   "passThreshold": 8.5,
-  "wave": "new-descent",
+  "wave": "thumb-deck",
   "waves": {
     "0-scaffold": {
       "status": "done",
@@ -655,6 +655,27 @@
     "modelled-sprites": {
       "status": "done",
       "notes": "Oil flask and wall sconce are low-poly 3D models rasterised into palette sprites at load (new src/renderer/models.js: lathe/box/tube meshes, orthographic z-buffer, Lambert+Blinn+glass transmission, 1-texel outline, self-shadow map, stippled-edge ground shadow). Sconce: TORCH_VIEWS 7 views x 4 flame frames fanned over +-TORCH_YAW_MAX 1.25 rad; the raycaster picks the view from the signed angle between the wall normal and the ray to the eye (one atan2 per visible torch), so the plate stays on the wall and the cup stands out over the corridor (sign pinned by the both-sides orientation test after a mirrored first version). Flask: per user, one still 3/4 view (OIL_YAW pi/6) with a solid-core, stipple-edged floor shadow; no spin, no bob (a bob would lift it off the painted shadow); Oil Sense ghost skips stippled shadow texels. Texture paint ~36 ms warm (was ~21). Gates: npm test 43/43 files (782 tests), validate-mazes --quick and full stress OK; orientation and stillness tests mutation-checked. Reviewed via before/after + fly-by video artifacts."
+    },
+    "thumb-deck": {
+      "status": "done",
+      "notes": "ARCHITECTURE.md §4.12. Three reported problems, one cause: everything wanted the top right. The game-over screen told a player killed by a crawler that their torch had gone out, because health and fuel deliberately end a run through one endRun (§4.11). endRun(state, cause) now writes run.endCause ('torch'|'slain'), puts it on the gameOver event, and menus.js picks HEADING_SLAIN ('You were slain') off it. resetRun clears it, so it cannot outlive its run. The touch buttons were a top-right bar (15vh margin + 64px inline drop) and the corner map moved top-right in New Descent, so the bar sat on the map the moment the map scroll was found — in portrait AND landscape. Rewritten as a bottom-right thumb deck: ATTACK (combat) / AUTO (classic) share one 112x92 primary slot, with CHALK/MAP/PAUSE right-aligned in a 58x44 system row above it. ROW_GAP 18 keeps PAUSE from catching a thumb sliding off ATTACK. hud.setTouchLayout(input.isTouch) puts the corner map top-right in BOTH modes on a touch device; the mouse layout is unchanged down to the pixel. Three fixes found by looking at the result rather than the diff: system buttons hidden then re-shown lost display:flex and dropped their labels to the top border (CHALK, ATTACK and AUTO all shipped that way); the LIFE bar's Math.max(4*u,...) floor drew an 8px stub through the first digit of 100/100 on a phone; the touch ATTACK button had no swing-lit state, so the mode's main button gave no cooldown feedback to the players most likely to use it. New gate: tools/shot-ui.mjs drives real Chrome at phone/landscape/desktop viewports and reports every control rect plus any OVERLAPPING pair, using a new window.__game.hudRects() (= hud.rects(), client-space cornerMap/attack). The first run of it reported 0 overlaps because it read r.width on a {w,h} — the harness was wrong before the code was, which is exactly the failure Trust the Evidence Last is about.",
+      "tests": {
+        "added": 8,
+        "total": 816
+      },
+      "files": [
+        "ARCHITECTURE.md",
+        "src/core/types.js",
+        "src/state/sim.js",
+        "src/state/game.js",
+        "src/ui/menus.js",
+        "src/ui/hud.js",
+        "src/ui/map.js",
+        "src/input/touch-overlay.js",
+        "src/main.js",
+        "styles.css",
+        "tools/shot-ui.mjs"
+      ]
     }
   },
   "modules": {
@@ -1187,6 +1208,12 @@
         "verify": "PASS — combat phase 22 swings, 3 connected, 1 killed, 8 taken (hp 12/100), 2 woke, 12 telegraphed, 0 discarded steps, 0 errors"
       },
       "stressPass": true
+    },
+    {
+      "iteration": 28,
+      "updated": "2026-09-18T04:10:53.819Z",
+      "wave": "thumb-deck",
+      "note": "Mobile UI wave. Death screen now names the cause; the touch controls moved off the corner map and onto a bottom-right thumb deck; three defects found by screenshot review that no test was looking for. 46/46 test files, validate-mazes and stress green, npm audit clean, 0 overlapping control pairs at every captured viewport."
     }
   ],
   "openIssues": [

@@ -386,6 +386,45 @@ test('Escape on level complete never abandons the run', () => {
   assert.deepEqual(log.filter((e) => e === 'nextLevel'), ['nextLevel'], 'the tally stayed finished');
 });
 
+test('game over: the heading says what actually killed you (§4.12)', () => {
+  // A live canvas, not the null one `harness()` uses: the heading is text the screen *draws*, so
+  // the assertion has to run the real draw path.
+  const menus = createMenus(liveCanvas(1280, 720), {});
+  menus.resize(1280, 720, 1);
+  const state = makeState('gameOver');
+  /** @param {string|undefined} endCause */
+  const heading = (endCause) => {
+    state.run.endCause = endCause;
+    state.time += 1;
+    // The heading is fitted, and on a narrow surface it splits across two lines — so the assertion
+    // is over every line of text the screen drew, not over one label.
+    /** @type {string[]} */
+    const labels = [];
+    setLayoutProbe((kind, _x, _y, _w, _h, _u, label) => {
+      if (kind === 'text') labels.push(label);
+    });
+    try {
+      menus.render(state);
+    } finally {
+      setLayoutProbe(null);
+    }
+    return labels.join(' | ');
+  };
+
+  const torch = heading('torch');
+  assert.match(torch, /torch/i, 'a dead torch still says so');
+  assert.doesNotMatch(torch, /slain/i);
+
+  const slain = heading('slain');
+  assert.match(slain, /slain/i, 'killed by a creature is not a torch that went out');
+  assert.doesNotMatch(slain, /torch/i, 'and must not mention the torch at all');
+
+  // An older state, a saved run from before the field existed, or Classic Descent — all read as the
+  // torch, which is the only way a Classic run can end.
+  assert.match(heading(undefined), /torch/i);
+  assert.match(heading(/** @type {any} */ ('nonsense')), /torch/i);
+});
+
 test('game over: back is still a direct exit (that run is already over)', () => {
   const { menus, log } = harness();
   const state = makeState('gameOver');

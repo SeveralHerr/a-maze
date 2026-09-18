@@ -425,6 +425,15 @@ const HEADING_CLEARED = 'Cleared';
 const HEADING_OUT = 'Your torch has gone out';
 const HEADING_OUT_TOP = 'Your torch';
 const HEADING_OUT_BOTTOM = 'has gone out';
+/**
+ * The other way a run ends (§4.12). A player killed by a crawler used to be told their torch had
+ * gone out — the wrong death, in a mode whose whole point is that something else can kill you.
+ * "Slain" and not "You died": it names the *cause*, which is the information the torch line carries
+ * too, and it is the register the rest of the screen is written in.
+ */
+const HEADING_SLAIN = 'You were slain';
+const HEADING_SLAIN_TOP = 'You were';
+const HEADING_SLAIN_BOTTOM = 'slain';
 /** Its note, from pause. */
 const CONFIRM_NOTE_RUN = 'YOUR RUN ENDS HERE';
 
@@ -4054,7 +4063,13 @@ export function createMenus(overlayCanvas, callbacks) {
     // the stored best is the likelier record.
     const newBest = run.score > 0 && (runStartBest >= 0 ? run.score > runStartBest : run.score >= best.score);
 
-    const headText = HEADING_OUT;
+    // What ended the run picks the heading, and with it the split the narrow fit falls back to
+    // (§4.12). Read off `run.endCause` rather than off `run.hp`, because health is 0 in Classic
+    // Descent and a dead torch there would otherwise read as a killing blow.
+    const slain = run.endCause === 'slain';
+    const headText = slain ? HEADING_SLAIN : HEADING_OUT;
+    const headTop = slain ? HEADING_SLAIN_TOP : HEADING_OUT_TOP;
+    const headBottom = slain ? HEADING_SLAIN_BOTTOM : HEADING_OUT_BOTTOM;
     const labels = endLabels;
     labels[0] = 'SCORE';
     labels[1] = 'DEPTH REACHED';
@@ -4082,7 +4097,7 @@ export function createMenus(overlayCanvas, callbacks) {
     // Buttons first, then the heading (capped one step above them on a phone), then the buttons
     // held to the heading — the same order as `drawComplete`.
     let itemScale = fitItemScale(screen, panelW - 8 * u, u, Math.min(scaleCap(m, 150), scoreScale + 1, Math.max(2, u + 1)));
-    let headScale = fitHeading(headText, HEADING_OUT_TOP, HEADING_OUT_BOTTOM, headW, Math.max(2, u + 1), m.narrow, itemScale + 1);
+    let headScale = fitHeading(headText, headTop, headBottom, headW, Math.max(2, u + 1), m.narrow, itemScale + 1);
     let headSplit = false;
     itemScale = Math.min(itemScale, headScale);
     let stripScale = stripScaleFor(left, right, u, rowScale);
@@ -4130,7 +4145,7 @@ export function createMenus(overlayCanvas, callbacks) {
 
     drawPanel(ctx, px, py, panelW, panelH, u, PANEL_END);
 
-    drawHeading(ctx, cx, py + 5 * u, headText, HEADING_OUT_TOP, HEADING_OUT_BOTTOM, headScale, headSplit, u);
+    drawHeading(ctx, cx, py + 5 * u, headText, headTop, headBottom, headScale, headSplit, u);
     drawRule(ctx, cx, py + 5 * u + headH + 2 * u, Math.round(panelW * 0.34), u);
 
     let y = py + headH + 15 * u;

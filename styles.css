@@ -121,12 +121,15 @@ body.portrait #view {
   touch-action: none;
 }
 
-/* The MAP/PAUSE buttons (src/input/touch-overlay.js) and the HUD's score panel both want the
-   top-right corner, and the HUD's top row is the taller of the two. The bar is pushed below it —
-   with `margin`, because the bar sets `top` and `padding` inline and would win the cascade. 15vh
-   clears the HUD's top row in both orientations and still lands where a thumb naturally reaches. */
-.amaze-touch-bar {
-  margin-top: 15vh;
+/* The thumb deck (src/input/touch-overlay.js, ARCHITECTURE.md §4.12) anchors itself to the bottom
+   right and needs no help clearing the HUD any more — the HUD's panels and the corner map are all
+   in the top half now, and the deck is in the bottom. What the page still owns is the hardware:
+   `#touch` is already inset by `env(safe-area-inset-bottom)`, but on a gesture-navigation Android
+   that inset is 0 while a system gesture bar still sits over the last few pixels, and a swipe-up
+   there dismisses the game instead of swinging. A flat floor under the deck costs nothing on a
+   device without one. */
+.amaze-touch-deck {
+  margin-bottom: 8px;
 }
 
 /* #touch must stay transparent to input: the overlay's own buttons opt back in with
