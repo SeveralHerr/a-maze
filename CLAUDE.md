@@ -61,6 +61,7 @@ Immediately before implementing any prompts set up the following tasks as a chec
 - Make the easy change
 - Security Review
 - Scout Rule
+- Trust the Evidence Last
 - Single Loop Learning
 - Double Loop Learning
 - Canary
@@ -87,6 +88,19 @@ Always leave the code better than you found it. Perform one of the following in 
 - Evaluate Code Coverage and add more complete tests
 - File length gate, reduce the file length of the files when over 500 lines by refactoring
 - Mutation testing, use a analysis tool to perform mutant hunting on the modified files. For example Cosmic Ray in Python or Striker in Angular.
+
+## Trust the Evidence Last
+Before believing what a screenshot, a gate or a metric says, check that it is measuring what
+you think. Three ways this has actually gone wrong here:
+- **A failing gate is guilty until proven innocent.** `verify.mjs`'s combat phase reported
+  "23 swings, 0 connected, 0 wakes" and that read as a combat bug; it was the harness dropping
+  the player inside a wall. Suspect the harness before the code, especially a harness you just
+  wrote.
+- **Screenshots go stale silently.** A shot taken before the change it is evidence for looks
+  exactly like one taken after. Re-capture after every change, tag the output, and never reuse
+  an older tag to illustrate a newer claim.
+- **Look at the artefact at the scale its defects live at.** Sprite art reviewed at sheet scale
+  is not reviewed; see the `pixel-art-texel-review` skill.
 
 ## Single Loop Learning
 Learn from the tasks you complete:
