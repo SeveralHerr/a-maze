@@ -425,3 +425,94 @@ test('modes: the Shrine is shut on the title now that each mode owns a purse', (
 test('modes: an enemy kind index is stable, because saves store it', () => {
   assert.deepEqual([...ENEMY_KINDS], ['crawler', 'wraith']);
 });
+
+
+// ─── Impact (the juice) ──────────────────────────────────────────────────────────────────────
+
+/**
+ * Swing, and step one frame at a time until the blow lands. Returns the state ON that frame — the
+ * hitstop is three frames long, so a test that batches a dozen steps has already stepped past it.
+ * @param {any} s
+ * @returns {boolean} true when a hit was found
+ */
+function swingUntilHit(s) {
+  tick(s, 1, ['attack']);
+  for (let i = 0; i < 40; i++) {
+    tick(s, 1);
+    if (events(s, 'enemyHit').length > 0) return true;
+  }
+  return false;
+}
+
+test('impact: a landed blow freezes the world, knocks the creature back and shakes the camera', () => {
+  const s = run('combat', 1);
+  const e = faceFirstEnemy(s, 0.95);
+  e.hpMax = 900;
+  e.hp = 900;
+  const x0 = e.x;
+  const shake0 = s.player.shake;
+  assert.ok(swingUntilHit(s), 'it connected');
+  assert.ok(e.hp < 900);
+  assert.ok(s.sim.hitStop > 0, 'the world is holding still');
+  assert.ok(s.player.shake > shake0, 'and the camera took a knock');
+  assert.ok(e.kt > 0, 'and it is being thrown');
+  // Knocked back ALONG the blow: the player faces +x, so the creature goes +x.
+  tick(s, 8);
+  assert.ok(e.x > x0 + 0.05, `thrown back (${x0.toFixed(2)} → ${e.x.toFixed(2)})`);
+});
+
+test('impact: the freeze stops the world but not the torch or the shake', () => {
+  const s = run('combat', 1);
+  const e = faceFirstEnemy(s, 0.95);
+  e.hpMax = 900;
+  e.hp = 900;
+  assert.ok(swingUntilHit(s));
+  assert.ok(s.sim.hitStop > 0);
+  const fuel = s.run.fuel;
+  const shake = s.player.shake;
+  const ex = e.x;
+  const px = s.player.x;
+  const hp = e.hp;
+  // One step inside the freeze.
+  tick(s, 1);
+  assert.ok(s.run.fuel < fuel, 'the torch keeps burning — a freeze must not make fighting free');
+  assert.ok(s.player.shake < shake, 'and the shake keeps decaying: a held shake is a photograph');
+  assert.equal(e.hp, hp, 'but nothing takes damage');
+  assert.equal(s.player.x, px, 'and the player does not move');
+  void ex;
+
+  // It ends on its own.
+  tick(s, 30);
+  assert.equal(s.sim.hitStop, 0, 'the freeze expires');
+});
+
+test('impact: a kill freezes longer than a hit, and being hit longest of all', () => {
+  assert.ok(COMBAT.HITSTOP_KILL > COMBAT.HITSTOP, 'a kill is worth punctuating');
+  assert.ok(COMBAT.HITSTOP_HURT > COMBAT.HITSTOP, 'being hit has to land hardest');
+  // And none of them is long enough to read as a stall rather than an impact.
+  for (const v of [COMBAT.HITSTOP, COMBAT.HITSTOP_KILL, COMBAT.HITSTOP_HURT]) {
+    assert.ok(v > 1 / 60 && v < 0.15, `${v}s is an impact, not a stutter`);
+  }
+});
+
+test('impact: a creature noticing the player is an event the player can hear', () => {
+  const s = run('combat', 2);
+  s.player.x = 1.5;
+  s.player.y = 1.5;
+  tick(s, 60);
+  faceFirstEnemy(s, 1);
+  let woke = 0;
+  for (let i = 0; i < 20; i++) {
+    tick(s, 1);
+    woke += events(s, 'enemyWake').length;
+  }
+  assert.equal(woke, 1, 'exactly one wake, the frame it noticed');
+});
+
+test('the crawler takes a real fight to kill, not one swing', () => {
+  // It had 30 hit points and died inside the follow-through of the swing that killed it, so a
+  // "fight" was over before it read as one.
+  const swings = Math.ceil(COMBAT.CRAWLER.hp / COMBAT.SWING.DAMAGE);
+  assert.ok(swings >= 3, `a crawler takes ${swings} clean swings`);
+  assert.ok(swings <= 5, `…but not ${swings}, which is a chore`);
+});

@@ -132,6 +132,10 @@ function createEnemy(id) {
     awake: false,
     // Seconds before this one can be staggered again (see `COMBAT.STAGGER_IMMUNE`).
     poise: 0,
+    // Knockback velocity from the last blow, tiles/second, decaying over `KNOCKBACK_TIME`.
+    kx: 0,
+    ky: 0,
+    kt: 0,
   };
 }
 
@@ -249,6 +253,9 @@ export function spawnEnemies(state) {
     e.hunt = 0;
     e.hurt = 0;
     e.poise = 0;
+    e.kx = 0;
+    e.ky = 0;
+    e.kt = 0;
     e.awake = false;
   }
 }
@@ -389,10 +396,28 @@ function damageEnemy(state, e, amount) {
   e.hp -= amount;
   e.hurt = 1;
   e.awake = true;
-  if (e.poise > 0) {
-    // Already reeling from the last one: this hit hurts but does not interrupt (see STAGGER_IMMUNE).
-  }
   const killed = e.hp <= 0;
+
+  // ── Impact ──
+  // Everything that makes a blow read as a blow rather than as a number going down, and all of it
+  // driven from the one place a blow is actually resolved.
+  const p = state.player;
+  const dx = e.x - p.x;
+  const dy = e.y - p.y;
+  const d = Math.sqrt(dx * dx + dy * dy);
+  if (d > 1e-4) {
+    // Thrown back ALONG the blow, not away from wherever it happens to be standing.
+    const push = COMBAT.KNOCKBACK * (killed ? 1.5 : 1);
+    e.kx = (dx / d) * push;
+    e.ky = (dy / d) * push;
+    e.kt = COMBAT.KNOCKBACK_TIME;
+  }
+  // The world holds still for two or three frames. The renderer keeps drawing, so the held frame is
+  // the one carrying the white flash and the sparks — which is the whole trick.
+  const stop = killed ? COMBAT.HITSTOP_KILL : COMBAT.HITSTOP;
+  if (state.sim.hitStop < stop) state.sim.hitStop = stop;
+  const shake = p.shake + (killed ? COMBAT.KILL_SHAKE : COMBAT.HIT_SHAKE_DEALT);
+  p.shake = shake > 1 ? 1 : shake;
   if (killed) {
     e.hp = 0;
     e.st = /** @type {EnemyState} */ (ST_DEAD);
@@ -431,6 +456,7 @@ function damagePlayer(state, e) {
   const p = state.player;
   const sh = p.shake + COMBAT.HIT_SHAKE;
   p.shake = sh > 1 ? 1 : sh;
+  if (state.sim.hitStop < COMBAT.HITSTOP_HURT) state.sim.hitStop = COMBAT.HITSTOP_HURT;
   if (run.hp < 0) run.hp = 0;
   state.events.push({ type: 'playerHit', kind: e.kind, damage: amount, x: e.x, y: e.y });
 }
@@ -469,8 +495,20 @@ export function stepCombat(state) {
     e.px = e.x;
     e.py = e.y;
     if (e.hurt > 0) {
-      e.hurt -= dt * 4;
+      e.hurt -= dt / COMBAT.FLASH_SECONDS;
       if (e.hurt < 0) e.hurt = 0;
+    }
+    // Knockback runs even on a dead or sleeping one: a corpse should be thrown, not stop dead.
+    if (e.kt > 0) {
+      e.kt -= dt;
+      if (e.kt <= 0) {
+        e.kt = 0;
+        e.kx = 0;
+        e.ky = 0;
+      } else {
+        const fade = e.kt / COMBAT.KNOCKBACK_TIME;
+        moveEnemy(state, e, e.kx * fade, e.ky * fade, dt);
+      }
     }
     if (e.st === ST_DEAD) {
       if (e.t < COMBAT.CORPSE_SECONDS) e.t += dt;
@@ -499,6 +537,9 @@ export function stepCombat(state) {
       e.awake = true;
       e.st = /** @type {EnemyState} */ (ST_CHASE);
       e.t = 0;
+      // Noticing the player is a moment, and the player should hear it happen from across a dark
+      // corridor — it is the only warning the mode gives before something arrives.
+      state.events.push({ type: 'enemyWake', kind: e.kind, x: e.x, y: e.y });
     }
 
     const sees = seesPoint(maze, e.x, e.y, p.x, p.y);

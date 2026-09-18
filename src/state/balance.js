@@ -1507,11 +1507,16 @@ export const COMBAT = Object.freeze({
   DENSITY_END: 0.55,
 
   /** Tiles at which a sleeping enemy notices the player, and at which a hunting one gives up. */
-  WAKE_TILES: 13,
-  LOSE_TILES: 21,
+  /**
+   * The wake radius is deliberately LARGER than the torch's reach, so a thing can be coming for you
+   * from outside the light. That is most of what makes the mode frightening: the drone swells, and
+   * there is nothing to see yet.
+   */
+  WAKE_TILES: 16,
+  LOSE_TILES: 26,
 
   /** Seconds an enemy that has lost sight keeps walking toward where the player last was. */
-  HUNT_SECONDS: 3.5,
+  HUNT_SECONDS: 6,
 
   /** Tiles from the maze start that the spawner keeps clear, so a floor never opens in an ambush. */
   SPAWN_CLEAR_TILES: 9,
@@ -1526,7 +1531,7 @@ export const COMBAT = Object.freeze({
   IFRAMES: 0.55,
 
   /** Camera shake added by taking a hit, 0..1. */
-  HIT_SHAKE: 0.7,
+  HIT_SHAKE: 0.85,
 
   /** Score for a kill, multiplied by the depth and the kind's `score` weight (like a gem). */
   KILL_SCORE: 45,
@@ -1536,7 +1541,32 @@ export const COMBAT = Object.freeze({
   DAMAGE_MULT_END: 1.75,
 
   /** Seconds a killed enemy's body stays on screen before its slot is freed. */
-  CORPSE_SECONDS: 1.1,
+  CORPSE_SECONDS: 1.4,
+
+  // ── Impact ──────────────────────────────────────────────────────────────────────────────────
+  /**
+   * HITSTOP: seconds the whole simulation holds still on a landed blow.
+   *
+   * The single biggest thing separating a hit that lands from a number going down. Three frames is
+   * enough — the eye reads it as the blade meeting something solid rather than as a stutter — and a
+   * kill gets longer, because a kill is the moment worth punctuating. The renderer keeps drawing
+   * throughout, so the frozen frame is the one carrying the white flash and the sparks.
+   */
+  HITSTOP: 0.055,
+  HITSTOP_KILL: 0.1,
+  /** And when the PLAYER is hit. Longest of the three: it has to land as "that hurt". */
+  HITSTOP_HURT: 0.09,
+
+  /** Tiles per second a struck creature is thrown back along the blow, and how long it decays over. */
+  KNOCKBACK: 5.4,
+  KNOCKBACK_TIME: 0.16,
+
+  /** Camera shake added by landing a blow, and by killing something (0..1). */
+  HIT_SHAKE_DEALT: 0.24,
+  KILL_SHAKE: 0.42,
+
+  /** Seconds a creature's white hit-flash lasts. */
+  FLASH_SECONDS: 0.16,
 
   /**
    * Seconds an enemy cannot be staggered again after being staggered once.
@@ -1582,16 +1612,22 @@ export const COMBAT = Object.freeze({
    * one that punishes standing still — but a single swing staggers it out of its own wind-up.
    */
   CRAWLER: Object.freeze({
-    hp: 30,
-    speed: 2.55,
+    /**
+     * 30 made it a one- or two-hit creature: it died before the swing that killed it had finished
+     * its own follow-through, so a fight was over before it read as one. 78 is four clean swings —
+     * three with an interrupt — long enough that the player has to back off, time a gap and come
+     * back in, which is where whatever tension this mode has actually lives.
+     */
+    hp: 78,
+    speed: 2.35,
     radius: 0.3,
     /** Distance at which it may open an attack, centre to centre. */
     reach: 1.0,
-    damage: 9,
-    windUp: 0.34,
+    damage: 11,
+    windUp: 0.3,
     strike: 0.12,
-    recover: 0.62,
-    stagger: 0.28,
+    recover: 0.52,
+    stagger: 0.24,
     score: 1,
   }),
 
@@ -1600,7 +1636,7 @@ export const COMBAT = Object.freeze({
    * the sword does, so it is the one you have to step around rather than trade with.
    */
   WRAITH: Object.freeze({
-    hp: 56,
+    hp: 96,
     speed: 1.32,
     radius: 0.34,
     reach: 1.3,

@@ -1685,6 +1685,32 @@ export function createAudio(options) {
   }
 
   /**
+   * A creature noticing the player, from wherever it is standing.
+   *
+   * The most important sound in the mode and the quietest: it is the only warning that something
+   * outside the torchlight has started coming, and it has to carry from across a corridor without
+   * telling the player what or exactly where. A crawler's is a dry chitinous rattle; a wraith's is
+   * a cold intake of breath that rises. Both are panned, so at least the SIDE is knowable.
+   * @param {'crawler'|'wraith'} kind
+   * @param {number} [pan]
+   */
+  function playWake(kind, pan = 0) {
+    const t = now();
+    if (kind === 'wraith') {
+      // A rising, breathy band of noise — air moving where there is no mouth.
+      sfxNoise('bandpass', 420, 1450, 1.6, t, 0.16, 0.62, 0.15, PRI.CUE, 0.34, pan);
+      sfx('sine', degreeHz(1), degreeHz(6), t + 0.04, 0.12, 0.5, 0.055, PRI.CUE, 0.4, 0, 0, pan);
+    } else {
+      // Six fast dry ticks: legs finding purchase on stone.
+      for (let i = 0; i < 6; i++) {
+        const f = 1900 * rng.range(0.85, 1.2);
+        sfxNoise('bandpass', f, f * 0.7, 3.4, t + i * 0.035 + rng.range(0, 0.012), 0.001, 0.035, 0.12, PRI.CUE, 0.12, pan);
+      }
+      sfxNoise('lowpass', 300, 200, 0.9, t, 0.01, 0.2, 0.07, PRI.CUE, 0.2, pan);
+    }
+  }
+
+  /**
    * Something landing a blow on the PLAYER. The one cue in the mode that must never be missed, so
    * it is the loudest thing in it and sits where nothing else does: a hard low thud with a detuned
    * minor second over it — the same interval the low-fuel warning uses, because both mean the same
@@ -2229,6 +2255,11 @@ export function createAudio(options) {
             break;
           case 'playerHit':
             if (!muted) playPlayerHit(pickupPan(e.x, e.y, state));
+            break;
+          case 'enemyWake':
+            if (!muted) {
+              playWake(e.kind === 'wraith' ? 'wraith' : 'crawler', pickupPan(e.x, e.y, state));
+            }
             break;
           case 'unlock':
             if (!muted) playUnlock(e.boon === true);

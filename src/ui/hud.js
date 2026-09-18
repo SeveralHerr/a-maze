@@ -585,6 +585,9 @@ const AUTO_TEXT = 'AUTO';
 /** The ATTACK plaque's label (New Descent, ARCHITECTURE.md §4.11). */
 const ATTACK_TEXT = 'ATTACK';
 
+/** UI units the ATTACK plaque sits above the bottom of the world band. */
+const ATTACK_LIFT = 4;
+
 /** Height of the health bar's well, in UI units. Half the fuel gauge's: it is the second instrument. */
 const HEALTH_BAR_UNITS = 3;
 
@@ -1896,11 +1899,15 @@ export function createHud(overlayCanvas, options) {
   /**
    * The ATTACK plaque, bottom right of the world band (New Descent, §4.11).
    *
-   * Bottom RIGHT rather than the AUTO button's bottom centre, and it is why the corner map moved to
-   * the top right: a thumb reaching the bottom right of a phone is the most comfortable reach there
-   * is, and on a desktop it sits under the hand that is already on the mouse. Unlike AUTO it is
-   * drawn **while the pointer is locked** — a locked click is itself a swing (§4.3), so the plaque
-   * is a label for a control that is live rather than a target that cannot be hit.
+   * **Bottom CENTRE, lifted clear of the bottom edge** — not the bottom right, where it started.
+   * The bottom right is where the sword is drawn: the plaque sat directly under the blade, so the
+   * one moment it was most worth looking at (mid-swing) was the one moment it was behind the
+   * weapon, and on a narrow view the two overlapped outright. Centre is also where a player's eye
+   * already is, and it is the slot the AUTO button vacated — New Descent never draws that one.
+   *
+   * Unlike AUTO it is drawn **while the pointer is locked**: a locked click is itself a swing
+   * (§4.3), so the plaque is a label for a control that is live rather than a target that cannot
+   * be hit.
    * @param {CanvasRenderingContext2D} ctx
    * @param {GameState} state
    * @param {SurfaceMetrics} m
@@ -1916,8 +1923,10 @@ export function createHud(overlayCanvas, options) {
     const padX = insetX + 2 * u;
     const chipH = 2 * insetY + 3 * u + heightAt('hud', size);
     const w = 2 * padX + measureAt(ATTACK_TEXT, 'hud', size);
-    const x = m.viewX + m.viewW - 3 * u - w;
-    const y = m.viewY + m.viewH - 3 * u - chipH;
+    const x = m.viewX + ((m.viewW - w) >> 1);
+    // Lifted a further `ATTACK_LIFT` units off the bottom edge, so it clears the sword's guard and
+    // the touch bar underneath it on a phone.
+    const y = m.viewY + m.viewH - (3 + ATTACK_LIFT) * u - chipH;
     panelOpts.frame = 'stone';
     panelOpts.border = border;
     panelOpts.rivets = false;

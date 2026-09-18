@@ -21,6 +21,7 @@ import {
   ENEMY_VIEWS,
   SHADOW_INDEX,
   SWORD_FRAMES,
+  SWORD_SMEAR_FRAMES,
   createCombatTextures,
   enemyFrameIndex,
 } from './enemies.js';
@@ -207,9 +208,14 @@ test('the sword reads as a sword: mostly blade, and it moves through the swing',
   const rest = bbox(SET.sword[0]);
   assert.ok(rest !== null);
   assert.ok(rest.h > rest.w, `the rest pose is longer than it is wide (${rest.w}×${rest.h})`);
-  // The strike frames are the ones that carry a motion smear; the rest do not.
+  // The cut's fast frames carry a motion smear; nothing else does. Checked against the painter's
+  // own list, so re-timing the arc cannot leave this asserting stale frame numbers.
   const stippled = SET.sword.map((t) => (t.stipple === null ? 0 : t.stipple.reduce((a, b) => a + b, 0)));
-  assert.ok(stippled[3] > 40 && stippled[4] > 20, `the strike frames smear (${stippled.join(',')})`);
+  const smeared = stippled.map((n, i) => (n > 0 ? i : -1)).filter((i) => i >= 0);
+  for (const i of smeared) {
+    assert.ok(SWORD_SMEAR_FRAMES.includes(i), `frame ${i} smears but is not a cut frame`);
+  }
+  assert.ok(smeared.length >= 3, `the cut smears (${stippled.join(',')})`);
   assert.equal(stippled[0], 0, 'the rest pose does not');
   // And every pose is a different picture — eight frames of the same sword is not an animation.
   for (let i = 1; i < SWORD_FRAMES; i++) {

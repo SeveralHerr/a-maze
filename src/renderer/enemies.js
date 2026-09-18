@@ -106,8 +106,15 @@ export function enemyFrameIndex(view, pose, gait = 0) {
   return v * ENEMY_FRAMES + g;
 }
 
-/** Sword poses, in swing order. The renderer picks one from the attack state machine. */
-export const SWORD_FRAMES = 8;
+/**
+ * Sword poses, in swing order. The renderer picks one from the attack state machine.
+ *
+ * Fourteen, not eight. Eight frames over a 0.44 s swing is one pose every 55 ms, and at that rate
+ * the blade TELEPORTS between two widely separated angles in the two frames that matter — the eye
+ * reads a cut as a sequence of stills rather than as one movement. Fourteen puts the fast part of
+ * the arc on ~30 ms steps, which is where it stops reading as a slideshow.
+ */
+export const SWORD_FRAMES = 14;
 
 /**
  * How big each creature's billboard stands in the world, and which texel row of its card is the
@@ -190,6 +197,37 @@ function rollMesh(m, angle, dx, dy) {
  */
 function scaleMesh(m, k) {
   for (let i = 0; i < m.p.length; i++) m.p[i] *= k;
+  return m;
+}
+
+/**
+ * Scale a mesh unevenly about the model origin, in place, fixing the normals as it goes.
+ *
+ * This is what turns a lathe into a **blade**. A surface of revolution swept over four segments has
+ * a diamond cross-section; squash one axis and it becomes a lens — two angled faces a side meeting
+ * at a sharp edge, which is exactly a sword's section. A normal does not scale like a position
+ * (it scales by the inverse), so it is corrected and renormalised here rather than left to point
+ * somewhere plausible-looking and light wrongly.
+ * @param {Mesh} m
+ * @param {number} sx @param {number} sy @param {number} sz
+ * @returns {Mesh} the same mesh
+ */
+function scaleMeshXYZ(m, sx, sy, sz) {
+  const ix = 1 / sx;
+  const iy = 1 / sy;
+  const iz = 1 / sz;
+  for (let i = 0; i < m.p.length; i += 3) {
+    m.p[i] *= sx;
+    m.p[i + 1] *= sy;
+    m.p[i + 2] *= sz;
+    let nx = m.n[i] * ix;
+    let ny = m.n[i + 1] * iy;
+    let nz = m.n[i + 2] * iz;
+    const l = Math.hypot(nx, ny, nz) || 1;
+    m.n[i] = nx / l;
+    m.n[i + 1] = ny / l;
+    m.n[i + 2] = nz / l;
+  }
   return m;
 }
 
@@ -660,18 +698,19 @@ function paintCreature(kind, yaw, gait, action, seed, tilt, stipple) {
  * point stays on the card across the whole arc — `enemies.test.mjs` pins it, because a pose that
  * clips is invisible as a bug and very visible as a sword with no point.
  */
-const SWORD_ORIGIN_ROW = 61;
-const SWORD_REACH = 44;
+const SWORD_ORIGIN_ROW = 62;
+const SWORD_REACH = 54;
 
 /** @type {import('./models.js').Material[]} */
 const SWORD_MATS = [
-  // 0 blade: bright, with a HARD NARROW specular. 0.92/1.3/0.62 parked the whole flat at the top of
-  // the steel ramp and produced a paper-white shape with no form at all — the correction for a blade
-  // that was too dark overshot into a blade that was not a solid. The ramp has seven steps; the
-  // point of the material is to use several of them, with the glint confined to the edge.
-  { ramp: RAMPS.steel, albedo: 0.66, spec: 1.5, shine: 52, ambient: 0.4 },
-  // 1 fuller (the groove down the blade): the same metal, a step darker.
-  { ramp: RAMPS.steel, albedo: 0.42, spec: 0.5, shine: 26, ambient: 0.3 },
+  // 0 blade. A LOW ambient on purpose: the lens section now produces the value structure, and a
+  // high ambient floods it back out. The diffuse term across four differently-angled faces is what
+  // draws the edge, the flat and the spine, and the narrow specular puts a glint on whichever face
+  // is square to the light as the sword turns through the swing.
+  { ramp: RAMPS.steel, albedo: 0.82, spec: 1.4, shine: 46, ambient: 0.16 },
+  // 1 fuller (the groove down the blade): the same metal, several steps darker, because a groove is
+  // in shadow from almost every direction.
+  { ramp: RAMPS.steel, albedo: 0.3, spec: 0.35, shine: 26, ambient: 0.12 },
   // 2 guard and pommel: brass.
   { ramp: RAMPS.gold, albedo: 0.78, spec: 0.7, shine: 20, ambient: 0.34 },
   // 3 grip: bound leather.
@@ -685,24 +724,52 @@ const SWORD_MATS = [
  */
 function swordMesh() {
   const m = createMesh();
-  // Blade: a flat tapered bar, four stacked boxes of narrowing width. A taper made of steps reads
-  // as a taper at 64 texels and costs nothing; a lathe would make it round, and a round sword reads
-  // as a pipe. It runs from the guard at 14 to the point at `SWORD_REACH`, so the steel is three
-  // quarters of the sprite — the proportion that separates a sword from a dagger at a glance.
-  box(m, -4.0, 14, -1.2, 4.0, 26, 1.2, 0);
-  box(m, -3.6, 26, -1.05, 3.6, 36, 1.05, 0);
-  box(m, -2.9, 36, -0.9, 2.9, SWORD_REACH - 6, 0.9, 0);
-  box(m, -1.5, SWORD_REACH - 6, -0.6, 1.5, SWORD_REACH, 0.6, 0); // the point
-  // Fuller: a shallow groove down the middle of the front face, so the flat is not a blank rectangle.
-  box(m, -0.7, 16, 1.1, 0.7, SWORD_REACH - 10, 1.28, 1);
-  // Crossguard. Narrow — a guard as wide as the blade is long reads as a crucifix, which is what
-  // the first pass of this sprite looked like.
-  box(m, -7.0, 11.5, -1.5, 7.0, 14.2, 1.5, 2);
-  box(m, -8.2, 12.2, -1.2, -6.4, 16.5, 1.2, 2);
-  box(m, 6.4, 12.2, -1.2, 8.2, 16.5, 1.2, 2);
-  // Grip: long enough for two hands, bound leather, with a brass pommel under it.
-  lathe(m, [[2.2, 0], [2.6, 1.8], [2.3, 5], [2.5, 9], [2.3, 12]], 3, { segs: 10, capBottom: true });
-  lathe(m, [[0, -4.2], [2.8, -3.2], [3.6, -0.8], [2.7, 1.2], [0, 2]], 2, { segs: 12 });
+
+  // ── Blade ──
+  // A LATHE swept over four segments, then squashed flat. Four segments make the cross-section a
+  // diamond; squashing z turns that into a lens — a sharp edge down each side, two shallow faces
+  // between them, and a ridge along the middle.
+  //
+  // This is the whole fix for a blade that read as a grey wedge. The previous one was stacked
+  // BOXES, and a box's front is a single flat quad: one surface normal, therefore exactly one tone
+  // across the entire width of the blade, no matter what the material does. A lens section gives
+  // four differently-angled faces, so the light itself produces a bright cutting edge, a mid flat
+  // and a dark spine — the value structure that reads as "sharp" at a dozen texels across.
+  const blade = createMesh();
+  lathe(
+    blade,
+    [
+      [3.0, 11],
+      [4.6, 15],
+      [4.7, 24],
+      [4.4, 34],
+      [3.8, 42],
+      [2.6, 48],
+      [1.2, SWORD_REACH - 2],
+      [0.15, SWORD_REACH],
+    ],
+    0,
+    { segs: 4, capBottom: true },
+  );
+  // Flattened to a quarter of its width: a blade, not a spike.
+  scaleMeshXYZ(blade, 1, 1, 0.26);
+  m.p.push(...blade.p);
+  m.n.push(...blade.n);
+  m.t.push(...blade.t);
+
+  // A fuller: a narrow groove running most of the blade's length, set just proud of the flat so it
+  // catches its own tone. It is what stops the two big faces reading as one slab.
+  box(m, -0.8, 18, 1.02, 0.8, SWORD_REACH - 12, 1.25, 1);
+
+  // ── Crossguard ──
+  // Swept forward at the tips, which is what makes it read as a guard rather than as a crossbar.
+  box(m, -8.5, 8.4, -1.7, 8.5, 11.6, 1.7, 2);
+  box(m, -10.4, 9.2, -1.4, -7.8, 14.2, 1.4, 2);
+  box(m, 7.8, 9.2, -1.4, 10.4, 14.2, 1.4, 2);
+
+  // ── Grip and pommel ──
+  lathe(m, [[2.3, -0.4], [2.7, 1.6], [2.4, 4.4], [2.6, 7], [2.4, 9]], 3, { segs: 10, capBottom: true });
+  lathe(m, [[0, -4.6], [2.9, -3.4], [3.8, -0.9], [2.8, 1.1], [0, 2]], 2, { segs: 12 });
   return m;
 }
 
@@ -720,21 +787,56 @@ function swordMesh() {
 function swordPose(i) {
   /** @type {ReadonlyArray<readonly [number, number, number, number]>} */
   const poses = [
-    // roll (radians, + = anticlockwise on screen), dx, dy (texels), yaw (how much of the flat is
-    // turned toward the eye). Every one is chosen so the rolled tip and the quillons stay inside
-    // the 64-texel card — `enemies.test.mjs` asserts it, because a pose that clips is invisible
-    // as a bug and very visible as a sword with no point.
-    [0.50, 16, -6, 0.5], // 0 rest: grip low-right, blade up across the view
-    [0.28, 20, -10, 0.4], // 1 wind-up: drawn back and to the right
-    [0.02, 23, -12, 0.3], // 2 wind-up peak: cocked upright, clear of the view
-    [0.88, 12, -4, 0.6], // 3 strike: swept up and across the middle of the view
-    [1.15, 16, 6, 0.85], // 4 follow-through: low and across, the flat turned to the eye
-    [1.00, 17, 2, 0.8], // 5 recover
-    [0.78, 17, -2, 0.65], // 6 recover
-    [0.62, 16, -4, 0.55], // 7 recover, nearly home
+    // roll (radians, + = anticlockwise on screen), the screen point the blade's MIDDLE sits on
+    // (mx, my in texels), and yaw (how much of the flat is turned toward the eye).
+    //
+    // The placement is derived, not typed: `dx`/`dy` are solved below so that the middle of the
+    // blade lands on (mx, my) whatever the roll is. Hand-typing the grip offset per pose meant
+    // every change to the arc silently pushed the tip off the card — five of fourteen poses were
+    // clipped that way — because the grip is the one end of the sword whose position nobody is
+    // looking at. Anchoring the middle keeps both ends in frame by construction.
+    //
+    // The shape of the list IS the weapon: one rest, four winding back and up over the shoulder
+    // (the telegraph the player reads), four tearing down across the view, then five settling home.
+    [0.46, 38, 40, 0.5], //  0 rest: blade up across the lower right
+    [0.30, 41, 37, 0.42], //  1 wind: drawing back
+    [0.12, 43, 34, 0.34], //  2 wind
+    [-0.08, 45, 32, 0.26], //  3 wind
+    [-0.22, 46, 31, 0.2], //  4 wind peak: cocked past vertical — the frame the player reads
+    [0.30, 40, 33, 0.42], //  5 strike: breaking forward
+    [0.86, 30, 29, 0.62], //  6 strike: through the middle of the view
+    [1.28, 20, 31, 0.86], //  7 strike: the frame that connects
+    [1.50, 15, 36, 0.92], //  8 follow-through: nearly horizontal, flat to the eye
+    [1.28, 19, 39, 0.86], //  9 recover
+    [1.02, 25, 41, 0.78], // 10 recover
+    [0.82, 30, 42, 0.68], // 11 recover
+    [0.62, 35, 42, 0.58], // 12 recover
+    [0.50, 37, 41, 0.52], // 13 recover, nearly home
   ];
-  const p = poses[i < 0 ? 0 : i >= poses.length ? poses.length - 1 : i];
-  return { roll: p[0], dx: p[1], dy: p[2], yaw: p[3] };
+  const q = poses[i < 0 ? 0 : i >= poses.length ? poses.length - 1 : i];
+  const roll = q[0];
+  // Solve the grip offset that puts the blade's middle on (mx, my). Model x is screen x measured
+  // from the card's centre column; model y is measured UP from `SWORD_ORIGIN_ROW`.
+  const half = SWORD_REACH * 0.5;
+  const dx = q[1] - SIZE / 2 + Math.sin(roll) * half;
+  const dy = SWORD_ORIGIN_ROW - q[2] - Math.cos(roll) * half;
+  return { roll, dx, dy, yaw: q[3] };
+}
+
+/**
+ * Sword poses that carry a motion smear: the frames of the cut where the blade is genuinely moving
+ * faster than the eye can resolve. Exported so `enemies.test.mjs` asserts against the same list the
+ * painter reads, rather than against frame numbers that go stale the moment the arc is re-timed.
+ * @type {ReadonlyArray<number>}
+ */
+export const SWORD_SMEAR_FRAMES = Object.freeze([5, 6, 7, 8]);
+
+/**
+ * @param {number} i
+ * @returns {boolean}
+ */
+function swordSmears(i) {
+  return SWORD_SMEAR_FRAMES.indexOf(i) >= 0;
 }
 
 /**
@@ -763,9 +865,9 @@ function paintSword(i, stipple) {
     (ramp, t, x, y) => (ramp === RAMPS.steel ? rampPickFlat(ramp, t) : rampPickChunky(ramp, t, x, y)),
     buf,
   );
-  // A stippled arc trailing the two fast frames: half-shaded, like the flame's halo, so it reads as
+  // A stippled arc trailing the fast frames: half-shaded, like the flame's halo, so it reads as
   // speed rather than as a second blade.
-  if (i === 3 || i === 4) trailArc(buf, stipple, i);
+  if (swordSmears(i)) trailArc(buf, stipple, i);
   return buf;
 }
 
@@ -777,41 +879,39 @@ function paintSword(i, stipple) {
  * @returns {void}
  */
 function trailArc(buf, stipple, frame) {
-  // A SOLID tapering band, not a scatter. The first pass gated each texel on a hash and then
-  // `renderWeapon` dropped every other screen pixel again for stippled texels — random scatter times
-  // a 50 % screen stipple is white noise, and it read as dead pixels rather than as a swing. The
-  // screen-space stipple alone is the translucency; this only has to describe the path.
+  // A smear that HUGS the blade and tapers to nothing behind it.
+  //
+  // Two earlier versions failed in opposite directions, and both failed the same way on screen —
+  // by reading as an object rather than as motion. A per-texel hash under the renderer's half-
+  // stipple was white noise; a solid band swept over the whole gap between two poses was a slab
+  // that detached from the sword and floated beside it. What works is a wedge: deep where it meets
+  // the blade, shallower every step back, gone before it has travelled far enough to look separate.
   const pose = swordPose(frame);
+  const prev = swordPose(frame - 1);
   const cx = SIZE / 2 + pose.dx;
   const cy = SWORD_ORIGIN_ROW - pose.dy;
-  const here = pose.roll;
-  const from = swordPose(frame - 1).roll;
-  const steps = 26;
-  // Only the OUTER part of the blade leaves a smear, and only a couple of texels of it. Sweeping the
-  // whole length across the whole arc fills a solid sector — which is what the first solid version
-  // drew: a white wedge over a quarter of the screen that read as fog rather than as a blade. What a
-  // fast blade actually leaves is a thin crescent trailing its tip.
-  const inner = SWORD_REACH * 0.62;
-  for (let k = 0; k <= steps; k++) {
-    const u = k / steps;
-    const a = from + (here - from) * u;
+  // Hard cap on the span. Past about a sixth of a turn the tail is far enough from the blade that
+  // no amount of fading stops it reading as a second object.
+  let from = prev.roll;
+  const maxSpan = 0.3;
+  if (Math.abs(pose.roll - from) > maxSpan) from = pose.roll - Math.sign(pose.roll - from) * maxSpan;
+  const steps = 16;
+  for (let k = 0; k < steps; k++) {
+    // u = 0 at the blade, 1 at the far end of the tail.
+    const u = k / (steps - 1);
+    const a = pose.roll + (from - pose.roll) * u;
     const sn = Math.sin(a);
     const cs = Math.cos(a);
-    // Brightest at the leading edge, dissolving back toward where the blade came from.
-    const lead = u > 0.82;
-    for (let r = inner; r < SWORD_REACH; r += 1) {
-      const along = (r - inner) / (SWORD_REACH - inner);
-      // One texel through most of it, two at the very tip.
-      const thick = along > 0.72 ? 1 : 0;
-      for (let w = -thick; w <= thick; w++) {
-        const x = Math.round(cx - sn * r + cs * w);
-        const y = Math.round(cy - cs * r - sn * w);
-        if (x < 0 || y < 0 || x >= SIZE || y >= SIZE) continue;
-        const i = (y << 6) | x;
-        if (buf[i] !== 0) continue;
-        buf[i] = lead ? C.steelPale : C.ironBase;
-        stipple[i] = 1;
-      }
+    // Deep against the blade, tapering to a single texel at the tail.
+    const depth = 16 * (1 - u) * (1 - u) + 1.5;
+    for (let r = SWORD_REACH - depth; r < SWORD_REACH + 1; r += 1) {
+      const x = Math.round(cx - sn * r);
+      const y = Math.round(cy - cs * r);
+      if (x < 1 || y < 1 || x >= SIZE - 1 || y >= SIZE - 1) continue;
+      const i = (y << 6) | x;
+      if (buf[i] !== 0) continue;
+      buf[i] = u < 0.35 ? C.steelGlint : u < 0.7 ? C.steelPale : C.ironLight;
+      stipple[i] = 1;
     }
   }
 }

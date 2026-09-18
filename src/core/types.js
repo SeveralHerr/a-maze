@@ -207,7 +207,10 @@
  * @property {number} lkx            x the player was last seen at
  * @property {number} lky            y the player was last seen at
  * @property {number} hunt           seconds left of walking to `lkx/lky` after losing sight
- * @property {number} hurt           0..1 hit flash, decays
+ * @property {number} hurt           0..1 hit flash, decays over `COMBAT.FLASH_SECONDS`
+ * @property {number} kx             knockback velocity from the last blow, tiles/second
+ * @property {number} ky
+ * @property {number} kt             seconds of knockback left
  * @property {number} damage         damage one of its hits does on this level
  * @property {boolean} awake         the player has been noticed
  */
@@ -304,7 +307,8 @@
  *   | {type:'unlock', id:string, rank:number, boon:boolean}
  *   | {type:'swing', hit:boolean}
  *   | {type:'enemyHit', kind:EnemyKind, x:number, y:number, damage:number, killed:boolean}
- *   | {type:'playerHit', kind:EnemyKind, damage:number, x:number, y:number}} GameEvent
+ *   | {type:'playerHit', kind:EnemyKind, damage:number, x:number, y:number}
+ *   | {type:'enemyWake', kind:EnemyKind, x:number, y:number}} GameEvent
  */
 
 // ─── Cross-seam shapes mirrored from §4.2 / §4.5 ─────────────────────────────────────────────

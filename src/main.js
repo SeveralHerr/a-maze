@@ -104,6 +104,17 @@ const MIN_LOAD_S = 0.8;
 const COMBAT_PAINT_BUDGET = 2;
 
 /**
+ * Which painted sword pose belongs to each phase of the swing (`renderer/enemies.js`).
+ *
+ * Spelled out rather than computed from a range, because the three phases are different lengths in
+ * both frames and seconds: the wind-up gets four poses over 0.10 s, the cut four over 0.08 s, and
+ * the recovery five over 0.26 s. Pose 0 is the rest position and belongs to no phase.
+ */
+const WEAPON_WIND = Object.freeze([1, 2, 3, 4]);
+const WEAPON_CUT = Object.freeze([5, 6, 7, 8]);
+const WEAPON_BACK = Object.freeze([9, 10, 11, 12, 13]);
+
+/**
  * Milliseconds after a fullscreen request during which losing pointer lock does not pause. Chrome
  * drops the lock 8–25 ms into the transition; a second covers a slow frame without masking a real
  * Esc, which leaves fullscreen and pauses through that change instead.
@@ -116,6 +127,9 @@ const IRIS_CLOSE_RATE = 2.8;
 
 /** World-flash decay rate, 1/s (the in-world pickup pop). */
 const FLASH_DECAY = 3.6;
+
+/** How fast the wound vignette fades, 1/s — about a second from a full hit (§4.11). */
+const HURT_PULSE_DECAY = 1.1;
 
 /** Page-flash decay rate, 1/s (the level-complete pop over the whole page). */
 const POST_FLASH_DECAY = 1.8;
@@ -672,6 +686,15 @@ function boot() {
   const fxRng = createRng(0x5a4c17);
 
   /**
+   * 1 the instant a blow lands on the player, decaying to 0 (New Descent, §4.11).
+   *
+   * Drives a red vignette on the post layer that outlasts the white flash, so taking damage reads as
+   * a condition rather than a blink. Shares the layer the low-fuel pulse uses — whichever is
+   * stronger wins, which is right: both mean the same thing.
+   */
+  let hurtPulse = 0;
+
+  /**
    * Route one dispatch's events to everything that reacts to them.
    *
    * Called from the store subscriber (see the file header): `state.events` always holds exactly the
@@ -759,29 +782,49 @@ function boot() {
           }
           break;
         case 'enemyHit': {
-          // A puff at the wound, brighter and longer when it was the killing blow. No world flash:
-          // the flash path belongs to pickups, and using both for one event doubles the brightness
-          // (§4.5 "two flash paths").
+          // The visual half of the impact — the other half is the hitstop the sim just took, and the
+          // two are what make a blow land. A burst at the wound, hard and fast on a hit, twice as
+          // much and slower on a kill so a death is legible as one.
+          //
+          // No world flash: the flash path belongs to pickups, and using both for one event doubles
+          // the brightness (§4.5 "two flash paths").
           raycaster.particles.burst(
             PARTICLE.SPARK,
             ev.x,
             ev.y,
-            0.5,
-            ev.killed ? 26 : 12,
-            ev.killed ? 2.2 : 1.4,
-            0.6,
+            0.55,
+            ev.killed ? 34 : 16,
+            ev.killed ? 3.4 : 2.6,
+            ev.killed ? 0.75 : 0.45,
             ev.kind === 'wraith' ? PARTICLE_COLORS.spark : PARTICLE_COLORS.ember,
             fxRng.next,
           );
+          if (ev.killed) {
+            // A second, slower plume of dust: the thing coming apart rather than being hit.
+            raycaster.particles.burst(
+              PARTICLE.DUST,
+              ev.x,
+              ev.y,
+              0.4,
+              20,
+              1.2,
+              1.1,
+              PARTICLE_COLORS.dust,
+              fxRng.next,
+            );
+          }
           break;
         }
         case 'playerHit':
           // The page flash, not the world one: this happened TO the player, so it belongs over
           // everything the way a game over does, and the HUD's health panel flashes with it.
-          postFlash.r = 150;
-          postFlash.g = 26;
-          postFlash.b = 20;
-          postFlash.a = Math.min(0.5, postFlash.a + 0.34);
+          postFlash.r = 170;
+          postFlash.g = 24;
+          postFlash.b = 18;
+          postFlash.a = Math.min(0.62, postFlash.a + 0.46);
+          // And a wound vignette that outlasts the flash — the screen edges stay red for about a
+          // second, so being hurt is a state the player can see they are in and not only an instant.
+          hurtPulse = 1;
           break;
         case 'ember':
           hud.notice(NOTICE_EMBER);
@@ -1311,22 +1354,26 @@ function boot() {
     // `kick` is SIGNED: negative drops the weapon back out of the way, positive drives it up into
     // the view. The first pass made it 0..1 and the renderer always pushed DOWN, so the strike —
     // the one frame the player is looking at — shoved the blade off the bottom of the screen.
+    // The fourteen painted poses laid over the attack state machine, so the frame on screen is
+    // always the frame the simulation is in — a wind-up the player can read is only a fair telegraph
+    // if it lasts exactly as long as the wind-up does. Each phase owns a contiguous slice of the
+    // list, and the slice is walked by its own 0..1 progress rather than on a separate clock.
     if (st === 1) {
-      // Wind-up: poses 1→2, the blade drawn back and down. This is the telegraph, and it earns the
-      // strike that follows by getting out of the way first.
+      // Wind-up: poses 1→4, the blade drawn back and up over the shoulder. This is the telegraph,
+      // and it earns the strike that follows by getting out of the way first.
       phase = S.WIND_UP > 0 ? clamp01(t / S.WIND_UP) : 1;
-      frame = phase < 0.5 ? 1 : 2;
+      frame = WEAPON_WIND[Math.min(WEAPON_WIND.length - 1, (phase * WEAPON_WIND.length) | 0)];
       kick = -0.45 * phase;
     } else if (st === 2) {
-      // Strike: poses 3→4, the two fast frames with the motion smear on them, driven up and across.
+      // Strike: poses 5→8, the four fast frames, the ones that carry the motion smear.
       phase = S.STRIKE > 0 ? clamp01(t / S.STRIKE) : 1;
-      frame = phase < 0.5 ? 3 : 4;
+      frame = WEAPON_CUT[Math.min(WEAPON_CUT.length - 1, (phase * WEAPON_CUT.length) | 0)];
       kick = 1;
       sweep = 0.35 + 0.65 * phase;
     } else if (st === 3) {
-      // Recover: poses 5→7 settling back to rest, and the lift decays with them.
+      // Recover: poses 9→13 settling back to rest, and the lift decays with them.
       phase = S.RECOVER > 0 ? clamp01(t / S.RECOVER) : 1;
-      frame = phase < 0.34 ? 5 : phase < 0.7 ? 6 : 7;
+      frame = WEAPON_BACK[Math.min(WEAPON_BACK.length - 1, (phase * WEAPON_BACK.length) | 0)];
       kick = 1 - phase;
       sweep = (1 - phase) * 0.8;
     }
@@ -1475,6 +1522,9 @@ function boot() {
         ? 0.18
         : 0.2 + 0.18 * Math.sin(state.time * 6.5) * Math.sin(state.time * 2.1)
       : 0;
+    // The wound vignette rides the same layer. Reduced Motion keeps the colour and drops the throb.
+    hurtPulse = hurtPulse > 0 ? Math.max(0, hurtPulse - frameDt * HURT_PULSE_DECAY) : 0;
+    const hurt = hurtPulse * (reduced ? 0.5 : 0.62);
 
     // The iris is the level-transition wipe: closed while a level is being carved and after the
     // run ends, open while there is a world worth looking at.
@@ -1490,7 +1540,7 @@ function boot() {
 
     postOpts.scanlines = state.settings.scanlines;
     postOpts.vignette = 0.52 + 0.34 * (1 - renderView.light);
-    postOpts.lowFuelPulse = pulse;
+    postOpts.lowFuelPulse = pulse > hurt ? pulse : hurt;
     postOpts.iris = iris;
     post.set(postOpts);
 

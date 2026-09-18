@@ -150,6 +150,9 @@ const BASE_PERKS = Object.freeze(computePerks(null));
  *   for "derive it from `run.fuelMax`" (a state installed without `levelReady`)
  * @property {number} scrollIdx    index of this level's map scroll in `levelData.items`, or −1
  * @property {boolean} attackHeld  the sword button is down this step (New Descent, §4.11)
+ * @property {number} hitStop      seconds of impact freeze still owed (§4.11). While it is above
+ *   zero the world does not advance — the renderer keeps drawing, so the held frame is the one
+ *   carrying the hit flash and the sparks
  * @property {LevelData|null} gridFor the level the item grid was built for (identity check)
  * @property {number} gridW        item-grid buckets across
  * @property {number} gridH        item-grid buckets down
@@ -250,6 +253,7 @@ export function createSimScratch() {
     flaskBase: 0,
     scrollIdx: -1,
     attackHeld: false,
+    hitStop: 0,
     gridFor: null,
     gridW: 0,
     gridH: 0,
@@ -295,6 +299,7 @@ export function resetSimScratch(sim) {
   sim.flaskBase = 0;
   sim.scrollIdx = -1;
   sim.attackHeld = false;
+  sim.hitStop = 0;
   // Drops the reference to the previous level's data — and forces a rebuild before the next query.
   sim.gridFor = null;
   sim.gridW = 0;
@@ -1260,6 +1265,34 @@ export function stepPlayingBody(state, input) {
   p.px = p.x;
   p.py = p.y;
   p.pangle = p.angle;
+
+  // ── Hitstop (New Descent, §4.11) ─────────────────────────────────────────────────────────
+  // A landed blow holds the WHOLE world still for two or three frames. The render loop is
+  // untouched, so those frames are spent looking at the hit flash, the sparks and the shake — the
+  // difference between a blade meeting something solid and a number going down.
+  //
+  // The camera keeps its shake decay and the torch keeps burning, because neither is the blow: a
+  // frozen shake is a still photograph of a shake, and a torch that stops during every exchange
+  // would make fighting free. Everything the player or a creature does is what stops.
+  if (sim.hitStop > 0) {
+    sim.hitStop -= dt;
+    if (sim.hitStop < 0) sim.hitStop = 0;
+    const shakeHeld = p.shake;
+    if (shakeHeld !== 0) {
+      const kh = 1 - Math.exp(-BOB.SHAKE_DECAY * dt);
+      p.shake = shakeHeld * (1 - kh);
+    }
+    run.levelTime += dt;
+    run.totalTime += dt;
+    run.fuel -= dt * FUEL.DRAIN * sim.drain;
+    if (run.fuel < 0) run.fuel = 0;
+    if (run.iframes > 0) {
+      run.iframes -= dt;
+      if (run.iframes < 0) run.iframes = 0;
+    }
+    updateDerived(state);
+    return;
+  }
 
   run.levelTime += dt;
   run.totalTime += dt;

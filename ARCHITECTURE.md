@@ -299,8 +299,9 @@ reaches `#overlay` and both pointer lock and the virtual stick die silently.
  *   | {type:'unlock', id:string, rank:number, boon:boolean}
  *   | {type:'swing', hit:boolean}
  *   | {type:'enemyHit', kind:EnemyKind, x:number, y:number, damage:number, killed:boolean}
- *   | {type:'playerHit', kind:EnemyKind, damage:number, x:number, y:number} } GameEvent
- *   (the last three: New Descent, §4.11 — never emitted in `'classic'`)
+ *   | {type:'playerHit', kind:EnemyKind, damage:number, x:number, y:number}
+ *   | {type:'enemyWake', kind:EnemyKind, x:number, y:number} } GameEvent
+ *   (the last four: New Descent, §4.11 — never emitted in `'classic'`)
  */
 ```
 
@@ -1409,8 +1410,19 @@ still the clock and a monster is what makes the clock hurt. An oil flask also me
 `COMBAT.HEAL_PER_OIL`, so the existing economy is the healing economy too.
 
 **Events** (§3 `GameEvent`): `{type:'swing', hit:boolean}`, `{type:'enemyHit', kind, x, y, damage,
-killed}`, `{type:'playerHit', kind, damage, x, y}`. `derived` gains `threat` (0..1, nearest awake
-enemy's proximity) for audio and the post stack.
+killed}`, `{type:'playerHit', kind, damage, x, y}` and `{type:'enemyWake', kind, x, y}` — the last
+is a creature *noticing* the player, which is the only warning the mode gives before something
+arrives out of the dark, and it is why waking is an event rather than a flag flip. `derived` gains
+`threat` (0..1, nearest awake enemy's proximity) for audio and the post stack.
+
+**Impact.** A landed blow is not a number going down: it takes `COMBAT.HITSTOP` (0.055 s, 0.1 on a
+kill, 0.09 when the player is hit) of **hitstop** — `sim.hitStop` holds the whole world still while
+the render loop keeps drawing, so the frozen frames are the ones carrying the white flash, the
+sparks and the shake. Through a freeze the torch still burns and the camera shake still decays,
+because neither is the blow: a frozen shake is a photograph of a shake, and a torch that stopped
+during every exchange would make fighting free. The struck creature is thrown `COMBAT.KNOCKBACK`
+tiles/second along the blow for `KNOCKBACK_TIME`, and the player's camera takes
+`HIT_SHAKE_DEALT` (or `KILL_SHAKE`).
 
 #### Renderer
 
